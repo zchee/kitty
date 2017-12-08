@@ -74,7 +74,7 @@ static FT_Library  library;
 
 static inline int
 font_units_to_pixels(Face *self, int x) {
-    return ceil((double)FT_MulFix(x, self->face->size->metrics.y_scale) / 64.0);
+    return ceil((double)FT_MulFix(x, self->face->size->metrics.y_scale) / 72.0);
 }
 
 static inline bool
