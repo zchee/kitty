@@ -5,7 +5,7 @@ ifdef VERBOSE
 		VVAL=--verbose
 endif
 
-APP_TARGET := /Applications/kitty-dev.app
+APP_TARGET := /Applications/kitty.app
 
 devel: clean
 	rm -rf linux-package
@@ -13,8 +13,8 @@ devel: clean
 	rm -fr \
 		${APP_TARGET}/Contents/Frameworks/kitty \
 		${APP_TARGET}/Contents/MacOS/kitty
-	cp -r ./linux-package/Contents/Frameworks/kitty /Applications/kitty-dev.app/Contents/Frameworks
-	cp -r ./linux-package/Contents/MacOS/kitty /Applications/kitty-dev.app/Contents/MacOS
+	cp -r ./linux-package/Contents/Frameworks/kitty /Applications/kitty.app/Contents/Frameworks
+	cp -r ./linux-package/Contents/MacOS/kitty /Applications/kitty.app/Contents/MacOS
 
 all:
 	python3 setup.py $(VVAL)
