@@ -142,7 +142,7 @@ get_load_flags(int hinting, int hintstyle, int base) {
     int flags = base;
     if (hinting) {
         if (hintstyle >= 3) flags |= FT_LOAD_TARGET_NORMAL;
-        else if (0 < hintstyle  && hintstyle < 3) flags |= FT_LOAD_TARGET_LIGHT;
+        else if (0 < hintstyle  && hintstyle < 3) flags |= (FT_LOAD_TARGET_LIGHT | FT_LOAD_TARGET_LCD | FT_LOAD_TARGET_LCD_V);
     } else flags |= FT_LOAD_NO_HINTING;
     return flags;
 }
@@ -272,6 +272,10 @@ load_glyph(Face *self, int glyph_index, int load_type) {
     int flags = get_load_flags(self->hinting, self->hintstyle, load_type);
     int error = FT_Load_Glyph(self->face, glyph_index, flags);
     if (error) { set_freetype_error("Failed to load glyph, with error:", error); return false; }
+    int error2 = FT_Render_Glyph(self->face->glyph, FT_RENDER_MODE_LCD);
+    if (error2) { set_freetype_error("Failed to render glyph, with error:", error2); return false; }
+    int error3 = FT_Render_Glyph(self->face->glyph, FT_RENDER_MODE_LCD_V);
+    if (error3) { set_freetype_error("Failed to render glyph, with error:", error3); return false; }
     return true;
 }
 
@@ -295,6 +299,7 @@ cell_metrics(PyObject *s, unsigned int* cell_width, unsigned int* cell_height, u
 #ifdef __APPLE__
     // See https://stackoverflow.com/questions/5511830/how-does-line-spacing-work-in-core-text-and-why-is-it-different-from-nslayoutm
     if (self->apple_leading <= 0) {
+        *cell_width -= floor(0.35 * (double)(*cell_width) + 0.5);
         *cell_height += floor(0.2 * (double)(*cell_height) + 0.5);
     }
 #endif
