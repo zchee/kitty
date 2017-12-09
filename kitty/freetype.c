@@ -104,7 +104,7 @@ set_font_size(Face *self, FT_F26Dot6 char_width, FT_F26Dot6 char_height, FT_UInt
             if (desired_height == 0) desired_height = global_state.cell_height;
             if (desired_height == 0) {
                 desired_height = ceil(((double)char_height / 64.) * (double)ydpi / 72.);
-                desired_height += ceil(0.2 * desired_height);
+                desired_height += ceil(0.15 * desired_height);
             }
             FT_Int strike_index = -1;
             for (FT_Int i = 0; i < self->face->num_fixed_sizes; i++) {
