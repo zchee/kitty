@@ -300,7 +300,7 @@ cell_metrics(PyObject *s, unsigned int* cell_width, unsigned int* cell_height, u
     // See https://stackoverflow.com/questions/5511830/how-does-line-spacing-work-in-core-text-and-why-is-it-different-from-nslayoutm
     if (self->apple_leading <= 0) {
         *cell_width -= floor(0.35 * (double)(*cell_width) + 0.5);
-        *cell_height += floor(0.2 * (double)(*cell_height) + 0.5);
+        *cell_height += floor(0.15 * (double)(*cell_height) + 0.5);
     }
 #endif
     *baseline = font_units_to_pixels(self, self->ascender);
