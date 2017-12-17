@@ -5,6 +5,15 @@ ifdef VERBOSE
 		VVAL=--verbose
 endif
 
+APP_TARGET ?= /Applications/kitty.app
+
+devel: clean
+	rm -rf linux-package
+	python3 setup.py $(VVAL) osx-bundle
+	rm -fr ${APP_TARGET}/Contents/Frameworks/kitty ${APP_TARGET}/Contents/MacOS/kitty
+	cp -r ./linux-package/Contents/Frameworks/kitty ${APP_TARGET}/Contents/Frameworks
+	cp -r ./linux-package/Contents/MacOS/kitty ${APP_TARGET}/Contents/MacOS
+
 all:
 	python3 setup.py $(VVAL)
 
