@@ -623,7 +623,7 @@ def main():
         build(args, native_optimizations=False)
         package(args)
     elif args.action == 'osx-bundle':
-        build(args, native_optimizations=False)
+        build(args, native_optimizations=True)
         package(args, for_bundle=True)
     elif args.action == 'clean':
         clean()
