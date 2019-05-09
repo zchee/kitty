@@ -9,6 +9,7 @@
 #define MARK_MASK {MARK_MASK}
 #define USE_SELECTION_FG
 #define NUM_COLORS 256
+#define NOT_SUBPIXEL
 
 // Inputs {{{
 layout(std140) uniform CellRenderData {
@@ -41,7 +42,7 @@ const uvec2 cell_pos_map[] = uvec2[4](
 // }}}
 
 
-#if defined(SIMPLE) || defined(BACKGROUND) || defined(SPECIAL)
+#if defined(SIMPLE) || defined(BACKGROUND) || defined(SPECIAL) || defined(SUBPIXEL)
 #define NEEDS_BACKROUND
 #endif
 
@@ -68,6 +69,7 @@ out vec3 strike_pos;
 out vec3 foreground;
 out vec3 decoration_fg;
 out float colored_sprite;
+out float subpixel;
 out float effective_text_alpha;
 #endif
 
@@ -76,6 +78,7 @@ out float effective_text_alpha;
 const uint BYTE_MASK = uint(0xFF);
 const uint Z_MASK = uint(0xFFF);
 const uint COLOR_MASK = uint(0x4000);
+const uint SUBPIXEL_MASK = uint(0x8000);
 const uint ZERO = uint(0);
 const uint ONE = uint(1);
 const uint TWO = uint(2);
@@ -178,6 +181,7 @@ void main() {
     // The character sprite being rendered
     sprite_pos = to_sprite_pos(pos, sprite_coords.x, sprite_coords.y, sprite_coords.z & Z_MASK);
     colored_sprite = float((sprite_coords.z & COLOR_MASK) >> 14);
+    subpixel = float((sprite_coords.z & SUBPIXEL_MASK) >> 15);
 
     // Foreground
     uint fg_as_uint = resolve_color(colors[fg_index], default_colors[fg_index]);

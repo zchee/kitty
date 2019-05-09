@@ -103,7 +103,7 @@ class LoadShaderPrograms:
 
     use_selection_fg = True
 
-    def __call__(self, semi_transparent: bool = False) -> None:
+    def __call__(self, semi_transparent: bool = False, subpixel_enabled: bool = False) -> None:
         compile_program(BLIT_PROGRAM, *load_shaders('blit'))
         v, f = load_shaders('cell')
 
@@ -126,6 +126,9 @@ class LoadShaderPrograms:
             if semi_transparent:
                 vv = vv.replace('#define NOT_TRANSPARENT', '#define TRANSPARENT')
                 ff = ff.replace('#define NOT_TRANSPARENT', '#define TRANSPARENT')
+            if subpixel_enabled:
+                vv = vv.replace('#define NOT_SUBPIXEL', '#define SUBPIXEL')
+                ff = ff.replace('#define NOT_SUBPIXEL', '#define SUBPIXEL')
             if not load_shader_programs.use_selection_fg:
                 vv = vv.replace('#define USE_SELECTION_FG', '#define DONT_USE_SELECTION_FG')
                 ff = ff.replace('#define USE_SELECTION_FG', '#define DONT_USE_SELECTION_FG')
