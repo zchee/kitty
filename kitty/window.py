@@ -67,7 +67,7 @@ class LoadShaderPrograms:
 
     use_selection_fg = True
 
-    def __call__(self, semi_transparent=False):
+    def __call__(self, semi_transparent=False, subpixel_enabled=False):
         compile_program(BLIT_PROGRAM, *load_shaders('blit'))
         v, f = load_shaders('cell')
 
@@ -112,6 +112,7 @@ class LoadShaderPrograms:
 
 
 load_shader_programs = LoadShaderPrograms()
+load_shader_programs.use_selection_fg = True
 
 
 def setup_colors(screen, opts):
