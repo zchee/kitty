@@ -15,6 +15,8 @@ typedef enum { LEFT_EDGE, TOP_EDGE, RIGHT_EDGE, BOTTOM_EDGE } Edge;
 typedef enum { RESIZE_DRAW_STATIC, RESIZE_DRAW_SCALED, RESIZE_DRAW_BLANK, RESIZE_DRAW_SIZE } ResizeDrawStrategy;
 typedef enum { REPEAT_MIRROR, REPEAT_CLAMP, REPEAT_DEFAULT } RepeatStrategy;
 
+typedef enum { SUBPIXEL_NONE, SUBPIXEL_LCD, SUBPIXEL_LCD_V } SubpixelRendering;
+
 typedef struct {
     char_type string[16];
     size_t len;
@@ -39,7 +41,7 @@ typedef struct {
     bool focus_follows_mouse;
     unsigned int hide_window_decorations;
     bool macos_hide_from_tasks, macos_quit_when_last_window_closed, macos_window_resizable, macos_traditional_fullscreen;
-    bool use_subpixel_rendering;
+    SubpixelRendering subpixel_rendering;
     unsigned int macos_option_as_alt;
     float macos_thicken_font;
     WindowTitleIn macos_show_window_title_in;
