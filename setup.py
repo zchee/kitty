@@ -230,7 +230,7 @@ def init_env(
         df += ' -Og'
         float_conversion = '-Wfloat-conversion'
     fortify_source = '-D_FORTIFY_SOURCE=2'
-    optimize = df if debug or sanitize else '-O3'
+    optimize = df if debug or sanitize else '-Ofast'
     sanitize_args = get_sanitize_args(cc, ccver) if sanitize else set()
     cppflags_ = os.environ.get(
         'OVERRIDE_CPPFLAGS', '-D{}DEBUG'.format('' if debug else 'N'),
@@ -248,16 +248,27 @@ def init_env(
             ' '.join(sanitize_args),
             stack_protector,
             missing_braces,
-            '-march=native' if native_optimizations else '',
+            '-march=native -flto' if native_optimizations else '',
             fortify_source
         )
     )
+
+    if is_macos:
+        # set -isystem and -isysroot flags
+        macos_sdk_platform_path = subprocess.check_output("xcrun --sdk macosx --show-sdk-platform-path", shell=True).strip().decode('utf-8')
+        _, err = subprocess.Popen(['xcrun', '-r', 'clang', '-v', '-x', 'c', '-o', os.devnull, '-'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
+        # 'Apple clang version **11.0.0** (clang-1100.0.33.15)'
+        clang_version = err.decode('utf-8').split('\n')[0].split()[3]
+        isystem_dir = Path(macos_sdk_platform_path).parent.parent.joinpath('Toolchains/XcodeDefault.xctoolchain/usr/lib/clang').joinpath(clang_version)
+        isysroot_dir = subprocess.check_output("xcrun --show-sdk-path", shell=True).strip().decode('utf-8')
+        cflags_ += ' -isystem {} -isysroot{}'.format(isystem_dir, isysroot_dir)
+
     cflags = shlex.split(cflags_) + shlex.split(
-        sysconfig.get_config_var('CCSHARED') or ''
+        sysconfig.get_config_var('CCSHARED')
     )
     ldflags_ = os.environ.get(
         'OVERRIDE_LDFLAGS',
-        '-Wall ' + ' '.join(sanitize_args) + ('' if debug else ' -O3')
+        '-Wall ' + ' '.join(sanitize_args) + ('' if debug else ' -Ofast')
     )
     ldflags = shlex.split(ldflags_)
     ldflags.append('-shared')
@@ -299,16 +310,22 @@ def kitty_env():
     font_libs.extend(pkg_config('harfbuzz', '--libs'))
     pylib = get_python_flags(cflags)
     gl_libs = ['-framework', 'OpenGL'] if is_macos else pkg_config('gl', '--libs')
-    libpng = pkg_config('libpng', '--libs')
-    ans.ldpaths += pylib + font_libs + gl_libs + libpng
+    libpng = ['-L/usr/local/opt/libpng/lib', '-lpng']
+    zlib = ['/usr/local/opt/zlib/lib/libz.a']
+    ans.ldpaths += pylib + font_libs + gl_libs + libpng + zlib
+    if not is_macos:
+        cflags.extend(pkg_config('libcanberra', '--cflags-only-I'))
+        ans.ldpaths += pkg_config('libcanberra', '--libs')
     if is_macos:
+        ans.cflags.append('-isystem/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/11.0.0')
+        ans.cflags.append('-isysroot/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk')
         ans.ldpaths.extend('-framework Cocoa'.split())
     else:
         ans.ldpaths += ['-lrt']
         if '-ldl' not in ans.ldpaths:
             ans.ldpaths.append('-ldl')
-    if '-lz' not in ans.ldpaths:
-        ans.ldpaths.append('-lz')
+    # if '-lz' not in ans.ldpaths:
+    #     ans.ldpaths.append('-lz')
 
     with suppress(FileExistsError):
         os.mkdir(build_dir)
@@ -528,7 +545,7 @@ def compile_c_extension(kenv, module, compilation_database, sources, headers, de
             else:
                 cppflags.extend(map(define, defines_))
 
-        cmd = [kenv.cc, '-MMD'] + cppflags + kenv.cflags
+        cmd = [kenv.cc, '-MMD', '-Ofast', '-flto'] + cppflags + kenv.cflags
         cmd += ['-c', src] + ['-o', dest]
         key = CompileKey(original_src, os.path.basename(dest))
         desc = 'Compiling {} ...'.format(emphasis(desc_prefix + src))
@@ -540,7 +557,7 @@ def compile_c_extension(kenv, module, compilation_database, sources, headers, de
     # Old versions of clang don't like -pthread being passed to the linker
     # Don't treat linker warnings as errors (linker generates spurious
     # warnings on some old systems)
-    unsafe = {'-pthread', '-Werror', '-pedantic-errors'}
+    unsafe = {'-pthread', '-Werror', '-pedantic-errors', '-Ofast', '-flto'}
     linker_cflags = list(filter(lambda x: x not in unsafe, kenv.cflags))
     cmd = [kenv.cc] + linker_cflags + kenv.ldflags + objects + kenv.ldpaths + ['-o', dest]
 
@@ -657,7 +674,7 @@ def build_launcher(args, launcher_dir='.', bundle_type='source'):
         if args.profile:
             libs.append('-lprofiler')
     else:
-        cflags.append('-O3')
+        cflags.append('-Ofast')
     if bundle_type.endswith('-freeze'):
         cppflags.append('-DFOR_BUNDLE')
         cppflags.append('-DPYVER="{}"'.format(sysconfig.get_python_version()))
@@ -677,6 +694,12 @@ def build_launcher(args, launcher_dir='.', bundle_type='source'):
     cppflags += shlex.split(os.environ.get('CPPFLAGS', ''))
     cflags += shlex.split(os.environ.get('CFLAGS', ''))
     ldflags = shlex.split(os.environ.get('LDFLAGS', ''))
+    cflags.append('-Ofast')
+    cflags.append('-flto')
+    cflags.append('-isystem/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/11.0.0')
+    cflags.append('-isysroot/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk')
+    ldflags.append('-Ofast')
+    ldflags.append('-flto')
     if bundle_type == 'linux-freeze':
         ldflags += ['-Wl,-rpath,$ORIGIN/../lib']
     os.makedirs(launcher_dir, exist_ok=True)
@@ -804,6 +827,7 @@ def macos_info_plist():
         CFBundleIconFile=appname + '.icns',
         NSHighResolutionCapable=True,
         NSSupportsAutomaticGraphicsSwitching=True,
+        UIViewEdgeAntialiasing=True,
         LSApplicationCategoryType='public.app-category.utilities',
         LSEnvironment={'KITTY_LAUNCHED_BY_LAUNCH_SERVICES': '1'},
         NSServices=[
@@ -1040,26 +1064,32 @@ def main():
     with CompilationDatabase(args.incremental) as cdb:
         args.compilation_database = cdb
         if args.action == 'build':
-            build(args)
+            build(args, native_optimizations=True)
             launcher_dir = 'kitty/launcher'
             if is_macos:
                 create_minimal_macos_bundle(args, launcher_dir)
             else:
                 build_launcher(args, launcher_dir=launcher_dir)
         elif args.action == 'linux-package':
-            build(args, native_optimizations=False)
+            build(args, native_optimizations=True)
+            if not os.path.exists(os.path.join(base, 'docs/_build/html')):
+                run_tool(['make', 'docs'])
             package(args, bundle_type='linux-package')
         elif args.action == 'linux-freeze':
-            build(args, native_optimizations=False)
+            build(args, native_optimizations=True)
+            if not os.path.exists(os.path.join(base, 'docs/_build/html')):
+                run_tool(['make', 'docs'])
             package(args, bundle_type='linux-freeze')
         elif args.action == 'macos-freeze':
-            build(args, native_optimizations=False)
+            build(args, native_optimizations=True)
             package(args, bundle_type='macos-freeze')
         elif args.action == 'kitty.app':
             args.prefix = 'kitty.app'
             if os.path.exists(args.prefix):
                 shutil.rmtree(args.prefix)
-            build(args)
+            build(args, native_optimizations=True)
+            if not os.path.exists(os.path.join(base, 'docs/_build/html')):
+                run_tool(['make', 'docs'])
             package(args, bundle_type='macos-package')
             print('kitty.app successfully built!')
 
