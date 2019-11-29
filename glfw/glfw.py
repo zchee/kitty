@@ -6,10 +6,26 @@ import json
 import os
 import re
 import sys
+import subprocess
+
+from pathlib import Path
 
 _plat = sys.platform.lower()
 is_linux = 'linux' in _plat
 base = os.path.dirname(os.path.abspath(__file__))
+
+
+def macos_isystem():
+    macos_sdk_platform_path = subprocess.check_output("xcrun --sdk macosx --show-sdk-platform-path", shell=True).strip().decode('utf-8')
+
+    _, err = subprocess.Popen(['xcrun', '-r', 'clang', '-v', '-x', 'c', '-o', os.devnull, '-'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
+    # 'Apple clang version **11.0.0** (clang-1100.0.33.15)'
+    clang_version = err.decode('utf-8').split('\n')[0].split()[3]
+
+    return Path(macos_sdk_platform_path).parent.parent.joinpath('Toolchains/XcodeDefault.xctoolchain/usr/lib/clang').joinpath(clang_version)
+
+def macos_isysroot():
+    return subprocess.check_output("xcrun --show-sdk-path", shell=True).strip().decode('utf-8')
 
 
 def wayland_protocol_file_name(base, ext='c'):
@@ -25,8 +41,8 @@ def init_env(env, pkg_config, at_least_version, test_compile, module='x11'):
     ans.cflags.append('-flto')
     ans.cppflags.append('-D_GLFW_' + module.upper())
     ans.cppflags.append('-D_GLFW_BUILD_DLL')
-    ans.cppflags.append('-isystem/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/11.0.3')
-    ans.cppflags.append('-isysroot/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk')
+    ans.cppflags.append('-isystem{}'.format(macos_isystem()))
+    ans.cppflags.append('-isysroot{}'.format(macos_isysroot()))
 
     with open(os.path.join(base, 'source-info.json')) as f:
         sinfo = json.load(f)
@@ -51,10 +67,17 @@ def init_env(env, pkg_config, at_least_version, test_compile, module='x11'):
 
     elif module == 'cocoa':
         ans.cppflags.append('-DGL_SILENCE_DEPRECATION')
+<<<<<<< HEAD
         for f_ in 'Cocoa IOKit CoreFoundation CoreVideo'.split():
             ans.ldpaths.extend(('-framework', f_))
         ans.cflags.append('-isystem/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/11.0.3')
         ans.cflags.append('-isysroot/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk')
+=======
+        for f in 'Cocoa IOKit CoreFoundation CoreVideo'.split():
+            ans.ldpaths.extend(('-framework', f))
+        ans.cflags.append('-isystem{}'.format(macos_isystem()))
+        ans.cflags.append('-isysroot{}'.format(macos_isysroot()))
+>>>>>>> 821753fa... all: add macos_isystem and macos_isysroot def
 
     elif module == 'wayland':
         at_least_version('wayland-protocols', *sinfo['wayland_protocols'])

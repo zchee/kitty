@@ -286,6 +286,18 @@ def init_env(
         ldflags.append('-lprofiler')
     return Env(cc, cppflags, cflags, ldflags, ccver=ccver)
 
+def macos_isystem():
+    macos_sdk_platform_path = subprocess.check_output("xcrun --sdk macosx --show-sdk-platform-path", shell=True).strip().decode('utf-8')
+
+    _, err = subprocess.Popen(['xcrun', '-r', 'clang', '-v', '-x', 'c', '-o', os.devnull, '-'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
+    # 'Apple clang version **11.0.0** (clang-1100.0.33.15)'
+    clang_version = err.decode('utf-8').split('\n')[0].split()[3]
+
+    return Path(macos_sdk_platform_path).parent.parent.joinpath('Toolchains/XcodeDefault.xctoolchain/usr/lib/clang').joinpath(clang_version)
+
+def macos_isysroot():
+    return subprocess.check_output("xcrun --show-sdk-path", shell=True).strip().decode('utf-8')
+
 
 def kitty_env():
     ans = env.copy()
@@ -317,8 +329,8 @@ def kitty_env():
         cflags.extend(pkg_config('libcanberra', '--cflags-only-I'))
         ans.ldpaths += pkg_config('libcanberra', '--libs')
     if is_macos:
-        ans.cflags.append('-isystem/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/11.0.0')
-        ans.cflags.append('-isysroot/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk')
+        ans.cflags.append('-isystem{}'.format(macos_isystem()))
+        ans.cflags.append('-isysroot{}'.format(macos_isysroot()))
         ans.ldpaths.extend('-framework Cocoa'.split())
     else:
         ans.ldpaths += ['-lrt']
@@ -696,8 +708,8 @@ def build_launcher(args, launcher_dir='.', bundle_type='source'):
     ldflags = shlex.split(os.environ.get('LDFLAGS', ''))
     cflags.append('-Ofast')
     cflags.append('-flto')
-    cflags.append('-isystem/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/11.0.0')
-    cflags.append('-isysroot/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk')
+    cflags.append('-isystem{}'.format(macos_isystem()))
+    cflags.append('-isysroot{}'.format(macos_isysroot()))
     ldflags.append('-Ofast')
     ldflags.append('-flto')
     if bundle_type == 'linux-freeze':
