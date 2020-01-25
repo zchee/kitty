@@ -1486,6 +1486,87 @@ class Splits(Layout):
 # }}}
 
 
+# Splits {{{
+class Pair:
+
+    def __init__(self, horizontal=True):
+        self.horizontal = horizontal
+        self.one = self.two = None
+        self.parent = None
+
+    def all_window_ids(self):
+        if self.one is not None:
+            if isinstance(self.one, Pair):
+                yield from self.one.all_window_ids
+            yield self.one
+        if self.two is not None:
+            if isinstance(self.two, Pair):
+                yield from self.two.all_window_ids
+            yield self.two
+
+    def self_and_descendants(self):
+        yield self
+        if isinstance(self.one, Pair):
+            yield from self.one.self_and_descendants
+        if isinstance(self.two, Pair):
+            yield from self.two.self_and_descendants
+
+    def remove_windows(self, window_ids):
+        if isinstance(self.one, int) and self.one in window_ids:
+            self.one = None
+        if isinstance(self.two, int) and self.two in window_ids:
+            self.two = None
+
+    @property
+    def is_redundant(self):
+        return self.one is None or self.two is None
+
+    def collapse_redundant_pairs(self):
+        while isinstance(self.one, Pair) and self.one.is_redundant:
+            self.one = self.one.one or self.one.two
+        while isinstance(self.two, Pair) and self.two.is_redundant:
+            self.two = self.two.one or self.two.two
+        if isinstance(self.one, Pair):
+            self.one.collapse_redundant_pairs()
+        if isinstance(self.two, Pair):
+            self.two.collapse_redundant_pairs()
+
+
+class Splits(Layout):
+    name = 'splits'
+
+    @property
+    def default_axis_is_horizontal(self):
+        return self.layout_opts['default_axis_is_horizontal']
+
+    def parse_layout_opts(self, layout_opts):
+        ans = Layout.parse_layout_opts(self, layout_opts)
+        ans['default_axis_is_horizontal'] = ans.get('split_axis', 'horizontal') == 'horizontal'
+        return ans
+
+    def do_layout(self, windows, active_window_idx):
+        window_count = len(windows)
+        if window_count == 1:
+            return self.layout_single_window(windows[0])
+        root = getattr(self, 'pairs_root', None)
+        if root is None:
+            self.pairs_root = root = Pair(horizontal=self.default_axis_is_horizontal)
+        all_present_window_ids = frozenset(w.overlay_for or w.id for w in windows)
+        already_placed_window_ids = frozenset(root.all_window_ids())
+        windows_to_remove = already_placed_window_ids - all_present_window_ids
+
+        if windows_to_remove:
+            for pair in root.self_and_descendants():
+                pair.remove_windows(windows_to_remove)
+            root.collapse_redundant_pairs()
+            if root.one is None or root.two is None:
+                q = root.one or root.two
+                if isinstance(q, Pair):
+                    root = self.pairs_root = q
+
+# }}}
+
+
 # Instantiation {{{
 
 all_layouts = {cast(str, o.name): o for o in globals().values() if isinstance(o, type) and issubclass(o, Layout) and o is not Layout}
