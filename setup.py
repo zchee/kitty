@@ -311,7 +311,9 @@ def kitty_env():
     at_least_version('harfbuzz', 1, 5)
     cflags.extend(pkg_config('libpng', '--cflags-only-I'))
     if is_macos:
-        font_libs = ['-framework', 'CoreText', '-framework', 'CoreGraphics']
+        font_libs = ['-framework', 'CoreText', '-framework', 'CoreGraphics', '-framework', 'IOKit', '-framework', 'CoreFoundation', '-framework', 'CoreVideo', '-framework', 'Metal', '-framework', 'AppKit', '-framework', 'QuartzCore', '-framework', 'Foundation', '-framework', 'IOSurface']
+        font_libs.append('-lc++')
+        font_libs.append('/usr/local/opt/molten-vk/lib/libMoltenVK.a')
         # Apple deprecated OpenGL in Mojave (10.14) silence the endless
         # warnings about it
         cppflags.append('-DGL_SILENCE_DEPRECATION')
@@ -322,7 +324,8 @@ def kitty_env():
     font_libs.extend(pkg_config('harfbuzz', '--libs'))
     pylib = get_python_flags(cflags)
     gl_libs = ['-framework', 'OpenGL'] if is_macos else pkg_config('gl', '--libs')
-    libpng = ['-L/usr/local/opt/libpng/lib', '-lpng']
+    # libpng = ['-L/usr/local/opt/libpng/lib', '-lpng']
+    libpng = ['/usr/local/opt/libpng/lib/libpng.a']
     zlib = ['/usr/local/opt/zlib/lib/libz.a']
     ans.ldpaths += pylib + font_libs + gl_libs + libpng + zlib
     if not is_macos:
@@ -842,6 +845,7 @@ def macos_info_plist():
         UIViewEdgeAntialiasing=True,
         LSApplicationCategoryType='public.app-category.utilities',
         LSEnvironment={'KITTY_LAUNCHED_BY_LAUNCH_SERVICES': '1'},
+        NSAppleEventsUsageDescription='kitty, an OpenGL based terminal emulator.',
         NSServices=[
             {
                 'NSMenuItem': {'default': 'New ' + appname + ' Tab Here'},

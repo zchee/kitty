@@ -1,3 +1,5 @@
+SHELL = /usr/bin/env bash
+
 ifdef V
 	VVAL=--verbose
 endif
@@ -11,9 +13,10 @@ APP_TARGET ?= $(join $(addsuffix /,${APPLICATIONS_DIR}), $(APP))
 
 default: devel
 
+# devel: clean fetch
 devel: VVAL=--verbose
 devel: CC=/usr/local/opt/ccache/libexec/clang
-devel: LDFLAGS='-F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks -F/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/PrivateFrameworks'
+devel: LDFLAGS=-F/System/Library/PrivateFrameworks -F/System/Library/Frameworks -F/usr/local/Frameworks
 devel: clean fetch
 	export PYTHONOPTIMIZE=2
 	python3 setup.py build --full $(VVAL)

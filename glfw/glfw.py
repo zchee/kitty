@@ -39,10 +39,10 @@ def init_env(env, pkg_config, at_least_version, test_compile, module='x11'):
     ans.cflags.append('-march=native')
     ans.cflags.append('-Ofast')
     ans.cflags.append('-flto')
+    ans.cflags.append('-isystem{}'.format(macos_isystem()))
+    ans.cflags.append('-isysroot{}'.format(macos_isysroot()))
     ans.cppflags.append('-D_GLFW_' + module.upper())
     ans.cppflags.append('-D_GLFW_BUILD_DLL')
-    ans.cppflags.append('-isystem{}'.format(macos_isystem()))
-    ans.cppflags.append('-isysroot{}'.format(macos_isysroot()))
 
     with open(os.path.join(base, 'source-info.json')) as f:
         sinfo = json.load(f)
@@ -67,17 +67,16 @@ def init_env(env, pkg_config, at_least_version, test_compile, module='x11'):
 
     elif module == 'cocoa':
         ans.cppflags.append('-DGL_SILENCE_DEPRECATION')
-<<<<<<< HEAD
         for f_ in 'Cocoa IOKit CoreFoundation CoreVideo'.split():
             ans.ldpaths.extend(('-framework', f_))
         ans.cflags.append('-isystem/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/11.0.3')
         ans.cflags.append('-isysroot/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk')
-=======
-        for f in 'Cocoa IOKit CoreFoundation CoreVideo'.split():
+        for f in 'Cocoa IOKit CoreFoundation CoreVideo Metal AppKit QuartzCore Foundation IOSurface'.split():
             ans.ldpaths.extend(('-framework', f))
+        ans.ldpaths.append('-lc++')
+        ans.ldpaths.append('/usr/local/opt/molten-vk/lib/libMoltenVK.a')
         ans.cflags.append('-isystem{}'.format(macos_isystem()))
         ans.cflags.append('-isysroot{}'.format(macos_isysroot()))
->>>>>>> 821753fa... all: add macos_isystem and macos_isysroot def
 
     elif module == 'wayland':
         at_least_version('wayland-protocols', *sinfo['wayland_protocols'])
