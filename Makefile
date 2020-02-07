@@ -14,13 +14,14 @@ APP_TARGET ?= $(join $(addsuffix /,${APPLICATIONS_DIR}), $(APP))
 default: devel
 
 # devel: clean fetch
+devel: CC=$(shell xcrun -f clang)
+devel: CXX=$(shell xcrun -f clang++)
 devel: VVAL=--verbose
-devel: CC=/usr/local/opt/ccache/libexec/clang
 devel: LDFLAGS=-F/System/Library/PrivateFrameworks -F/System/Library/Frameworks -F/usr/local/Frameworks
 devel: clean fetch
 	export PYTHONOPTIMIZE=2
-	python3 setup.py build --full $(VVAL)
-	python3 setup.py kitty.app $(VVAL)
+	python3.7 setup.py build --full $(VVAL)
+	python3.7 setup.py kitty.app $(VVAL)
 	rm -rf /usr/local/share/man/man1/kitty.1 /usr/local/share/doc/kitty
 	command cp -f docs/_build/man/kitty.1 /usr/local/share/man/man1
 	command cp -rf docs/_build/html /usr/local/share/doc/kitty
