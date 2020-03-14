@@ -7,6 +7,9 @@ import os
 import re
 import sys
 from typing import Callable, List, Optional, Tuple
+import subprocess
+
+from pathlib import Path
 
 _plat = sys.platform.lower()
 is_linux = 'linux' in _plat
@@ -53,11 +56,30 @@ def wayland_protocol_file_name(base: str, ext: str = 'c') -> str:
     return 'wayland-{}-client-protocol.{}'.format(base, ext)
 
 
+def macos_isystem():
+    macos_sdk_platform_path = subprocess.check_output("xcrun --sdk macosx --show-sdk-platform-path", shell=True).strip().decode('utf-8')
+
+    _, err = subprocess.Popen(['xcrun', '-r', 'clang', '-v', '-x', 'c', '-o', os.devnull, '-'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
+    # 'Apple clang version **11.0.0** (clang-1100.0.33.15)'
+    clang_version = err.decode('utf-8').split('\n')[0].split()[3]
+
+    return Path(macos_sdk_platform_path).parent.parent.joinpath('Toolchains/XcodeDefault.xctoolchain/usr/lib/clang').joinpath(clang_version)
+
+
+def macos_isysroot():
+    return subprocess.check_output("xcrun --show-sdk-path", shell=True).strip().decode('utf-8')
+
+
 def init_env(env: Env, pkg_config: Callable, at_least_version: Callable, test_compile: Callable, module: str = 'x11') -> Env:
     ans = env.copy()
     ans.cflags.append('-fpic')
+    ans.cflags.append('-march=native')
+    ans.cflags.append('-Ofast')
+    ans.cflags.append('-flto')
     ans.cppflags.append('-D_GLFW_' + module.upper())
     ans.cppflags.append('-D_GLFW_BUILD_DLL')
+    ans.cppflags.append('-isystem{}'.format(macos_isystem()))
+    ans.cppflags.append('-isysroot{}'.format(macos_isysroot()))
 
     with open(os.path.join(base, 'source-info.json')) as f:
         sinfo = json.load(f)
@@ -82,8 +104,10 @@ def init_env(env: Env, pkg_config: Callable, at_least_version: Callable, test_co
 
     elif module == 'cocoa':
         ans.cppflags.append('-DGL_SILENCE_DEPRECATION')
-        for f_ in 'Cocoa IOKit CoreFoundation CoreVideo'.split():
-            ans.ldpaths.extend(('-framework', f_))
+        for f in 'Cocoa IOKit CoreFoundation CoreVideo'.split():
+            ans.ldpaths.extend(('-framework', f))
+        ans.cflags.append('-isystem{}'.format(macos_isystem()))
+        ans.cflags.append('-isysroot{}'.format(macos_isysroot()))
 
     elif module == 'wayland':
         at_least_version('wayland-protocols', *sinfo['wayland_protocols'])
@@ -98,7 +122,7 @@ def init_env(env: Env, pkg_config: Callable, at_least_version: Callable, test_co
         for dep in 'wayland-egl wayland-client wayland-cursor xkbcommon dbus-1'.split():
             ans.cflags.extend(pkg_config(dep, '--cflags-only-I'))
             ans.ldpaths.extend(pkg_config(dep, '--libs'))
-        has_memfd_create = test_compile(env.cc, '-Werror', src='''#define _GNU_SOURCE
+        has_memfd_create = test_compile(env.cc, '-Wno-objc-multiple-method-names', src='''#define _GNU_SOURCE
     #include <unistd.h>
     #include <sys/syscall.h>
     int main(void) {
