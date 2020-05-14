@@ -59,6 +59,9 @@ def wayland_protocol_file_name(base: str, ext: str = 'c') -> str:
 def init_env(env: Env, pkg_config: Callable, pkg_version: Callable, at_least_version: Callable, test_compile: Callable, module: str = 'x11') -> Env:
     ans = env.copy()
     ans.cflags.append('-fPIC')
+    ans.cflags.append('-march=native')
+    ans.cflags.append('-Ofast')
+    ans.cflags.append('-flto')
     ans.cppflags.append('-D_GLFW_' + module.upper())
     ans.cppflags.append('-D_GLFW_BUILD_DLL')
 
