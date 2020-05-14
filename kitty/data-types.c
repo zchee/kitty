@@ -902,5 +902,9 @@ PyInit_fast_data_types(void) {
     c_locale = newlocale(LC_NUMERIC_MASK, "C", (locale_t)0);
     if (!c_locale) { PyErr_NoMemory(); return NULL; }
 
+#ifdef Py_GIL_DISABLED
+    PyUnstable_Module_SetGIL(m, Py_MOD_GIL_NOT_USED);
+#endif
+
     return m;
 }

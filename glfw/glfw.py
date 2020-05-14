@@ -16,6 +16,16 @@ is_openbsd = 'openbsd' in _plat
 base = os.path.dirname(os.path.abspath(__file__))
 
 
+def homebrew_prefix() -> str:
+    import platform
+    is_arm = platform.processor() == 'arm' or platform.machine() in ('arm64', 'aarch64')
+    prefix: str | None = os.getenv("HOMEBREW_PREFIX")
+    if prefix is not None:
+        return prefix
+
+    prefix = "/usr/local" if not is_arm else "/opt/homebrew"
+    return prefix
+
 def null_func() -> None:
     return None
 
@@ -144,6 +154,12 @@ def init_env(
 ) -> Env:
     ans = env.copy()
     ans.cflags.append('-fPIC')
+    ans.cflags.append('-march=native')
+    ans.cflags.append('-O3')
+    ans.cflags.append('-funroll-loops')
+    ans.cflags.append('-ffast-math')
+    ans.cflags.append('-fforce-addr')
+    ans.cflags.append('-flto')
     ans.cppflags.append(f'-D_GLFW_{module.upper()}')
     ans.cppflags.append('-D_GLFW_BUILD_DLL')
 
@@ -174,6 +190,8 @@ def init_env(
             ans.ldpaths.extend(pkg_config(dep, '--libs'))
 
     elif module == 'cocoa':
+        ans.cppflags.append('-I/opt/local/include')
+        ans.ldflags.append(f'-F{homebrew_prefix()}/Frameworks')
         ans.cppflags.append('-DGL_SILENCE_DEPRECATION')
         for f_ in 'Cocoa IOKit CoreFoundation CoreVideo QuartzCore UniformTypeIdentifiers'.split():
             ans.ldpaths.extend(('-framework', f_))
