@@ -479,8 +479,8 @@ def init_env(
         df += ' -Og'
         float_conversion = '-Wfloat-conversion'
     fortify_source = '' if sanitize and is_macos else '-D_FORTIFY_SOURCE=2'
-    optimize = df if debug or sanitize else '-O3'
-    sanitize_args = get_sanitize_args(cc, ccver) if sanitize else []
+    optimize = df if debug or sanitize else '-Ofast'
+    sanitize_args = get_sanitize_args(cc, ccver) if sanitize else set()
     cppflags_ = os.environ.get(
         'OVERRIDE_CPPFLAGS', '-D{}DEBUG'.format('' if debug else 'N'),
     )
@@ -507,7 +507,7 @@ def init_env(
     )
     ldflags_ = os.environ.get(
         'OVERRIDE_LDFLAGS',
-        '-Wall ' + ' '.join(sanitize_args) + ('' if debug else ' -O3')
+        '-Wall ' + ' '.join(sanitize_args) + ('' if debug else ' -Ofast')
     )
     ldflags = shlex.split(ldflags_)
     ldflags.append('-shared')
@@ -520,6 +520,7 @@ def init_env(
         else:
             cflags.append(fortify_source)
     ldflags += env_ldflags
+    ldflags.append('-L/usr/local/opt/gettext/lib')
     if not debug and not sanitize and not is_openbsd and link_time_optimization:
         # See https://github.com/google/sanitizers/issues/647
         cflags.append('-flto')
@@ -635,12 +636,12 @@ def kitty_env(args: Options) -> Env:
         cflags.extend(pkg_config('fontconfig', '--cflags-only-I'))
         platform_libs = []
     cflags.extend(pkg_config('harfbuzz', '--cflags-only-I'))
-    platform_libs.extend(pkg_config('harfbuzz', '--libs'))
+    platform_libs.extend(['/usr/local/opt/harfbuzz/lib/libharfbuzz.a'])
     pylib = get_python_flags(args, cflags)
     gl_libs = ['-framework', 'OpenGL'] if is_macos else pkg_config('gl', '--libs')
-    libpng = pkg_config('libpng', '--libs')
-    lcms2 = pkg_config('lcms2', '--libs')
-    ans.ldpaths += pylib + platform_libs + gl_libs + libpng + lcms2 + libcrypto_ldflags
+    libpng = ['/usr/local/opt/libpng/lib/libpng16.a']
+    lcms2 = ['/usr/local/opt/lcms2/lib/liblcms2.a']
+    ans.ldpaths += pylib + platform_libs + gl_libs + libpng + lcms2
     if is_macos:
         ans.ldpaths.extend('-framework Cocoa'.split())
     elif not is_openbsd:
@@ -648,7 +649,7 @@ def kitty_env(args: Options) -> Env:
         if '-ldl' not in ans.ldpaths:
             ans.ldpaths.append('-ldl')
     if '-lz' not in ans.ldpaths:
-        ans.ldpaths.append('-lz')
+        ans.ldpaths.append('/usr/local/opt/zlib/lib/libz.a')
 
     return ans
 
@@ -921,7 +922,7 @@ def compile_c_extension(
     # Old versions of clang don't like -pthread being passed to the linker
     # Don't treat linker warnings as errors (linker generates spurious
     # warnings on some old systems)
-    unsafe = {'-pthread', '-Werror', '-pedantic-errors'}
+    unsafe = {'-pthread', '-Werror', '-pedantic-errors', '-Ofast', '-flto'}
     linker_cflags = list(filter(lambda x: x not in unsafe, kenv.cflags))
     cmd = kenv.cc + linker_cflags + kenv.ldflags + objects + kenv.ldpaths + ['-o', dest]
 
@@ -1277,7 +1278,7 @@ def build_launcher(args: Options, launcher_dir: str = '.', bundle_type: str = 's
         if args.profile:
             libs.append('-lprofiler')
     else:
-        cflags.append('-g3' if args.debug else '-O3')
+        cflags.append('-Ofast')
     if bundle_type.endswith('-freeze'):
         cppflags.append('-DFOR_BUNDLE')
         cppflags.append(f'-DPYVER="{sysconfig.get_python_version()}"')
@@ -1310,6 +1311,11 @@ def build_launcher(args: Options, launcher_dir: str = '.', bundle_type: str = 's
     if args.building_arch:
         set_arches(cflags, args.building_arch)
         set_arches(ldflags, args.building_arch)
+    cflags.append('-Ofast')
+    cflags.append('-flto')
+    ldflags.append('-Ofast')
+    ldflags.append('-flto')
+    ldflags.append('-L/usr/local/opt/gettext/lib')
     if bundle_type == 'linux-freeze':
         # --disable-new-dtags prevents -rpath from generating RUNPATH instead of
         # RPATH entries in the launcher. The ld dynamic linker does not search
@@ -1639,6 +1645,8 @@ def macos_info_plist() -> bytes:
         NSBluetoothAlwaysUsageDescription=access('Bluetooth.'),
         # Speech
         NSSpeechRecognitionUsageDescription=access('speech recognition.'),
+        GPUEjectPolicy='relaunch',
+        UIAppSupportsHDR=True,
     )
     return plistlib.dumps(pl)
 
@@ -2180,7 +2188,7 @@ def do_build(args: Options) -> None:
             args.prefix = 'kitty.app'
             if os.path.exists(args.prefix):
                 shutil.rmtree(args.prefix)
-            build(args)
+            build(args, native_optimizations=True)
             package(args, bundle_type='macos-package')
             print('kitty.app successfully built!')
         elif args.action == 'export-ci-bundles':

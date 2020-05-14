@@ -33,9 +33,26 @@ if len(non_characters) != 66:
     raise SystemExit('non_characters table incorrect')
 emoji_skin_tone_modifiers = frozenset(range(0x1f3fb, 0x1F3FF + 1))
 
+def get_data_raw(uri: str) -> Iterable[str]:
+    url = f'{uri}'
+    print('url: {}'.format(url))
+    bn = os.path.basename(url)
+    local = os.path.join('/tmp', bn)
+    if os.path.exists(local):
+        with open(local, 'rb') as f:
+            data = f.read()
+    else:
+        data = urlopen(url).read()
+        with open(local, 'wb') as f:
+            f.write(data)
+    for line in data.decode('utf-8').splitlines():
+        line = line.strip()
+        if line and not line.startswith('#'):
+            yield line
 
 def get_data(fname: str, folder: str = 'UCD') -> Iterable[str]:
     url = f'https://www.unicode.org/Public/{folder}/latest/{fname}'
+    print('url: {}'.format(url))
     bn = os.path.basename(url)
     local = os.path.join('/tmp', bn)
     if os.path.exists(local):
@@ -220,7 +237,7 @@ def parse_emoji_modifier_sequence(spec: str) -> None:
 
 
 def parse_emoji() -> None:
-    for line in get_data('emoji-sequences.txt', 'emoji'):
+    for line in get_data_raw('https://unicode.org/Public/emoji/13.1/emoji-sequences.txt'):
         parts = [x.strip() for x in line.split(';')]
         if len(parts) < 2:
             continue
@@ -244,7 +261,7 @@ ambiguous: set[int] = set()
 def parse_eaw() -> None:
     global doublewidth, ambiguous
     seen: set[int] = set()
-    for line in get_data('ucd/EastAsianWidth.txt'):
+    for line in get_data_raw('https://unicode.org/Public/14.0.0/ucd/EastAsianWidth-14.0.0d7.txt'):
         chars, eaw = split_two(line)
         if eaw == 'A':
             ambiguous |= chars
