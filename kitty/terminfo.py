@@ -26,7 +26,7 @@ def encode_keystring(keybytes: bytes) -> str:
     return keybytes.decode('ascii').replace('\033', r'\E')
 
 
-names = 'xterm-kitty', 'KovIdTTY'
+names = 'xterm-256color', 'KovIdTTY'
 
 termcap_aliases = {
     'TN': 'name'
@@ -65,6 +65,8 @@ bool_capabilities = {
     # The following are entries that we don't use
     # # background color erase
     # 'bce',
+
+    'RGB',
 }
 
 termcap_aliases.update({
@@ -81,13 +83,13 @@ termcap_aliases.update({
 
 numeric_capabilities = {
     # maximum number of colors on screen
-    'colors': 256,
+    'colors': 16777216,
     'cols': 80,
     'lines': 24,
     # tabs initially every # spaces
     'it': 8,
     # maximum number of color-pairs on the screen
-    'pairs': 32767,
+    'pairs': 65536,
 }
 
 termcap_aliases.update({
@@ -210,9 +212,11 @@ string_capabilities = {
     # Save cursor
     'sc': r'\E7',
     # Set background color
-    'setab': r'\E[%?%p1%{8}%<%t4%p1%d%e%p1%{16}%<%t10%p1%{8}%-%d%e48;5;%p1%d%;m',
+    # 'setab': r'\E[%?%p1%{8}%<%t4%p1%d%e%p1%{16}%<%t10%p1%{8}%-%d%e48;5;%p1%d%;m',
+    'setab': r'\E[%?%p1%{8}%<%t4%p1%d%e48:5:%p1%{65536}%/%d:%p1%{256}%/%{255}%&%d:%p1%{255}%&%d%;m',
     # Set foreground color
-    'setaf': r'\E[%?%p1%{8}%<%t3%p1%d%e%p1%{16}%<%t9%p1%{8}%-%d%e38;5;%p1%d%;m',
+    # 'setaf': r'\E[%?%p1%{8}%<%t3%p1%d%e%p1%{16}%<%t9%p1%{8}%-%d%e38;5;%p1%d%;m',
+    'setaf': r'\E[%?%p1%{8}%<%t3%p1%d%e38:5:%p1%{65536}%/%d:%p1%{256}%/%{255}%&%d:%p1%{255}%&%d%;m',
     # Set attributes
     'sgr': r'%?%p9%t\E(0%e\E(B%;\E[0%?%p6%t;1%;%?%p2%t;4%;%?%p1%p3%|%t;7%;%?%p4%t;5%;%?%p7%t;8%;m',
     # Clear all attributes
@@ -436,7 +440,7 @@ queryable_capabilities = cast(Dict[str, str], numeric_capabilities.copy())
 queryable_capabilities.update(string_capabilities)
 extra = (bool_capabilities | numeric_capabilities.keys() | string_capabilities.keys()) - set(termcap_aliases.values())
 no_termcap_for = frozenset(
-    'Su Tc setrgbf setrgbb fullkbd kUP kDN'.split() + [
+    'Su Tc setrgbf setrgbb fullkbd kUP kDN RGB'.split() + [
         'k{}{}'.format(key, mod)
         for key in 'UP DN RIT LFT END HOM IC DC PRV NXT'.split()
         for mod in range(3, 8)])
