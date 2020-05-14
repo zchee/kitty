@@ -9,10 +9,18 @@ import subprocess
 import sys
 import tempfile
 
+def homebrew_prefix() -> str:
+    prefix: str | None = os.getenv("HOMEBREW_PREFIX")
+    if prefix is not None:
+        return prefix
+
+    prefix = "/usr/local" if not is_arm else "/opt/homebrew"
+    return prefix
+
 
 def compile_terminfo(base):
     with tempfile.TemporaryDirectory() as tdir:
-        proc = subprocess.run(['tic', '-x', f'-o{tdir}', 'terminfo/kitty.terminfo'], capture_output=True)
+        proc = subprocess.run([f'{homebrew_prefix()}/opt/ncurses-head/bin/tic', '-x', f'-o{tdir}', 'terminfo/kitty.terminfo'], capture_output=True)
         if proc.returncode != 0:
             sys.stderr.buffer.write(proc.stderr)
             raise SystemExit(proc.returncode)
@@ -39,7 +47,7 @@ def generate_terminfo():
 
     with open('terminfo/kitty.terminfo', 'w') as f:
         f.write(generate_terminfo())
-    proc = subprocess.run(['tic', '-CrT0', 'terminfo/kitty.terminfo'], capture_output=True)
+    proc = subprocess.run([f'{homebrew_prefix()}/opt/ncurses-head/bin/tic', '-CrT0', 'terminfo/kitty.terminfo'], capture_output=True)
     if proc.returncode != 0:
         sys.stderr.buffer.write(proc.stderr)
         raise SystemExit(proc.returncode)
