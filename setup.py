@@ -273,6 +273,8 @@ def set_arches(flags: List[str], arches: Iterable[str] = ('x86_64', 'arm64')) ->
 
 
 def detect_librsync(cc: List[str], cflags: List[str], ldflags: List[str]) -> str:
+    print(cflags)
+    print(ldflags)
     if not test_compile(
             cc, *cflags, libraries=('rsync',), ldflags=ldflags, show_stderr=True,
             src='#include <librsync.h>\nint main(void) { rs_strerror(0); return 0; }'):
@@ -299,6 +301,10 @@ def is_gcc(cc: Iterable[str]) -> bool:
 
     return f(tuple(cc))
 
+def homebrew_prefix() -> str:
+    p = subprocess.Popen(['brew', '--prefix'], stdout=subprocess.PIPE)
+    ret = p.wait()
+    return os.path.join(str(p.stdout.read().decode('utf8')).rstrip(), 'opt')
 
 def init_env(
     debug: bool = False,
@@ -316,10 +322,6 @@ def init_env(
     extra_library_dirs: Iterable[str] = ()
 ) -> Env:
     native_optimizations = native_optimizations and not sanitize and not debug
-    if native_optimizations and is_macos and is_arm:
-        # see https://github.com/kovidgoyal/kitty/issues/3126
-        # -march=native is not supported when targeting Apple Silicon
-        native_optimizations = False
     cc, ccver = cc_version()
     print('CC:', cc, ccver)
     stack_protector = first_successful_compile(cc, '-fstack-protector-strong', '-fstack-protector')
@@ -343,7 +345,7 @@ def init_env(
     werror = '' if ignore_compiler_warnings else '-pedantic-errors -Werror'
     std = '' if is_openbsd else '-std=c11'
     sanitize_flag = ' '.join(sanitize_args)
-    march = '-march=native -flto' if native_optimizations else ''
+    march = '-march=native -flto' if not is_arm else '-mcpu=apple-a14 -flto' if native_optimizations else ''
     cflags_ = os.environ.get(
         'OVERRIDE_CFLAGS', (
             f'-Wextra {float_conversion} -Wno-missing-field-initializers -Wall -Wstrict-prototypes {std}'
@@ -363,8 +365,11 @@ def init_env(
     cppflags += shlex.split(os.environ.get('CPPFLAGS', ''))
     cflags += shlex.split(os.environ.get('CFLAGS', ''))
     ldflags += shlex.split(os.environ.get('LDFLAGS', ''))
+    print(homebrew_prefix())
+    cflags.append('-I' + os.path.join(homebrew_prefix(), 'librsync/include'))
+    ldflags.append('-L' + os.path.join(homebrew_prefix(), 'librsync/lib'))
     detect_librsync(cc, cflags, ldflags)
-    ldflags.append('-L/usr/local/opt/gettext/lib')
+    ldflags.append('-L' + os.path.join(homebrew_prefix(), 'gettext/lib'))
     if not debug and not sanitize and not is_openbsd and link_time_optimization:
         # See https://github.com/google/sanitizers/issues/647
         cflags.append('-flto')
@@ -446,11 +451,11 @@ def kitty_env() -> Env:
         cflags.extend(pkg_config('fontconfig', '--cflags-only-I'))
         platform_libs = pkg_config('fontconfig', '--libs')
     cflags.extend(pkg_config('harfbuzz', '--cflags-only-I'))
-    platform_libs.extend(['/usr/local/opt/harfbuzz/lib/libharfbuzz.a', '-L/usr/local/opt/graphite2/lib', '-lgraphite2'])
+    platform_libs.extend([os.path.join(homebrew_prefix(), 'harfbuzz/lib/libharfbuzz.a'), '-L' + os.path.join(homebrew_prefix(), 'graphite2/lib'), '-lgraphite2'])
     pylib = get_python_flags(cflags)
     gl_libs = ['-framework', 'OpenGL'] if is_macos else pkg_config('gl', '--libs')
-    libpng = ['/usr/local/opt/libpng/lib/libpng16.a']
-    lcms2 = ['/usr/local/opt/lcms2/lib/liblcms2.a']
+    libpng = [os.path.join(homebrew_prefix(), 'libpng/lib/libpng16.a')]
+    lcms2 = [os.path.join(homebrew_prefix(), 'lcms2/lib/liblcms2.a')]
     ans.ldpaths += pylib + platform_libs + gl_libs + libpng + lcms2
     if is_macos:
         ans.ldpaths.extend('-framework Cocoa'.split())
@@ -459,7 +464,7 @@ def kitty_env() -> Env:
         if '-ldl' not in ans.ldpaths:
             ans.ldpaths.append('-ldl')
     if '-lz' not in ans.ldpaths:
-        ans.ldpaths.append('/usr/local/opt/zlib/lib/libz.a')
+        ans.ldpaths.append(os.path.join(homebrew_prefix(), 'zlib/lib/libz.a'))
 
     with suppress(FileExistsError):
         os.mkdir(build_dir)
@@ -888,7 +893,7 @@ def build_launcher(args: Options, launcher_dir: str = '.', bundle_type: str = 's
     cflags.append('-flto')
     ldflags.append('-Ofast')
     ldflags.append('-flto')
-    ldflags.append('-L/usr/local/opt/gettext/lib')
+    ldflags.append('-L' + os.path.join(homebrew_prefix(), 'gettext/lib'))
     if bundle_type == 'linux-freeze':
         ldflags += ['-Wl,-rpath,$ORIGIN/../lib']
     os.makedirs(launcher_dir, exist_ok=True)
@@ -1049,7 +1054,7 @@ def macos_info_plist() -> bytes:
         CFBundleGetInfoString='kitty, an OpenGL based terminal emulator https://sw.kovidgoyal.net/kitty/',
         CFBundleIconFile=appname + '.icns',
         NSHighResolutionCapable=True,
-        NSSupportsAutomaticGraphicsSwitching=True,
+        NSSupportsAutomaticGraphicsSwitching=False,
         LSApplicationCategoryType='public.app-category.utilities',
         LSEnvironment={'KITTY_LAUNCHED_BY_LAUNCH_SERVICES': '1'},
         NSServices=[

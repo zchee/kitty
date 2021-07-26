@@ -9,7 +9,7 @@ APPLICATIONS_DIR ?= /Applications
 APP ?= kitty.app
 APP_TARGET ?= $(join $(addsuffix /,${APPLICATIONS_DIR}), $(APP))
 
-IDENTITY := $(shell security find-identity -v | grep 'Developer ID Application' | awk -F'"' '{print $$2}')
+IDENTITY := $(shell security find-identity -v | grep 'Apple Development' | awk -F'"' '{print $$2}')
 
 default: devel
 
@@ -17,7 +17,7 @@ devel: CC=/usr/local/opt/ccache-head/libexec/clang
 devel: VVAL=--verbose
 devel: fetch
 devel: clean
-	python3 -OO setup.py kitty.app --full --update-check-interval=0 $(VVAL)
+	python3 -OO setup.py kitty.app --full --update-check-interval=0 --shell-integration=disabled $(VVAL)
 	${MAKE} docs
 	rm -rf /usr/local/share/man/man1/kitty.1 /usr/local/share/man/man5/kitty.conf.5 /usr/local/share/doc/kitty
 	install -m 0644 docs/_build/man/kitty.1 /usr/local/share/man/man1

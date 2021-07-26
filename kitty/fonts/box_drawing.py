@@ -15,7 +15,8 @@ from typing import (
 )
 
 scale = (0.001, 1., 1.5, 2.)
-_dpi = 96.0
+_dpi = 98.0
+# _dpi = 218.0
 BufType = MutableSequence[int]
 
 
