@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3.13t -Xgil=0 -OO
 # vim:fileencoding=utf-8
 # License: GPL v3 Copyright: 2017, Kovid Goyal <kovid at kovidgoyal.net>
 
@@ -15,6 +15,16 @@ is_linux = 'linux' in _plat
 is_openbsd = 'openbsd' in _plat
 base = os.path.dirname(os.path.abspath(__file__))
 
+
+def homebrew_prefix() -> str:
+    import platform
+    is_arm = platform.processor() == 'arm' or platform.machine() in ('arm64', 'aarch64')
+    prefix: str | None = os.getenv("HOMEBREW_PREFIX")
+    if prefix is not None:
+        return prefix
+
+    prefix = "/usr/local" if not is_arm else "/opt/homebrew"
+    return prefix
 
 def null_func() -> None:
     return None
@@ -145,7 +155,8 @@ def init_env(
     ans = env.copy()
     ans.cflags.append('-fPIC')
     ans.cflags.append('-march=native')
-    ans.cflags.append('-Ofast')
+    ans.cflags.append('-O3')
+    ans.cflags.append('-ffast-math')
     ans.cflags.append('-flto')
     ans.cppflags.append(f'-D_GLFW_{module.upper()}')
     ans.cppflags.append('-D_GLFW_BUILD_DLL')
@@ -177,6 +188,8 @@ def init_env(
             ans.ldpaths.extend(pkg_config(dep, '--libs'))
 
     elif module == 'cocoa':
+        ans.cppflags.append('-I/opt/local/include')
+        ans.ldflags.append('-F/usr/local/Frameworks')
         ans.cppflags.append('-DGL_SILENCE_DEPRECATION')
         for f_ in 'Cocoa IOKit CoreFoundation CoreVideo UniformTypeIdentifiers'.split():
             ans.ldpaths.extend(('-framework', f_))
