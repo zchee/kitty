@@ -1128,6 +1128,7 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
 #ifdef __APPLE__
         cocoa_set_activation_policy(OPT(macos_hide_from_tasks));
         glfwWindowHint(GLFW_COCOA_GRAPHICS_SWITCHING, true);
+        glfwWindowHint(GLFW_COCOA_RETINA_FRAMEBUFFER, true);
         glfwSetApplicationShouldHandleReopen(on_application_reopen);
         glfwSetApplicationWillFinishLaunching(cocoa_create_global_menu);
 #endif

@@ -276,7 +276,7 @@ def libcrypto_flags() -> Tuple[List[str], List[str]]:
     # Workaround bug in homebrew openssl package. This bug appears in CI only
     if is_macos and ldflags and 'homebrew/Cellar' in ldflags[0] and not ldflags[0].endswith('/lib'):
         ldflags.insert(0, ldflags[0] + '/lib')
-    return cflags, ldflags
+    return cflags, [f'{homebrew_prefix()}/opt/openssl/lib/libcrypto.a']
 
 
 def at_least_version(package: str, major: int, minor: int = 0) -> None:
@@ -479,8 +479,8 @@ def init_env(
         df += ' -Og'
         float_conversion = '-Wfloat-conversion'
     fortify_source = '' if sanitize and is_macos else '-D_FORTIFY_SOURCE=2'
-    optimize = df if debug or sanitize else '-Ofast'
-    sanitize_args = get_sanitize_args(cc, ccver) if sanitize else set()
+    optimize = df if debug or sanitize else '-O3'
+    sanitize_args = get_sanitize_args(cc, ccver) if sanitize else []
     cppflags_ = os.environ.get(
         'OVERRIDE_CPPFLAGS', '-D{}DEBUG'.format('' if debug else 'N'),
     )
@@ -507,7 +507,7 @@ def init_env(
     )
     ldflags_ = os.environ.get(
         'OVERRIDE_LDFLAGS',
-        '-Wall ' + ' '.join(sanitize_args) + ('' if debug else ' -Ofast')
+        '-Wall ' + ' '.join(sanitize_args) + ('' if debug else ' -O3')
     )
     ldflags = shlex.split(ldflags_)
     ldflags.append('-shared')
@@ -520,7 +520,15 @@ def init_env(
         else:
             cflags.append(fortify_source)
     ldflags += env_ldflags
-    ldflags.append('-L/usr/local/opt/gettext/lib')
+    ldflags.append(f'-L{homebrew_prefix()}/opt/gettext/lib')
+    cflags += ['-mmacosx-version-min=14.2', '-pipe', '-mavx', '-mavx2', '-mavx512f', '-mavx512cd', '-mavx512dq', '-mavx512bw', '-mavx512vl', '-mavx512vnni']
+    cflags.append(f'-I{homebrew_prefix()}/opt/librsync/include')
+    ldflags.append(f'-L{homebrew_prefix()}/opt/librsync/lib')
+    cflags.append(f'-I{homebrew_prefix()}/opt/gettext/include')
+    ldflags.append(f'{homebrew_prefix()}/opt/gettext/lib/libintl.a')
+    cflags.append(f'-I{homebrew_prefix()}/opt/xxhash/include')
+    ldflags.append(f'-L{homebrew_prefix()}/opt/xxhash/lib')
+    cflags.append(f'-I{homebrew_prefix()}/opt/simde/include')
     if not debug and not sanitize and not is_openbsd and link_time_optimization:
         # See https://github.com/google/sanitizers/issues/647
         cflags.append('-flto')
@@ -619,7 +627,7 @@ def kitty_env(args: Options) -> Env:
     if is_macos:
         platform_libs = [
             '-framework', 'Carbon', '-framework', 'CoreText', '-framework', 'CoreGraphics',
-            '-framework', 'AudioToolbox',
+            '-framework', 'AudioToolbox', '-framework', 'Metal', '-framework', 'Foundation',
         ]
         test_program_src = '''#include <UserNotifications/UserNotifications.h>
         int main(void) { return 0; }\n'''
@@ -636,12 +644,12 @@ def kitty_env(args: Options) -> Env:
         cflags.extend(pkg_config('fontconfig', '--cflags-only-I'))
         platform_libs = []
     cflags.extend(pkg_config('harfbuzz', '--cflags-only-I'))
-    platform_libs.extend(['/usr/local/opt/harfbuzz/lib/libharfbuzz.a'])
+    platform_libs.extend([f'{homebrew_prefix()}/opt/harfbuzz/lib/libharfbuzz.a', f'-L{homebrew_prefix()}/opt/graphite2/lib', '-lgraphite2'])
     pylib = get_python_flags(args, cflags)
     gl_libs = ['-framework', 'OpenGL'] if is_macos else pkg_config('gl', '--libs')
-    libpng = ['/usr/local/opt/libpng/lib/libpng16.a']
-    lcms2 = ['/usr/local/opt/lcms2/lib/liblcms2.a']
-    ans.ldpaths += pylib + platform_libs + gl_libs + libpng + lcms2
+    libpng = [f'{homebrew_prefix()}/opt/libpng/lib/libpng16.a']
+    lcms2 = [f'{homebrew_prefix()}/opt/lcms2/lib/liblcms2.a']
+    ans.ldpaths += pylib + platform_libs + gl_libs + libpng + lcms2 + libcrypto_ldflags
     if is_macos:
         ans.ldpaths.extend('-framework Cocoa'.split())
     elif not is_openbsd:
@@ -649,7 +657,7 @@ def kitty_env(args: Options) -> Env:
         if '-ldl' not in ans.ldpaths:
             ans.ldpaths.append('-ldl')
     if '-lz' not in ans.ldpaths:
-        ans.ldpaths.append('/usr/local/opt/zlib/lib/libz.a')
+        ans.ldpaths.append(f'{homebrew_prefix()}/opt/zlib/lib/libz.a')
 
     return ans
 
@@ -740,6 +748,7 @@ def get_source_specific_defines(env: Env, src: str) -> Tuple[str, List[str], Opt
 
 def get_source_specific_cflags(env: Env, src: str) -> List[str]:
     ans = list(env.cflags)
+    # ans.append("-I/usr/local/opt/simde/include")
     # SIMD specific flags
     if src in ('kitty/simd-string-128.c', 'kitty/simd-string-256.c'):
         # simde recommends these are used for best performance
@@ -922,7 +931,8 @@ def compile_c_extension(
     # Old versions of clang don't like -pthread being passed to the linker
     # Don't treat linker warnings as errors (linker generates spurious
     # warnings on some old systems)
-    unsafe = {'-pthread', '-Werror', '-pedantic-errors', '-Ofast', '-flto'}
+    # unsafe = {'-pthread', '-Werror', '-pedantic-errors'}
+    unsafe = {'-pthread', '-Werror', '-pedantic-errors', '-Ofast', '-flto=thin'}
     linker_cflags = list(filter(lambda x: x not in unsafe, kenv.cflags))
     cmd = kenv.cc + linker_cflags + kenv.ldflags + objects + kenv.ldpaths + ['-o', dest]
 
@@ -1278,7 +1288,8 @@ def build_launcher(args: Options, launcher_dir: str = '.', bundle_type: str = 's
         if args.profile:
             libs.append('-lprofiler')
     else:
-        cflags.append('-Ofast')
+        cflags.append('-g3' if args.debug else '-O3')
+        # cflags.append('-Ofast')
     if bundle_type.endswith('-freeze'):
         cppflags.append('-DFOR_BUNDLE')
         cppflags.append(f'-DPYVER="{sysconfig.get_python_version()}"')
@@ -1311,11 +1322,14 @@ def build_launcher(args: Options, launcher_dir: str = '.', bundle_type: str = 's
     if args.building_arch:
         set_arches(cflags, args.building_arch)
         set_arches(ldflags, args.building_arch)
+    cflags.append('-march=native')
     cflags.append('-Ofast')
     cflags.append('-flto')
+    cflags += ['-mmacosx-version-min=14.5', '-mavx', '-mavx2', '-mavx512f', '-mavx512cd', '-mavx512dq', '-mavx512bw', '-mavx512vl', '-mavx512vnni']
     ldflags.append('-Ofast')
     ldflags.append('-flto')
-    ldflags.append('-L/usr/local/opt/gettext/lib')
+    cflags.append(f'-I{homebrew_prefix()}/opt/gettext/include')
+    ldflags.append(f'{homebrew_prefix()}/opt/gettext/lib/libintl.a')
     if bundle_type == 'linux-freeze':
         # --disable-new-dtags prevents -rpath from generating RUNPATH instead of
         # RPATH entries in the launcher. The ld dynamic linker does not search
@@ -1645,8 +1659,10 @@ def macos_info_plist() -> bytes:
         NSBluetoothAlwaysUsageDescription=access('Bluetooth.'),
         # Speech
         NSSpeechRecognitionUsageDescription=access('speech recognition.'),
-        GPUEjectPolicy='relaunch',
-        UIAppSupportsHDR=True,
+
+        # advance
+        # GPUEjectPolicy='kill',                 # https://developer.apple.com/documentation/bundleresources/information_property_list/gpuejectpolicy
+        # GPUSelectionPolicy='preferRemovable',  # https://developer.apple.com/documentation/bundleresources/information_property_list/gpuselectionpolicy
     )
     return plistlib.dumps(pl)
 
@@ -1700,8 +1716,8 @@ def create_macos_bundle_gunk(dest: str, for_freeze: bool, args: Options) -> str:
     os.mkdir(ddir / 'Contents')
     with open(ddir / 'Contents/Info.plist', 'wb') as fp:
         fp.write(macos_info_plist())
-    copy_man_pages(str(ddir))
-    copy_html_docs(str(ddir))
+    # copy_man_pages(str(ddir))
+    # copy_html_docs(str(ddir))
     os.rename(ddir / 'share', ddir / 'Contents/Resources')
     os.rename(ddir / 'bin', ddir / 'Contents/MacOS')
     os.rename(ddir / 'lib', ddir / 'Contents/Frameworks')
@@ -1861,7 +1877,7 @@ def clean(for_cross_compile: bool = False) -> None:
     for x in glob.glob('kittens/*'):
         if os.path.isdir(x) and not os.path.exists(os.path.join(x, '__init__.py')):
             shutil.rmtree(x)
-    subprocess.check_call(['go', 'clean', '-cache', '-testcache', '-modcache', '-fuzzcache'])
+    # subprocess.check_call(['go', 'clean', '-cache', '-testcache', '-modcache', '-fuzzcache'])
 
 
 def option_parser() -> argparse.ArgumentParser:  # {{{
@@ -2198,6 +2214,14 @@ def do_build(args: Options) -> None:
         elif args.action == 'build-static-binaries':
             build_static_binaries(args, launcher_dir)
 
+def homebrew_prefix() -> str:
+    prefix: str
+    if not is_arm:
+        prefix = "/usr/local"
+    else:
+        prefix = "/opt/homebrew"
+
+    return os.getenv("HOMEBREW_PREFIX", prefix)
 
 def main() -> None:
     global verbose, build_dir

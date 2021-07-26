@@ -4,8 +4,8 @@
 <dict>
 	<key>com.apple.security.automation.apple-events</key>
 	<true/>
-  <key>com.apple.security.application-groups</key>
-  <true/>
+    <key>com.apple.security.application-groups</key>
+    <true/>
 	<key>com.apple.security.cs.allow-dyld-environment-variables</key>
 	<true/>
 	<key>com.apple.security.cs.allow-jit</key>
@@ -18,11 +18,11 @@
 	<true/>
 	<key>com.apple.security.cs.disable-executable-page-protection</key>
 	<true/>
+	<key>com.apple.security.get-task-allow</key>
+	<true/>
 	<key>com.apple.security.device.audio-input</key>
 	<true/>
 	<key>com.apple.security.device.camera</key>
-	<true/>
-	<key>com.apple.security.get-task-allow</key>
 	<true/>
 	<key>com.apple.security.personal-information.addressbook</key>
 	<true/>
@@ -31,6 +31,6 @@
 	<key>com.apple.security.personal-information.location</key>
 	<true/>
 	<key>com.apple.security.personal-information.photos-library</key>
-	<true/>
+    <true/>
 </dict>
 </plist>

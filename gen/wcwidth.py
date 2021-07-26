@@ -237,7 +237,7 @@ def parse_emoji_modifier_sequence(spec: str) -> None:
 
 
 def parse_emoji() -> None:
-    for line in get_data_raw('https://unicode.org/Public/emoji/13.1/emoji-sequences.txt'):
+    for line in get_data_raw('https://unicode.org/Public/emoji/latest/emoji-sequences.txt'):
         parts = [x.strip() for x in line.split(';')]
         if len(parts) < 2:
             continue
@@ -261,7 +261,7 @@ ambiguous: set[int] = set()
 def parse_eaw() -> None:
     global doublewidth, ambiguous
     seen: set[int] = set()
-    for line in get_data_raw('https://unicode.org/Public/14.0.0/ucd/EastAsianWidth-14.0.0d7.txt'):
+    for line in get_data_raw('https://unicode.org/Public/14.0.0/ucd/EastAsianWidth.txt'):
         chars, eaw = split_two(line)
         if eaw == 'A':
             ambiguous |= chars
