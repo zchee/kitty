@@ -1,4 +1,4 @@
-44995 18283
+45000 18285
 0 null
 1 start of heading
 2 start of text
@@ -11228,6 +11228,10 @@
 12281 ideographic description character surround from upper right
 12282 ideographic description character surround from lower left
 12283 ideographic description character overlaid
+12284 ideographic description character surround from right
+12285 ideographic description character surround from lower right
+12286 ideographic description character horizontal reflection
+12287 ideographic description character rotation
 12288 ideographic space
 12289 ideographic comma
 12290 ideographic full stop
@@ -11702,6 +11706,7 @@
 12769 cjk stroke hzzzg
 12770 cjk stroke pg
 12771 cjk stroke q
+12783 ideographic description character subtraction
 12784 katakana letter small ku
 12785 katakana letter small si
 12786 katakana letter small su

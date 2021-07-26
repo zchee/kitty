@@ -12,7 +12,7 @@ import tempfile
 
 def compile_terminfo(base):
     with tempfile.TemporaryDirectory() as tdir:
-        proc = subprocess.run(['tic', '-x', f'-o{tdir}', 'terminfo/kitty.terminfo'], capture_output=True)
+        proc = subprocess.run(['/usr/local/bin/tic', '-x', f'-o{tdir}', 'terminfo/kitty.terminfo'], capture_output=True)
         if proc.returncode != 0:
             sys.stderr.buffer.write(proc.stderr)
             raise SystemExit(proc.returncode)
@@ -38,7 +38,7 @@ def generate_terminfo():
 
     with open('terminfo/kitty.terminfo', 'w') as f:
         f.write(generate_terminfo())
-    proc = subprocess.run(['tic', '-CrT0', 'terminfo/kitty.terminfo'], capture_output=True)
+    proc = subprocess.run(['/usr/local/bin/tic', '-CrT0', 'terminfo/kitty.terminfo'], capture_output=True)
     if proc.returncode != 0:
         sys.stderr.buffer.write(proc.stderr)
         raise SystemExit(proc.returncode)

@@ -13,7 +13,7 @@ from itertools import repeat
 from typing import Any, Callable, Dict, Iterable, Iterator, List, MutableSequence, Optional, Sequence, Tuple
 
 scale = (0.001, 1., 1.5, 2.)
-_dpi = 96.0
+_dpi = 96.0  # 218.0
 BufType = MutableSequence[int]
 
 

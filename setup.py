@@ -16,6 +16,7 @@ import sysconfig
 import tempfile
 import textwrap
 import time
+from pathlib import Path
 from contextlib import suppress
 from functools import lru_cache, partial
 from pathlib import Path
@@ -131,24 +132,27 @@ def libcrypto_flags() -> Tuple[List[str], List[str]]:
     # have an ancient broken system OpenSSL, so we need to check for one
     # installed by all the various macOS package managers.
     extra_pc_dir = ''
+    openssl_prefix = ''
 
     try:
         cflags = pkg_config('libcrypto', '--cflags-only-I', fatal=False)
+        openssl_prefix = pkg_config('libcrypto', '--variable=prefix', fatal=False)[0]
     except subprocess.CalledProcessError:
         if is_macos:
             import ssl
             v = ssl.OPENSSL_VERSION_INFO
             pats = f'{v[0]}.{v[1]}', f'{v[0]}'
             for pat in pats:
-                q = f'opt/openssl@{pat}/lib/pkgconfig'
+                q = f'opt/openssl@{pat}'
                 openssl_dirs = glob.glob(f'/opt/homebrew/{q}') + glob.glob(f'/usr/local/{q}')
                 if openssl_dirs:
                     break
             if not openssl_dirs:
                 raise SystemExit(f'Failed to find OpenSSL version {v[0]}.{v[1]} on your system')
+                os.path.Path.joinpath
             extra_pc_dir = os.pathsep.join(openssl_dirs)
         cflags = pkg_config('libcrypto', '--cflags-only-I', extra_pc_dir=extra_pc_dir)
-    return cflags, pkg_config('libcrypto', '--libs', extra_pc_dir=extra_pc_dir)
+    return cflags, [f'{openssl_prefix}/lib/libcrypto.a']
 
 
 def at_least_version(package: str, major: int, minor: int = 0) -> None:
@@ -363,7 +367,7 @@ def init_env(
         df += ' -Og'
         float_conversion = '-Wfloat-conversion'
     fortify_source = '' if sanitize and is_macos else '-D_FORTIFY_SOURCE=2'
-    optimize = df if debug or sanitize else '-Ofast'
+    optimize = df if debug or sanitize else '-O3'
     sanitize_args = get_sanitize_args(cc, ccver) if sanitize else set()
     cppflags_ = os.environ.get(
         'OVERRIDE_CPPFLAGS', '-D{}DEBUG'.format('' if debug else 'N'),
@@ -382,7 +386,7 @@ def init_env(
         'OVERRIDE_CFLAGS', (
             f'-Wextra {float_conversion} -Wno-missing-field-initializers -Wall -Wstrict-prototypes {std}'
             f' {werror} {optimize} {sanitize_flag} -fwrapv {stack_protector} {missing_braces}'
-            f' -pipe {march} -fvisibility=hidden {fortify_source} -Wno-unguarded-availability-new'
+            f' -pipe {march} -fvisibility=hidden {fortify_source} -Wno-unguarded-availability-new -Wno-strict-prototypes'
         )
     )
     cflags = shlex.split(cflags_) + shlex.split(
@@ -390,14 +394,17 @@ def init_env(
     )
     ldflags_ = os.environ.get(
         'OVERRIDE_LDFLAGS',
-        '-Wall ' + ' '.join(sanitize_args) + ('' if debug else ' -Ofast')
+        '-Wall ' + ' '.join(sanitize_args) + ('' if debug else ' -O3')
     )
     ldflags = shlex.split(ldflags_)
     ldflags.append('-shared')
     cppflags += shlex.split(os.environ.get('CPPFLAGS', ''))
     cflags += shlex.split(os.environ.get('CFLAGS', ''))
     ldflags += shlex.split(os.environ.get('LDFLAGS', ''))
+    cflags.append('-I/usr/local/opt/librsync/include')
+    ldflags.append('-L/usr/local/opt/librsync/lib')
     detect_librsync(cc, cflags, ldflags)
+    ldflags.append('/usr/local/opt/gettext/lib/libintl.a')
     ldflags.append('-L/usr/local/opt/gettext/lib')
     if not debug and not sanitize and not is_openbsd and link_time_optimization:
         # See https://github.com/google/sanitizers/issues/647
@@ -477,12 +484,12 @@ def kitty_env(args: Options) -> Env:
         cflags.extend(pkg_config('fontconfig', '--cflags-only-I'))
         platform_libs = []
     cflags.extend(pkg_config('harfbuzz', '--cflags-only-I'))
-    platform_libs.extend(['/usr/local/opt/harfbuzz/lib/libharfbuzz.a'])
+    platform_libs.extend(['/usr/local/opt/harfbuzz/lib/libharfbuzz.a', '-L/usr/local/opt/graphite2/lib', '-lgraphite2'])
     pylib = get_python_flags(args, cflags)
     gl_libs = ['-framework', 'OpenGL'] if is_macos else pkg_config('gl', '--libs')
     libpng = ['/usr/local/opt/libpng/lib/libpng16.a']
     lcms2 = ['/usr/local/opt/lcms2/lib/liblcms2.a']
-    ans.ldpaths += pylib + platform_libs + gl_libs + libpng + lcms2
+    ans.ldpaths += pylib + platform_libs + gl_libs + libpng + lcms2 + libcrypto_ldflags
     if is_macos:
         ans.ldpaths.extend('-framework Cocoa'.split())
     elif not is_openbsd:
@@ -733,7 +740,7 @@ def compile_c_extension(
         src, defines = get_source_specific_defines(kenv, src)
         if defines is not None:
             cppflags.extend(map(define, defines))
-        cmd = kenv.cc + ['-MMD', '-Ofast', '-flto'] + cppflags + kenv.cflags
+        cmd = kenv.cc + ['-MMD', '-O3', '-flto=thin'] + cppflags + kenv.cflags
         if is_macos:
             cmd += ['-Wno-deprecated-declarations']
         cmd += ['-c', src] + ['-o', dest]
@@ -747,7 +754,7 @@ def compile_c_extension(
     # Old versions of clang don't like -pthread being passed to the linker
     # Don't treat linker warnings as errors (linker generates spurious
     # warnings on some old systems)
-    unsafe = {'-pthread', '-Werror', '-pedantic-errors', '-Ofast', '-flto'}
+    unsafe = {'-pthread', '-Werror', '-pedantic-errors', '-O3', '-flto=thin'}
     linker_cflags = list(filter(lambda x: x not in unsafe, kenv.cflags))
     cmd = kenv.cc + linker_cflags + kenv.ldflags + objects + kenv.ldpaths + ['-o', dest]
 
@@ -1056,7 +1063,7 @@ def build_launcher(args: Options, launcher_dir: str = '.', bundle_type: str = 's
         if args.profile:
             libs.append('-lprofiler')
     else:
-        cflags.append('-Ofast')
+        cflags.append('-O3')
     if bundle_type.endswith('-freeze'):
         cppflags.append('-DFOR_BUNDLE')
         cppflags.append(f'-DPYVER="{sysconfig.get_python_version()}"')
@@ -1080,10 +1087,11 @@ def build_launcher(args: Options, launcher_dir: str = '.', bundle_type: str = 's
     if args.build_universal_binary:
         set_arches(cflags)
         set_arches(ldflags)
-    cflags.append('-Ofast')
+    cflags.append('-O3')
     cflags.append('-flto')
-    ldflags.append('-Ofast')
+    ldflags.append('-O3')
     ldflags.append('-flto')
+    ldflags.append('/usr/local/opt/gettext/lib/libintl.a')
     ldflags.append('-L/usr/local/opt/gettext/lib')
     if bundle_type == 'linux-freeze':
         # --disable-new-dtags prevents -rpath from generating RUNPATH instead of
@@ -1371,7 +1379,7 @@ def macos_info_plist() -> bytes:
         # User Interface and Graphics
         CFBundleIconFile=f'{appname}.icns',
         NSHighResolutionCapable=True,
-        NSSupportsAutomaticGraphicsSwitching=True,
+        NSSupportsAutomaticGraphicsSwitching=False,
         # Needed for dark mode in Mojave when linking against older SDKs
         NSRequiresAquaSystemAppearance='NO',
         # Document and URL Types
@@ -1606,7 +1614,7 @@ def clean(for_cross_compile: bool = False) -> None:
     for x in glob.glob('kittens/*'):
         if os.path.isdir(x) and not os.path.exists(os.path.join(x, '__init__.py')):
             shutil.rmtree(x)
-    subprocess.check_call(['go', 'clean', '-cache', '-testcache', '-modcache', '-fuzzcache'])
+    # subprocess.check_call(['go', 'clean', '-cache', '-testcache', '-modcache', '-fuzzcache'])
 
 
 def option_parser() -> argparse.ArgumentParser:  # {{{
@@ -1882,8 +1890,6 @@ def main() -> None:
             if os.path.exists(args.prefix):
                 shutil.rmtree(args.prefix)
             build(args, native_optimizations=True)
-            if not os.path.exists(os.path.join(base, 'docs/_build/html')):
-                run_tool(['make', 'docs'])
             package(args, bundle_type='macos-package')
             print('kitty.app successfully built!')
         elif args.action == 'export-ci-bundles':
