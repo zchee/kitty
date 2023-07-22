@@ -401,11 +401,11 @@ def init_env(
     cppflags += shlex.split(os.environ.get('CPPFLAGS', ''))
     cflags += shlex.split(os.environ.get('CFLAGS', ''))
     ldflags += shlex.split(os.environ.get('LDFLAGS', ''))
-    cflags.append('-I/usr/local/opt/librsync/include')
-    ldflags.append('-L/usr/local/opt/librsync/lib')
+    cflags.append('-I/opt/homebrew/opt/librsync/include')
+    ldflags.append('-L/opt/homebrew/opt/librsync/lib')
     detect_librsync(cc, cflags, ldflags)
-    ldflags.append('/usr/local/opt/gettext/lib/libintl.a')
-    ldflags.append('-L/usr/local/opt/gettext/lib')
+    ldflags.append('/opt/homebrew/opt/gettext/lib/libintl.a')
+    ldflags.append('-L/opt/homebrew/opt/gettext/lib')
     if not debug and not sanitize and not is_openbsd and link_time_optimization:
         # See https://github.com/google/sanitizers/issues/647
         cflags.append('-flto')
@@ -484,11 +484,11 @@ def kitty_env(args: Options) -> Env:
         cflags.extend(pkg_config('fontconfig', '--cflags-only-I'))
         platform_libs = []
     cflags.extend(pkg_config('harfbuzz', '--cflags-only-I'))
-    platform_libs.extend(['/usr/local/opt/harfbuzz/lib/libharfbuzz.a', '-L/usr/local/opt/graphite2/lib', '-lgraphite2'])
+    platform_libs.extend(['/opt/homebrew/opt/harfbuzz/lib/libharfbuzz.a', '-L/opt/homebrew/opt/graphite2/lib', '-lgraphite2'])
     pylib = get_python_flags(args, cflags)
     gl_libs = ['-framework', 'OpenGL'] if is_macos else pkg_config('gl', '--libs')
-    libpng = ['/usr/local/opt/libpng/lib/libpng16.a']
-    lcms2 = ['/usr/local/opt/lcms2/lib/liblcms2.a']
+    libpng = ['/opt/homebrew/opt/libpng/lib/libpng16.a']
+    lcms2 = ['/opt/homebrew//opt/lcms2/lib/liblcms2.a']
     ans.ldpaths += pylib + platform_libs + gl_libs + libpng + lcms2 + libcrypto_ldflags
     if is_macos:
         ans.ldpaths.extend('-framework Cocoa'.split())
@@ -497,7 +497,7 @@ def kitty_env(args: Options) -> Env:
         if '-ldl' not in ans.ldpaths:
             ans.ldpaths.append('-ldl')
     if '-lz' not in ans.ldpaths:
-        ans.ldpaths.append('/usr/local/opt/zlib/lib/libz.a')
+        ans.ldpaths.append('/opt/homebrew//opt/zlib/lib/libz.a')
 
     os.makedirs(build_dir, exist_ok=True)
     return ans
@@ -1091,8 +1091,8 @@ def build_launcher(args: Options, launcher_dir: str = '.', bundle_type: str = 's
     cflags.append('-flto')
     ldflags.append('-O3')
     ldflags.append('-flto')
-    ldflags.append('/usr/local/opt/gettext/lib/libintl.a')
-    ldflags.append('-L/usr/local/opt/gettext/lib')
+    ldflags.append('/opt/homebrew//opt/gettext/lib/libintl.a')
+    ldflags.append('-L/opt/homebrew/opt/gettext/lib')
     if bundle_type == 'linux-freeze':
         # --disable-new-dtags prevents -rpath from generating RUNPATH instead of
         # RPATH entries in the launcher. The ld dynamic linker does not search
@@ -1379,7 +1379,7 @@ def macos_info_plist() -> bytes:
         # User Interface and Graphics
         CFBundleIconFile=f'{appname}.icns',
         NSHighResolutionCapable=True,
-        NSSupportsAutomaticGraphicsSwitching=False,
+        NSSupportsAutomaticGraphicsSwitching=True,
         # Needed for dark mode in Mojave when linking against older SDKs
         NSRequiresAquaSystemAppearance='NO',
         # Document and URL Types

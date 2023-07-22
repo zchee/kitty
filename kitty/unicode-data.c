@@ -788,7 +788,7 @@ is_non_rendered_char(char_type code) {
 
 bool
 is_word_char(char_type code) {
-	// L and N categories (137935 codepoints) {{{
+	// L and N categories (138538 codepoints) {{{
 	switch(code) {
 		case 0x30 ... 0x39:
 			return true;
@@ -2277,6 +2277,8 @@ is_word_char(char_type code) {
 		case 0x2b820 ... 0x2cea1:
 			return true;
 		case 0x2ceb0 ... 0x2ebe0:
+			return true;
+		case 0x2ebf0 ... 0x2ee4a:
 			return true;
 		case 0x2f800 ... 0x2fa1d:
 			return true;

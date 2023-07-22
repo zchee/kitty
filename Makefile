@@ -21,17 +21,17 @@ export IDENTITY
 
 default: devel
 
-devel: CC=/usr/local/opt/ccache-head/libexec/clang
+devel: CC=${HOMEBREW_PREFIX}/opt/ccache-head/libexec/clang
 devel: VVAL=--verbose
 devel: rebase
 devel: clean
 	python3 -OO setup.py kitty.app --full --update-check-interval=0 $(VVAL)
-	${MAKE} docs SPHINXBUILD=/usr/local/share/pipx/sphinx-build
-	rm -rf /usr/local/share/man/man1/kitty.1 /usr/local/share/man/man5/kitty.conf.5 /usr/local/share/doc/kitty
-	install -m 0644 docs/_build/man/kitty.1 /usr/local/share/man/man1
-	install -m 0644 docs/_build/man/kitty.conf.5 /usr/local/share/man/man5
-	rm -rf /usr/local/share/doc/kitty
-	command cp -rf docs/_build/html /usr/local/share/doc/kitty
+	# ${MAKE} docs SPHINXBUILD=/usr/local/share/pipx/sphinx-build
+	# rm -rf /usr/local/share/man/man1/kitty.1 /usr/local/share/man/man5/kitty.conf.5 /usr/local/share/doc/kitty
+	# install -m 0644 docs/_build/man/kitty.1 /usr/local/share/man/man1
+	# install -m 0644 docs/_build/man/kitty.conf.5 /usr/local/share/man/man5
+	# rm -rf /usr/local/share/doc/kitty
+	# command cp -rf docs/_build/html /usr/local/share/doc/kitty
 	for f in `find ${APP} -type f -name '*.so'`; \
 		do \
 		codesign -dvvvvv --options=runtime --entitlements ./entitlements.plist -s "${IDENTITY}" $${f}; \

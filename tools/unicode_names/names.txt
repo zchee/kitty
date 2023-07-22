@@ -1,4 +1,4 @@
-45000 18285
+45002 18286
 0 null
 1 start of heading
 2 start of text
@@ -37232,6 +37232,8 @@
 183969 <cjk ideograph extension e, last>
 183984 <cjk ideograph extension f, first>
 191456 <cjk ideograph extension f, last>
+191472 <cjk ideograph extension i, first>
+192074 <cjk ideograph extension i, last>
 194560 cjk compatibility ideograph-2f800
 194561 cjk compatibility ideograph-2f801
 194562 cjk compatibility ideograph-2f802
