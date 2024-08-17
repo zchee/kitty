@@ -336,7 +336,7 @@ static inline void parse_graphics_code(PS *self, uint8_t *parser_buf,
     } break;
 
     } // end switch
-  }   // end while
+  } // end while
 
   switch (state) {
   case EQUAL:

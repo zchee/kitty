@@ -2,7 +2,7 @@
 #include "data-types.h"
 #include "state.h"
 // START_KNOWN_MARKS
-static const combining_type VS15 = 1364, VS16 = 1365;
+static const combining_type VS15 = 1365, VS16 = 1366;
 // END_KNOWN_MARKS
 
 // Converts row/column diacritics to numbers.

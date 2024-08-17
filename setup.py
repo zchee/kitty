@@ -521,7 +521,7 @@ def init_env(
             cflags.append(fortify_source)
     ldflags += env_ldflags
     ldflags.append(f'-L{homebrew_prefix()}/opt/gettext/lib')
-    cflags += ['-mmacosx-version-min=14.2', '-pipe', '-mavx', '-mavx2', '-mavx512f', '-mavx512cd', '-mavx512dq', '-mavx512bw', '-mavx512vl', '-mavx512vnni']
+    cflags += ['-mmacosx-version-min=14.6', '-pipe', '-mavx', '-mavx2', '-mavx512f', '-mavx512cd', '-mavx512dq', '-mavx512bw', '-mavx512vl', '-mavx512vnni']
     cflags.append(f'-I{homebrew_prefix()}/opt/librsync/include')
     ldflags.append(f'-L{homebrew_prefix()}/opt/librsync/lib')
     cflags.append(f'-I{homebrew_prefix()}/opt/gettext/include')
@@ -775,6 +775,12 @@ def get_source_specific_cflags(env: Env, src: str) -> List[str]:
                 ans.append('-mavx')
             elif 'avx2' in q:
                 ans.append('-mavx2')
+            ans.append('-mavx512f')
+            ans.append('-mavx512cd')
+            ans.append('-mavx512dq')
+            ans.append('-mavx512bw')
+            ans.append('-mavx512vl')
+            ans.append('-mavx512vnni')
     return ans
 
 

@@ -50,8 +50,8 @@ def get_data_raw(uri: str) -> Iterable[str]:
         if line and not line.startswith('#'):
             yield line
 
-def get_data(fname: str, folder: str = 'UCD') -> Iterable[str]:
-    url = f'https://www.unicode.org/Public/{folder}/latest/{fname}'
+def get_data(fname: str, folder: str = 'draft/UCD') -> Iterable[str]:
+    url = f'https://www.unicode.org/Public/{folder}/{fname}'
     print('url: {}'.format(url))
     bn = os.path.basename(url)
     local = os.path.join('/tmp', bn)
@@ -237,7 +237,7 @@ def parse_emoji_modifier_sequence(spec: str) -> None:
 
 
 def parse_emoji() -> None:
-    for line in get_data_raw('https://unicode.org/Public/emoji/latest/emoji-sequences.txt'):
+    for line in get_data_raw('https://unicode.org/Public/draft/emoji/emoji-sequences.txt'):
         parts = [x.strip() for x in line.split(';')]
         if len(parts) < 2:
             continue
@@ -261,7 +261,7 @@ ambiguous: set[int] = set()
 def parse_eaw() -> None:
     global doublewidth, ambiguous
     seen: set[int] = set()
-    for line in get_data_raw('https://unicode.org/Public/14.0.0/ucd/EastAsianWidth.txt'):
+    for line in get_data_raw('https://unicode.org/Public/draft/UCD/ucd/EastAsianWidth.txt'):
         chars, eaw = split_two(line)
         if eaw == 'A':
             ambiguous |= chars
