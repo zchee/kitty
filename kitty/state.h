@@ -10,6 +10,7 @@
 #include "screen.h"
 #include "monotonic.h"
 #include "window_logo.h"
+#include "renderer_backend_types.h"
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
 #include <hb.h>
@@ -48,6 +49,7 @@ typedef struct Options {
     double wheel_scroll_multiplier, touch_scroll_multiplier;
     int wheel_scroll_min_lines;
     bool enable_audio_bell;
+    RendererBackendPreference metal_renderer;
     CursorShape cursor_shape, cursor_shape_unfocused;
     float cursor_beam_thickness;
     float cursor_underline_thickness;
@@ -415,19 +417,16 @@ OSWindow* add_os_window(void);
 OSWindow* current_os_window(void);
 void os_window_regions(OSWindow*, Region *main, Region *tab_bar);
 bool drag_scroll(Window *, OSWindow*);
-void draw_borders(ssize_t vao_idx, unsigned int num_border_rects, BorderRect *rect_buf, bool rect_data_is_dirty, color_type, unsigned int, bool, OSWindow *w);
 ssize_t create_cell_vao(void);
 ssize_t create_graphics_vao(void);
 ssize_t create_border_vao(void);
 bool send_cell_data_to_gpu(ssize_t, Screen *, OSWindow *);
-void draw_cells(const WindowRenderData*, OSWindow *, bool, bool, bool, Window*);
 bool update_cursor_trail(CursorTrail *ct, Window *w, monotonic_t now, OSWindow *os_window);
 void set_gpu_viewport(unsigned w, unsigned h);
 void free_texture(uint32_t*);
 void free_framebuffer(uint32_t*);
 void send_image_to_gpu(uint32_t*, const void*, int32_t, int32_t, bool, bool, bool, RepeatStrategy);
 void send_sprite_to_gpu(FONTS_DATA_HANDLE fg, sprite_index, pixel*, sprite_index);
-void blank_canvas(float, color_type, bool);
 void blank_os_window(OSWindow *);
 void set_os_window_chrome(OSWindow *w);
 FONTS_DATA_HANDLE load_fonts_data(double, double, double);
@@ -472,5 +471,4 @@ void update_mouse_pointer_shape(void);
 void adjust_window_size_for_csd(OSWindow *w, int width, int height, int *adjusted_width, int *adjusted_height);
 void dispatch_buffered_keys(Window *w);
 bool screen_needs_rendering_in_layers(OSWindow *os_window, Window *w, Screen *screen);
-void setup_os_window_for_rendering(OSWindow*, Tab*, Window*, bool);
 void swap_window_buffers(OSWindow *w);

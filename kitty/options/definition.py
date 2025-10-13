@@ -3730,6 +3730,18 @@ config is not supported.
 '''
     )
 
+opt('metal_renderer', 'auto',
+    choices=('auto', 'metal', 'opengl'), ctype='renderer_backend_preference',
+    long_text='''
+macOS only. Controls which renderer backend kitty uses. The default of
+:code:`auto` prefers Apple's Metal backend on macOS 13 or later and falls back
+to OpenGL when Metal is unavailable. Use :code:`metal` to force an attempt to
+use Metal even when automatic detection would fall back, and :code:`opengl`
+to continue using OpenGL. When Metal initialization fails kitty logs the
+reason and continues with OpenGL.
+'''
+    )
+
 opt('wayland_enable_ime', 'yes', option_type='to_bool', ctype='bool', long_text='''
 Enable Input Method Extension on Wayland. This is typically used for
 inputting text in East Asian languages. However, its implementation in

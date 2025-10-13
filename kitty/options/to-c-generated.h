@@ -1345,6 +1345,19 @@ convert_from_opts_macos_colorspace(PyObject *py_opts, Options *opts) {
 }
 
 static void
+convert_from_python_metal_renderer(PyObject *val, Options *opts) {
+    opts->metal_renderer = renderer_backend_preference(val);
+}
+
+static void
+convert_from_opts_metal_renderer(PyObject *py_opts, Options *opts) {
+    PyObject *ret = PyObject_GetAttrString(py_opts, "metal_renderer");
+    if (ret == NULL) return;
+    convert_from_python_metal_renderer(ret, opts);
+    Py_DECREF(ret);
+}
+
+static void
 convert_from_python_wayland_enable_ime(PyObject *val, Options *opts) {
     opts->wayland_enable_ime = PyObject_IsTrue(val);
 }
@@ -1564,6 +1577,8 @@ convert_opts_from_python_opts(PyObject *py_opts, Options *opts) {
     convert_from_opts_macos_menubar_title_max_length(py_opts, opts);
     if (PyErr_Occurred()) return false;
     convert_from_opts_macos_colorspace(py_opts, opts);
+    if (PyErr_Occurred()) return false;
+    convert_from_opts_metal_renderer(py_opts, opts);
     if (PyErr_Occurred()) return false;
     convert_from_opts_wayland_enable_ime(py_opts, opts);
     if (PyErr_Occurred()) return false;

@@ -8,6 +8,7 @@
 #include "loop-utils.h"
 #include "safe-wrappers.h"
 #include "state.h"
+#include "renderer_backend.h"
 #include "threading.h"
 #include "screen.h"
 #include "monotonic.h"
@@ -810,36 +811,6 @@ prepare_to_render_os_window(OSWindow *os_window, monotonic_t now, unsigned int *
     return needs_render || was_previously_rendered_with_layers != os_window->needs_layers;
 }
 
-static void
-render_prepared_os_window(OSWindow *os_window, unsigned int active_window_id, color_type active_window_bg, unsigned int num_visible_windows, bool all_windows_have_same_bg) {
-    Tab *tab = os_window->tabs + os_window->active_tab;
-    setup_os_window_for_rendering(os_window, tab, NULL, true);
-    BorderRects *br = &tab->border_rects;
-    draw_borders(br->vao_idx, br->num_border_rects, br->rect_buf, br->is_dirty, active_window_bg, num_visible_windows, all_windows_have_same_bg, os_window);
-    br->is_dirty = false;
-    if (TD.screen && os_window->num_tabs >= OPT(tab_bar_min_tabs)) draw_cells(&TD, os_window, true, true, false, NULL);
-    unsigned int num_of_visible_windows = 0;
-    Window *active_window = NULL;
-    for (unsigned int i = 0; i < tab->num_windows; i++) { if (tab->windows[i].visible) num_of_visible_windows++; }
-    for (unsigned int i = 0; i < tab->num_windows; i++) {
-        Window *w = tab->windows + i;
-        if (w->visible && WD.screen) {
-            bool is_active_window = i == tab->active_window;
-            if (is_active_window) active_window = w;
-            draw_cells(&WD, os_window, is_active_window, false, num_of_visible_windows == 1, w);
-            if (WD.screen->start_visual_bell_at != 0) set_maximum_wait(ANIMATION_SAMPLE_WAIT);
-        }
-    }
-    setup_os_window_for_rendering(os_window, tab, active_window, false);
-    swap_window_buffers(os_window);
-    os_window->last_active_tab = os_window->active_tab; os_window->last_num_tabs = os_window->num_tabs; os_window->last_active_window_id = active_window_id;
-    os_window->focused_at_last_render = os_window->is_focused;
-    if (os_window->redraw_count) os_window->redraw_count--;
-    if (USE_RENDER_FRAMES) request_frame_render(os_window);
-#undef WD
-#undef TD
-}
-
 static bool
 no_render_frame_received_recently(OSWindow *w, monotonic_t now, monotonic_t max_wait) {
     bool ans = now - w->last_render_frame_received_at > max_wait;
@@ -873,7 +844,14 @@ render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images) {
     make_os_window_context_current(w);
     bool needs_render = w->redraw_count > 0 || w->live_resize.in_progress;
     if (w->viewport_size_dirty) {
-        set_gpu_viewport(w->viewport_width, w->viewport_height);
+        RendererResizeParams resize_params = {
+            .framebuffer_width = w->viewport_width,
+            .framebuffer_height = w->viewport_height,
+            .framebuffer_scale = (float)((w->viewport_x_ratio > 0.0 && w->viewport_y_ratio > 0.0)
+                    ? (w->viewport_x_ratio + w->viewport_y_ratio) * 0.5
+                    : 1.0),
+        };
+        renderer_backend_on_resize(w->handle, &resize_params);
         w->viewport_size_dirty = false;
         needs_render = true;
     }
@@ -884,7 +862,49 @@ render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images) {
     if (prepare_to_render_os_window(w, now, &active_window_id, &active_window_bg, &num_visible_windows, &all_windows_have_same_bg, scan_for_animated_images)) needs_render = true;
     if (w->last_active_window_id != active_window_id || w->last_active_tab != w->active_tab || w->focused_at_last_render != w->is_focused) needs_render = true;
     if (w->render_calls < 3 && w->bgimage && w->bgimage->texture_id) needs_render = true;
-    if (needs_render) render_prepared_os_window(w, active_window_id, active_window_bg, num_visible_windows, all_windows_have_same_bg);
+    if (needs_render) {
+        RendererFrameParams frame_params = {
+            .frame_start_time = now,
+            .vsync_enabled = OPT(sync_to_monitor),
+        };
+        if (!renderer_backend_begin_frame(w->handle, &frame_params)) {
+            return false;
+        }
+        RendererRenderParams render_params = {
+            .os_window = w,
+            .active_window_id = active_window_id,
+            .active_window_bg = active_window_bg,
+            .num_visible_windows = num_visible_windows,
+            .all_windows_have_same_bg = all_windows_have_same_bg,
+        };
+        if (!renderer_backend_render(w->handle, &render_params)) {
+            return false;
+        }
+        RendererPresentParams present_params = {
+            .blocking = true,
+            .capture_framebuffer = false,
+        };
+        if (!renderer_backend_present(w->handle, &present_params)) {
+            return false;
+        }
+        w->keep_rendering_till_swap = 0;
+        w->last_active_tab = w->active_tab;
+        w->last_num_tabs = w->num_tabs;
+        w->last_active_window_id = active_window_id;
+        w->focused_at_last_render = w->is_focused;
+        if (w->redraw_count) w->redraw_count--;
+        if (USE_RENDER_FRAMES) request_frame_render(w);
+        if (num_visible_windows) {
+            Tab *tab = w->tabs + w->active_tab;
+            for (unsigned int i = 0; i < tab->num_windows; i++) {
+                Window *candidate = tab->windows + i;
+                if (candidate->visible && candidate->render_data.screen && candidate->render_data.screen->start_visual_bell_at != 0) {
+                    set_maximum_wait(ANIMATION_SAMPLE_WAIT);
+                    break;
+                }
+            }
+        }
+    }
     if (w->is_focused) change_menubar_title(w->window_title);
     return needs_render;
 }

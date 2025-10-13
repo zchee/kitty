@@ -11,6 +11,11 @@
 #include "control-codes.h"
 #include <structmember.h>
 #include "glfw-wrapper.h"
+#include "renderer_backend.h"
+#include "opengl_renderer.h"
+#ifdef __APPLE__
+#include "metal_renderer.h"
+#endif
 #ifdef __APPLE__
 #include "cocoa_window.h"
 #else
@@ -25,14 +30,46 @@ typedef struct mouse_cursor {
 
 static mouse_cursor cursors[GLFW_INVALID_CURSOR+1] = {0};
 
-static void
-apply_swap_interval(int val) {
-    (void)val;
-#ifndef __APPLE__
-    if (val < 0) val = OPT(sync_to_monitor) && !global_state.is_wayland ? 1 : 0;
-    glfwSwapInterval(val);
-#endif
+#ifdef __APPLE__
+static bool metal_preflight_attempted = false;
+static bool metal_preflight_succeeded = false;
+static bool
+select_metal_if_preferred(void) {
+    RendererBackendPreference pref = OPT(metal_renderer);
+    if (pref == RENDERER_BACKEND_PREFERENCE_OPENGL) {
+        if (renderer_backend_current_type() != RENDERER_BACKEND_OPENGL) {
+            renderer_backend_select(RENDERER_BACKEND_OPENGL);
+        }
+        return false;
+    }
+    if (metal_preflight_attempted) {
+        if (!metal_preflight_succeeded) {
+            renderer_backend_select(RENDERER_BACKEND_OPENGL);
+            return false;
+        }
+        renderer_backend_select(RENDERER_BACKEND_METAL);
+        return true;
+    }
+    metal_preflight_attempted = true;
+    RendererBackendType metal_type = renderer_backend_type_from_name("metal");
+    if (metal_type == (RendererBackendType)-1) {
+        renderer_backend_select(RENDERER_BACKEND_OPENGL);
+        return false;
+    }
+    renderer_backend_select(metal_type);
+    const char *reason = NULL;
+    if (!metal_renderer_preflight(&reason)) {
+        if (reason) log_error("Metal renderer unavailable: %s", reason);
+        renderer_backend_select(RENDERER_BACKEND_OPENGL);
+        metal_preflight_succeeded = false;
+        return false;
+    }
+    metal_preflight_succeeded = true;
+    return true;
 }
+#else
+static inline bool select_metal_if_preferred(void) { return false; }
+#endif
 
 void
 get_platform_dependent_config_values(void *glfw_window) {
@@ -373,10 +410,9 @@ change_live_resize_state(OSWindow *w, bool in_progress) {
 #ifdef __APPLE__
         cocoa_out_of_sequence_render(w);
 #else
-        GLFWwindow *orig_ctx = make_os_window_context_current(w);
-        apply_swap_interval(in_progress ? 0 : -1);
-        if (orig_ctx) glfwMakeContextCurrent(orig_ctx);
-
+        void *ctx_token = make_os_window_context_current(w);
+        renderer_backend_apply_swap_interval(in_progress ? 0 : -1);
+        renderer_backend_restore_context(ctx_token);
 #endif
     }
 }
@@ -407,8 +443,22 @@ framebuffer_size_callback(GLFWwindow *w, int width, int height) {
         window->live_resize.last_resize_event_at = monotonic();
         window->live_resize.width = MAX(0, width); window->live_resize.height = MAX(0, height);
         window->live_resize.num_of_resize_events++;
-        make_os_window_context_current(window);
-        set_gpu_viewport(width, height);
+        void *ctx_token = make_os_window_context_current(window);
+        float framebuffer_scale = 1.0f;
+        if (window->viewport_x_ratio > 0.0 && window->viewport_y_ratio > 0.0) {
+            framebuffer_scale = (float)((window->viewport_x_ratio + window->viewport_y_ratio) * 0.5);
+        } else if (window->viewport_x_ratio > 0.0) {
+            framebuffer_scale = (float)window->viewport_x_ratio;
+        } else if (window->viewport_y_ratio > 0.0) {
+            framebuffer_scale = (float)window->viewport_y_ratio;
+        }
+        RendererResizeParams resize_params = {
+            .framebuffer_width = width,
+            .framebuffer_height = height,
+            .framebuffer_scale = framebuffer_scale,
+        };
+        renderer_backend_on_resize(window->handle, &resize_params);
+        renderer_backend_restore_context(ctx_token);
         request_tick_callback();
     } else log_error("Ignoring resize request for tiny size: %dx%d", width, height);
     global_state.callback_os_window = NULL;
@@ -915,12 +965,10 @@ set_os_window_icon(PyObject UNUSED *self, PyObject *args) {
 
 void*
 make_os_window_context_current(OSWindow *w) {
-    GLFWwindow *current_context = glfwGetCurrentContext();
-    if (w->handle != current_context) {
-        glfwMakeContextCurrent(w->handle);
-        return current_context;
+    if (!w || !w->handle) {
+        return NULL;
     }
-    return NULL;
+    return renderer_backend_make_context_current(w->handle);
 }
 
 void
@@ -1352,13 +1400,23 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
     if (lsc && window_state != WINDOW_HIDDEN) window_state = WINDOW_NORMAL;
 
     static bool is_first_window = true;
+#ifdef __APPLE__
+    select_metal_if_preferred();
+    const bool using_metal = renderer_backend_current_type() == RENDERER_BACKEND_METAL;
+    glfwWindowHint(GLFW_CLIENT_API, using_metal ? GLFW_NO_API : GLFW_OPENGL_API);
+#else
+    select_metal_if_preferred();
+    const bool using_metal = false;
+#endif
     if (is_first_window) {
-        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, OPENGL_REQUIRED_VERSION_MAJOR);
-        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, OPENGL_REQUIRED_VERSION_MINOR);
-        glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, true);
-        // We don't use depth and stencil buffers
-        glfwWindowHint(GLFW_DEPTH_BITS, 0);
-        glfwWindowHint(GLFW_STENCIL_BITS, 0);
+        if (!using_metal) {
+            glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, OPENGL_REQUIRED_VERSION_MAJOR);
+            glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, OPENGL_REQUIRED_VERSION_MINOR);
+            glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, true);
+            // We don't use depth and stencil buffers
+            glfwWindowHint(GLFW_DEPTH_BITS, 0);
+            glfwWindowHint(GLFW_STENCIL_BITS, 0);
+        }
         glfwSetApplicationCloseCallback(application_close_requested_callback);
         glfwSetCurrentSelectionCallback(get_current_selection);
         glfwSetHasCurrentSelectionCallback(has_current_selection);
@@ -1398,7 +1456,7 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
         return NULL;
     }
     bool want_semi_transparent = (1.0 - OPT(background_opacity) >= 0.01) || OPT(dynamic_background_opacity);
-    glfwWindowHint(GLFW_TRANSPARENT_FRAMEBUFFER, want_semi_transparent);
+        glfwWindowHint(GLFW_TRANSPARENT_FRAMEBUFFER, want_semi_transparent);
     uint32_t bgcolor = OPT(background);
     uint32_t bgalpha = (uint32_t)((MAX(0.f, MIN((OPT(background_opacity) * 255), 255.f))));
     glfwWindowHint(GLFW_WAYLAND_BGCOLOR, ((bgalpha & 0xff) << 24) | bgcolor);
@@ -1443,15 +1501,19 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
     if (temp_window) { glfwDestroyWindow(temp_window); temp_window = NULL; }
     if (glfw_window == NULL) glfw_failure;
 #undef glfw_failure
-    glfwMakeContextCurrent(glfw_window);
-    if (is_first_window) gl_init();
-    bool is_semi_transparent = glfwGetWindowAttrib(glfw_window, GLFW_TRANSPARENT_FRAMEBUFFER);
-    // blank the window once so that there is no initial flash of color
-    // changing, in case the background color is not black
-    blank_canvas(is_semi_transparent ? OPT(background_opacity) : 1.0f, OPT(background), true);
-    apply_swap_interval(-1);
+    RendererWindowConfig renderer_cfg = {
+        .is_first_window = is_first_window,
+        .wants_transparency = want_semi_transparent,
+        .background_opacity = OPT(background_opacity),
+        .background_color = OPT(background),
+    };
+    if (!renderer_backend_attach_window(glfw_window, &renderer_cfg)) {
+        return NULL;
+    }
+    renderer_backend_apply_swap_interval(-1);
     // On Wayland the initial swap is allowed only after the first XDG configure event
-    if (glfwAreSwapsAllowed(glfw_window)) glfwSwapBuffers(glfw_window);
+    if (glfwAreSwapsAllowed(glfw_window)) renderer_backend_swap_buffers(glfw_window);
+    bool is_semi_transparent = glfwGetWindowAttrib(glfw_window, GLFW_TRANSPARENT_FRAMEBUFFER);
     glfwSetInputMode(glfw_window, GLFW_LOCK_KEY_MODS, true);
     PyObject *pret = PyObject_CallFunction(pre_show_callback, "N", native_window_handle(glfw_window));
     if (pret == NULL) return NULL;
@@ -2090,7 +2152,7 @@ is_mouse_hidden(OSWindow *w) {
 void
 swap_window_buffers(OSWindow *os_window) {
     if (glfwAreSwapsAllowed(os_window->handle)) {
-        glfwSwapBuffers(os_window->handle);
+        renderer_backend_swap_buffers(os_window->handle);
         os_window->keep_rendering_till_swap = 0;
     }
 }
@@ -2666,6 +2728,10 @@ void cleanup_glfw(void) {
 
 bool
 init_glfw(PyObject *m) {
+    if (!register_opengl_renderer_backend()) return false;
+#ifdef __APPLE__
+    if (!register_metal_renderer_backend()) return false;
+#endif
     if (PyModule_AddFunctions(m, module_methods) != 0) return false;
     register_at_exit_cleanup_func(GLFW_CLEANUP_FUNC, cleanup_glfw);
 

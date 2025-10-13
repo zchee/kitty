@@ -672,7 +672,7 @@ def kitty_env(args: Options) -> Env:
     if is_macos:
         platform_libs = [
             '-framework', 'Carbon', '-framework', 'CoreText', '-framework', 'CoreGraphics',
-            '-framework', 'AudioToolbox', '-framework', 'Metal', '-framework', 'Foundation',
+            '-framework', 'AudioToolbox', '-framework', 'Metal', '-framework', 'QuartzCore', '-framework', 'Foundation',
         ]
         test_program_src = '''#include <UserNotifications/UserNotifications.h>
         int main(void) { return 0; }\n'''
@@ -813,6 +813,11 @@ def get_source_specific_defines(env: Env, src: str) -> Tuple[str, List[str], Opt
 
 def get_source_specific_cflags(env: Env, src: str) -> List[str]:
     ans = list(env.cflags)
+    if src.endswith('.mm'):
+        ans = [flag for flag in ans if not flag.startswith('-std=')]
+        ans.append('-std=gnu++17')
+        ans.append('-fobjc-arc')
+        return ans
     # ans.append("-I/usr/local/opt/simde/include")
     # SIMD specific flags
     if src in ('kitty/simd-string-128.c', 'kitty/simd-string-256.c'):
@@ -1031,6 +1036,9 @@ def compile_c_extension(
 def find_c_files() -> Tuple[List[str], List[str]]:
     ans, headers = [], []
     d = 'kitty'
+    allowed_exts = {'.c', '.m'}
+    if is_macos:
+        allowed_exts.add('.mm')
     exclude = {
         'fontconfig.c', 'freetype.c', 'desktop.c', 'freetype_render_ui_text.c'
     } if is_macos else {
@@ -1038,7 +1046,7 @@ def find_c_files() -> Tuple[List[str], List[str]]:
     }
     for x in sorted(os.listdir(d)):
         ext = os.path.splitext(x)[1]
-        if ext in ('.c', '.m') and os.path.basename(x) not in exclude:
+        if ext in allowed_exts and os.path.basename(x) not in exclude:
             ans.append(os.path.join('kitty', x))
         elif ext == '.h':
             headers.append(os.path.join('kitty', x))

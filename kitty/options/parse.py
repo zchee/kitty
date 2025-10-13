@@ -1071,6 +1071,14 @@ class Parser:
 
     choices_for_linux_display_server = frozenset(('auto', 'wayland', 'x11'))
 
+    def metal_renderer(self, val: str, ans: dict[str, typing.Any]) -> None:
+        val = val.lower()
+        if val not in self.choices_for_metal_renderer:
+            raise ValueError(f"The value {val} is not a valid choice for metal_renderer")
+        ans["metal_renderer"] = val
+
+    choices_for_metal_renderer = frozenset(('auto', 'metal', 'opengl'))
+
     def listen_on(self, val: str, ans: dict[str, typing.Any]) -> None:
         ans['listen_on'] = str(val)
 

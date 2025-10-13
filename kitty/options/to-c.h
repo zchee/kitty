@@ -71,6 +71,15 @@ scrollbar(PyObject *src) {
     return SCROLLBAR_ON_SCROLLED;
 }
 
+static inline RendererBackendPreference
+renderer_backend_preference(PyObject *value) {
+    const char *backend = PyUnicode_AsUTF8(value);
+    if (!backend) return RENDERER_BACKEND_PREFERENCE_AUTO;
+    if (strcmp(backend, "metal") == 0) return RENDERER_BACKEND_PREFERENCE_METAL;
+    if (strcmp(backend, "opengl") == 0) return RENDERER_BACKEND_PREFERENCE_OPENGL;
+    return RENDERER_BACKEND_PREFERENCE_AUTO;
+}
+
 static inline unsigned
 undercurl_style(PyObject *x) {
     RAII_PyObject(thick, PyUnicode_FromString("thick"));

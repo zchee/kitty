@@ -23,6 +23,7 @@ choices_for_allow_remote_control = typing.Literal['password', 'socket-only', 'so
 choices_for_background_image_layout = typing.Literal['mirror-tiled', 'scaled', 'tiled', 'clamped', 'centered', 'cscaled']
 choices_for_default_pointer_shape = typing.Literal['arrow', 'beam', 'text', 'pointer', 'hand', 'help', 'wait', 'progress', 'crosshair', 'cell', 'vertical-text', 'move', 'e-resize', 'ne-resize', 'nw-resize', 'n-resize', 'se-resize', 'sw-resize', 's-resize', 'w-resize', 'ew-resize', 'ns-resize', 'nesw-resize', 'nwse-resize', 'zoom-in', 'zoom-out', 'alias', 'copy', 'not-allowed', 'no-drop', 'grab', 'grabbing']
 choices_for_linux_display_server = typing.Literal['auto', 'wayland', 'x11']
+choices_for_metal_renderer = typing.Literal['auto', 'metal', 'opengl']
 choices_for_macos_colorspace = typing.Literal['srgb', 'default', 'displayp3']
 choices_for_macos_show_window_title_in = typing.Literal['all', 'menubar', 'none', 'window']
 choices_for_placement_strategy = typing.Literal['top-left', 'top', 'top-right', 'left', 'center', 'right', 'bottom-left', 'bottom', 'bottom-right']
@@ -376,6 +377,7 @@ option_names = (
     'kitty_mod',
     'linux_bell_theme',
     'linux_display_server',
+    'metal_renderer',
     'listen_on',
     'macos_colorspace',
     'macos_custom_beam_cursor',
@@ -570,6 +572,7 @@ class Options:
     kitty_mod: int = 5
     linux_bell_theme: str = '__custom'
     linux_display_server: choices_for_linux_display_server = 'auto'
+    metal_renderer: choices_for_metal_renderer = 'auto'
     listen_on: str = 'none'
     macos_colorspace: choices_for_macos_colorspace = 'srgb'
     macos_custom_beam_cursor: bool = False

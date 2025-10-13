@@ -16,6 +16,7 @@
 #include "srgb_gamma.h"
 #include "uniforms_generated.h"
 #include "state.h"
+#include "opengl_renderer_priv.h"
 
 enum {
     CELL_PROGRAM, CELL_FG_PROGRAM, CELL_BG_PROGRAM, CELL_PROGRAM_SENTINEL,

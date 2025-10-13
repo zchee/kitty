@@ -37,6 +37,17 @@ class TestConfParsing(BaseTest):
         cli_parsing(self)
 
 
+class TestRendererPreferenceOptions(BaseTest):
+
+    def test_metal_renderer_option_accepts_valid_values(self) -> None:
+        opts = self.set_options({'metal_renderer': 'opengl'})
+        self.assertEqual('opengl', opts.metal_renderer)
+
+    def test_metal_renderer_option_rejects_invalid_value(self) -> None:
+        with self.assertRaisesRegex(ValueError, 'metal_renderer'):
+            self.set_options({'metal_renderer': 'bogus'})
+
+
 def cli_parsing(self):
     from kitty.cli import CLIOptions, Options, parse_cmdline, parse_option_spec
     seq, disabled = parse_option_spec('''\
