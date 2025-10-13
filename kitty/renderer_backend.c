@@ -197,14 +197,11 @@ renderer_backend_present(GLFWwindow *window, const RendererPresentParams *params
     if (!entry) {
         return false;
     }
-    if (entry->ops->present) {
-        return entry->ops->present(window, params);
+    if (!entry->ops->present) {
+        PyErr_SetString(PyExc_RuntimeError, "Renderer backend does not implement present()");
+        return false;
     }
-    if (entry->ops->swap_buffers) {
-        entry->ops->swap_buffers(window);
-        return true;
-    }
-    return true;
+    return entry->ops->present(window, params);
 }
 
 void

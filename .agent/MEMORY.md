@@ -23,9 +23,8 @@ Authoritative roadmap for delivering Metal rendering support on macOS with full 
 
 ## Immediate Blockers
 1. GL helper code needs extraction into OpenGL-exclusive translation units before Metal can implement alternate draw paths without violating “no duplication.”
-2. `RendererBackendOps` in `renderer_backend.h` lacks an explicit `swap_buffers` hook even though `renderer_backend.c` still references it—abstraction must be tidied up before additional backends.
-3. Test environment requires a Python 3.11-compatible `fast_data_types.so` to enable meaningful regression testing post-changes.
-4. GLFW/Cocoa plumbing currently assumes an OpenGL context; Metal will need CAMetalLayer ownership and present-style pacing integrated into these paths.
+2. Test environment requires a Python 3.11-compatible `fast_data_types.so` to enable meaningful regression testing post-changes.
+3. GLFW/Cocoa plumbing currently assumes an OpenGL context; Metal will need CAMetalLayer ownership and present-style pacing integrated into these paths.
 
 ## Phase Roadmap
 
@@ -35,14 +34,13 @@ Authoritative roadmap for delivering Metal rendering support on macOS with full 
 
 **Key Tasks**
 - Move `setup_os_window_for_rendering`, `draw_cells`, `draw_borders`, `blank_canvas`, cursor trail, background image, scrollbar, and indirect framebuffer logic from `kitty/shaders.c` into OpenGL-specific source files (e.g., `opengl_renderer_draw.c`).
-- Resolve `swap_buffers` pointer mismatch and confirm whether an explicit `end_frame` hook is required.
 - Ensure `child-monitor.c`, live resize, and screenshot paths interact exclusively through backend-agnostic hooks.
 - Rebuild `fast_data_types.so` for Python 3.11 and get `python3.11 test.py renderer_backend` passing.
 - Expand resize / on_resize tests to confirm backend dispatch routes correctly after refactor.
 
 **Exit Criteria**
 - No OpenGL helper symbols accessible outside OpenGL translation units.
-- Renderer dispatcher compiles without unused hooks and all tests in `python3.11 test.py renderer_backend` pass.
+- Renderer dispatcher compiles without unused hooks and all tests in `python3.11 test.py renderer_backend` pass. (Swap-buffer mismatch resolved on 2025-10-13; present hook now required with dedicated test coverage.)
 
 ### Phase 2 – Metal Bootstrap
 **Goals**

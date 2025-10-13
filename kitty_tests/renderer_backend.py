@@ -341,6 +341,25 @@ class TestRendererBackend(BaseTest):
         self.assertIs(err_type, RuntimeError)
         self.assertIn("render", str(err_value))
 
+    def test_renderer_backend_present_missing_hook_sets_error(self) -> None:
+        self.addCleanup(ffi.reset)
+        ops = ffi.make_backend_ops("stub-missing-present", present=None)
+        self.assertTrue(
+            ffi.lib.renderer_backend_register(
+                ffi.RENDERER_BACKEND_METAL, ctypes.byref(ops)
+            )
+        )
+        renderer_backend_select('metal')
+        present_params = ffi.RendererPresentParams(
+            blocking=True,
+            capture_framebuffer=False,
+        )
+        success = ffi.lib.renderer_backend_present(None, ctypes.byref(present_params))
+        self.assertFalse(success)
+        err_type, err_value, _ = ffi.fetch_error()
+        self.assertIs(err_type, RuntimeError)
+        self.assertIn("present", str(err_value))
+
     def test_opengl_helpers_are_not_python_accessible(self) -> None:
         # Ensure OpenGL-specific helpers are not exposed through the public C API.
         for name in ("draw_cells", "draw_borders", "blank_canvas", "setup_os_window_for_rendering"):
