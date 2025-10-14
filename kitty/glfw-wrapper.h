@@ -7,6 +7,8 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
+#include <sys/types.h>
 #include "monotonic.h"
 
 #ifndef GFW_EXTERN
