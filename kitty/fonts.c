@@ -20,6 +20,23 @@
 #define debug debug_fonts
 
 static PyObject *python_send_to_gpu_impl = NULL;
+static extra_sprite_upload_hook sprite_upload_hook = NULL;
+static extra_sprite_free_hook sprite_free_hook = NULL;
+
+void
+set_extra_sprite_upload_hook(extra_sprite_upload_hook hook) {
+    sprite_upload_hook = hook;
+}
+
+void
+set_extra_sprite_free_hook(extra_sprite_free_hook hook) {
+    sprite_free_hook = hook;
+}
+
+void
+notify_extra_sprite_free(FONTS_DATA_HANDLE fg) {
+    if (sprite_free_hook) sprite_free_hook(fg);
+}
 extern PyTypeObject Line_Type;
 
 enum {NO_FONT=-3, MISSING_FONT=-2, BLANK_FONT=-1, BOX_FONT=0};
@@ -99,11 +116,6 @@ typedef union DecorationsKey {
     uint64_t val;
 } DecorationsKey;
 static_assert(sizeof(DecorationsKey) == sizeof(uint64_t), "Fix the ordering of DecorationsKey");
-
-typedef struct DecorationMetadata {
-    sprite_index start_idx;
-    DecorationGeometry underline_region;
-} DecorationMetadata;
 
 static uint64_t hash_decorations_key(DecorationsKey k) { return vt_hash_integer(k.val); }
 static bool cmpr_decorations_key(DecorationsKey a, DecorationsKey b) { return a.val == b.val; }
@@ -387,8 +399,10 @@ current_send_sprite_to_gpu(FontGroup *fg, pixel *buf, DecorationMetadata dec, Fo
     sprite_index ans = current_sprite_index(&fg->sprite_tracker);
     if (!do_increment(fg)) return 0;
     if (python_send_to_gpu_impl) { python_send_to_gpu(fg, ans, buf); return ans; }
+    if (sprite_upload_hook) sprite_upload_hook((FONTS_DATA_HANDLE)fg, ans, buf, dec, scaled_metrics);
     if (dec.underline_region.height && OPT(underline_exclusion).thickness > 0) calculate_underline_exclusion_zones(
             buf, fg, dec.underline_region, scaled_metrics);
+    if (!fg->sprite_map) return ans;
     send_sprite_to_gpu((FONTS_DATA_HANDLE)fg, ans, buf, dec.start_idx);
     if (0) { printf("Sprite: %u dec_idx: %u\n", ans, dec.start_idx); display_rgba_data(buf, fg->fcm.cell_width, fg->fcm.cell_height); printf("\n"); }
     return ans;
@@ -2059,10 +2073,16 @@ initialize_font_group(FontGroup *fg) {
 
 
 void
-send_prerendered_sprites_for_window(OSWindow *w) {
+send_prerendered_sprites_for_window(OSWindow *w, bool ensure_opengl_resources) {
     FontGroup *fg = (FontGroup*)w->fonts_data;
     if (!fg->sprite_map) {
-        fg->sprite_map = alloc_sprite_map();
+        if (ensure_opengl_resources) {
+            fg->sprite_map = alloc_sprite_map();
+            send_prerendered_sprites(fg);
+        } else {
+            send_prerendered_sprites(fg);
+        }
+    } else if (!ensure_opengl_resources) {
         send_prerendered_sprites(fg);
     }
 }

@@ -104,6 +104,7 @@ alloc_sprite_map(void) {
 
 void
 free_sprite_data(FONTS_DATA_HANDLE fg) {
+    notify_extra_sprite_free(fg);
     SpriteMap *sprite_map = (SpriteMap*)fg->sprite_map;
     if (sprite_map) {
         if (sprite_map->texture_id) free_texture(&sprite_map->texture_id);

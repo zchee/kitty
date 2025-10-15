@@ -7,6 +7,7 @@
 
 #include "cleanup.h"
 #include "options/to-c-generated.h"
+#include "renderer_backend.h"
 #include <math.h>
 #include <sys/mman.h>
 
@@ -1088,7 +1089,7 @@ PYWRAP1(os_window_font_size) {
     WITH_OS_WINDOW(os_window_id)
         if (new_sz > 0 && (force || new_sz != os_window->fonts_data->font_sz_in_pts)) {
             on_os_window_font_size_change(os_window, new_sz);
-            send_prerendered_sprites_for_window(os_window);
+            send_prerendered_sprites_for_window(os_window, renderer_backend_current_type() == RENDERER_BACKEND_OPENGL);
             resize_screen(os_window, os_window->tab_bar_render_data.screen, false);
             for (size_t ti = 0; ti < os_window->num_tabs; ti++) {
                 Tab *tab = os_window->tabs + ti;

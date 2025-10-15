@@ -1533,9 +1533,11 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
         }
     }
     if (is_first_window) {
-        PyObject *ret = PyObject_CallNoArgs(load_programs);
-        if (ret == NULL) return NULL;
-        Py_DECREF(ret);
+        if (!using_metal && load_programs && !Py_IsNone(load_programs)) {
+            PyObject *ret = PyObject_CallNoArgs(load_programs);
+            if (ret == NULL) return NULL;
+            Py_DECREF(ret);
+        }
         get_platform_dependent_config_values(glfw_window);
         if (!global_state.supports_framebuffer_srgb) {
             log_error("The OpenGL drivers dont support GL_FRAMEBUFFER_SRGB this will cause a small rendering performance penalty");
@@ -1566,7 +1568,7 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
     glfwSetCocoaToggleFullscreenIntercept(glfw_window, intercept_cocoa_fullscreen);
     glfwCocoaSetWindowResizeCallback(glfw_window, cocoa_os_window_resized);
 #endif
-    send_prerendered_sprites_for_window(w);
+    send_prerendered_sprites_for_window(w, !using_metal);
     if (logo.pixels && logo.width && logo.height) glfwSetWindowIcon(glfw_window, 1, &logo);
     set_glfw_mouse_pointer_shape_in_window(glfw_window, OPT(default_pointer_shape));
     update_os_window_viewport(w, false);

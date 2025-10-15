@@ -8,6 +8,7 @@
 
 #include "lineops.h"
 #include "state.h"
+#include "decorations.h"
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
 #include <hb.h>
@@ -81,6 +82,18 @@ PyObject*
 font_features_as_dict(const FontFeatures *font_features);
 bool
 has_cell_text(bool(*has_codepoint)(const void*, char_type ch), const void* face, bool do_debug, const ListOfChars *lc);
+
+typedef struct DecorationMetadata {
+    sprite_index start_idx;
+    DecorationGeometry underline_region;
+} DecorationMetadata;
+
+typedef void (*extra_sprite_upload_hook)(FONTS_DATA_HANDLE fg, sprite_index idx, const pixel *buf, DecorationMetadata dec, FontCellMetrics metrics);
+typedef void (*extra_sprite_free_hook)(FONTS_DATA_HANDLE fg);
+
+void set_extra_sprite_upload_hook(extra_sprite_upload_hook hook);
+void set_extra_sprite_free_hook(extra_sprite_free_hook hook);
+void notify_extra_sprite_free(FONTS_DATA_HANDLE fg);
 
 static inline void
 right_shift_canvas(pixel *canvas, size_t width, size_t height, size_t amt) {

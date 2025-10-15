@@ -430,7 +430,7 @@ void send_sprite_to_gpu(FONTS_DATA_HANDLE fg, sprite_index, pixel*, sprite_index
 void blank_os_window(OSWindow *);
 void set_os_window_chrome(OSWindow *w);
 FONTS_DATA_HANDLE load_fonts_data(double, double, double);
-void send_prerendered_sprites_for_window(OSWindow *w);
+void send_prerendered_sprites_for_window(OSWindow *w, bool ensure_opengl_resources);
 #ifdef __APPLE__
 #include "cocoa_window.h"
 #endif

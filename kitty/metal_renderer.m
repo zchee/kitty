@@ -6,6 +6,7 @@
 #include <stdbool.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #ifdef MAX
 #undef MAX
@@ -18,6 +19,8 @@
 #include "metal_renderer.h"
 #include "renderer_backend.h"
 #include "renderer_backend_types.h"
+#include "fonts.h"
+#include "state.h"
 
 extern void log_error(const char *fmt, ...);
 
@@ -48,6 +51,185 @@ static MetalGlobalState g_metal = {
     .debug_labels = false,
     .display_sync_enabled = true,
 };
+
+typedef struct {
+    id<MTLTexture> spriteTexture;
+    id<MTLBuffer> decorationsBuffer;
+    NSUInteger spriteWidth;
+    NSUInteger spriteHeight;
+    NSUInteger spriteLayers;
+    NSUInteger decorationsCapacity;
+} MetalSpriteAtlas;
+
+static bool sprite_hooks_registered = false;
+
+static MetalSpriteAtlas*
+metal_font_atlas(FONTS_DATA_HANDLE fg) {
+    MetalSpriteAtlas *atlas = (MetalSpriteAtlas *)fg->metal_sprite_map;
+    if (!atlas) {
+        atlas = calloc(1, sizeof(MetalSpriteAtlas));
+        if (!atlas) {
+            PyErr_NoMemory();
+            return NULL;
+        }
+        fg->metal_sprite_map = atlas;
+    }
+    return atlas;
+}
+
+static void
+metal_release_font_atlas(FONTS_DATA_HANDLE fg) {
+    MetalSpriteAtlas *atlas = (MetalSpriteAtlas *)fg->metal_sprite_map;
+    if (!atlas) return;
+    atlas->spriteTexture = nil;
+    atlas->decorationsBuffer = nil;
+    free(atlas);
+    fg->metal_sprite_map = NULL;
+}
+
+static bool
+ensure_sprite_texture_capacity(MetalSpriteAtlas *atlas, NSUInteger width, NSUInteger height, NSUInteger layers) {
+    if (atlas->spriteTexture && width <= atlas->spriteWidth && height <= atlas->spriteHeight && layers <= atlas->spriteLayers) {
+        return true;
+    }
+    if (!g_metal.device || !g_metal.command_queue) {
+        metal_log("sprite_texture_alloc_failed", "Metal device or command queue unavailable");
+        return false;
+    }
+    MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:width height:height mipmapped:NO];
+    descriptor.textureType = MTLTextureType2DArray;
+    descriptor.arrayLength = layers;
+    descriptor.storageMode = MTLStorageModeManaged;
+    descriptor.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> newTexture = [g_metal.device newTextureWithDescriptor:descriptor];
+    if (!newTexture) {
+        metal_log("sprite_texture_alloc_failed", "width=%lu height=%lu layers=%lu", (unsigned long)width, (unsigned long)height, (unsigned long)layers);
+        PyErr_SetString(PyExc_RuntimeError, "Metal failed to allocate sprite texture");
+        return false;
+    }
+    if (atlas->spriteTexture) {
+        NSUInteger copyWidth = MIN(width, atlas->spriteWidth);
+        NSUInteger copyHeight = MIN(height, atlas->spriteHeight);
+        NSUInteger sliceCount = MIN(layers, atlas->spriteLayers);
+        if (copyWidth && copyHeight && sliceCount) {
+            id<MTLCommandBuffer> cb = [g_metal.command_queue commandBuffer];
+            id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+            MTLSize size = MTLSizeMake(copyWidth, copyHeight, 1);
+            MTLOrigin origin = MTLOriginMake(0, 0, 0);
+            for (NSUInteger slice = 0; slice < sliceCount; slice++) {
+                [blit copyFromTexture:atlas->spriteTexture
+                          sourceSlice:slice
+                          sourceLevel:0
+                         sourceOrigin:origin
+                           sourceSize:size
+                            toTexture:newTexture
+                     destinationSlice:slice
+                     destinationLevel:0
+                    destinationOrigin:origin];
+            }
+            [blit endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+        }
+    }
+    atlas->spriteTexture = newTexture;
+    atlas->spriteWidth = width;
+    atlas->spriteHeight = height;
+    atlas->spriteLayers = layers;
+    return true;
+}
+
+static bool
+ensure_decorations_buffer_capacity(MetalSpriteAtlas *atlas, NSUInteger neededCapacity) {
+    if (atlas->decorationsCapacity >= neededCapacity) {
+        return true;
+    }
+    if (!g_metal.device) {
+        metal_log("decorations_buffer_alloc_failed", "Metal device unavailable");
+        return false;
+    }
+    NSUInteger newCapacity = neededCapacity + 256;
+    id<MTLBuffer> newBuffer = [g_metal.device newBufferWithLength:newCapacity * sizeof(uint32_t) options:MTLResourceStorageModeManaged];
+    if (!newBuffer) {
+        metal_log("decorations_buffer_alloc_failed", "capacity=%lu", (unsigned long)newCapacity);
+        PyErr_SetString(PyExc_RuntimeError, "Metal failed to allocate decorations buffer");
+        return false;
+    }
+    if (atlas->decorationsBuffer) {
+        memcpy([newBuffer contents], [atlas->decorationsBuffer contents], atlas->decorationsCapacity * sizeof(uint32_t));
+        [newBuffer didModifyRange:NSMakeRange(0, atlas->decorationsCapacity * sizeof(uint32_t))];
+    }
+    atlas->decorationsBuffer = newBuffer;
+    atlas->decorationsCapacity = newCapacity;
+    return true;
+}
+
+static void
+metal_sprite_upload(FONTS_DATA_HANDLE fg, sprite_index idx, const pixel *buf, DecorationMetadata dec, FontCellMetrics metrics) {
+    if (!g_metal.initialized) return;
+    MetalSpriteAtlas *atlas = metal_font_atlas(fg);
+    if (!atlas) return;
+    unsigned xnum = 0, ynum = 0, zmax = 0;
+    sprite_tracker_current_layout(fg, &xnum, &ynum, &zmax);
+    NSUInteger layers = (NSUInteger)zmax + 1;
+    if (!layers) return;
+    const NSUInteger cellWidth = metrics.cell_width;
+    const NSUInteger cellHeightPlusOne = metrics.cell_height + 1;
+    if (!cellWidth || !cellHeightPlusOne) return;
+    NSUInteger width = (NSUInteger)xnum * cellWidth;
+    NSUInteger height = (NSUInteger)ynum * cellHeightPlusOne;
+    if (!width || !height) return;
+    if (!ensure_sprite_texture_capacity(atlas, width, height, layers)) return;
+    unsigned x = 0, y = 0, z = 0;
+    sprite_index_to_pos(idx, xnum, ynum, &x, &y, &z);
+    if (z >= layers) return;
+    MTLRegion region = MTLRegionMake3D((NSUInteger)x * cellWidth, (NSUInteger)y * cellHeightPlusOne, 0, cellWidth, cellHeightPlusOne, 1);
+    NSUInteger bytesPerRow = cellWidth * sizeof(pixel);
+    NSUInteger bytesPerImage = bytesPerRow * cellHeightPlusOne;
+    @autoreleasepool {
+        [atlas->spriteTexture replaceRegion:region mipmapLevel:0 slice:z withBytes:buf bytesPerRow:bytesPerRow bytesPerImage:bytesPerImage];
+    }
+    if (!ensure_decorations_buffer_capacity(atlas, (NSUInteger)idx + 1)) return;
+    if (atlas->decorationsBuffer) {
+        uint32_t *dest = (uint32_t *)[atlas->decorationsBuffer contents];
+        dest[idx] = dec.start_idx;
+        if (atlas->decorationsBuffer.storageMode == MTLStorageModeManaged) {
+            [atlas->decorationsBuffer didModifyRange:NSMakeRange((NSUInteger)idx * sizeof(uint32_t), sizeof(uint32_t))];
+        }
+    }
+}
+
+static void
+metal_sprite_free(FONTS_DATA_HANDLE fg) {
+    metal_release_font_atlas(fg);
+}
+
+static void
+metal_release_all_font_atlases(void) {
+    for (size_t i = 0; i < global_state.num_os_windows; i++) {
+        OSWindow *w = global_state.os_windows + i;
+        if (w->fonts_data) {
+            metal_release_font_atlas(w->fonts_data);
+        }
+    }
+}
+
+static void
+metal_register_sprite_hooks(void) {
+    if (sprite_hooks_registered) return;
+    set_extra_sprite_upload_hook(metal_sprite_upload);
+    set_extra_sprite_free_hook(metal_sprite_free);
+    sprite_hooks_registered = true;
+}
+
+static void
+metal_unregister_sprite_hooks(void) {
+    if (!sprite_hooks_registered) return;
+    metal_release_all_font_atlases();
+    set_extra_sprite_upload_hook(NULL);
+    set_extra_sprite_free_hook(NULL);
+    sprite_hooks_registered = false;
+}
 
 @interface MetalWindowState : NSObject
 @property (nonatomic, strong) CAMetalLayer *layer;
@@ -288,6 +470,7 @@ metal_backend_ensure_initialized(const RendererInitConfig *cfg) {
     g_metal.debug_labels = cfg ? cfg->enable_debug_labels : false;
     g_metal.display_sync_enabled = !g_metal.prefer_low_latency;
     set_display_sync_for_all_layers();
+    metal_register_sprite_hooks();
     return true;
 }
 
@@ -303,6 +486,7 @@ metal_backend_shutdown(void) {
         GLFWwindow *window = (GLFWwindow *)window_key_value.pointerValue;
         destroy_window_state(window);
     }
+    metal_unregister_sprite_hooks();
     g_metal.command_queue = nil;
     g_metal.device = nil;
     g_metal.initialized = false;

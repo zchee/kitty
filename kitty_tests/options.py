@@ -44,7 +44,7 @@ class TestRendererPreferenceOptions(BaseTest):
         self.assertEqual('opengl', opts.metal_renderer)
 
     def test_metal_renderer_option_rejects_invalid_value(self) -> None:
-        with self.assertRaisesRegex(ValueError, 'metal_renderer'):
+        with self.assertRaisesRegex(ValueError, 'bogus.*metal_renderer'):
             self.set_options({'metal_renderer': 'bogus'})
 
 

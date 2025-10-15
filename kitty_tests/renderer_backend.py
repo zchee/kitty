@@ -372,6 +372,7 @@ class TestRendererBackend(BaseTest):
         err_type, err_value, _ = ffi.fetch_error()
         self.assertIs(err_type, RuntimeError)
         self.assertIn("render", str(err_value))
+        self.assertIn("stub-missing-render", str(err_value))
 
     def test_renderer_backend_present_missing_hook_sets_error(self) -> None:
         self.addCleanup(ffi.reset)
@@ -391,6 +392,7 @@ class TestRendererBackend(BaseTest):
         err_type, err_value, _ = ffi.fetch_error()
         self.assertIs(err_type, RuntimeError)
         self.assertIn("present", str(err_value))
+        self.assertIn("stub-missing-present", str(err_value))
 
     def test_opengl_helpers_are_not_python_accessible(self) -> None:
         # Ensure OpenGL-specific helpers are not exposed through the public C API.

@@ -20,6 +20,24 @@ static const char *const renderer_backend_names[RENDERER_BACKEND_COUNT] = {
     [RENDERER_BACKEND_METAL] = "metal",
 };
 
+static inline const char*
+backend_label(const RegisteredBackend *entry) {
+    if (!entry || !entry->ops) {
+        return "renderer backend";
+    }
+    if (entry->ops->name) {
+        return entry->ops->name;
+    }
+    ptrdiff_t idx = entry - registered_backends;
+    if (idx >= 0 && idx < RENDERER_BACKEND_COUNT) {
+        const char *name = renderer_backend_names[idx];
+        if (name) {
+            return name;
+        }
+    }
+    return "renderer backend";
+}
+
 static bool
 validate_backend_type(RendererBackendType type) {
     return type >= 0 && type < RENDERER_BACKEND_COUNT;
@@ -113,6 +131,10 @@ ensure_backend_ready(RegisteredBackend *entry, const RendererInitConfig *cfg) {
         PyErr_SetString(PyExc_RuntimeError, "Renderer backend not selected");
         return false;
     }
+    if (!entry->ops) {
+        PyErr_SetString(PyExc_RuntimeError, "Renderer backend has no registered operations");
+        return false;
+    }
     if (!entry->ops->ensure_initialized) {
         entry->initialized = true;
         entry->init_cfg = *cfg;
@@ -135,10 +157,10 @@ renderer_backend_attach_window(GLFWwindow *window, const RendererWindowConfig *c
     RegisteredBackend *entry = current_backend_entry();
     RendererInitConfig init_cfg = current_init_config();
     void *ctx_token = NULL;
-    if (entry && entry->ops->make_context_current) {
+    if (entry && entry->ops && entry->ops->make_context_current) {
         ctx_token = entry->ops->make_context_current(window);
     }
-    bool restore_context = entry && entry->ops->restore_context && ctx_token;
+    bool restore_context = entry && entry->ops && entry->ops->restore_context && ctx_token;
     bool ok = ensure_backend_ready(entry, &init_cfg);
     if (ok && entry->ops->attach_window) {
         ok = entry->ops->attach_window(window, config);
@@ -152,7 +174,7 @@ renderer_backend_attach_window(GLFWwindow *window, const RendererWindowConfig *c
 void*
 renderer_backend_make_context_current(GLFWwindow *window) {
     RegisteredBackend *entry = current_backend_entry();
-    if (!entry || !entry->ops->make_context_current) {
+    if (!entry || !entry->ops || !entry->ops->make_context_current) {
         return NULL;
     }
     return entry->ops->make_context_current(window);
@@ -161,7 +183,7 @@ renderer_backend_make_context_current(GLFWwindow *window) {
 void
 renderer_backend_restore_context(void *token) {
     RegisteredBackend *entry = current_backend_entry();
-    if (!entry || !entry->ops->restore_context) {
+    if (!entry || !entry->ops || !entry->ops->restore_context) {
         return;
     }
     entry->ops->restore_context(token);
@@ -170,7 +192,7 @@ renderer_backend_restore_context(void *token) {
 void
 renderer_backend_apply_swap_interval(int val) {
     RegisteredBackend *entry = current_backend_entry();
-    if (!entry || !entry->ops->apply_swap_interval) {
+    if (!entry || !entry->ops || !entry->ops->apply_swap_interval) {
         return;
     }
     entry->ops->apply_swap_interval(val);
@@ -183,6 +205,10 @@ renderer_backend_begin_frame(GLFWwindow *window, const RendererFrameParams *para
     if (!ensure_backend_ready(entry, &init_cfg)) {
         return false;
     }
+    if (!entry->ops) {
+        PyErr_SetString(PyExc_RuntimeError, "Renderer backend has no registered operations");
+        return false;
+    }
     if (entry->ops->begin_frame) {
         return entry->ops->begin_frame(window, params);
     }
@@ -192,8 +218,12 @@ renderer_backend_begin_frame(GLFWwindow *window, const RendererFrameParams *para
 bool
 renderer_backend_render(GLFWwindow *window, const RendererRenderParams *params) {
     RegisteredBackend *entry = current_backend_entry();
-    if (!entry || !entry->ops->render) {
-        PyErr_SetString(PyExc_RuntimeError, "Renderer backend does not implement render()");
+    if (!entry || !entry->ops) {
+        PyErr_SetString(PyExc_RuntimeError, "Renderer backend not selected");
+        return false;
+    }
+    if (!entry->ops->render) {
+        PyErr_Format(PyExc_RuntimeError, "%s backend does not implement render()", backend_label(entry));
         return false;
     }
     return entry->ops->render(window, params);
@@ -202,11 +232,12 @@ renderer_backend_render(GLFWwindow *window, const RendererRenderParams *params) 
 bool
 renderer_backend_present(GLFWwindow *window, const RendererPresentParams *params) {
     RegisteredBackend *entry = current_backend_entry();
-    if (!entry) {
+    if (!entry || !entry->ops) {
+        PyErr_SetString(PyExc_RuntimeError, "Renderer backend not selected");
         return false;
     }
     if (!entry->ops->present) {
-        PyErr_SetString(PyExc_RuntimeError, "Renderer backend does not implement present()");
+        PyErr_Format(PyExc_RuntimeError, "%s backend does not implement present()", backend_label(entry));
         return false;
     }
     return entry->ops->present(window, params);
@@ -215,7 +246,7 @@ renderer_backend_present(GLFWwindow *window, const RendererPresentParams *params
 void
 renderer_backend_on_resize(GLFWwindow *window, const RendererResizeParams *params) {
     RegisteredBackend *entry = current_backend_entry();
-    if (!entry || !entry->ops->on_resize) {
+    if (!entry || !entry->ops || !entry->ops->on_resize) {
         return;
     }
     entry->ops->on_resize(window, params);
@@ -224,7 +255,7 @@ renderer_backend_on_resize(GLFWwindow *window, const RendererResizeParams *param
 void
 renderer_backend_on_suspend(void) {
     RegisteredBackend *entry = current_backend_entry();
-    if (!entry || !entry->ops->on_suspend) {
+    if (!entry || !entry->ops || !entry->ops->on_suspend) {
         return;
     }
     entry->ops->on_suspend();
@@ -233,7 +264,7 @@ renderer_backend_on_suspend(void) {
 void
 renderer_backend_on_resume(void) {
     RegisteredBackend *entry = current_backend_entry();
-    if (!entry || !entry->ops->on_resume) {
+    if (!entry || !entry->ops || !entry->ops->on_resume) {
         return;
     }
     entry->ops->on_resume();
@@ -254,7 +285,7 @@ renderer_backend_shutdown_active(void) {
     if (!entry) {
         return;
     }
-    if (entry->ops->shutdown) {
+    if (entry->ops && entry->ops->shutdown) {
         entry->ops->shutdown();
     }
     entry->initialized = false;
