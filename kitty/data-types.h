@@ -18,6 +18,8 @@
 #include <stdbool.h>
 #include <poll.h>
 #include <pthread.h>
+#include "color_type.h"
+#include "compiler.h"
 #include "glfw-wrapper.h"
 #include "banned.h"
 // Required minimum OpenGL version
@@ -29,11 +31,7 @@
 #endif
 #define GLSL_VERSION 140
 #define GLFW_MOD_KITTY (GLFW_MOD_LAST * 2)
-#define UNUSED __attribute__ ((unused))
 #define PYNOARG PyObject *__a1 UNUSED, PyObject *__a2 UNUSED
-#define EXPORTED __attribute__ ((visibility ("default")))
-#define LIKELY(x)    __builtin_expect (!!(x), 1)
-#define UNLIKELY(x)  __builtin_expect (!!(x), 0)
 #define MAX(x, y) __extension__ ({ \
     const __typeof__ (x) __a__ = (x); const __typeof__ (y) __b__ = (y); \
         __a__ > __b__ ? __a__ : __b__;})
@@ -62,7 +60,6 @@ typedef unsigned long long id_type;
 typedef uint32_t char_type;
 static_assert(sizeof(Py_UCS4) == sizeof(char_type), "PyUCS4 and char_type dont match");
 #define MAX_CHAR_TYPE_VALUE UINT32_MAX
-typedef uint32_t color_type;
 typedef uint16_t hyperlink_id_type;
 typedef int key_type;
 #define HYPERLINK_MAX_NUMBER UINT16_MAX

@@ -2,7 +2,7 @@
 
 #include <stdbool.h>
 
-#include "data-types.h"
+#include "color_type.h"
 #include "monotonic.h"
 
 typedef enum {

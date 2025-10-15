@@ -1,0 +1,498 @@
+#import <AppKit/AppKit.h>
+#import <Metal/Metal.h>
+#import <QuartzCore/CAMetalLayer.h>
+
+#include <math.h>
+#include <stdbool.h>
+#include <stdarg.h>
+#include <stdio.h>
+
+#ifdef MAX
+#undef MAX
+#endif
+#ifdef MIN
+#undef MIN
+#endif
+
+#include "glfw-wrapper.h"
+#include "metal_renderer.h"
+#include "renderer_backend.h"
+#include "renderer_backend_types.h"
+
+extern void log_error(const char *fmt, ...);
+
+static void
+metal_log(const char *event, const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    char detail[256];
+    vsnprintf(detail, sizeof(detail), fmt, args);
+    va_end(args);
+    log_error("metal_event=%s %s", event, detail);
+}
+
+typedef struct {
+    id<MTLDevice> device;
+    id<MTLCommandQueue> command_queue;
+    bool initialized;
+    bool prefer_low_latency;
+    bool debug_labels;
+    bool display_sync_enabled;
+} MetalGlobalState;
+
+static MetalGlobalState g_metal = {
+    .device = nil,
+    .command_queue = nil,
+    .initialized = false,
+    .prefer_low_latency = false,
+    .debug_labels = false,
+    .display_sync_enabled = true,
+};
+
+@interface MetalWindowState : NSObject
+@property (nonatomic, strong) CAMetalLayer *layer;
+@property (nonatomic, strong) id<CAMetalDrawable> drawable;
+@property (nonatomic, strong) id<MTLCommandBuffer> commandBuffer;
+@property (nonatomic) MTLClearColor clearColor;
+@property (nonatomic) float backgroundOpacity;
+@property (nonatomic) color_type fallbackBackground;
+@property (nonatomic, strong) id closeObserver;
+@end
+
+@implementation MetalWindowState
+@end
+
+static NSMapTable<NSValue *, MetalWindowState *> *
+window_state_table(void) {
+    static NSMapTable<NSValue *, MetalWindowState *> *table = nil;
+    static dispatch_once_t once_token;
+    dispatch_once(&once_token, ^{
+        table = [NSMapTable strongToStrongObjectsMapTable];
+    });
+    return table;
+}
+
+static NSValue*
+window_key(GLFWwindow *window) {
+    return [NSValue valueWithPointer:(const void *)window];
+}
+
+static MetalWindowState*
+state_for_window(GLFWwindow *window) {
+    return [window_state_table() objectForKey:window_key(window)];
+}
+
+static MetalWindowState*
+ensure_state_for_window(GLFWwindow *window) {
+    NSMapTable *table = window_state_table();
+    NSValue *key = window_key(window);
+    MetalWindowState *state = [table objectForKey:key];
+    if (!state) {
+        state = [[MetalWindowState alloc] init];
+        [table setObject:state forKey:key];
+    }
+    return state;
+}
+
+static void
+remove_state_for_window(GLFWwindow *window) {
+    [window_state_table() removeObjectForKey:window_key(window)];
+}
+
+static inline void
+reset_command_primitives(MetalWindowState *state) {
+    if (!state) return;
+    state.commandBuffer = nil;
+    state.drawable = nil;
+}
+
+static MTLClearColor
+clear_color_from(color_type color, float alpha) {
+    const double r = ((color >> 16) & 0xFF) / 255.0;
+    const double g = ((color >> 8) & 0xFF) / 255.0;
+    const double b = (color & 0xFF) / 255.0;
+    const double clamped_alpha = fmax(0.0, fmin((double)alpha, 1.0));
+    return MTLClearColorMake(r, g, b, clamped_alpha);
+}
+
+static bool
+ensure_command_primitives(GLFWwindow *window, MetalWindowState *state) {
+    (void)window;
+    if (!state || !state.layer) {
+        PyErr_SetString(PyExc_RuntimeError, "Metal window state missing layer");
+        return false;
+    }
+    reset_command_primitives(state);
+
+    @autoreleasepool {
+        id<CAMetalDrawable> drawable = [state.layer nextDrawable];
+        if (!drawable) {
+            PyErr_SetString(PyExc_RuntimeError, "Metal layer failed to supply drawable");
+            metal_log("drawable_acquire_failed", "layer=%p", state.layer);
+            return false;
+        }
+        state.drawable = drawable;
+
+        id<MTLCommandBuffer> command_buffer = [g_metal.command_queue commandBuffer];
+        if (!command_buffer) {
+            PyErr_SetString(PyExc_RuntimeError, "Metal command queue failed to create command buffer");
+            metal_log("command_buffer_create_failed", "command_queue=%p", g_metal.command_queue);
+            return false;
+        }
+        if (g_metal.debug_labels) {
+            command_buffer.label = @"kitty-frame";
+        }
+        state.commandBuffer = command_buffer;
+        if (g_metal.debug_labels) {
+            metal_log("command_primitives_ready", "drawable=%p command_buffer=%p", state.drawable, state.commandBuffer);
+        }
+    }
+    return true;
+}
+
+static void
+encode_draw_end(id<MTLRenderCommandEncoder> encoder) {
+    if (encoder) {
+        [encoder endEncoding];
+    }
+}
+
+static bool
+encode_clear_pass(GLFWwindow *window, MetalWindowState *state, MTLClearColor clear_color) {
+    if (!ensure_command_primitives(window, state)) {
+        return false;
+    }
+    @autoreleasepool {
+        MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        if (!pass) {
+            PyErr_SetString(PyExc_RuntimeError, "Failed to allocate Metal render pass descriptor");
+            return false;
+        }
+        pass.colorAttachments[0].texture = state.drawable.texture;
+        pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        pass.colorAttachments[0].clearColor = clear_color;
+
+        id<MTLRenderCommandEncoder> encoder = [state.commandBuffer renderCommandEncoderWithDescriptor:pass];
+        if (!encoder) {
+            PyErr_SetString(PyExc_RuntimeError, "Failed to create Metal command encoder");
+            return false;
+        }
+        if (g_metal.debug_labels) {
+            encoder.label = @"kitty-clear";
+        }
+        encode_draw_end(encoder);
+    }
+    return true;
+}
+
+static void
+destroy_window_state(GLFWwindow *window) {
+    MetalWindowState *state = state_for_window(window);
+    if (!state) return;
+    if (state.closeObserver) {
+        [[NSNotificationCenter defaultCenter] removeObserver:state.closeObserver];
+        state.closeObserver = nil;
+    }
+    reset_command_primitives(state);
+    state.layer = nil;
+    remove_state_for_window(window);
+}
+
+static void
+update_layer_properties(CAMetalLayer *layer, const RendererResizeParams *params) {
+    if (!layer) return;
+    if (params) {
+        layer.contentsScale = params->framebuffer_scale > 0.f ? params->framebuffer_scale : 1.f;
+        CGSize drawable_size = CGSizeMake((CGFloat)params->framebuffer_width, (CGFloat)params->framebuffer_height);
+        layer.drawableSize = drawable_size;
+    } else {
+        layer.contentsScale = layer.contentsScale > 0.0 ? layer.contentsScale : 1.0;
+        if (layer.superlayer) {
+            layer.frame = layer.superlayer.bounds;
+        }
+    }
+}
+
+static void
+set_display_sync_for_all_layers(void) {
+    NSEnumerator *enumerator = [window_state_table() objectEnumerator];
+    MetalWindowState *state = nil;
+    while ((state = [enumerator nextObject])) {
+        if (state.layer) {
+            state.layer.displaySyncEnabled = g_metal.display_sync_enabled;
+        }
+    }
+}
+
+static bool preflight_attempted = false;
+static bool preflight_success = false;
+static const char *preflight_failure_reason = NULL;
+
+static inline void
+set_preflight_failure(const char *reason) {
+    preflight_success = false;
+    preflight_failure_reason = reason;
+    metal_log("preflight_failure", "reason=\"%s\"", reason ? reason : "unknown");
+}
+
+bool
+metal_renderer_preflight(const char **failure_reason) {
+    if (!preflight_attempted) {
+        preflight_attempted = true;
+        if (@available(macOS 13.0, *)) {
+            id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+            if (device) {
+                preflight_success = true;
+                preflight_failure_reason = NULL;
+            } else {
+                set_preflight_failure("Metal renderer unavailable: no compatible GPU reported by Metal.");
+            }
+        } else {
+            set_preflight_failure("Metal renderer requires macOS 13 or newer.");
+        }
+    }
+    if (failure_reason && !preflight_success) {
+        *failure_reason = preflight_failure_reason;
+    }
+    return preflight_success;
+}
+
+static bool
+metal_backend_ensure_initialized(const RendererInitConfig *cfg) {
+    const char *reason = NULL;
+    if (!metal_renderer_preflight(&reason)) {
+        PyErr_SetString(PyExc_RuntimeError, reason ? reason : "Metal preflight failed");
+        return false;
+    }
+    if (!g_metal.initialized) {
+        @autoreleasepool {
+            id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+            if (!device) {
+                PyErr_SetString(PyExc_RuntimeError, "Metal device creation failed after preflight success");
+                metal_log("device_create_failed", "reason=MTLCreateSystemDefaultDevice_null");
+                return false;
+            }
+            id<MTLCommandQueue> queue = [device newCommandQueue];
+            if (!queue) {
+                PyErr_SetString(PyExc_RuntimeError, "Failed to create Metal command queue");
+                metal_log("command_queue_create_failed", "device=%p", device);
+                return false;
+            }
+            g_metal.device = device;
+            g_metal.command_queue = queue;
+            g_metal.initialized = true;
+        }
+    }
+    g_metal.prefer_low_latency = cfg ? cfg->prefer_low_latency : false;
+    g_metal.debug_labels = cfg ? cfg->enable_debug_labels : false;
+    g_metal.display_sync_enabled = !g_metal.prefer_low_latency;
+    set_display_sync_for_all_layers();
+    return true;
+}
+
+static void
+metal_backend_shutdown(void) {
+    NSEnumerator *key_enumerator = [window_state_table() keyEnumerator];
+    NSValue *key = nil;
+    NSMutableArray<NSValue *> *keys = [NSMutableArray array];
+    while ((key = [key_enumerator nextObject])) {
+        [keys addObject:key];
+    }
+    for (NSValue *window_key_value in keys) {
+        GLFWwindow *window = (GLFWwindow *)window_key_value.pointerValue;
+        destroy_window_state(window);
+    }
+    g_metal.command_queue = nil;
+    g_metal.device = nil;
+    g_metal.initialized = false;
+}
+
+static void*
+metal_backend_make_context_current(GLFWwindow *window) {
+    (void)window;
+    return NULL;
+}
+
+static void
+metal_backend_restore_context(void *token) {
+    (void)token;
+}
+
+static bool
+metal_backend_attach_window(GLFWwindow *window, const RendererWindowConfig *config) {
+    if (!metal_backend_ensure_initialized(NULL)) {
+        return false;
+    }
+
+    NSWindow *ns_window = (__bridge NSWindow *)glfwGetCocoaWindow(window);
+    if (!ns_window) {
+        PyErr_SetString(PyExc_RuntimeError, "Failed to acquire NSWindow for Metal attachment");
+        return false;
+    }
+    NSView *content_view = ns_window.contentView;
+    if (!content_view) {
+        PyErr_SetString(PyExc_RuntimeError, "Failed to acquire NSView for Metal attachment");
+        return false;
+    }
+
+    MetalWindowState *state = ensure_state_for_window(window);
+    if (state.closeObserver) {
+        [[NSNotificationCenter defaultCenter] removeObserver:state.closeObserver];
+        state.closeObserver = nil;
+    }
+    reset_command_primitives(state);
+    if (state.layer) {
+        [state.layer removeFromSuperlayer];
+        state.layer = nil;
+    }
+
+    @autoreleasepool {
+        CAMetalLayer *layer = [CAMetalLayer layer];
+        if (!layer) {
+            PyErr_SetString(PyExc_RuntimeError, "Failed to create CAMetalLayer");
+            destroy_window_state(window);
+            return false;
+        }
+        layer.device = g_metal.device;
+        layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        layer.framebufferOnly = YES;
+        layer.allowsNextDrawableTimeout = NO;
+        layer.presentsWithTransaction = NO;
+        layer.opaque = config ? !config->wants_transparency : YES;
+        layer.displaySyncEnabled = g_metal.display_sync_enabled;
+        const CGFloat backing_scale = ns_window.backingScaleFactor;
+        layer.contentsScale = backing_scale > 0.0 ? backing_scale : 1.0;
+        layer.drawableSize = CGSizeMake(content_view.bounds.size.width * layer.contentsScale,
+                                        content_view.bounds.size.height * layer.contentsScale);
+
+        content_view.wantsLayer = YES;
+        content_view.layer = layer;
+        state.layer = layer;
+    }
+
+    state.backgroundOpacity = config ? config->background_opacity : 1.0f;
+    state.fallbackBackground = config ? config->background_color : 0;
+    state.clearColor = clear_color_from(state.fallbackBackground, state.backgroundOpacity);
+
+    id observer = [[NSNotificationCenter defaultCenter] addObserverForName:NSWindowWillCloseNotification
+                                                                   object:ns_window
+                                                                    queue:nil
+                                                               usingBlock:^(NSNotification *note) {
+        (void)note;
+        destroy_window_state(window);
+    }];
+    state.closeObserver = observer;
+
+    return encode_clear_pass(window, state, state.clearColor);
+}
+
+static void
+metal_backend_apply_swap_interval(int val) {
+    int effective = val;
+    if (val < 0) {
+        effective = g_metal.prefer_low_latency ? 0 : 1;
+    }
+    g_metal.display_sync_enabled = effective != 0;
+    set_display_sync_for_all_layers();
+}
+
+static bool
+metal_backend_begin_frame(GLFWwindow *window, const RendererFrameParams *params) {
+    (void)params;
+    MetalWindowState *state = state_for_window(window);
+    if (!state) {
+        PyErr_SetString(PyExc_RuntimeError, "Metal backend begin_frame called on unknown window");
+        return false;
+    }
+    return ensure_command_primitives(window, state);
+}
+
+static bool
+metal_backend_render(GLFWwindow *window, const RendererRenderParams *params) {
+    MetalWindowState *state = state_for_window(window);
+    if (!state) {
+        PyErr_SetString(PyExc_RuntimeError, "Metal backend render called on unknown window");
+        return false;
+    }
+    color_type bg = params && params->active_window_bg ? params->active_window_bg : state.fallbackBackground;
+    state.clearColor = clear_color_from(bg, state.backgroundOpacity);
+    return encode_clear_pass(window, state, state.clearColor);
+}
+
+static bool
+metal_backend_present(GLFWwindow *window, const RendererPresentParams *params) {
+    MetalWindowState *state = state_for_window(window);
+    if (!state) {
+        PyErr_SetString(PyExc_RuntimeError, "Metal backend present called on unknown window");
+        metal_log("present_failed", "reason=unknown_window window=%p", window);
+        return false;
+    }
+    if (params && params->capture_framebuffer) {
+        PyErr_SetString(PyExc_RuntimeError, "Metal framebuffer capture is not supported yet");
+        metal_log("present_failed", "reason=capture_not_supported");
+        return false;
+    }
+    if (!state.commandBuffer || !state.drawable) {
+        metal_log("present_retry", "cause=missing_primitives command_buffer=%p drawable=%p", state.commandBuffer, state.drawable);
+        if (!encode_clear_pass(window, state, state.clearColor)) {
+            return false;
+        }
+    }
+    @autoreleasepool {
+        [state.commandBuffer presentDrawable:state.drawable];
+        [state.commandBuffer commit];
+        if (!params || params->blocking) {
+            [state.commandBuffer waitUntilScheduled];
+        }
+    }
+    if (g_metal.debug_labels) {
+        const bool blocking = params ? params->blocking : true;
+        metal_log("present", "drawable=%p blocking=%d", state.drawable, blocking ? 1 : 0);
+    }
+    reset_command_primitives(state);
+    return true;
+}
+
+static void
+metal_backend_on_resize(GLFWwindow *window, const RendererResizeParams *params) {
+    MetalWindowState *state = state_for_window(window);
+    if (!state || !state.layer) return;
+    @autoreleasepool {
+        update_layer_properties(state.layer, params);
+    }
+}
+
+static void
+metal_backend_on_suspend(void) {
+    NSEnumerator *enumerator = [window_state_table() objectEnumerator];
+    MetalWindowState *state = nil;
+    while ((state = [enumerator nextObject])) {
+        reset_command_primitives(state);
+    }
+}
+
+static void
+metal_backend_on_resume(void) {
+    // Resources are recreated lazily per-frame.
+}
+
+bool
+register_metal_renderer_backend(void) {
+    static const RendererBackendOps metal_ops = {
+        .name = "metal",
+        .ensure_initialized = metal_backend_ensure_initialized,
+        .shutdown = metal_backend_shutdown,
+        .attach_window = metal_backend_attach_window,
+        .make_context_current = metal_backend_make_context_current,
+        .restore_context = metal_backend_restore_context,
+        .apply_swap_interval = metal_backend_apply_swap_interval,
+        .begin_frame = metal_backend_begin_frame,
+        .render = metal_backend_render,
+        .present = metal_backend_present,
+        .on_resize = metal_backend_on_resize,
+        .on_suspend = metal_backend_on_suspend,
+        .on_resume = metal_backend_on_resume,
+    };
+    return renderer_backend_register(RENDERER_BACKEND_METAL, &metal_ops);
+}

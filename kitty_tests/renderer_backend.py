@@ -137,6 +137,11 @@ class BackendFFI:
             self.lib.register_metal_renderer_backend.argtypes = []
             self.lib.register_metal_renderer_backend.restype = ctypes.c_bool
             self.has_metal = True
+            if hasattr(self.lib, "metal_renderer_preflight"):
+                self.lib.metal_renderer_preflight.argtypes = [ctypes.POINTER(ctypes.c_char_p)]
+                self.lib.metal_renderer_preflight.restype = ctypes.c_bool
+            else:
+                self.has_metal = False
         else:
             self.has_metal = False
 
@@ -178,7 +183,7 @@ class BackendFFI:
         if begin_frame is self.DEFAULT:
             ops.begin_frame = self._begin_true
         elif begin_frame is None:
-            ops.begin_frame = None
+            ops.begin_frame = ctypes.cast(None, self.BeginFrameFunc)
         else:
             cb = self.BeginFrameFunc(begin_frame)
             refs.append(cb)
@@ -187,7 +192,7 @@ class BackendFFI:
         if render is self.DEFAULT:
             ops.render = self._render_true
         elif render is None:
-            ops.render = None
+            ops.render = ctypes.cast(None, self.RenderFunc)
         else:
             cb = self.RenderFunc(render)
             refs.append(cb)
@@ -196,7 +201,7 @@ class BackendFFI:
         if present is self.DEFAULT:
             ops.present = self._present_true
         elif present is None:
-            ops.present = None
+            ops.present = ctypes.cast(None, self.PresentFunc)
         else:
             cb = self.PresentFunc(present)
             refs.append(cb)
@@ -250,6 +255,33 @@ class TestRendererBackend(BaseTest):
             self.assertIn('metal', available)
         else:
             self.assertNotIn('metal', available)
+
+    def test_metal_preflight_reports_status(self) -> None:
+        if not ffi.has_metal:
+            self.skipTest("Metal backend not compiled in this build")
+        reason = ctypes.c_char_p()
+        result = ffi.lib.metal_renderer_preflight(ctypes.byref(reason))
+        if sys.platform == 'darwin':
+            self.assertTrue(
+                result,
+                "Metal preflight should succeed on supported macOS hosts.",
+            )
+            self.assertIsNone(
+                reason.value,
+                "Successful Metal preflight must not return a failure reason.",
+            )
+        else:
+            self.assertFalse(result)
+            self.assertIsNotNone(
+                reason.value,
+                "Metal preflight on non-macOS hosts must provide a reason.",
+            )
+            message = reason.value.decode('utf-8', errors='ignore')
+            self.assertNotEqual(
+                message.strip(),
+                '',
+                "Metal preflight failure reason should be informative.",
+            )
 
     def test_select_metal_round_trip(self) -> None:
         available = renderer_backends_available()

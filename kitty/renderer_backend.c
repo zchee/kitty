@@ -15,6 +15,10 @@ typedef struct {
 static RegisteredBackend registered_backends[RENDERER_BACKEND_COUNT];
 static RendererBackendType selected_backend = RENDERER_BACKEND_OPENGL;
 static bool backend_selected = false;
+static const char *const renderer_backend_names[RENDERER_BACKEND_COUNT] = {
+    [RENDERER_BACKEND_OPENGL] = "opengl",
+    [RENDERER_BACKEND_METAL] = "metal",
+};
 
 static bool
 validate_backend_type(RendererBackendType type) {
@@ -71,7 +75,7 @@ renderer_backend_type_name(RendererBackendType type) {
     if (!validate_backend_type(type) || !registered_backends[type].registered) {
         return NULL;
     }
-    return registered_backends[type].ops->name;
+    return renderer_backend_names[type];
 }
 
 RendererBackendType
@@ -81,8 +85,12 @@ renderer_backend_type_from_name(const char *name) {
     }
     for (RendererBackendType t = 0; t < RENDERER_BACKEND_COUNT; t++) {
         if (registered_backends[t].registered) {
-            const char *candidate = registered_backends[t].ops->name;
+            const char *candidate = renderer_backend_names[t];
             if (candidate && strcmp(candidate, name) == 0) {
+                return t;
+            }
+            const char *alt = registered_backends[t].ops->name;
+            if (alt && strcmp(alt, name) == 0) {
                 return t;
             }
         }
@@ -297,7 +305,10 @@ py_renderer_backends_available(PyObject *self UNUSED, PyObject *noargs UNUSED) {
     }
     for (RendererBackendType t = 0; t < RENDERER_BACKEND_COUNT; t++) {
         if (registered_backends[t].registered) {
-            const char *name = registered_backends[t].ops->name;
+            const char *name = renderer_backend_type_name(t);
+            if (!name) {
+                name = registered_backends[t].ops ? registered_backends[t].ops->name : NULL;
+            }
             if (!name) continue;
             PyObject *py_name = PyUnicode_FromString(name);
             if (!py_name) {

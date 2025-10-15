@@ -36,6 +36,7 @@
 #endif
 
 #include "monotonic.h"
+#include "renderer_backend.h"
 
 #ifdef __APPLE__
 #include <libproc.h>
@@ -713,6 +714,9 @@ static PyMethodDef module_methods[] = {
     {"timed_debug_print", (PyCFunction)py_timed_debug_print, METH_VARARGS, ""},
     {"find_in_memoryview", (PyCFunction)find_in_memoryview, METH_VARARGS, ""},
     {"run_at_exit_cleanup_functions", (PyCFunction)py_run_atexit_cleanup_functions, METH_NOARGS, ""},
+    {"renderer_backend_current", (PyCFunction)py_renderer_backend_current, METH_NOARGS, ""},
+    {"renderer_backend_select", (PyCFunction)py_renderer_backend_select, METH_VARARGS, ""},
+    {"renderer_backends_available", (PyCFunction)py_renderer_backends_available, METH_NOARGS, ""},
 #ifdef __APPLE__
     METHODB(user_cache_dir, METH_NOARGS),
     METHODB(process_group_map, METH_NOARGS),
