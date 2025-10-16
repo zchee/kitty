@@ -1,115 +1,92 @@
-# Metal Renderer Execution Memory  
-_Last updated: 2025-10-15_
+# Metal Renderer Execution Memory
+_Last updated: 2025-10-16_
 
-Canonical scratchpad for the macOS Metal bring-up. Always overwrite this file with the latest truth—no append-only notes.
+Canonical scratchpad for the macOS Metal bring-up. Always overwrite this file with the latest truth—do **not** append.
 
 ---
 
 ## Guardrails
-1. Follow repository rules: no duplication, no dead code, no mocks, no over-engineering, no resource leaks, consistent naming.
-2. Error handling: fail fast on critical configuration and backend/device initialization; log-and-continue for optional features; gracefully degrade on external service failures; surface user-friendly messages via the resilience layer.
-3. Every new or refactored function must ship with non-cheating tests that exercise the real execution path.
-4. Ship only complete increments—leave no TODO placeholders or partial implementations.
-5. Prefer reuse of existing helpers; audit relevant modules before introducing new utilities.
+1. Obey repository rules: no duplication, no dead code, no mocks, no over-engineering, no resource leaks, consistent naming, ASCII-only unless pre-existing data uses Unicode.
+2. Error-handling policy: fail fast on critical configuration / backend init, log-and-continue for optional features, gracefully degrade on external service loss, surface friendly messages through the resilience layer.
+3. Every new or refactored function ships with real (non-cheating) tests that execute production pathways.
+4. Deliver complete increments—no TODO placeholders or partial implementations.
+5. Favour existing helpers; audit relevant modules before introducing new utilities.
 
-## Current Snapshot
-- **Backend dispatcher** (`kitty/renderer_backend.{h,c}`): lifecycle hooks (`begin_frame`, `render`, `present`, etc.) route rendering through the selected backend; null-hook guards keep ctypes stubs from crashing and include backend-aware messaging.
-- **OpenGL path** (`kitty/opengl_renderer.c`, `kitty/shaders.c`, `kitty/gl.c`): fully featured VAO/VBO rendering with layered compositing, graphics protocol, cursor trails, background images. Serves as parity target.
-- **Metal path** (`kitty/metal_renderer.m`): device + command queue + CAMetalLayer creation works; clears + presents; new sprite upload hooks now mirror glyph atlas data into Metal-managed textures/buffers but no draw encoders exist yet.
-- **Backend selection** (`kitty/glfw.c`): `select_metal_if_preferred()` honors `metal_renderer` option. First-window initialization skips GLSL compilation and GL sprite uploads when Metal is active.
-- **Sprite pipeline**:
-  - `kitty/fonts.c`: prerender routines call backend-neutral hooks; GL path still uses `send_sprite_to_gpu`.
-  - `kitty/metal_renderer.m`: registers sprite upload/free hooks; maintains `MTLTexture` array and decorations `MTLBuffer` per `FontGroup` (stored in new `metal_sprite_map` field).
-- **`FONTS_DATA_HEAD`** (`kitty/data-types.h`): now includes `metal_sprite_map` pointer so each font group carries Metal atlas state alongside GL sprite map.
-- **State plumbing**: `send_prerendered_sprites_for_window` takes a flag to control GL resource allocation vs. Metal-only capture; callers in `glfw.c` and `state.c` pass `!using_metal` / backend checks accordingly.
-- **Tests**: `python3.13 setup.py build`, `python3.13 -m unittest kitty_tests.renderer_backend`, and `python3.13 -m unittest kitty_tests.options.TestRendererPreferenceOptions` all pass. Multiprocessing spawn test still fails under Homebrew Python because `_random` module missing.
+---
 
-## Build & Test Status
-- `python3.13 setup.py build` (2025-10-15) succeeds with the new Metal sprite hooks.
-- `python3.13 -m unittest kitty_tests.renderer_backend` passes.
-- `python3.13 -m unittest kitty_tests.options.TestRendererPreferenceOptions` passes.
-- `kitty_tests.tui.TestTUI.test_multiprocessing_spawn` still errors on Homebrew `python@3.13t` (missing `_random`).
-- No metallib/MSL build pipeline yet; Metal rendering remains unimplemented.
+## Current Snapshot (2025-10-16)
+- OpenGL backend is feature-complete and the active default.
+- Metal backend now consumes `renderer_shared` frame prep to drive background clears and stages cell/selection data in CPU buffers, but still lacks cell/decorations rendering.
+- `renderer_shared_prepare_frame` is implemented in shared C and feeds both GLSL and Metal, returning default background metadata for parity decisions.
+- Build system lacks metallib compilation and Metal-specific packaging steps.
+- Renderer backend test harness now exposes safe C helpers (`renderer_backend_register_stub_for_tests`, `renderer_backend_render_for_tests`, `renderer_backend_present_for_tests`), resolving prior Python 3.13 ctypes segfaults.
 
-## Outstanding Defects & Blockers
-1. **Environment dependency**: `_random` absent in Homebrew Python used for spawn test. Need policy (document requirement or guarded skip).
-2. **Rendering parity**: Metal backend still lacks cell/border/graphics/cursor/background draw encoders.
-3. **Resource parity**: Metal stores glyph atlases but draw code doesn’t consume them; border buffers, uniform data, and pipeline states outstanding.
-4. **Shader toolchain**: No translation of GLSL to MSL, no metallib build integration.
+---
 
-## Architectural Work Breakdown
-### Backend abstraction cleanup
-- [x] Dispatcher null-hook guards and backend-aware errors.
-- [x] Skip GL init (GLSL, sprite upload) when Metal active.
-- [ ] Audit remaining direct GL usage (resize paths, suspend/resume, screenshot capture) and route through backend.
+## Completed to Date
+- ✅ Reworked renderer-backend test infrastructure to avoid null function-pointer registration via ctypes; Python unit tests now pass without segfaults.
+- ✅ Centralised shared renderer frame preparation (`renderer_shared.c`), refactoring OpenGL to use the helpers and wiring Metal to capture shared buffers for future pipelines while matching OpenGL background colours.
 
-### Metal bootstrap (current focus)
-- [x] Register Metal sprite atlas hooks, capture prerendered glyph data into `MTLTexture`/`MTLBuffer`.
-- [ ] Define Metal equivalents for border rect buffers, uniform/argument buffers, per-frame constants.
-- [ ] Choose shader translation approach (SPIRV-Cross, Tint, bespoke) and generate first MSL cell shader.
-- [ ] Integrate metallib build + packaging into `setup.py` / install artifacts.
+---
 
-### Feature parity
-- [ ] Implement Metal cell rendering pipeline (vertex/index buffers, uniform buffers, pipeline states).
-- [ ] Port borders, cursor trail, background image passes to Metal encoders.
-- [ ] Handle layered windows (offscreen texture + blit) similar to OpenGL `setup_os_window_for_rendering`.
-- [ ] Integrate graphics protocol textures and decorations buffer lookup.
-- [ ] Build backend-neutral render graph to feed both GL and Metal.
-- [ ] Add image-diff or checksum regression tests comparing GL vs Metal output (skip when Metal unavailable).
+## Implementation Roadmap
 
-### Performance & robustness
-- [ ] Profile Metal path (Metal System Trace) once functional.
-- [ ] Device-loss recovery, sleep/App Nap handling.
-- [ ] Long-duration soak tests on Apple Silicon and Intel hardware.
+### Reliability Gate (Week 0)
+- [x] Stabilise renderer backend tests (segfault fix via native helpers).
+- [ ] Clean any experimental shader changes and rebaseline OpenGL rendering outputs.
+- [ ] Capture reference render traces on macOS (OpenGL) and Linux for future Metal diffs.
 
-## Roadmap Checklist
-- **Phase 1 – Backend Abstraction Stabilisation**
-  - [x] Guard dispatcher against null hooks.
-  - [x] Enforce `metal_renderer` option validation.
-  - [x] Gate OpenGL-only prerender routines.
-  - [ ] Remove remaining GL leakage on Metal code paths.
-- **Phase 2 – Metal Bootstrap Enhancements**
-  - [x] Metal sprite atlas capture.
-  - [ ] Metal buffer/texture wrappers for borders + uniforms.
-  - [ ] Shader translation + metallib integration.
-- **Phase 3 – Feature Parity**
-  - [ ] Metal cell/border/graphics/cursor/background encoders.
-  - [ ] Backend-neutral render graph.
-  - [ ] Cross-backend comparison tests.
-- **Phase 4 – Performance & Robustness**
-  - [ ] Profiling, recovery flows, soak testing.
+### Phase 1 – Shared Infrastructure (Weeks 1-3)
+- Finalise `RendererBackendOps` invariants and document lifecycle expectations (begin/render/present semantics, resize handling, error propagation).
+- [x] Land `renderer_shared` buffer-management helpers (typed mapping/unmapping, lifetime guarantees) with strict tests.
+- [x] Refactor OpenGL backend to consume `renderer_shared` outputs without behavioural change.
+- Introduce renderer preference plumbing (`auto|metal|opengl`) in options/CLI, including persistence and tests.
 
-## Dependencies & Tooling
-- Need decision on shader translation tool (SPIRV-Cross, Tint, custom).
-- Metallib build steps required in `setup.py` and packaging.
-- CI must run on Metal-capable macOS 13+ hosts.
-- Python runtime must supply `_random` for multiprocessing spawn test or skip logic must document deficiency.
+### Phase 2 – Metal Core Skeleton (Weeks 3-5)
+- Implement Metal device/queue/swapchain setup, command-buffer lifecycle, and CAMetalLayer management.
+- Integrate presentation pacing (CVDisplayLink or equivalent) respecting low-latency preferences.
+- Extend `setup.py` to compile `.metal` sources into metallib artefacts; ensure frameworks (`Metal`, `MetalKit`, `QuartzCore`) are linked for macOS builds.
+- Add smoke tests covering Metal preflight success/failure and backend selection fallback.
 
-## Risks & Mitigations
-| Risk | Impact | Mitigation |
-| --- | --- | --- |
-| Missing `_random` in spawned Python | Multiprocessing test fails | Document requirement or add explicit skip with warning |
-| Lack of Metal render pipelines | Metal backend unusable | Implement encoders incrementally using new atlas data |
-| Shader translation mismatch | Visual artifacts / crashes | Adopt automated GLSL↔MSL validation and shared metadata |
-| Metal resource leaks | Long-running sessions degrade | Sprite hooks release resources; ensure encoder resources cleaned up |
+### Phase 3 – Cell & Text Rendering (Weeks 5-9)
+- Translate GLSL shaders (cell, bg, cursor) to MSL or build a translation pipeline.
+- Establish Metal pipeline state cache mirroring GLSL uniform layouts.
+- Map `renderer_shared` buffers into `MTLBuffer`s with proper synchronisation (managed vs shared storage).
+- Build image-diff harness comparing Metal and OpenGL outputs for canonical traces.
 
-## Pending Decisions / Questions
-1. Choose shader translation workflow and related metadata pipeline.
-2. Define backend-neutral render graph format to reduce duplicated draw logic.
-3. Decide on metallib packaging strategy for builds/app bundle.
+### Phase 4 – Decorations & UI (Weeks 9-12)
+- Implement underline/strike sprites, cursor variants, selections, tab bar, borders, rounded-rect, tint, visual bell, scrollbar, hyperlink highlighting.
+- Support background image compositing and indirect framebuffer path (`needs_layers`).
 
-## Key Files & References
-- Dispatcher: `kitty/renderer_backend.{h,c}`, `kitty/renderer_backend_types.h`
-- OpenGL renderer: `kitty/opengl_renderer.c`, `kitty/shaders.c`, `kitty/gl.c`
-- Metal renderer: `kitty/metal_renderer.m`
-- Fonts/sprite pipeline: `kitty/fonts.c`, `kitty/fonts.h`, `kitty/shaders.c`
-- Window glue: `kitty/glfw.c`, `glfw/cocoa_window.m`, `glfw/nsgl_context.m`
-- Python bindings/tests: `kitty/data-types.c`, `kitty/fast_data_types.pyi`, `kitty_tests/renderer_backend.py`, `kitty_tests/options.py`
-- Design doc: `docs/metal_renderer_architecture.md`
+### Phase 5 – Graphics Protocol & Capture (Weeks 12-14)
+- Port graphics protocol texture uploads, alpha-mask shaders, and blit pipelines.
+- Implement framebuffer capture/screenshot flows with parity to OpenGL.
+- Add regression tests covering Metal rendering of graphics uploads and capture API.
 
-## Working Protocol
-1. Re-read this file and `docs/metal_renderer_architecture.md` before working on renderer code.
-2. After meaningful progress, overwrite (not append to) this file with updated facts, risks, and plans.
-3. Log new failures, mitigations, or environment changes immediately.
-4. Keep roadmap checkboxes accurate; mark completed tasks promptly.
-5. Record unresolved decisions so they can be addressed before implementation continues.
+### Phase 6 – Hardening & Release (Weeks 14-16)
+- Perform Metal System Trace profiling, memory-leak audits, resize stress tests.
+- Update documentation, CLI help, changelog, and fallback guidance.
+- Ensure `auto` preference defaults to Metal on macOS 13+ with reliable fallback to OpenGL on failure.
+
+---
+
+## Cross-Cutting Needs
+- **Testing/CI:** Provision macOS (Apple Silicon + Intel) runners with Metal support; expand `kitty_tests/renderer_backend.py` and future integration tests to exercise Metal paths; integrate image-diff tooling once rendering parity exists.
+- **Tooling:** Metallib caching strategy, shader translation workflow, structured logging via `metal_log`.
+- **Tooling:** Python 3.13 toolchain verified for building `fast_data_types` and running renderer shared-unit tests.
+- **Ownership:** Assign leads for shared infra, Metal rendering, build/CI, QA automation; maintain weekly status updates here.
+- **Risk Mitigation:** Maintain documented `--renderer-backend` toggle; instrument robust fallback to OpenGL on runtime errors; monitor post-release telemetry.
+
+---
+
+## Immediate Next Actions
+1. Rebaseline OpenGL shaders/render outputs and remove lingering experimental edits.
+2. Capture baseline render traces/screenshots (OpenGL) on macOS and Linux for future Metal comparison.
+3. Draft and circulate `renderer_shared` API specification detailing buffer contracts and Metal consumption expectations.
+4. Decide on shader translation approach (manual MSL port vs automated pipeline) and outline supporting tooling requirements.
+
+---
+
+## Testing Coverage
+- Python: `python3.13 -m unittest kitty_tests.renderer_backend` (now stable).
+- Future: add Metal-specific integration tests once rendering is implemented.

@@ -19,10 +19,13 @@
 #include "metal_renderer.h"
 #include "renderer_backend.h"
 #include "renderer_backend_types.h"
+#include "renderer_shared.h"
 #include "fonts.h"
 #include "state.h"
 
 extern void log_error(const char *fmt, ...);
+
+@class MetalWindowState;
 
 static void
 metal_log(const char *event, const char *fmt, ...) {
@@ -62,6 +65,68 @@ typedef struct {
 } MetalSpriteAtlas;
 
 static bool sprite_hooks_registered = false;
+
+@interface MetalWindowState : NSObject
+@property (nonatomic, strong) CAMetalLayer *layer;
+@property (nonatomic, strong) id<CAMetalDrawable> drawable;
+@property (nonatomic, strong) id<MTLCommandBuffer> commandBuffer;
+@property (nonatomic) MTLClearColor clearColor;
+@property (nonatomic) float backgroundOpacity;
+@property (nonatomic) color_type fallbackBackground;
+@property (nonatomic, strong) id closeObserver;
+@property (nonatomic) RendererSharedFrameResult sharedFrame;
+@property (nonatomic) void *cellBuffer;
+@property (nonatomic) size_t cellBufferCapacity;
+@property (nonatomic) size_t cellBufferLength;
+@property (nonatomic) void *selectionBuffer;
+@property (nonatomic) size_t selectionBufferCapacity;
+@property (nonatomic) size_t selectionBufferLength;
+@end
+
+static void*
+metal_shared_buffer_map(RendererSharedBufferType type, size_t size, void *user) {
+    MetalWindowState *state = (__bridge MetalWindowState *)user;
+    if (!state || size == 0) {
+        return NULL;
+    }
+    switch (type) {
+        case RENDERER_SHARED_BUFFER_CELL_DATA: {
+            if (state.cellBufferCapacity < size) {
+                void *new_buf = realloc(state.cellBuffer, size);
+                if (!new_buf) {
+                    return NULL;
+                }
+                state.cellBuffer = new_buf;
+                state.cellBufferCapacity = size;
+            }
+            state.cellBufferLength = size;
+            return state.cellBuffer;
+        }
+        case RENDERER_SHARED_BUFFER_SELECTIONS: {
+            if (state.selectionBufferCapacity < size) {
+                void *new_buf = realloc(state.selectionBuffer, size);
+                if (!new_buf) {
+                    return NULL;
+                }
+                state.selectionBuffer = new_buf;
+                state.selectionBufferCapacity = size;
+            }
+            state.selectionBufferLength = size;
+            return state.selectionBuffer;
+        }
+        case RENDERER_SHARED_BUFFER_UNIFORMS:
+            return NULL;
+    }
+    return NULL;
+}
+
+static void
+metal_shared_buffer_unmap(RendererSharedBufferType type, void *ptr, size_t size, void *user) {
+    (void)type;
+    (void)ptr;
+    (void)size;
+    (void)user;
+}
 
 static MetalSpriteAtlas*
 metal_font_atlas(FONTS_DATA_HANDLE fg) {
@@ -231,16 +296,6 @@ metal_unregister_sprite_hooks(void) {
     sprite_hooks_registered = false;
 }
 
-@interface MetalWindowState : NSObject
-@property (nonatomic, strong) CAMetalLayer *layer;
-@property (nonatomic, strong) id<CAMetalDrawable> drawable;
-@property (nonatomic, strong) id<MTLCommandBuffer> commandBuffer;
-@property (nonatomic) MTLClearColor clearColor;
-@property (nonatomic) float backgroundOpacity;
-@property (nonatomic) color_type fallbackBackground;
-@property (nonatomic, strong) id closeObserver;
-@end
-
 @implementation MetalWindowState
 @end
 
@@ -377,6 +432,19 @@ destroy_window_state(GLFWwindow *window) {
         state.closeObserver = nil;
     }
     reset_command_primitives(state);
+    if (state.cellBuffer) {
+        free(state.cellBuffer);
+        state.cellBuffer = NULL;
+        state.cellBufferCapacity = 0;
+        state.cellBufferLength = 0;
+    }
+    if (state.selectionBuffer) {
+        free(state.selectionBuffer);
+        state.selectionBuffer = NULL;
+        state.selectionBufferCapacity = 0;
+        state.selectionBufferLength = 0;
+    }
+    state.sharedFrame = (RendererSharedFrameResult){0};
     state.layer = nil;
     remove_state_for_window(window);
 }
@@ -599,7 +667,42 @@ metal_backend_render(GLFWwindow *window, const RendererRenderParams *params) {
         PyErr_SetString(PyExc_RuntimeError, "Metal backend render called on unknown window");
         return false;
     }
+    OSWindow *os_window = params ? params->os_window : NULL;
+    Screen *screen = NULL;
+    if (os_window && os_window->num_tabs > 0) {
+        unsigned int tab_index = MIN(os_window->active_tab, os_window->num_tabs - 1);
+        Tab *tab = os_window->tabs + tab_index;
+        if (tab && tab->num_windows > 0) {
+            unsigned int window_index = MIN(tab->active_window, tab->num_windows - 1);
+            Window *active_window = tab->windows + window_index;
+            if (active_window) {
+                screen = active_window->render_data.screen;
+            }
+        }
+    }
+    if (screen) {
+        RendererSharedBufferOps ops = {
+            .map = metal_shared_buffer_map,
+            .unmap = metal_shared_buffer_unmap,
+        };
+        RendererSharedFrameParams frame_params = {
+            .screen = screen,
+            .os_window = os_window,
+            .cursor_has_moved = false,
+        };
+        RendererSharedFrameResult frame_result = {0};
+        if (!renderer_shared_prepare_frame(&frame_params, &ops, (__bridge void *)state, &frame_result)) {
+            return false;
+        }
+        state.sharedFrame = frame_result;
+        if (frame_result.default_bg) {
+            state.clearColor = clear_color_from(frame_result.default_bg, state.backgroundOpacity);
+        }
+    }
     color_type bg = params && params->active_window_bg ? params->active_window_bg : state.fallbackBackground;
+    if (state.sharedFrame.default_bg) {
+        bg = state.sharedFrame.default_bg;
+    }
     state.clearColor = clear_color_from(bg, state.backgroundOpacity);
     return encode_clear_pass(window, state, state.clearColor);
 }

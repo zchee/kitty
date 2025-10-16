@@ -49,7 +49,18 @@ EXPORTED void renderer_backend_on_resume(void);
 EXPORTED void renderer_backend_swap_buffers(GLFWwindow *window);
 EXPORTED void renderer_backend_shutdown_active(void);
 EXPORTED void renderer_backend_reset_for_tests(void);
+EXPORTED bool renderer_backend_register_stub_for_tests(
+    RendererBackendType type,
+    const char *name,
+    bool provide_render,
+    bool provide_present
+);
+EXPORTED bool renderer_backend_render_for_tests(const RendererRenderParams *params);
+EXPORTED bool renderer_backend_present_for_tests(const RendererPresentParams *params);
 
+PyObject *py_renderer_backend_register_stub_for_tests(PyObject *self, PyObject *args);
+PyObject *py_renderer_backend_render_for_tests(PyObject *self, PyObject *args, PyObject *kwargs);
+PyObject *py_renderer_backend_present_for_tests(PyObject *self, PyObject *args, PyObject *kwargs);
 PyObject *py_renderer_backend_current(PyObject *self, PyObject *noargs);
 PyObject *py_renderer_backend_select(PyObject *self, PyObject *args);
 PyObject *py_renderer_backends_available(PyObject *self, PyObject *noargs);

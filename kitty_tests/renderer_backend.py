@@ -21,6 +21,7 @@ class BackendFFI:
 
     def __init__(self) -> None:
         self.lib = ctypes.CDLL(fast_data_types.__file__)
+        self.stub_helper = getattr(fast_data_types, "renderer_backend_register_stub_for_tests", None)
 
         class RendererFrameParams(ctypes.Structure):
             _fields_ = [
@@ -353,12 +354,20 @@ class TestRendererBackend(BaseTest):
 
     def test_renderer_backend_render_missing_hook_sets_error(self) -> None:
         self.addCleanup(ffi.reset)
-        ops = ffi.make_backend_ops("stub-missing-render", render=None)
-        self.assertTrue(
-            ffi.lib.renderer_backend_register(
-                ffi.RENDERER_BACKEND_METAL, ctypes.byref(ops)
+        if ffi.stub_helper:
+            ffi.stub_helper(
+                "stub-missing-render",
+                ffi.RENDERER_BACKEND_METAL,
+                False,
+                True,
             )
-        )
+        else:
+            ops = ffi.make_backend_ops("stub-missing-render", render=None)
+            self.assertTrue(
+                ffi.lib.renderer_backend_register(
+                    ffi.RENDERER_BACKEND_METAL, ctypes.byref(ops)
+                )
+            )
         renderer_backend_select('metal')
         render_params = ffi.RendererRenderParams(
             os_window=None,
@@ -367,32 +376,62 @@ class TestRendererBackend(BaseTest):
             num_visible_windows=0,
             all_windows_have_same_bg=True,
         )
-        success = ffi.lib.renderer_backend_render(None, ctypes.byref(render_params))
-        self.assertFalse(success)
-        err_type, err_value, _ = ffi.fetch_error()
-        self.assertIs(err_type, RuntimeError)
-        self.assertIn("render", str(err_value))
-        self.assertIn("stub-missing-render", str(err_value))
+        if hasattr(fast_data_types, "renderer_backend_render_for_tests"):
+            with self.assertRaises(RuntimeError) as exc:
+                fast_data_types.renderer_backend_render_for_tests(
+                    active_window_id=1,
+                    active_window_bg=0,
+                    num_visible_windows=0,
+                    all_windows_have_same_bg=True,
+                )
+            message = str(exc.exception)
+            self.assertIn("render", message)
+            self.assertIn("stub-missing-render", message)
+        else:
+            success = ffi.lib.renderer_backend_render(None, ctypes.byref(render_params))
+            self.assertFalse(success)
+            err_type, err_value, _ = ffi.fetch_error()
+            self.assertIs(err_type, RuntimeError)
+            self.assertIn("render", str(err_value))
+            self.assertIn("stub-missing-render", str(err_value))
 
     def test_renderer_backend_present_missing_hook_sets_error(self) -> None:
         self.addCleanup(ffi.reset)
-        ops = ffi.make_backend_ops("stub-missing-present", present=None)
-        self.assertTrue(
-            ffi.lib.renderer_backend_register(
-                ffi.RENDERER_BACKEND_METAL, ctypes.byref(ops)
+        if ffi.stub_helper:
+            ffi.stub_helper(
+                "stub-missing-present",
+                ffi.RENDERER_BACKEND_METAL,
+                True,
+                False,
             )
-        )
+        else:
+            ops = ffi.make_backend_ops("stub-missing-present", present=None)
+            self.assertTrue(
+                ffi.lib.renderer_backend_register(
+                    ffi.RENDERER_BACKEND_METAL, ctypes.byref(ops)
+                )
+            )
         renderer_backend_select('metal')
         present_params = ffi.RendererPresentParams(
             blocking=True,
             capture_framebuffer=False,
         )
-        success = ffi.lib.renderer_backend_present(None, ctypes.byref(present_params))
-        self.assertFalse(success)
-        err_type, err_value, _ = ffi.fetch_error()
-        self.assertIs(err_type, RuntimeError)
-        self.assertIn("present", str(err_value))
-        self.assertIn("stub-missing-present", str(err_value))
+        if hasattr(fast_data_types, "renderer_backend_present_for_tests"):
+            with self.assertRaises(RuntimeError) as exc:
+                fast_data_types.renderer_backend_present_for_tests(
+                    blocking=True,
+                    capture_framebuffer=False,
+                )
+            message = str(exc.exception)
+            self.assertIn("present", message)
+            self.assertIn("stub-missing-present", message)
+        else:
+            success = ffi.lib.renderer_backend_present(None, ctypes.byref(present_params))
+            self.assertFalse(success)
+            err_type, err_value, _ = ffi.fetch_error()
+            self.assertIs(err_type, RuntimeError)
+            self.assertIn("present", str(err_value))
+            self.assertIn("stub-missing-present", str(err_value))
 
     def test_opengl_helpers_are_not_python_accessible(self) -> None:
         # Ensure OpenGL-specific helpers are not exposed through the public C API.

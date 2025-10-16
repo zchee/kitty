@@ -17,6 +17,7 @@
 #include "uniforms_generated.h"
 #include "state.h"
 #include "opengl_renderer_priv.h"
+#include "renderer_shared.h"
 
 enum {
     CELL_PROGRAM, CELL_FG_PROGRAM, CELL_BG_PROGRAM, CELL_PROGRAM_SENTINEL,
@@ -418,142 +419,33 @@ create_graphics_vao(void) {
 
 #define IS_SPECIAL_COLOR(name) (screen->color_profile->overridden.name.type == COLOR_IS_SPECIAL || (screen->color_profile->overridden.name.type == COLOR_NOT_SET && screen->color_profile->configured.name.type == COLOR_IS_SPECIAL))
 
-static void
-pick_cursor_color(color_type cell_fg, color_type cell_bg, color_type *cursor_fg, color_type *cursor_bg, color_type default_fg, color_type default_bg) {
-    ARGB32 fg, bg, dfg, dbg;
-    fg.rgb = cell_fg; bg.rgb = cell_bg;
-    *cursor_fg = cell_bg; *cursor_bg = cell_fg;
-    double cell_contrast = rgb_contrast(fg, bg);
-    if (cell_contrast < 2.5) {
-        dfg.rgb = default_fg; dbg.rgb = default_bg;
-        if (rgb_contrast(dfg, dbg) > cell_contrast) {
-            *cursor_fg = default_bg; *cursor_bg = default_fg;
-        }
-    }
-}
-
 static bool
 has_bgimage(OSWindow *w) {
     return w->bgimage && w->bgimage->texture_id > 0;
 }
 
 static color_type
-cell_update_uniform_block(ssize_t vao_idx, Screen *screen, int uniform_buffer, const CursorRenderInfo *cursor, OSWindow *os_window, float inactive_text_alpha, float bg_alpha) {
-    struct GPUCellRenderData {
-        GLfloat use_cell_bg_for_selection_fg, use_cell_fg_for_selection_color, use_cell_for_selection_bg;
-
-        GLuint default_fg, highlight_fg, highlight_bg, main_cursor_fg, main_cursor_bg, url_color, url_style, inverted, extra_cursor_fg, extra_cursor_bg;
-
-        GLuint columns, lines, sprites_xnum, sprites_ynum, cursor_shape, cell_width, cell_height;
-        GLuint cursor_x1, cursor_x2, cursor_y1, cursor_y2;
-        GLfloat cursor_opacity, inactive_text_alpha, dim_opacity, blink_opacity;
-
-        GLuint bg_colors0, bg_colors1, bg_colors2, bg_colors3, bg_colors4, bg_colors5, bg_colors6, bg_colors7;
-        GLfloat bg_opacities0, bg_opacities1, bg_opacities2, bg_opacities3, bg_opacities4, bg_opacities5, bg_opacities6, bg_opacities7;
-    };
-    // Send the uniform data
-    struct GPUCellRenderData *rd = (struct GPUCellRenderData*)map_vao_buffer(vao_idx, uniform_buffer, GL_WRITE_ONLY);
-    ColorProfile *cp = screen->paused_rendering.expires_at ? &screen->paused_rendering.color_profile : screen->color_profile;
-    if (UNLIKELY(cp->dirty || screen->reload_all_gpu_data)) {
-        copy_color_table_to_buffer(cp, (GLuint*)rd, cell_program_layouts[CELL_PROGRAM].color_table.offset / sizeof(GLuint), cell_program_layouts[CELL_PROGRAM].color_table.stride / sizeof(GLuint));
-    }
-#define COLOR(name) colorprofile_to_color(cp, cp->overridden.name, cp->configured.name).rgb
-    rd->default_fg = COLOR(default_fg);
-    rd->highlight_fg = COLOR(highlight_fg); rd->highlight_bg = COLOR(highlight_bg);
-    rd->extra_cursor_fg = screen->extra_cursors.color.text.val;
-    rd->extra_cursor_bg = screen->extra_cursors.color.cursor.val;
-    rd->bg_colors0 = COLOR(default_bg);
-    rd->bg_opacities0 = bg_alpha;
-#define SETBG(which) { \
-    colorprofile_to_transparent_color(cp, which - 1, &rd->bg_colors##which, &rd->bg_opacities##which); }
-    SETBG(1); SETBG(2); SETBG(3); SETBG(4); SETBG(5); SETBG(6); SETBG(7);
-#undef SETBG
-    // selection
-    if (IS_SPECIAL_COLOR(highlight_fg)) {
-        if (IS_SPECIAL_COLOR(highlight_bg)) {
-            rd->use_cell_bg_for_selection_fg = 1.f; rd->use_cell_fg_for_selection_color = 0.f;
-        } else {
-            rd->use_cell_bg_for_selection_fg = 0.f; rd->use_cell_fg_for_selection_color = 1.f;
-        }
-    } else {
-        rd->use_cell_bg_for_selection_fg = 0.f; rd->use_cell_fg_for_selection_color = 0.f;
-    }
-    rd->use_cell_for_selection_bg = IS_SPECIAL_COLOR(highlight_bg) ? 1. : 0.;
-    // Cursor position
-    Line *line_for_cursor = NULL;
-    rd->cursor_opacity = MAX(0, MIN(cursor->cursor_opacity, 1));
-    rd->blink_opacity = MAX(0, MIN(cursor->text_blink_opacity, 1));
-    if (rd->cursor_opacity != 0 && cursor->is_visible) {
-        rd->cursor_x1 = cursor->x, rd->cursor_y1 = cursor->y;
-        rd->cursor_x2 = cursor->x, rd->cursor_y2 = cursor->y;
-        CursorShape cs = (cursor->is_focused || OPT(cursor_shape_unfocused) == NO_CURSOR_SHAPE) ? cursor->shape : OPT(cursor_shape_unfocused);
-        rd->cursor_shape = cs;
-        color_type cell_fg = rd->default_fg, cell_bg = rd->bg_colors0;
-        index_type cell_color_x = cursor->x;
-        bool reversed = false;
-        if (cursor->x < screen->columns && cursor->y < screen->lines) {
-            if (screen->paused_rendering.expires_at) {
-                linebuf_init_line(screen->paused_rendering.linebuf, cursor->y); line_for_cursor = screen->paused_rendering.linebuf->line;
-            } else {
-                linebuf_init_line(screen->linebuf, cursor->y); line_for_cursor = screen->linebuf->line;
-            }
-        }
-        if (line_for_cursor) {
-            colors_for_cell(line_for_cursor, cp, &cell_color_x, &cell_fg, &cell_bg, &reversed);
-            const CPUCell *cursor_cell;
-            const bool large_cursor = ((cursor_cell = &line_for_cursor->cpu_cells[cursor->x])->is_multicell) && cursor_cell->x == 0 && cursor_cell->y == 0;
-            if (large_cursor) {
-                switch(cs) {
-                    case CURSOR_BEAM:
-                        rd->cursor_y2 += cursor_cell->scale - 1; break;
-                    case CURSOR_UNDERLINE:
-                        rd->cursor_y1 += cursor_cell->scale - 1;
-                        rd->cursor_y2 = rd->cursor_y1;
-                        rd->cursor_x2 += mcd_x_limit(cursor_cell) - 1;
-                        break;
-                    case CURSOR_BLOCK:
-                        rd->cursor_y2 += cursor_cell->scale - 1;
-                        rd->cursor_x2 += mcd_x_limit(cursor_cell) - 1;
-                        break;
-                    case CURSOR_HOLLOW: case NUM_OF_CURSOR_SHAPES: case NO_CURSOR_SHAPE: break;
-                };
-            }
-        }
-        // If you change the following algorithm remember to change it in the cell shader for extra cursors too
-        if (IS_SPECIAL_COLOR(cursor_color)) {
-            if (line_for_cursor) pick_cursor_color(cell_fg, cell_bg, &rd->main_cursor_fg, &rd->main_cursor_bg, rd->default_fg, rd->bg_colors0);
-            else { rd->main_cursor_fg = rd->bg_colors0; rd->main_cursor_bg = rd->default_fg; }
-            if (cell_bg == cell_fg) {
-                rd->main_cursor_fg = rd->bg_colors0; rd->main_cursor_bg = rd->default_fg;
-            } else { rd->main_cursor_fg = cell_bg; rd->main_cursor_bg = cell_fg; }
-        } else {
-            rd->main_cursor_bg = COLOR(cursor_color);
-            if (IS_SPECIAL_COLOR(cursor_text_color)) rd->main_cursor_fg = cell_bg;
-            else rd->main_cursor_fg = COLOR(cursor_text_color);
-        }
-        // store last rendered cursor color for trail rendering
-        screen->last_rendered.cursor_bg = rd->main_cursor_bg;
-    } else {
-        rd->cursor_shape = 0;
-        rd->cursor_x1 = screen->columns + 1; rd->cursor_x2 = screen->columns;
-        rd->cursor_y1 = screen->lines + 1; rd->cursor_y2 = screen->lines;
-    }
-
-    rd->columns = screen->columns; rd->lines = screen->lines;
-
-    unsigned int x, y, z;
-    sprite_tracker_current_layout(os_window->fonts_data, &x, &y, &z);
-    rd->sprites_xnum = x; rd->sprites_ynum = y;
-    rd->inverted = screen_invert_colors(screen) ? 1 : 0;
-    rd->cell_width = os_window->fonts_data->fcm.cell_width;
-    rd->cell_height = os_window->fonts_data->fcm.cell_height;
-    rd->inactive_text_alpha = inactive_text_alpha;
-    rd->dim_opacity = OPT(dim_opacity);
-
-#undef COLOR
-    rd->url_color = OPT(url_color); rd->url_style = OPT(url_style);
-    color_type default_bg = rd->bg_colors0;
-    unmap_vao_buffer(vao_idx, uniform_buffer); rd = NULL;
+cell_update_uniform_block(
+    ssize_t vao_idx,
+    Screen *screen,
+    int uniform_buffer,
+    const CursorRenderInfo *cursor,
+    OSWindow *os_window,
+    float inactive_text_alpha,
+    float bg_alpha
+) {
+    RendererCellUniformData *rd = (RendererCellUniformData*)map_vao_buffer(vao_idx, uniform_buffer, GL_WRITE_ONLY);
+    color_type default_bg = renderer_shared_populate_uniform_data(
+        screen,
+        cursor,
+        os_window,
+        inactive_text_alpha,
+        bg_alpha,
+        rd,
+        cell_program_layouts[CELL_PROGRAM].color_table.offset,
+        cell_program_layouts[CELL_PROGRAM].color_table.stride
+    );
+    unmap_vao_buffer(vao_idx, uniform_buffer);
     return default_bg;
 }
 

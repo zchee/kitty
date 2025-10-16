@@ -1,5 +1,6 @@
 #include "renderer_backend.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "state.h"
@@ -10,6 +11,7 @@ typedef struct {
     bool initialized;
     bool have_init_cfg;
     RendererInitConfig init_cfg;
+    char *label;
 } RegisteredBackend;
 
 static RegisteredBackend registered_backends[RENDERER_BACKEND_COUNT];
@@ -25,8 +27,8 @@ backend_label(const RegisteredBackend *entry) {
     if (!entry || !entry->ops) {
         return "renderer backend";
     }
-    if (entry->ops->name) {
-        return entry->ops->name;
+    if (entry->label) {
+        return entry->label;
     }
     ptrdiff_t idx = entry - registered_backends;
     if (idx >= 0 && idx < RENDERER_BACKEND_COUNT) {
@@ -52,21 +54,108 @@ current_backend_entry(void) {
     return entry->registered ? entry : NULL;
 }
 
+static bool
+stub_ensure_initialized(const RendererInitConfig *cfg UNUSED) {
+    return true;
+}
+
+static void
+stub_shutdown(void) {}
+
+static bool
+stub_attach_window(GLFWwindow *window UNUSED, const RendererWindowConfig *config UNUSED) {
+    return true;
+}
+
+static void*
+stub_make_context_current(GLFWwindow *window UNUSED) {
+    return NULL;
+}
+
+static void
+stub_restore_context(void *token UNUSED) {}
+
+static void
+stub_apply_swap_interval(int val UNUSED) {}
+
+static bool
+stub_begin_frame(GLFWwindow *window UNUSED, const RendererFrameParams *params UNUSED) {
+    return true;
+}
+
+static bool
+stub_render_true(GLFWwindow *window UNUSED, const RendererRenderParams *params UNUSED) {
+    return true;
+}
+
+static bool
+stub_present_true(GLFWwindow *window UNUSED, const RendererPresentParams *params UNUSED) {
+    return true;
+}
+
+static void
+stub_on_resize(GLFWwindow *window UNUSED, const RendererResizeParams *params UNUSED) {}
+
+static void
+stub_on_suspend(void) {}
+
+static void
+stub_on_resume(void) {}
+
 bool
 renderer_backend_register(RendererBackendType type, const RendererBackendOps *ops) {
     if (!validate_backend_type(type) || !ops || !ops->name) {
         PyErr_SetString(PyExc_ValueError, "renderer_backend_register received invalid arguments");
         return false;
     }
+    char *label = NULL;
+    size_t name_len = strlen(ops->name);
+    label = malloc(name_len + 1);
+    if (!label) {
+        PyErr_NoMemory();
+        return false;
+    }
+    memcpy(label, ops->name, name_len + 1);
+    if (registered_backends[type].label) {
+        free(registered_backends[type].label);
+    }
     registered_backends[type].ops = ops;
     registered_backends[type].registered = true;
     registered_backends[type].initialized = false;
     registered_backends[type].have_init_cfg = false;
+    registered_backends[type].label = label;
     if (!backend_selected) {
         selected_backend = type;
         backend_selected = true;
     }
     return true;
+}
+
+bool
+renderer_backend_register_stub_for_tests(
+    RendererBackendType type,
+    const char *name,
+    bool provide_render,
+    bool provide_present
+) {
+    static RendererBackendOps ops = {
+        .ensure_initialized = stub_ensure_initialized,
+        .shutdown = stub_shutdown,
+        .attach_window = stub_attach_window,
+        .make_context_current = stub_make_context_current,
+        .restore_context = stub_restore_context,
+        .apply_swap_interval = stub_apply_swap_interval,
+        .begin_frame = stub_begin_frame,
+        .render = stub_render_true,
+        .present = stub_present_true,
+        .on_resize = stub_on_resize,
+        .on_suspend = stub_on_suspend,
+        .on_resume = stub_on_resume,
+    };
+    ops.name = name;
+    ops.render = provide_render ? stub_render_true : NULL;
+    ops.present = provide_present ? stub_present_true : NULL;
+    return renderer_backend_register(type, &ops);
 }
 
 bool
@@ -243,6 +332,16 @@ renderer_backend_present(GLFWwindow *window, const RendererPresentParams *params
     return entry->ops->present(window, params);
 }
 
+bool
+renderer_backend_render_for_tests(const RendererRenderParams *params) {
+    return renderer_backend_render(NULL, params);
+}
+
+bool
+renderer_backend_present_for_tests(const RendererPresentParams *params) {
+    return renderer_backend_present(NULL, params);
+}
+
 void
 renderer_backend_on_resize(GLFWwindow *window, const RendererResizeParams *params) {
     RegisteredBackend *entry = current_backend_entry();
@@ -297,9 +396,104 @@ renderer_backend_reset_for_tests(void) {
     for (RendererBackendType t = 0; t < RENDERER_BACKEND_COUNT; t++) {
         registered_backends[t].initialized = false;
         registered_backends[t].have_init_cfg = false;
+        if (registered_backends[t].label) {
+            free(registered_backends[t].label);
+            registered_backends[t].label = NULL;
+        }
     }
     backend_selected = false;
     selected_backend = RENDERER_BACKEND_OPENGL;
+}
+
+PyObject*
+py_renderer_backend_register_stub_for_tests(PyObject *self UNUSED, PyObject *args) {
+    const char *name = NULL;
+    int type_int = RENDERER_BACKEND_METAL;
+    int provide_render = 1;
+    int provide_present = 1;
+    if (!PyArg_ParseTuple(args, "s|ipp", &name, &type_int, &provide_render, &provide_present)) {
+        return NULL;
+    }
+    RendererBackendType type = (RendererBackendType)type_int;
+    if (!validate_backend_type(type)) {
+        PyErr_SetString(PyExc_ValueError, "renderer_backend_register_stub_for_tests received invalid backend type");
+        return NULL;
+    }
+    if (!renderer_backend_register_stub_for_tests(type, name, provide_render != 0, provide_present != 0)) {
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
+PyObject*
+py_renderer_backend_render_for_tests(PyObject *self UNUSED, PyObject *args, PyObject *kwargs) {
+    static char *kwlist[] = {
+        "active_window_id",
+        "active_window_bg",
+        "num_visible_windows",
+        "all_windows_have_same_bg",
+        NULL
+    };
+    unsigned int active_window_id = 0;
+    unsigned int active_window_bg = 0;
+    unsigned int num_visible_windows = 0;
+    int all_same_bg = 0;
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "|IIIp",
+            kwlist,
+            &active_window_id,
+            &active_window_bg,
+            &num_visible_windows,
+            &all_same_bg)) {
+        return NULL;
+    }
+    RendererRenderParams params = {
+        .os_window = NULL,
+        .active_window_id = active_window_id,
+        .active_window_bg = active_window_bg,
+        .num_visible_windows = num_visible_windows,
+        .all_windows_have_same_bg = all_same_bg != 0,
+    };
+    if (!renderer_backend_render_for_tests(&params)) {
+        if (PyErr_Occurred()) {
+            return NULL;
+        }
+        Py_RETURN_FALSE;
+    }
+    Py_RETURN_TRUE;
+}
+
+PyObject*
+py_renderer_backend_present_for_tests(PyObject *self UNUSED, PyObject *args, PyObject *kwargs) {
+    static char *kwlist[] = {
+        "blocking",
+        "capture_framebuffer",
+        NULL
+    };
+    int blocking = 1;
+    int capture_framebuffer = 0;
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "|pp",
+            kwlist,
+            &blocking,
+            &capture_framebuffer)) {
+        return NULL;
+    }
+    RendererPresentParams params = {
+        .blocking = blocking != 0,
+        .capture_framebuffer = capture_framebuffer != 0,
+    };
+    if (!renderer_backend_present_for_tests(&params)) {
+        if (PyErr_Occurred()) {
+            return NULL;
+        }
+        Py_RETURN_FALSE;
+    }
+    Py_RETURN_TRUE;
 }
 
 PyObject*
