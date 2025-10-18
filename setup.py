@@ -1242,10 +1242,77 @@ def build(args: Options, native_optimizations: bool = True, call_init: bool = Tr
     compile_glfw(args.compilation_database, args.build_dsym)
     compile_kittens(args)
     add_builtin_fonts(args)
+    compile_metal_shaders(args)
 
 
 def safe_makedirs(path: str) -> None:
     os.makedirs(path, exist_ok=True)
+
+
+def metal_tool_cmd(xcrun: str, tool: str, sdk: str = 'macosx') -> List[str]:
+    return [xcrun, '--sdk', sdk, tool]
+
+
+def compile_metal_shaders(args: Options) -> None:
+    if not is_macos:
+        return
+    metal_src_dir = os.path.join(src_base, 'kitty', 'metal')
+    if not os.path.isdir(metal_src_dir):
+        return
+    metal_sources = sorted(glob.glob(os.path.join(metal_src_dir, '*.metal')))
+    if not metal_sources:
+        return
+    xcrun = shutil.which('xcrun')
+    if not xcrun:
+        raise SystemExit('The Metal toolchain was not found. Install Xcode command line tools to build the Metal renderer.')
+    metal_build_dir = os.path.join(build_dir, 'metal')
+    safe_makedirs(metal_build_dir)
+    failures: List[Tuple[str, str, Union[int, None]]] = []
+    min_macos_version = '13.0'
+    for src in metal_sources:
+        name = os.path.splitext(os.path.basename(src))[0]
+        air = os.path.join(metal_build_dir, f'{name}.air')
+        metallib_output = os.path.join(metal_build_dir, f'{name}.metallib')
+        package_metallib = os.path.join(metal_src_dir, f'{name}.metallib')
+
+        def cleanup_outputs(remove_air: bool = False) -> None:
+            if remove_air:
+                with suppress(FileNotFoundError):
+                    os.remove(air)
+            with suppress(FileNotFoundError):
+                os.remove(metallib_output)
+            with suppress(FileNotFoundError):
+                os.remove(package_metallib)
+
+        if newer(air, src):
+            compile_cmd = metal_tool_cmd(xcrun, 'metal') + [
+                '-c',
+                src,
+                '-o',
+                air,
+                f'-mmacosx-version-min={min_macos_version}',
+            ]
+            try:
+                run_tool(compile_cmd, desc=f'Compiling Metal shader {emphasis(name)} ...')
+            except SystemExit as exc:
+                failures.append((name, 'compile', exc.code if isinstance(exc.code, int) else None))
+                cleanup_outputs(remove_air=True)
+                continue
+        if newer(metallib_output, air):
+            link_cmd = metal_tool_cmd(xcrun, 'metallib') + [air, '-o', metallib_output]
+            try:
+                run_tool(link_cmd, desc=f'Linking Metal library {emphasis(name)} ...')
+            except SystemExit as exc:
+                failures.append((name, 'link', exc.code if isinstance(exc.code, int) else None))
+                cleanup_outputs(remove_air=False)
+                continue
+        if newer(package_metallib, metallib_output):
+            shutil.copy2(metallib_output, package_metallib)
+    if failures:
+        print(error('Metal shader build failed; the Metal renderer will fall back to OpenGL.'), file=sys.stderr)
+        for shader, stage, code in failures:
+            reason = f'exit code {code}' if code is not None else 'unknown error'
+            print(error(f'  - {shader}: {stage} step failed ({reason})'), file=sys.stderr)
 
 
 def update_go_generated_files(args: Options, kitty_exe: str) -> None:
@@ -1928,7 +1995,7 @@ def package(args: Options, bundle_type: str, do_build_all: bool = True) -> None:
     shutil.copy2('logo/beam-cursor@2x.png', os.path.join(libdir, 'logo'))
     shutil.copytree('shell-integration', os.path.join(libdir, 'shell-integration'), dirs_exist_ok=True)
     shutil.copytree('fonts', os.path.join(libdir, 'fonts'), dirs_exist_ok=True)
-    allowed_extensions = frozenset('py glsl so'.split())
+    allowed_extensions = frozenset('py glsl so metallib'.split())
 
     def src_ignore(parent: str, entries: Iterable[str]) -> List[str]:
         return [
