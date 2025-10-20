@@ -669,56 +669,84 @@ has_scrollbar(Window *w, Screen *screen) {
 
 static unsigned
 render_a_bar(const UIRenderData *ui, WindowBarData *bar, PyObject *title, bool along_bottom) {
-    unsigned border_width = (unsigned)ceil(thickness_as_float(ui->os_window, 1));
-    unsigned bar_height = ui->cell_height + 2;
-    unsigned bar_width = ui->screen_width - 2 * border_width;
-    if (!bar->buf || bar->width != bar_width || bar->height != bar_height) {
-        free(bar->buf);
-        bar->buf = malloc((size_t)4 * bar_width * bar_height);
-        if (!bar->buf) return 0;
-        bar->height = bar_height;
-        bar->width = bar_width;
-        bar->needs_render = true;
+    RendererSharedBarSurface surface = {0};
+    if (!renderer_shared_prepare_bar_surface(
+            ui->screen,
+            ui->os_window,
+            bar,
+            title,
+            ui->screen_width,
+            ui->screen_height,
+            ui->cell_height,
+            along_bottom,
+            &surface) || !surface.visible) {
+        return 0;
     }
-#define RGBCOL(which, fallback) ( 0xff000000 | colorprofile_to_color_with_fallback(ui->screen->color_profile, ui->screen->color_profile->overridden.which, ui->screen->color_profile->configured.which, ui->screen->color_profile->overridden.fallback, ui->screen->color_profile->configured.fallback))
-    color_type fg = RGBCOL(default_fg, default_fg), bg = RGBCOL(default_bg, default_bg);
-#undef RGBCOL
-    if (bar->last_drawn_title_object_id != title || bar->needs_render) {
-        static char titlebuf[2048] = {0};
-        if (!title) return 0;
-        snprintf(titlebuf, arraysz(titlebuf), " %s", PyUnicode_AsUTF8(title));
-        if (!draw_window_title(ui->os_window->fonts_data->font_sz_in_pts, ui->os_window->fonts_data->logical_dpi_y, titlebuf, fg, bg, bar->buf, bar_width, bar_height)) return 0;
-        Py_CLEAR(bar->last_drawn_title_object_id);
-        bar->last_drawn_title_object_id = Py_NewRef(title);
-    }
-    static ImageRenderData data = {.group_count=1};
-    gpu_data_for_image(&data, -1, 1, 1, -1);
-    glGenTextures(1, &data.texture_id);
-    glBindTexture(GL_TEXTURE_2D, data.texture_id);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_SRGB_ALPHA, bar_width, bar_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, bar->buf);
-    bind_program(GRAPHICS_PROGRAM);
+
     Viewport border_rect = {
-        .height=bar_height + 2 * border_width, .left=ui->screen_left, .width=ui->screen_width, .top=ui->screen_top};
-    if (along_bottom) border_rect.top += ui->screen_height - border_rect.height;
+        .height = (GLsizei)(surface.height_px + 2u * surface.border_width_px),
+        .left = ui->screen_left,
+        .width = ui->screen_width,
+        .top = ui->screen_top
+    };
+    if (along_bottom) {
+        border_rect.top += ui->screen_height - border_rect.height;
+    }
     const unsigned sh = ui->full_framebuffer_height;
-    // first blank the area to be drawn to background
+
     enable_scissor_using_top_left_origin(border_rect, sh);
-    blank_canvas(ui->bg_alpha, bg, false);
+    blank_canvas(ui->bg_alpha, surface.background_color, false);
     disable_scissor();
-    // then draw the rendered text
-    save_viewport_using_top_left_origin(
-        border_rect.left + border_width, border_rect.top + border_width, bar_width, bar_height, sh);
-    draw_graphics(GRAPHICS_PROGRAM, &data, 0, 1, 1.f);
-    restore_viewport();
-    free_texture(&data.texture_id);
-    // finally draw border with transparent bg
-    draw_rounded_rect(ui->os_window, border_rect, sh, 1, ui->cell_width, fg, bg, 0.f);
+
+    if (surface.pixels && surface.width_px && surface.height_px) {
+        static ImageRenderData data = {.group_count = 1};
+        data.texture_id = 0;
+        gpu_data_for_image(&data, -1, 1, 1, -1);
+        glGenTextures(1, &data.texture_id);
+        glBindTexture(GL_TEXTURE_2D, data.texture_id);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(
+            GL_TEXTURE_2D,
+            0,
+            GL_SRGB_ALPHA,
+            (GLsizei)surface.width_px,
+            (GLsizei)surface.height_px,
+            0,
+            GL_RGBA,
+            GL_UNSIGNED_BYTE,
+            surface.pixels
+        );
+        bind_program(GRAPHICS_PROGRAM);
+        save_viewport_using_top_left_origin(
+            border_rect.left + (GLsizei)surface.border_width_px,
+            border_rect.top + (GLsizei)surface.border_width_px,
+            (GLsizei)surface.width_px,
+            (GLsizei)surface.height_px,
+            sh
+        );
+        draw_graphics(GRAPHICS_PROGRAM, &data, 0, 1, 1.f);
+        restore_viewport();
+        free_texture(&data.texture_id);
+    }
+
+    draw_rounded_rect(
+        ui->os_window,
+        border_rect,
+        sh,
+        1,
+        ui->cell_width,
+        surface.foreground_color,
+        surface.background_color,
+        0.f
+    );
+
     return border_rect.height;
+}
+
 }
 
 static bool
@@ -728,24 +756,14 @@ has_hyperlink_target(OSWindow *os_window, Window *w, Screen *screen) {
 
 static void
 draw_hyperlink_target(const UIRenderData *ui) {
-    if (!has_hyperlink_target(ui->os_window, ui->window, ui->screen)) return;
-    Screen *screen = ui->screen;
-    const bool along_bottom = screen->current_hyperlink_under_mouse.y < 3;
-    Window *window = ui->window;
-    WindowBarData *bd = &window->url_target_bar_data;
-    if (bd->hyperlink_id_for_title_object != screen->current_hyperlink_under_mouse.id) {
-        bd->hyperlink_id_for_title_object = screen->current_hyperlink_under_mouse.id;
-        Py_CLEAR(bd->last_drawn_title_object_id);
-        const char *url = get_hyperlink_for_id(screen->hyperlink_pool, bd->hyperlink_id_for_title_object, true);
-        if (url == NULL) url = "";
-        bd->last_drawn_title_object_id = PyObject_CallMethod(global_state.boss, "sanitize_url_for_display_to_user", "s", url);
-        if (bd->last_drawn_title_object_id == NULL) { PyErr_Print(); return; }
-        bd->needs_render = true;
-    }
-    if (bd->last_drawn_title_object_id == NULL) return;
-    PyObject *ref = Py_NewRef(bd->last_drawn_title_object_id);  // render_a_bar clears bd->last_drawn_title_object_id
-    render_a_bar(ui, &window->title_bar_data, bd->last_drawn_title_object_id, along_bottom);
-    Py_DECREF(ref);
+    bool along_bottom = false;
+    PyObject *title = renderer_shared_get_hyperlink_title(ui->screen, ui->window, ui->os_window, &along_bottom);
+    if (!title) return;
+    render_a_bar(ui, &ui->window->title_bar_data, title, along_bottom);
+    Py_DECREF(title);
+}
+
+
 }
 
 static bool
@@ -756,37 +774,38 @@ has_window_number(Window *w, Screen *screen) {
 static void
 draw_window_number(const UIRenderData *ui) {
     if (!has_window_number(ui->window, ui->screen)) return;
-    unsigned title_bar_height = 0, requested_height = ui->screen_height;
-    if (ui->window->title && PyUnicode_Check(ui->window->title) && (requested_height > (ui->cell_height + 1) * 2)) {
+    unsigned title_bar_height = 0;
+    if (ui->window->title && PyUnicode_Check(ui->window->title) && (ui->screen_height > (ui->cell_height + 1) * 2)) {
         title_bar_height = render_a_bar(ui, &ui->window->title_bar_data, ui->window->title, false);
     }
-    unsigned height_for_letter = ui->screen_height - title_bar_height - ui->cell_height;
-    unsigned width_for_letter = ui->screen_width - ui->cell_width;
-    requested_height = MIN(12 * ui->cell_height, MIN(height_for_letter, width_for_letter));
-    if (requested_height < 4) return;
-#define lr ui->screen->last_rendered_window_char
-    if (!lr.canvas || lr.ch != ui->screen->display_window_char || lr.requested_height != requested_height) {
-        free(lr.canvas); lr.canvas = NULL;
-        lr.requested_height = requested_height; lr.height_px = requested_height; lr.ch = 0;
-        lr.canvas = draw_single_ascii_char(ui->screen->display_window_char, &lr.width_px, &lr.height_px);
-        if (lr.height_px < 4 || lr.width_px < 4 || !lr.canvas) return;
-        lr.ch = ui->screen->display_window_char;
+
+    RendererSharedWindowNumber info = {0};
+    if (!renderer_shared_prepare_window_number(
+            ui->screen,
+            ui->screen_width,
+            ui->screen_height,
+            ui->screen_left,
+            ui->screen_top,
+            ui->full_framebuffer_height,
+            ui->cell_width,
+            ui->cell_height,
+            title_bar_height,
+            &info) || !info.visible || !info.pixels) {
+        return;
     }
-    unsigned letter_x = 0, letter_y = title_bar_height;
-    if (lr.width_px < ui->screen_width) letter_x = (ui->screen_width - lr.width_px) / 2;
-    if (lr.height_px + title_bar_height < ui->screen_height) letter_y += (ui->screen_height - lr.height_px - title_bar_height) / 2;
+
     bind_program(GRAPHICS_ALPHA_MASK_PROGRAM);
-    ImageRenderData *ird = load_alpha_mask_texture(lr.width_px, lr.height_px, lr.canvas);
+    ImageRenderData *ird = load_alpha_mask_texture(info.width_px, info.height_px, info.pixels);
     gpu_data_for_image(ird, -1, 1, 1, -1);
     glUniform1i(graphics_program_layouts[GRAPHICS_ALPHA_MASK_PROGRAM].uniforms.image, GRAPHICS_UNIT);
-    color_type digit_color = colorprofile_to_color_with_fallback(ui->screen->color_profile, ui->screen->color_profile->overridden.highlight_bg, ui->screen->color_profile->configured.highlight_bg, ui->screen->color_profile->overridden.default_fg, ui->screen->color_profile->configured.default_fg);
-    color_vec3(graphics_program_layouts[GRAPHICS_ALPHA_MASK_PROGRAM].uniforms.amask_fg, digit_color);
+    color_vec3(graphics_program_layouts[GRAPHICS_ALPHA_MASK_PROGRAM].uniforms.amask_fg, info.glyph_color);
     glUniform4f(graphics_program_layouts[GRAPHICS_ALPHA_MASK_PROGRAM].uniforms.amask_bg_premult, 0.f, 0.f, 0.f, 0.f);
     save_viewport_using_top_left_origin(
-        ui->screen_left + letter_x, ui->screen_top + letter_y, lr.width_px, lr.height_px, ui->full_framebuffer_height);
+        info.offset_x_px, info.offset_y_px, info.width_px, info.height_px, ui->full_framebuffer_height);
     draw_graphics(GRAPHICS_ALPHA_MASK_PROGRAM, ird, 0, 1, 1.f);
     restore_viewport();
-#undef lr
+}
+
 }
 
 // Helper function to extract and apply opacity to color components
@@ -798,103 +817,78 @@ set_color_uniform_with_opacity(color_type color, float opacity) {
     glUniform4f(tint_program_layout.uniforms.tint_color, r, g, b, opacity);
 }
 
-static color_type
-scrollbar_color(Screen *screen, unsigned val) {
-    switch (val & 0xff) {
-#define C(which) colorprofile_to_color(screen->color_profile, screen->color_profile->overridden.which, screen->color_profile->configured.which).rgb
-        case 0: return C(default_fg);
-        case 1: return C(highlight_bg);
-#undef C
-        default: return val >> 8;
-    }
-}
-
 static void
 draw_scrollbar(const UIRenderData *ui) {
     Screen *screen = ui->screen;
     Window *window = ui->window;
-    if (!window || !screen || !has_scrollbar(window, screen)) return;
+    if (!window || !screen) return;
 
-    color_type bar_color = scrollbar_color(screen, OPT(scrollbar_handle_color)), track_color = scrollbar_color(screen, OPT(scrollbar_track_color));
-    float bar_frac = (float)screen->scrolled_by / MAX(1u, (float)screen->historybuf->count);
-    float opacity = OPT(scrollbar_handle_opacity);
-    float track_opacity = window->scrollbar.is_hovering ? OPT(scrollbar_track_hover_opacity) : OPT(scrollbar_track_opacity);
-    GLsizei scrollbar_width_px = (GLsizei)(OPT(scrollbar_width) * ui->cell_width);
-    if (window->scrollbar.is_hovering) scrollbar_width_px = (GLsizei)(OPT(scrollbar_hover_width) * ui->cell_width);
-    GLsizei scrollbar_gap_px = (GLsizei)(OPT(scrollbar_gap) * ui->cell_width);
-    unsigned scrollbar_radius = (unsigned)(OPT(scrollbar_radius) * ui->cell_width);
+    RendererSharedScrollbarMetrics metrics = {0};
+    if (!renderer_shared_prepare_scrollbar_metrics(
+            screen,
+            window,
+            &window->render_data,
+            ui->screen_left,
+            ui->screen_top,
+            ui->screen_width,
+            ui->screen_height,
+            ui->cell_width,
+            ui->cell_height,
+            ui->full_framebuffer_height,
+            &metrics) || !metrics.visible) {
+        return;
+    }
 
-    // Calculate window boundaries including padding
-    GLsizei window_right_edge = ui->screen_left + ui->screen_width + window->render_data.geometry.spaces.right;
-    GLsizei window_top_edge = ui->screen_top - window->render_data.geometry.spaces.top;
-    GLsizei window_height = ui->screen_height + window->render_data.geometry.spaces.top + window->render_data.geometry.spaces.bottom;
-
-    // Position scrollbar on right side with gap
-    GLsizei scrollbar_left = window_right_edge - scrollbar_width_px - scrollbar_gap_px;
-    GLsizei scrollbar_top = window_top_edge + scrollbar_gap_px;
-    GLsizei scrollbar_height = window_height - 2 * scrollbar_gap_px;
-
-    // Calculate thumb size and position
-    float visible_fraction = (float)screen->lines / (float)(screen->lines + screen->historybuf->count);
-    float min_thumb_height_fraction = (OPT(scrollbar_min_handle_height) * ui->cell_height) / (float)window_height;
-    float thumb_height_fraction = MAX(min_thumb_height_fraction, visible_fraction);
-
-    // Convert to OpenGL coordinates (range -1.0 to 1.0, total span = 2.0)
-    const float GL_COORD_SPAN = 2.0f;
-    float thumb_height_gl = thumb_height_fraction * GL_COORD_SPAN;
-    float available_space = GL_COORD_SPAN - thumb_height_gl;
-    float thumb_bottom_gl = -1.0f + available_space * bar_frac;
-    float thumb_top_gl = thumb_bottom_gl + thumb_height_gl;
-
-    // Store thumb position for mouse interaction (normalized window coordinates)
-    float scrollbar_top_in_window = (float)(window_top_edge + scrollbar_gap_px) / (float)ui->full_framebuffer_height;
-    float scrollbar_height_in_window = (float)(window_height - 2 * scrollbar_gap_px) / (float)ui->full_framebuffer_height;
-    float thumb_top_fraction = (1.0f - thumb_top_gl) / 2.0f;
-    float thumb_bottom_fraction = (1.0f - thumb_bottom_gl) / 2.0f;
-    window->scrollbar.thumb_top = scrollbar_top_in_window + thumb_top_fraction * scrollbar_height_in_window;
-    window->scrollbar.thumb_bottom = scrollbar_top_in_window + thumb_bottom_fraction * scrollbar_height_in_window;
-
-    // Set viewport for scrollbar area
     save_viewport_using_top_left_origin(
-        scrollbar_left, scrollbar_top, scrollbar_width_px, scrollbar_height,
+        (GLsizei)metrics.left_px,
+        (GLsizei)metrics.top_px,
+        (GLsizei)metrics.width_px,
+        (GLsizei)metrics.height_px,
         ui->full_framebuffer_height
     );
 
-    // Draw scrollbar track (background)
-    if (track_opacity > 0) {
+    if (metrics.track_opacity > 0.f) {
         bind_program(TINT_PROGRAM);
-        set_color_uniform_with_opacity(track_color, track_opacity);
+        set_color_uniform_with_opacity(metrics.track_color, metrics.track_opacity);
         glUniform4f(tint_program_layout.uniforms.edges, -1.f, 1.f, 1.f, -1.f);
         draw_quad(true, 0);
     }
 
-    // Draw scrollbar thumb (handle)
-    if (scrollbar_radius > 0) {
-        // Rounded thumb - use separate viewport and rounded rect program
-        GLsizei thumb_height_px = (GLsizei)(thumb_height_fraction * scrollbar_height);
-        GLsizei thumb_top_px = scrollbar_top + (GLsizei)(thumb_top_fraction * scrollbar_height);
+    const float thumb_top_gl = 1.f - 2.f * metrics.thumb_top_fraction;
+    const float thumb_bottom_gl = 1.f - 2.f * metrics.thumb_bottom_fraction;
+
+    if (metrics.corner_radius_px > 0u) {
+        GLsizei thumb_height_px = (GLsizei)metrics.thumb_height_px;
+        GLsizei thumb_top_px = (GLsizei)metrics.thumb_top_px;
 
         restore_viewport();
 
         bind_program(ROUNDED_RECT_PROGRAM);
-        color_vec4(rounded_rect_program_layout.uniforms.color, bar_color, opacity);
+        color_vec4(rounded_rect_program_layout.uniforms.color, metrics.handle_color, metrics.handle_opacity);
         color_vec4(rounded_rect_program_layout.uniforms.background_color, 0, 0.0f);
 
         float y = (float)ui->full_framebuffer_height - (float)(thumb_top_px + thumb_height_px);
         glUniform4f(rounded_rect_program_layout.uniforms.rect,
-                    (float)scrollbar_left, y,
-                    (float)scrollbar_width_px, (float)thumb_height_px);
+                    (float)metrics.left_px,
+                    y,
+                    (float)metrics.width_px,
+                    (float)thumb_height_px);
 
-        float thickness = (float)MAX(scrollbar_width_px, thumb_height_px);
-        glUniform2f(rounded_rect_program_layout.uniforms.params, thickness, (float)scrollbar_radius);
+        float thickness = (float)MAX((int)metrics.width_px, (int)thumb_height_px);
+        glUniform2f(rounded_rect_program_layout.uniforms.params, thickness, (float)metrics.corner_radius_px);
 
-        save_viewport_using_top_left_origin(scrollbar_left, thumb_top_px,
-                                           scrollbar_width_px, thumb_height_px,
-                                           ui->full_framebuffer_height);
+        save_viewport_using_top_left_origin(
+            (GLsizei)metrics.left_px,
+            thumb_top_px,
+            (GLsizei)metrics.width_px,
+            thumb_height_px,
+            ui->full_framebuffer_height
+        );
         draw_quad(true, 0);
         restore_viewport();
     } else {
-        set_color_uniform_with_opacity(bar_color, opacity);
+        bind_program(TINT_PROGRAM);
+        set_color_uniform_with_opacity(metrics.handle_color, metrics.handle_opacity);
         glUniform4f(tint_program_layout.uniforms.edges, -1.f, thumb_top_gl, 1.f, thumb_bottom_gl);
         draw_quad(true, 0);
         restore_viewport();

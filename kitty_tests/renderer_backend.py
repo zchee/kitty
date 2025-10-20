@@ -146,11 +146,11 @@ class BackendFFI:
         if hasattr(self.lib, "register_metal_renderer_backend"):
             self.lib.register_metal_renderer_backend.argtypes = []
             self.lib.register_metal_renderer_backend.restype = ctypes.c_bool
-            self.has_metal = True
-            if hasattr(self.lib, "metal_renderer_preflight"):
+            self.has_metal = sys.platform == 'darwin'
+            if self.has_metal and hasattr(self.lib, "metal_renderer_preflight"):
                 self.lib.metal_renderer_preflight.argtypes = [ctypes.POINTER(ctypes.c_char_p)]
                 self.lib.metal_renderer_preflight.restype = ctypes.c_bool
-            if hasattr(self.lib, "metal_compute_background_geometry"):
+            if self.has_metal and hasattr(self.lib, "metal_compute_background_geometry"):
                 self.lib.metal_compute_background_geometry.argtypes = [
                     ctypes.c_uint,
                     ctypes.c_uint,
@@ -160,8 +160,64 @@ class BackendFFI:
                     ctypes.POINTER(MetalBackgroundGeometry),
                 ]
                 self.lib.metal_compute_background_geometry.restype = ctypes.c_bool
-            else:
+            elif self.has_metal:
                 self.has_metal = False
+            if self.has_metal:
+                class TextureRef(ctypes.Structure):
+                    _fields_ = [
+                        ("id", ctypes.c_uint32),
+                        ("refcnt", ctypes.c_uint32),
+                        ("backend_handle", ctypes.c_void_p),
+                    ]
+
+                class RendererGraphicsImageUpload(ctypes.Structure):
+                    _fields_ = [
+                        ("pixels", ctypes.c_void_p),
+                        ("width", ctypes.c_int32),
+                        ("height", ctypes.c_int32),
+                        ("is_opaque", ctypes.c_uint8),
+                        ("is_4byte_aligned", ctypes.c_uint8),
+                        ("linear_filter", ctypes.c_uint8),
+                        ("_pad0", ctypes.c_uint8),
+                        ("repeat", ctypes.c_int32),
+                    ]
+
+                class MetalGraphicsTextureInfo(ctypes.Structure):
+                    _fields_ = [
+                        ("width", ctypes.c_uint32),
+                        ("height", ctypes.c_uint32),
+                        ("linear_filter", ctypes.c_bool),
+                        ("is_opaque", ctypes.c_bool),
+                        ("repeat", ctypes.c_int32),
+                    ]
+
+                class RepeatStrategy:
+                    MIRROR = 0
+                    CLAMP = 1
+                    DEFAULT = 2
+
+                self.TextureRef = TextureRef
+                self.RendererGraphicsImageUpload = RendererGraphicsImageUpload
+                self.MetalGraphicsTextureInfo = MetalGraphicsTextureInfo
+                self.RepeatStrategy = RepeatStrategy
+
+                self.lib.renderer_backend_upload_graphics_image.argtypes = [
+                    ctypes.POINTER(TextureRef),
+                    ctypes.POINTER(RendererGraphicsImageUpload),
+                ]
+                self.lib.renderer_backend_upload_graphics_image.restype = ctypes.c_bool
+                self.lib.renderer_backend_destroy_graphics_image.argtypes = [
+                    ctypes.POINTER(TextureRef)
+                ]
+                self.lib.renderer_backend_destroy_graphics_image.restype = None
+                if hasattr(self.lib, "metal_renderer_debug_get_graphics_texture"):
+                    self.lib.metal_renderer_debug_get_graphics_texture.argtypes = [
+                        ctypes.c_uint32,
+                        ctypes.POINTER(MetalGraphicsTextureInfo),
+                    ]
+                    self.lib.metal_renderer_debug_get_graphics_texture.restype = ctypes.c_bool
+                else:
+                    self.has_metal = False
         else:
             self.has_metal = False
 
@@ -273,6 +329,17 @@ class BackendFFI:
             ctypes.byref(err_type), ctypes.byref(err_value), ctypes.byref(err_tb)
         )
         return err_type.value, err_value.value, err_tb.value
+
+    def graphics_texture_info(self, texture_id: int):
+        if not self.has_metal or not hasattr(self, "MetalGraphicsTextureInfo"):
+            raise RuntimeError("Metal graphics texture inspection unavailable")
+        info = self.MetalGraphicsTextureInfo()
+        ok = self.lib.metal_renderer_debug_get_graphics_texture(
+            ctypes.c_uint32(texture_id), ctypes.byref(info)
+        )
+        if not ok:
+            return None
+        return info
 
 
 ffi = BackendFFI()
@@ -491,3 +558,129 @@ class TestRendererBackend(BaseTest):
                 hasattr(fast_data_types, name),
                 f"{name} should not be exported via fast_data_types",
             )
+
+
+class TestMetalGraphicsTextures(BaseTest):
+
+    def setUp(self) -> None:
+        super().setUp()
+        if not ffi.has_metal or sys.platform != 'darwin':
+            self.skipTest("Metal backend unavailable on this platform")
+        ffi.reset()
+        renderer_backend_select('metal')
+        self.addCleanup(renderer_backend_select, 'opengl')
+
+    def _make_upload(
+        self,
+        data: ctypes.Array,
+        *,
+        width: int,
+        height: int,
+        is_opaque: bool,
+        linear: bool,
+        repeat: int,
+    ):
+        upload = ffi.RendererGraphicsImageUpload()
+        upload.pixels = ctypes.cast(data, ctypes.c_void_p)
+        upload.width = width
+        upload.height = height
+        upload.is_opaque = 1 if is_opaque else 0
+        upload.is_4byte_aligned = 1
+        upload.linear_filter = 1 if linear else 0
+        upload._pad0 = 0
+        upload.repeat = repeat
+        return upload
+
+    def test_upload_rgba_texture_metadata(self) -> None:
+        tex = ffi.TextureRef()
+        width, height = 2, 2
+        rgba = (ctypes.c_uint8 * (width * height * 4))(
+            255, 0, 0, 128,
+            0, 255, 0, 255,
+            0, 0, 255, 64,
+            255, 255, 255, 255,
+        )
+        upload = self._make_upload(
+            rgba,
+            width=width,
+            height=height,
+            is_opaque=False,
+            linear=True,
+            repeat=ffi.RepeatStrategy.DEFAULT,
+        )
+        ok = ffi.lib.renderer_backend_upload_graphics_image(
+            ctypes.byref(tex), ctypes.byref(upload)
+        )
+        self.assertTrue(ok, "Metal graphics upload should succeed for RGBA data")
+        self.assertNotEqual(tex.id, 0)
+        self.assertTrue(tex.backend_handle)
+        info = ffi.graphics_texture_info(tex.id)
+        self.assertIsNotNone(info)
+        assert info is not None
+        self.assertEqual(info.width, width)
+        self.assertEqual(info.height, height)
+        self.assertTrue(info.linear_filter)
+        self.assertFalse(info.is_opaque)
+        self.assertEqual(info.repeat, ffi.RepeatStrategy.DEFAULT)
+        texture_id = tex.id
+        ffi.lib.renderer_backend_destroy_graphics_image(ctypes.byref(tex))
+        self.assertEqual(tex.id, 0)
+        self.assertFalse(tex.backend_handle)
+        self.assertIsNone(
+            ffi.graphics_texture_info(texture_id),
+            "Destroy should remove Metal texture from debug map",
+        )
+
+    def test_upload_rgb_texture_marks_opaque(self) -> None:
+        tex = ffi.TextureRef()
+        width, height = 1, 2
+        rgb = (ctypes.c_uint8 * (width * height * 3))(
+            10, 20, 30,
+            200, 210, 220,
+        )
+        upload = self._make_upload(
+            rgb,
+            width=width,
+            height=height,
+            is_opaque=True,
+            linear=False,
+            repeat=ffi.RepeatStrategy.CLAMP,
+        )
+        ok = ffi.lib.renderer_backend_upload_graphics_image(
+            ctypes.byref(tex), ctypes.byref(upload)
+        )
+        self.assertTrue(ok)
+        info = ffi.graphics_texture_info(tex.id)
+        self.assertIsNotNone(info)
+        assert info is not None
+        self.assertEqual(info.width, width)
+        self.assertEqual(info.height, height)
+        self.assertFalse(info.linear_filter)
+        self.assertTrue(info.is_opaque)
+        self.assertEqual(info.repeat, ffi.RepeatStrategy.CLAMP)
+        ffi.lib.renderer_backend_destroy_graphics_image(ctypes.byref(tex))
+
+    def test_destroy_graphics_texture_clears_state(self) -> None:
+        tex = ffi.TextureRef()
+        width = height = 1
+        rgba = (ctypes.c_uint8 * 4)(0, 0, 0, 255)
+        upload = self._make_upload(
+            rgba,
+            width=width,
+            height=height,
+            is_opaque=False,
+            linear=True,
+            repeat=ffi.RepeatStrategy.DEFAULT,
+        )
+        self.assertTrue(
+            ffi.lib.renderer_backend_upload_graphics_image(
+                ctypes.byref(tex), ctypes.byref(upload)
+            )
+        )
+        texture_id = tex.id
+        ffi.lib.renderer_backend_destroy_graphics_image(ctypes.byref(tex))
+        self.assertEqual(tex.id, 0)
+        self.assertIsNone(
+            ffi.graphics_texture_info(texture_id),
+            "Destroyed Metal texture should not be reported by debug helper",
+        )

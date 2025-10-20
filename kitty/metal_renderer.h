@@ -82,6 +82,19 @@ EXPORTED bool metal_compute_background_geometry(
 EXPORTED void metal_background_image_uploaded(BackgroundImage *bgimage, BackgroundImageLayout layout, bool linear_filter);
 EXPORTED void metal_background_image_release(BackgroundImage *bgimage);
 
+typedef struct MetalGraphicsTextureDebugInfo {
+    uint32_t width;
+    uint32_t height;
+    bool linear_filter;
+    bool is_opaque;
+    RepeatStrategy repeat;
+} MetalGraphicsTextureDebugInfo;
+
+EXPORTED bool metal_renderer_debug_get_graphics_texture(
+    uint32_t texture_id,
+    MetalGraphicsTextureDebugInfo *out_info
+);
+
 #ifdef __cplusplus
 }
 #endif

@@ -541,4 +541,159 @@ fragment float4 trail_fragment(
     return float4(color_rgb * opacity, opacity);
 }
 
+struct OverlayTintUniforms {
+    float4 edges;
+    float4 color;
+};
+
+struct OverlayVertexOut {
+    float4 position [[position]];
+};
+
+vertex OverlayVertexOut
+overlay_tint_vertex(uint vertex_id [[vertex_id]], constant OverlayTintUniforms &uniforms [[buffer(0)]]) {
+    const float2 positions[4] = {
+        float2(uniforms.edges.x, uniforms.edges.y),
+        float2(uniforms.edges.x, uniforms.edges.w),
+        float2(uniforms.edges.z, uniforms.edges.w),
+        float2(uniforms.edges.z, uniforms.edges.y)
+    };
+    OverlayVertexOut out;
+    out.position = float4(positions[vertex_id & 3], 0.0, 1.0);
+    return out;
+}
+
+fragment float4
+overlay_tint_fragment(constant OverlayTintUniforms &uniforms [[buffer(0)]]) {
+    return uniforms.color;
+}
+
+struct OverlayRoundedUniforms {
+    float2 size;
+    float thickness;
+    float radius;
+    float3 padding;
+    float4 color;
+};
+
+struct OverlayRoundedVertexOut {
+    float4 position [[position]];
+    float2 local;
+};
+
+vertex OverlayRoundedVertexOut
+overlay_rounded_vertex(uint vertex_id [[vertex_id]], constant OverlayRoundedUniforms &uniforms [[buffer(0)]]) {
+    const float2 corners[4] = {
+        float2(0.0, uniforms.size.y),
+        float2(0.0, 0.0),
+        float2(uniforms.size.x, 0.0),
+        float2(uniforms.size.x, uniforms.size.y)
+    };
+    const float2 positions[4] = {
+        float2(-1.0,  1.0),
+        float2(-1.0, -1.0),
+        float2( 1.0, -1.0),
+        float2( 1.0,  1.0)
+    };
+    OverlayRoundedVertexOut out;
+    uint idx = vertex_id & 3;
+    out.position = float4(positions[idx], 0.0, 1.0);
+    out.local = corners[idx];
+    return out;
+}
+
+fragment float4
+overlay_rounded_fragment(OverlayRoundedVertexOut in [[stage_in]], constant OverlayRoundedUniforms &uniforms [[buffer(1)]]) {
+    float2 half_size = uniforms.size * 0.5f;
+    float2 center = float2(half_size.x, half_size.y);
+    float2 p = in.local - center;
+    float2 b = half_size - uniforms.radius;
+    float2 d = fabs(p) - b;
+    float dist = length(max(d, 0.0)) + min(max(d.x, d.y), 0.0) - uniforms.radius;
+    float outer_edge = -dist;
+    float inner_edge = outer_edge - uniforms.thickness;
+    const float step_size = 1.0;
+    float alpha = smoothstep(-step_size, step_size, outer_edge) - smoothstep(-step_size, step_size, inner_edge);
+    float4 color = uniforms.color;
+    color.rgb *= alpha;
+    color.a *= alpha;
+    return color;
+}
+
+struct OverlayTextureUniforms {
+    float2 tex_scale;
+};
+
+struct OverlayTextureVertexOut {
+    float4 position [[position]];
+    float2 texcoord;
+};
+
+vertex OverlayTextureVertexOut
+overlay_texture_vertex(uint vertex_id [[vertex_id]], constant OverlayTextureUniforms &uniforms [[buffer(0)]]) {
+    const float2 positions[4] = {
+        float2(-1.0,  1.0),
+        float2(-1.0, -1.0),
+        float2( 1.0, -1.0),
+        float2( 1.0,  1.0)
+    };
+    const float2 texcoords[4] = {
+        float2(0.0, 0.0),
+        float2(0.0, uniforms.tex_scale.y),
+        float2(uniforms.tex_scale.x, uniforms.tex_scale.y),
+        float2(uniforms.tex_scale.x, 0.0)
+    };
+    OverlayTextureVertexOut out;
+    uint idx = vertex_id & 3;
+    out.position = float4(positions[idx], 0.0, 1.0);
+    out.texcoord = texcoords[idx];
+    return out;
+}
+
+fragment float4
+overlay_texture_fragment(OverlayTextureVertexOut in [[stage_in]], texture2d<float> tex [[texture(0)]], sampler smp [[sampler(0)]]) {
+    return tex.sample(smp, in.texcoord);
+}
+
+struct OverlayAlphaUniforms {
+    float2 tex_scale;
+    float4 color;
+};
+
+struct OverlayAlphaVertexOut {
+    float4 position [[position]];
+    float2 texcoord;
+};
+
+vertex OverlayAlphaVertexOut
+overlay_alpha_vertex(uint vertex_id [[vertex_id]], constant OverlayAlphaUniforms &uniforms [[buffer(0)]]) {
+    const float2 positions[4] = {
+        float2(-1.0,  1.0),
+        float2(-1.0, -1.0),
+        float2( 1.0, -1.0),
+        float2( 1.0,  1.0)
+    };
+    const float2 texcoords[4] = {
+        float2(0.0, 0.0),
+        float2(0.0, uniforms.tex_scale.y),
+        float2(uniforms.tex_scale.x, uniforms.tex_scale.y),
+        float2(uniforms.tex_scale.x, 0.0)
+    };
+    OverlayAlphaVertexOut out;
+    uint idx = vertex_id & 3;
+    out.position = float4(positions[idx], 0.0, 1.0);
+    out.texcoord = texcoords[idx];
+    return out;
+}
+
+fragment float4
+overlay_alpha_fragment(OverlayAlphaVertexOut in [[stage_in]], constant OverlayAlphaUniforms &uniforms [[buffer(1)]], texture2d<float> mask [[texture(0)]], sampler smp [[sampler(0)]]) {
+    float alpha = mask.sample(smp, in.texcoord).r;
+    float4 color = uniforms.color;
+    color.rgb *= alpha;
+    color.a *= alpha;
+    return color;
+}
+
+
 } // namespace kitty
