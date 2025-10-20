@@ -153,6 +153,37 @@ static void
 opengl_backend_on_resume(void) {
 }
 
+static bool
+opengl_backend_upload_graphics_image(TextureRef *ref, const RendererGraphicsImageUpload *upload) {
+    if (!ref || !upload) {
+        PyErr_SetString(PyExc_RuntimeError, "OpenGL graphics upload received invalid arguments");
+        return false;
+    }
+    GLuint texture = ref->id;
+    send_image_to_gpu(&texture,
+                      upload->pixels,
+                      upload->width,
+                      upload->height,
+                      upload->is_opaque,
+                      upload->is_4byte_aligned,
+                      upload->linear_filter,
+                      upload->repeat);
+    ref->id = texture;
+    ref->backend_handle = NULL;
+    return true;
+}
+
+static void
+opengl_backend_destroy_graphics_image(TextureRef *ref) {
+    if (!ref) {
+        return;
+    }
+    if (ref->id) {
+        free_texture(&ref->id);
+    }
+    ref->backend_handle = NULL;
+}
+
 bool
 register_opengl_renderer_backend(void) {
     static const RendererBackendOps opengl_ops = {
@@ -169,6 +200,8 @@ register_opengl_renderer_backend(void) {
         .on_resize = opengl_backend_on_resize,
         .on_suspend = opengl_backend_on_suspend,
         .on_resume = opengl_backend_on_resume,
+        .upload_graphics_image = opengl_backend_upload_graphics_image,
+        .destroy_graphics_image = opengl_backend_destroy_graphics_image,
     };
     return renderer_backend_register(RENDERER_BACKEND_OPENGL, &opengl_ops);
 }

@@ -42,6 +42,9 @@ typedef struct {
     uint8_t* bitmap;
     uint32_t refcnt, id;
     size_t mmap_size;
+#ifdef __APPLE__
+    void *metal_texture;
+#endif
 } BackgroundImage;
 
 
@@ -77,7 +80,9 @@ typedef struct {
 typedef enum { ANIMATION_STOPPED = 0, ANIMATION_LOADING = 1, ANIMATION_RUNNING = 2} AnimationState;
 
 typedef struct TextureRef {
-    uint32_t id, refcnt;
+    uint32_t id;
+    uint32_t refcnt;
+    void *backend_handle;
 } TextureRef;
 
 #define NAME ref_map

@@ -56,6 +56,15 @@ class BackendFFI:
         self.RendererResizeParams = RendererResizeParams
         self.RendererRenderParams = RendererRenderParams
 
+        class MetalBackgroundGeometry(ctypes.Structure):
+            _fields_ = [
+                ("tiled", ctypes.c_float),
+                ("positions", ctypes.c_float * 4),
+                ("sizes", ctypes.c_float * 4),
+            ]
+
+        self.MetalBackgroundGeometry = MetalBackgroundGeometry
+
         self.EnsureFunc = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_void_p)
         self.ShutdownFunc = ctypes.CFUNCTYPE(None)
         self.AttachWindowFunc = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
@@ -141,6 +150,16 @@ class BackendFFI:
             if hasattr(self.lib, "metal_renderer_preflight"):
                 self.lib.metal_renderer_preflight.argtypes = [ctypes.POINTER(ctypes.c_char_p)]
                 self.lib.metal_renderer_preflight.restype = ctypes.c_bool
+            if hasattr(self.lib, "metal_compute_background_geometry"):
+                self.lib.metal_compute_background_geometry.argtypes = [
+                    ctypes.c_uint,
+                    ctypes.c_uint,
+                    ctypes.c_uint,
+                    ctypes.c_uint,
+                    ctypes.c_int,
+                    ctypes.POINTER(MetalBackgroundGeometry),
+                ]
+                self.lib.metal_compute_background_geometry.restype = ctypes.c_bool
             else:
                 self.has_metal = False
         else:
@@ -161,6 +180,17 @@ class BackendFFI:
         if self.has_metal:
             self.lib.register_metal_renderer_backend()
         renderer_backend_select('opengl')
+
+        class BackgroundImageLayout:
+            TILING = 0
+            SCALED = 1
+            MIRRORED = 2
+            CLAMPED = 3
+            CENTER_CLAMPED = 4
+            CENTER_SCALED = 5
+
+        self.BackgroundImageLayout = BackgroundImageLayout
+        self._has_background_geometry = hasattr(self.lib, "metal_compute_background_geometry")
 
     def make_backend_ops(
         self,
@@ -213,6 +243,27 @@ class BackendFFI:
         ops.on_resume = self._resume_noop
         ops._refs = refs  # keep callbacks alive
         return ops
+
+    def compute_background_geometry(
+        self,
+        framebuffer_width: int,
+        framebuffer_height: int,
+        image_width: int,
+        image_height: int,
+        layout: int,
+    ) -> tuple[bool, "MetalBackgroundGeometry"]:
+        if not self._has_background_geometry:
+            raise RuntimeError("Metal background geometry function unavailable")
+        geometry = self.MetalBackgroundGeometry()
+        ok = self.lib.metal_compute_background_geometry(
+            framebuffer_width,
+            framebuffer_height,
+            image_width,
+            image_height,
+            layout,
+            ctypes.byref(geometry),
+        )
+        return bool(ok), geometry
 
     def fetch_error(self):
         err_type = ctypes.py_object()

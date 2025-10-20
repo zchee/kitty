@@ -42,6 +42,8 @@ class TestMetalHelperFunctions(BaseTest):
             for symbol in (
                 "metal_renderer_prepare_border_uniforms_for_tests",
                 "metal_renderer_prepare_trail_uniforms_for_tests",
+                "metal_cell_draw_flag_defaults",
+                "renderer_shared_visual_bell_alpha_scale_for_tests",
             )
         )
         if cls.has_helpers:
@@ -68,6 +70,13 @@ class TestMetalHelperFunctions(BaseTest):
                 ctypes.POINTER(MetalTrailUniforms),
             ]
             cls.lib.metal_renderer_prepare_trail_uniforms_for_tests.restype = None
+            cls.lib.metal_cell_draw_flag_defaults.argtypes = []
+            cls.lib.metal_cell_draw_flag_defaults.restype = ctypes.c_uint32
+            cls.lib.renderer_shared_visual_bell_alpha_scale_for_tests.argtypes = [
+                ctypes.c_uint32,
+                ctypes.c_float,
+            ]
+            cls.lib.renderer_shared_visual_bell_alpha_scale_for_tests.restype = ctypes.c_float
 
     def setUp(self) -> None:
         super().setUp()
@@ -147,3 +156,20 @@ class TestMetalHelperFunctions(BaseTest):
             self.assertAlmostEqual(actual, expected, places=6)
         self.assertEqual(uniforms.color, color)
         self.assertAlmostEqual(uniforms.opacity, opacity, places=6)
+
+    def test_draw_flag_defaults(self) -> None:
+        defaults = self.lib.metal_cell_draw_flag_defaults()
+        self.assertEqual(defaults & 0b001, 0b001)
+        self.assertEqual(defaults & 0b010, 0b010)
+        self.assertEqual(defaults & 0b100, 0b100)
+
+    def test_visual_bell_alpha_scale(self) -> None:
+        # Dark color => attenuation 0.4
+        flash = 0x202020
+        intensity = 0.5
+        alpha = self.lib.renderer_shared_visual_bell_alpha_scale_for_tests(flash, ctypes.c_float(intensity))
+        self.assertAlmostEqual(alpha, intensity * 0.4, places=6)
+        # Bright color => attenuation 0.6
+        bright = 0xffffff
+        alpha_bright = self.lib.renderer_shared_visual_bell_alpha_scale_for_tests(bright, ctypes.c_float(intensity))
+        self.assertAlmostEqual(alpha_bright, intensity * 0.6, places=6)

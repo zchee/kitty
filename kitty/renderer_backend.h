@@ -2,11 +2,14 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "Python.h"
 #include "compiler.h"
 #include "glfw-wrapper.h"
 #include "renderer_backend_types.h"
+
+struct TextureRef;
 
 typedef struct RendererWindowConfig {
     bool is_first_window;
@@ -14,6 +17,16 @@ typedef struct RendererWindowConfig {
     float background_opacity;
     color_type background_color;
 } RendererWindowConfig;
+
+typedef struct RendererGraphicsImageUpload {
+    const void *pixels;
+    int32_t width;
+    int32_t height;
+    bool is_opaque;
+    bool is_4byte_aligned;
+    bool linear_filter;
+    RepeatStrategy repeat;
+} RendererGraphicsImageUpload;
 
 typedef struct RendererBackendOps {
     const char *name;
@@ -29,6 +42,8 @@ typedef struct RendererBackendOps {
     void  (*on_resize)(GLFWwindow *window, const RendererResizeParams *params);
     void  (*on_suspend)(void);
     void  (*on_resume)(void);
+    bool  (*upload_graphics_image)(struct TextureRef *ref, const RendererGraphicsImageUpload *upload);
+    void  (*destroy_graphics_image)(struct TextureRef *ref);
 } RendererBackendOps;
 
 EXPORTED bool renderer_backend_register(RendererBackendType type, const RendererBackendOps *ops);
@@ -47,6 +62,8 @@ EXPORTED void renderer_backend_on_resize(GLFWwindow *window, const RendererResiz
 EXPORTED void renderer_backend_on_suspend(void);
 EXPORTED void renderer_backend_on_resume(void);
 EXPORTED void renderer_backend_swap_buffers(GLFWwindow *window);
+EXPORTED bool renderer_backend_upload_graphics_image(struct TextureRef *ref, const RendererGraphicsImageUpload *upload);
+EXPORTED void renderer_backend_destroy_graphics_image(struct TextureRef *ref);
 EXPORTED void renderer_backend_shutdown_active(void);
 EXPORTED void renderer_backend_reset_for_tests(void);
 EXPORTED bool renderer_backend_register_stub_for_tests(

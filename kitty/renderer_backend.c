@@ -102,6 +102,20 @@ stub_on_suspend(void) {}
 static void
 stub_on_resume(void) {}
 
+static bool
+stub_upload_graphics_image(struct TextureRef *ref UNUSED, const RendererGraphicsImageUpload *upload UNUSED) {
+    return true;
+}
+
+static void
+stub_destroy_graphics_image(struct TextureRef *ref) {
+    if (!ref) {
+        return;
+    }
+    ref->id = 0;
+    ref->backend_handle = NULL;
+}
+
 bool
 renderer_backend_register(RendererBackendType type, const RendererBackendOps *ops) {
     if (!validate_backend_type(type) || !ops || !ops->name) {
@@ -151,6 +165,8 @@ renderer_backend_register_stub_for_tests(
         .on_resize = stub_on_resize,
         .on_suspend = stub_on_suspend,
         .on_resume = stub_on_resume,
+        .upload_graphics_image = stub_upload_graphics_image,
+        .destroy_graphics_image = stub_destroy_graphics_image,
     };
     ops.name = name;
     ops.render = provide_render ? stub_render_true : NULL;
@@ -376,6 +392,41 @@ renderer_backend_swap_buffers(GLFWwindow *window) {
         .capture_framebuffer = false,
     };
     (void)renderer_backend_present(window, &params);
+}
+
+bool
+renderer_backend_upload_graphics_image(struct TextureRef *ref, const RendererGraphicsImageUpload *upload) {
+    if (!ref || !upload) {
+        PyErr_SetString(PyExc_RuntimeError, "Invalid arguments to renderer_backend_upload_graphics_image");
+        return false;
+    }
+    RegisteredBackend *entry = current_backend_entry();
+    RendererInitConfig init_cfg = current_init_config();
+    if (!ensure_backend_ready(entry, &init_cfg)) {
+        return false;
+    }
+    if (!entry->ops || !entry->ops->upload_graphics_image) {
+        PyErr_Format(PyExc_RuntimeError, "%s backend does not implement graphics image upload", backend_label(entry));
+        return false;
+    }
+    if (!entry->ops->upload_graphics_image(ref, upload)) {
+        return false;
+    }
+    return true;
+}
+
+void
+renderer_backend_destroy_graphics_image(struct TextureRef *ref) {
+    if (!ref) {
+        return;
+    }
+    RegisteredBackend *entry = current_backend_entry();
+    if (entry && entry->ops && entry->ops->destroy_graphics_image) {
+        entry->ops->destroy_graphics_image(ref);
+    } else {
+        ref->id = 0;
+        ref->backend_handle = NULL;
+    }
 }
 
 void

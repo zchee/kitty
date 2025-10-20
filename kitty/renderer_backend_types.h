@@ -17,6 +17,12 @@ typedef enum {
     RENDERER_BACKEND_PREFERENCE_OPENGL
 } RendererBackendPreference;
 
+typedef enum {
+    REPEAT_MIRROR,
+    REPEAT_CLAMP,
+    REPEAT_DEFAULT
+} RepeatStrategy;
+
 typedef struct RendererInitConfig {
     bool prefer_low_latency;
     bool enable_debug_labels;

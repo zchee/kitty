@@ -8,6 +8,7 @@
 #define GRAPHICS_INTERNAL_APIS
 #include "graphics.h"
 #include "state.h"
+#include "renderer_backend.h"
 #include "disk-cache.h"
 #include "iqsort.h"
 #include "safe-wrappers.h"
@@ -109,7 +110,7 @@ static void*
 clear_texture_ref(TextureRef **x) {
     if (*x) {
         if ((*x)->refcnt < 2) {
-            if ((*x)->id) free_texture(&(*x)->id);
+            renderer_backend_destroy_graphics_image(*x);
             free(*x); *x = NULL;
         } else (*x)->refcnt--;
     }
@@ -127,6 +128,7 @@ new_texture_ref(void) {
     TextureRef *ans = calloc(1, sizeof(TextureRef));
     if (!ans) fatal("Out of memory allocating a TextureRef");
     ans->refcnt = 1;
+    ans->backend_handle = NULL;
     return ans;
 }
 
@@ -703,7 +705,18 @@ upload_to_gpu(GraphicsManager *self, Image *img, const bool is_opaque, const boo
         self->context_made_current_for_this_command = true;
     }
     if (img->texture) {
-        send_image_to_gpu(&img->texture->id, data, img->width, img->height, is_opaque, is_4byte_aligned, true, REPEAT_CLAMP);
+        const RendererGraphicsImageUpload upload = {
+            .pixels = data,
+            .width = (int32_t)img->width,
+            .height = (int32_t)img->height,
+            .is_opaque = is_opaque,
+            .is_4byte_aligned = is_4byte_aligned,
+            .linear_filter = true,
+            .repeat = REPEAT_CLAMP,
+        };
+        if (!renderer_backend_upload_graphics_image(img->texture, &upload)) {
+            return;
+        }
     }
 }
 

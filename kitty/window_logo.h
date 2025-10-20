@@ -18,6 +18,9 @@ typedef struct WindowLogo {
     uint32_t texture_id;
     uint8_t* bitmap;
     size_t mmap_size;
+#ifdef __APPLE__
+    void *metal_texture;
+#endif
 } WindowLogo;
 
 typedef struct WindowLogoTable WindowLogoTable;

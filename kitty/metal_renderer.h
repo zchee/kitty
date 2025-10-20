@@ -6,12 +6,16 @@
 #include "compiler.h"
 #include "renderer_backend_types.h"
 
+typedef enum BackgroundImageLayout BackgroundImageLayout;
+typedef struct BackgroundImage BackgroundImage;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 EXPORTED bool register_metal_renderer_backend(void);
 EXPORTED bool metal_renderer_preflight(const char **failure_reason);
+EXPORTED uint32_t metal_cell_draw_flag_defaults(void);
 EXPORTED bool metal_compute_viewport_params(
     unsigned int framebuffer_width,
     unsigned int framebuffer_height,
@@ -60,6 +64,23 @@ EXPORTED void metal_renderer_prepare_trail_uniforms_for_tests(
     color_type color,
     float opacity,
     MetalTrailUniforms *out_uniforms);
+
+typedef struct {
+    float tiled;
+    float positions[4];
+    float sizes[4];
+} MetalBackgroundGeometry;
+
+EXPORTED bool metal_compute_background_geometry(
+    unsigned int framebuffer_width,
+    unsigned int framebuffer_height,
+    unsigned int image_width,
+    unsigned int image_height,
+    BackgroundImageLayout layout,
+    MetalBackgroundGeometry *out_geometry);
+
+EXPORTED void metal_background_image_uploaded(BackgroundImage *bgimage, BackgroundImageLayout layout, bool linear_filter);
+EXPORTED void metal_background_image_release(BackgroundImage *bgimage);
 
 #ifdef __cplusplus
 }

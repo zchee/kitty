@@ -9,6 +9,10 @@
 #include "state.h"
 #include "window_logo.h"
 #include <sys/mman.h>
+#include <errno.h>
+#ifdef __APPLE__
+#include <CoreFoundation/CoreFoundation.h>
+#endif
 
 typedef struct WindowLogoItem {
     WindowLogo wl;
@@ -36,11 +40,19 @@ struct WindowLogoTable {
 
 static void
 free_window_logo_bitmap(WindowLogo *wl) {
-    if (!wl->bitmap) return;
-    if (wl->mmap_size) {
-        if (munmap(wl->bitmap, wl->mmap_size) != 0) log_error("Failed to unmap window logo bitmap with error: %s", strerror(errno));
-    } else free(wl->bitmap);
-    wl->bitmap = NULL; wl->mmap_size = 0;
+    if (wl->bitmap) {
+        if (wl->mmap_size) {
+            if (munmap(wl->bitmap, wl->mmap_size) != 0) log_error("Failed to unmap window logo bitmap with error: %s", strerror(errno));
+        } else free(wl->bitmap);
+        wl->bitmap = NULL;
+        wl->mmap_size = 0;
+    }
+#ifdef __APPLE__
+    if (wl->metal_texture) {
+        CFRelease(wl->metal_texture);
+        wl->metal_texture = NULL;
+    }
+#endif
 }
 
 static void
