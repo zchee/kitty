@@ -1,61 +1,64 @@
-# Metal Renderer Execution Memory  
-_Last updated: 2025-10-21 (Metal framebuffer capture + ctypes coverage refresh)_
+# Metal Backend Migration Playbook
+_Last updated: 2025-10-21 (python3.13 link stalled at launcher step)_
 
-This memo supersedes all prior notes. Treat it as the canonical roadmap when resuming Metal migration work.
-
----
-
-## Ground Rules
-1. **Parity-first:** Maintain pixel and behavioural parity with the OpenGL path (cells, inline graphics, overlays, screenshots) before promoting Metal to default.
-2. **Shared data flow:** Continue sourcing all geometry + colour info via `renderer_shared`; avoid Metal-only forks.
-3. **Fail-fast fallback:** Any Metal init/encode/capture failure must fall back to OpenGL without leaking command buffers, drawables, textures, or test fixtures.
-4. **Metallib integrity:** Regenerate `kitty/metal/*.metallib` whenever `.metal` sources change; never hand-alter binaries.
-5. **Per-function tests:** Every touched helper/encoder/export needs ctypes coverage (macOS + Metal gated) with deliberate assertions.
-6. **Resource hygiene:** Pair every allocation (textures, buffers, observers, capture buffers) with explicit teardown.
-7. **Debug discipline:** Funnel new logging through existing debug flags (`g_metal.debug_labels`, etc.).
+This document is the canonical snapshot of what already works, what still breaks, and the exact next actions required to finish the Metal renderer bring-up. Treat it as source-of-truth for future sessions; overwrite it again after every major milestone.
 
 ---
 
-## Current Implementation Snapshot
-- ✅ **Draw flag + overlay parity**  
-  Cell/overlay sequencing matches OpenGL; ctypes tests cover draw flag helper, graphics uniforms, and new capture helpers.
-- ✅ **Window capture plumbing**  
-  `RendererPresentParams.capture_framebuffer` now blits the drawable into a shared buffer, converts BGRA→RGBA, and caches the result for screenshots/tests. Debug APIs expose the captured bytes.
-- ✅ **Helper coverage**  
-  `kitty_tests/test_metal_helpers.py` now exercises capture conversions (BGRA swap, raw RGBA passthrough) alongside existing uniform checks.
-- ⚠️ **Build still blocked on Metal shader + renderer_shared warnings**  
-  `python3.13 setup.py build` fails earlier in `cell.metal` (“MetalTrailUniforms.extra_alpha”) and pedantic warnings in `renderer_shared.c`. These must be resolved before tests run.
-- ⚠️ **fast_data_types unavailable under Python 3.13**  
-  Build failure prevents ctypes harness from loading the extension; tests remain unexecuted in this sandbox.
+## Current Understanding
+
+### Build status
+- ⚠️ `python3.13 setup.py build` compiles shaders, Objective-C, and C modules successfully, including the regenerated `kitty/metal/cell.metallib`. The link step fails when producing `launcher` because the Python 3.13 framework on this machine does not export `_Py_DecRefShared` / `_Py_MergeZeroLocalRefcount`.
+- ✅ Metal shader struct layouts (`MetalTrailUniforms`, `MetalGraphicsUniforms`, `MetalGraphicsAlphaUniforms`) are now aligned across `cell.metal` and Objective-C, enforced with `_Static_assert` checks.
+- ✅ `TextureRef` is exported unconditionally so Metal/OpenGL backends compile. `renderer_shared.c` unused-parameter warnings are silenced with `UNUSED`.
+- ✅ Metal background textures, graphics textures, and helper pipelines compile after the assorted fixes. `kitty/metal/cell.metallib` at `kitty/metal/cell.metallib` is the freshly generated binary.
+- ⚠️ `kitty_tests/test_metal_helpers` still skips everything because the shared library never links; once the Python symbols issue is solved the tests should exercise the helpers again.
+
+### Behavioural snapshot
+- Metal draw paths now encode background, graphics, visual-bell, scrollbar, hyperlink, and window-number passes using shared draw params and sampler caches. Property access on `MetalWindowState` avoids ivar privacy violations.
+- Graphics uploads use plain Objective-C retain/release semantics (no ARC bridge macros) and keep the sampler cache keyed by repeat/linear filter.
+- Metallib generation is manual (`xcrun metal` / `metallib`) and must be automated; stale binaries can silently regress behaviour.
+- Capture helpers (`metal_renderer_copy_captured_frame_for_tests`, etc.) logically work but still rely on the yet-to-be-linked shared object for Python visibility.
 
 ---
 
-## Next Actions
-1. **Unblock build/test pipeline**
-   - Fix `cell.metal` compile errors (ensure MetalTrailUniforms matches struct layout) and silence `renderer_shared.c` pedantic warnings.
-   - Re-run `python3.13 setup.py build` and `python3.13 test.py --module test_metal_helpers`.
-2. **Screenshot plumbing**
-   - Identify call-sites that request framebuffer capture (screenshots, remote commands) and wire them to consume the new Metal capture buffer.
-   - Verify PNG/IPC paths expect RGBA and honour stride.
-3. **Metallib tooling**
-   - Add timestamp/hash tracking in `setup.py` so `.metal` edits rebuild `.metallib`.
-   - Ensure regenerated metallib ships in wheels/app bundles with version guardrails.
-4. **Runtime stability**
-   - Audit capture teardown paths (`destroy_window_state`, shutdown, failure) for leaks; add explicit tests if possible.
-   - Confirm `metal_record_failure` clears capture buffers alongside pipelines.
-5. **Extended validation**
-   - Add ctypes coverage for other overlay helpers (scrollbar metrics, hyperlink background) and capture error cases once build is green.
-   - Plan automated GL↔Metal image diff harness for regression detection post-capture parity.
-6. **Documentation**
-   - Update contributor docs with minimum Python/macOS versions until the Python 3.13 build is reliable.
+## Immediate Roadmap
+
+1. **Fix Python 3.13 linker symbols**
+   - Investigate the macOS Python framework for `_Py_DecRefShared` and `_Py_MergeZeroLocalRefcount`.
+   - Possible solutions: link against the correct `libpython3.13t.a` / `.dylib`, adjust `setup.py` to add `-undefined dynamic_lookup`, or vendor the CPython Objects/abstract refcount objects as the official build does.
+   - Do not proceed to feature work until the launcher links cleanly.
+
+2. **Automate metallib regeneration**
+   - Add explicit build rules in `setup.py` or Makefile that call:
+     ```
+     xcrun metal -c kitty/metal/cell.metal -o build/metal/cell.air -mmacosx-version-min=13.0
+     xcrun metallib build/metal/cell.air -o kitty/metal/cell.metallib
+     ```
+   - Ensure these commands run whenever `cell.metal` changes (dependency tracking).
+   - Document the steps in developer docs, and add a validation step that fails the build if the metallib timestamp predates the shader source.
+
+3. **Re-enable Metal helper tests**
+   - Once the build produces the shared library, run `python3.13 test.py --module test_metal_helpers`.
+   - Expand coverage:
+     - Verify sampler cache repeat modes.
+     - Confirm `metal_compute_background_geometry` edge cases.
+     - Exercise capture helpers with BGRA and RGBA conversions.
+
+4. **Audit capture & teardown paths**
+   - Walk through `metal_backend_present`, `metal_capture_framebuffer`, `metal_finalize_capture`, and shutdown paths to ensure no leaks (buffers/textures, capture state).
+   - Mirror OpenGL capture semantics, especially for screenshots and remote control features.
+
+5. **Documentation / onboarding**
+   - Update project docs with: minimum macOS (13+), `python3.13` requirement, metallib workflow, known skip conditions.
+   - Summarise outstanding risks (Python link dependency, test skips) for the next engineer.
 
 ---
 
-## Quick Reference
-- Capture helpers: `metal_renderer_copy_captured_frame_for_tests`, `_debug_set_...`, `_debug_clear_...`.
-- Capture implementation: `metal_backend_present`, `metal_capture_framebuffer`, `metal_finalize_capture`, state fields on `MetalWindowState`.
-- Tests: `kitty_tests/test_metal_helpers.py` (draw flags, graphics uniforms, capture conversions).
-- Shader pipeline: `kitty/metal/cell.metal` (pending struct alignment fix).
-- Build command: `python3.13 setup.py build` (currently failing prior to tests).
+## Longer-Term Considerations
 
-Keep this memo sync’d after every significant Metal renderer change to avoid rediscovery.
+- Build automation: integrate Metal pipeline build into CI (macOS runner with Xcode toolchain).
+- Parity tests: design an image-diff harness comparing Metal vs OpenGL output for regressions.
+- Performance instrumentation: once functional, add toggles for Metal capture/logging akin to current OpenGL debug flags.
+
+Keep this file authoritative. When any of the objectives above change status, overwrite this document with the new ground truth.***

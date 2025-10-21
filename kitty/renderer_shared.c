@@ -373,7 +373,7 @@ renderer_shared_prepare_bar_surface(
     WindowBarData *bar,
     PyObject *title,
     unsigned int screen_width_px,
-    unsigned int screen_height_px,
+    unsigned int screen_height_px UNUSED,
     unsigned int cell_height_px,
     bool along_bottom,
     RendererSharedBarSurface *out_surface
@@ -462,7 +462,7 @@ renderer_shared_prepare_window_number(
     unsigned int screen_height_px,
     unsigned int screen_left_px,
     unsigned int screen_top_px,
-    unsigned int framebuffer_height_px,
+    unsigned int framebuffer_height_px UNUSED,
     unsigned int cell_width_px,
     unsigned int cell_height_px,
     unsigned int title_bar_height_px,
@@ -623,7 +623,8 @@ renderer_shared_test_scrollbar_metrics(
     screen.scrolled_by = scrolled_by;
     screen.lines = (unsigned int)((double)screen_height_px / (double)MAX(cell_height_px, 1u));
     screen.columns = (unsigned int)((double)screen_width_px / (double)MAX(cell_width_px, 1u));
-    linebuf.cpu_cells = NULL;
+    linebuf.cpu_cell_buf = NULL;
+    linebuf.gpu_cell_buf = NULL;
     screen.linebuf = &linebuf;
     screen.main_linebuf = &linebuf;
 

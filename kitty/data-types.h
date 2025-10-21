@@ -119,6 +119,7 @@ typedef enum BackgroundImageLayout {
     CENTER_CLAMPED,
     CENTER_SCALED
 } BackgroundImageLayout;
+#define BACKGROUND_IMAGE_LAYOUT_DEFINED 1
 typedef struct ImageAnchorPosition {
     float canvas_x, canvas_y, image_x, image_y;
 } ImageAnchorPosition;

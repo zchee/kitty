@@ -17,13 +17,13 @@ constant uint REVERSE_SHIFT = 5u;
 constant uint STRIKE_SHIFT = 6u;
 constant uint DIM_SHIFT = 7u;
 constant uint BLINK_SHIFT = 8u;
-constant uint MARK_SHIFT = 9u;
+constant uint MARK_SHIFT [[maybe_unused]] = 9u;
 constant uint COLOR_NOT_SET = 0u;
 constant uint COLOR_IS_SPECIAL = 1u;
 constant uint COLOR_IS_INDEX = 2u;
 constant uint COLOR_IS_RGB = 3u;
 
-constant uint CELL_CURSOR_SHAPE_NONE = 0u;
+constant uint CELL_CURSOR_SHAPE_NONE [[maybe_unused]] = 0u;
 constant uint CELL_CURSOR_SHAPE_BLOCK = 1u;
 constant uint CELL_CURSOR_SHAPE_BEAM = 2u;
 constant uint CELL_CURSOR_SHAPE_UNDERLINE = 3u;
@@ -453,7 +453,7 @@ struct BorderVertexOut {
     float4 color_premul;
 };
 
-constant uint DEFAULT_BG = 0u;
+constant uint DEFAULT_BG [[maybe_unused]] = 0u;
 constant uint ACTIVE_BORDER_COLOR = 1u;
 constant uint INACTIVE_BORDER_COLOR = 2u;
 constant uint WINDOW_BACKGROUND_PLACEHOLDER = 3u;
@@ -553,6 +553,21 @@ struct GraphicsVertexOut {
     float2 texcoord;
 };
 
+struct MetalGraphicsUniforms {
+    float4 src_rect;
+    float4 dest_rect;
+    float extra_alpha;
+    float _pad[3];
+};
+
+struct MetalGraphicsAlphaUniforms {
+    float4 src_rect;
+    float4 dest_rect;
+    float3 foreground_rgb;
+    float _pad0;
+    float4 background_premul;
+};
+
 vertex GraphicsVertexOut
 graphics_vertex(uint vertex_id [[vertex_id]], constant MetalGraphicsUniforms &uniforms [[buffer(0)]]) {
     const float2 dest_points[4] = {
@@ -618,7 +633,7 @@ graphics_alpha_vertex(uint vertex_id [[vertex_id]], constant MetalGraphicsAlphaU
 fragment float4
 graphics_alpha_fragment(GraphicsAlphaVertexOut in [[stage_in]], texture2d<float> image [[texture(0)]], sampler smp [[sampler(0)]], constant MetalGraphicsAlphaUniforms &uniforms [[buffer(1)]]) {
     float mask = image.sample(smp, in.texcoord).r;
-    float4 fg = vec4_premul(float4(uniforms.foreground_rgb * mask, mask));
+    float4 fg = vec4_premul(uniforms.foreground_rgb, mask);
     return alpha_blend_premul(fg, uniforms.background_premul);
 }
 

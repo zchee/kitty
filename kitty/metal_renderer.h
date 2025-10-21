@@ -7,7 +7,6 @@
 #include "renderer_backend_types.h"
 
 struct BackgroundImage;
-enum BackgroundImageLayout;
 
 #ifdef __cplusplus
 extern "C" {
@@ -76,10 +75,10 @@ EXPORTED bool metal_compute_background_geometry(
     unsigned int framebuffer_height,
     unsigned int image_width,
     unsigned int image_height,
-    enum BackgroundImageLayout layout,
+    unsigned int layout,
     MetalBackgroundGeometry *out_geometry);
 
-EXPORTED void metal_background_image_uploaded(struct BackgroundImage *bgimage, enum BackgroundImageLayout layout, bool linear_filter);
+EXPORTED void metal_background_image_uploaded(struct BackgroundImage *bgimage, unsigned int layout, bool linear_filter);
 EXPORTED void metal_background_image_release(struct BackgroundImage *bgimage);
 
 typedef struct MetalGraphicsTextureDebugInfo {
@@ -101,6 +100,10 @@ typedef struct MetalCapturedFrameDebugInfo {
     uint32_t bytes_per_row;
     const uint8_t *pixels;
 } MetalCapturedFrameDebugInfo;
+
+_Static_assert(sizeof(MetalTrailUniforms) == 64, "MetalTrailUniforms layout mismatch");
+_Static_assert(sizeof(MetalGraphicsUniforms) == 48, "MetalGraphicsUniforms layout mismatch");
+_Static_assert(sizeof(MetalGraphicsAlphaUniforms) == 64, "MetalGraphicsAlphaUniforms layout mismatch");
 
 EXPORTED bool metal_renderer_copy_captured_frame_for_tests(MetalCapturedFrameDebugInfo *out_info);
 EXPORTED bool metal_renderer_debug_set_captured_frame_for_tests(

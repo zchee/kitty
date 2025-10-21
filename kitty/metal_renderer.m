@@ -516,8 +516,14 @@ static bool ensure_command_primitives(GLFWwindow *window, MetalWindowState *stat
 static void encode_draw_end(id<MTLRenderCommandEncoder> encoder);
 static void set_preflight_failure(const char *reason);
 static MTLClearColor clear_color_from(color_type color, float alpha);
-static bool metal_encode_cells(GLFWwindow *window, MetalWindowState *state, MetalSpriteAtlas *atlas, size_t instance_count);
-static bool metal_encode_background(GLFWwindow *window, MetalWindowState *state, OSWindow *os_window);
+static bool metal_encode_cell_pass(GLFWwindow *window, MetalWindowState *state, MetalSpriteAtlas *atlas, size_t instance_count, uint32_t draw_bg_mask, bool draw_foreground, bool allow_clear);
+static bool metal_encode_background(GLFWwindow *window, MetalWindowState *state, OSWindow *os_window, color_type fallback_bg);
+static bool metal_encode_background_tint(GLFWwindow *window, MetalWindowState *state, color_type background_color);
+static bool metal_prepare_window_logo_image(Window *window, unsigned int screen_width, unsigned int screen_height, float inactive_alpha, ImageRenderData *out_image, float *out_extra_alpha);
+static bool metal_encode_visual_bell(GLFWwindow *window, MetalWindowState *state, Screen *screen);
+static bool metal_encode_scrollbar(GLFWwindow *window, MetalWindowState *state, OSWindow *os_window, Window *render_window, Screen *screen, const WindowGeometry *geometry, unsigned int screen_width_px, unsigned int screen_height_px);
+static bool metal_encode_hyperlink_target(GLFWwindow *window, MetalWindowState *state, OSWindow *os_window, Window *render_window, Screen *screen, const WindowGeometry *geometry, unsigned int screen_width_px, unsigned int screen_height_px);
+static bool metal_encode_window_number(GLFWwindow *window, MetalWindowState *state, OSWindow *os_window, Window *render_window, Screen *screen, const WindowGeometry *geometry, unsigned int screen_width_px, unsigned int screen_height_px);
 static bool encode_clear_pass(GLFWwindow *window, MetalWindowState *state, MTLClearColor clear_color);
 static MetalBackgroundTexture* metal_background_texture(BackgroundImage *bgimage);
 static bool metal_background_texture_ensure_ready(MetalBackgroundTexture *background);
@@ -526,6 +532,8 @@ static void metal_clear_last_capture(void);
 static void metal_set_last_capture(const uint8_t *pixels, size_t length, uint32_t width, uint32_t height, uint32_t bytes_per_row, bool owns_memory);
 static bool metal_capture_framebuffer(MetalWindowState *state);
 static void metal_finalize_capture(MetalWindowState *state);
+static bool metal_backend_upload_graphics_image(TextureRef *ref, const RendererGraphicsImageUpload *upload);
+static void metal_backend_destroy_graphics_image(TextureRef *ref);
 
 static void *
 metal_shared_buffer_map(RendererSharedBufferType type, size_t size, void *user) {
@@ -1350,8 +1358,6 @@ metal_ensure_resources(void) {
         }
         g_metal.graphics_alpha_pipeline = pipeline;
     }
-
-    }
     if (!g_metal.atlas_sampler) {
         MTLSamplerDescriptor *sampler = [[MTLSamplerDescriptor alloc] init];
         sampler.label = @"kitty-atlas";
@@ -1589,7 +1595,7 @@ metal_pipeline_for_graphics_texture(const MetalGraphicsTexture *texture) {
         return nil;
     }
     if (texture.isOpaque) {
-        return g_metal.graphics_premult_pipeline ?: g_metal.graphics_pipeline;
+        return g_metal.graphics_premult_pipeline ? g_metal.graphics_premult_pipeline : g_metal.graphics_pipeline;
     }
     return g_metal.graphics_pipeline;
 }
@@ -2636,7 +2642,7 @@ metal_encode_background_tint(GLFWwindow *window, MetalWindowState *state, color_
     if (!state || OPT(background_tint) <= 0.f) {
         return true;
     }
-    if (!state->commandBuffer || !state->drawable) {
+    if (!state.commandBuffer || !state.drawable) {
         if (!ensure_command_primitives(window, state)) {
             return false;
         }
@@ -2650,10 +2656,10 @@ metal_encode_background_tint(GLFWwindow *window, MetalWindowState *state, color_
             PyErr_SetString(PyExc_RuntimeError, "Failed to allocate Metal render pass descriptor for background tint");
             return false;
         }
-        pass.colorAttachments[0].texture = state->drawable.texture;
+        pass.colorAttachments[0].texture = state.drawable.texture;
         pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-        pass.colorAttachments[0].clearColor = state->clearColor;
+        pass.colorAttachments[0].clearColor = state.clearColor;
         id<MTLRenderCommandEncoder> encoder = [state.commandBuffer renderCommandEncoderWithDescriptor:pass];
         if (!encoder) {
             PyErr_SetString(PyExc_RuntimeError, "Failed to create Metal command encoder for background tint");
@@ -2665,8 +2671,8 @@ metal_encode_background_tint(GLFWwindow *window, MetalWindowState *state, color_
         [encoder setViewport:(MTLViewport){
             .originX = 0.0,
             .originY = 0.0,
-            .width = state->drawable.texture.width,
-            .height = state->drawable.texture.height,
+            .width = state.drawable.texture.width,
+            .height = state.drawable.texture.height,
             .znear = 0.0,
             .zfar = 1.0
         }];
@@ -2680,7 +2686,7 @@ metal_encode_background_tint(GLFWwindow *window, MetalWindowState *state, color_
         [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
         encode_draw_end(encoder);
     }
-    state->frameHasContent = YES;
+    state.frameHasContent = YES;
     return true;
 }
 
@@ -2705,7 +2711,7 @@ metal_encode_background(
         }
         return true;
     }
-    if (!state->commandBuffer || !state->drawable) {
+    if (!state.commandBuffer || !state.drawable) {
         if (!ensure_command_primitives(window, state)) {
             return false;
         }
@@ -2713,8 +2719,8 @@ metal_encode_background(
     if (!metal_ensure_resources()) {
         return false;
     }
-    const unsigned int fb_width = (unsigned int)state->drawable.texture.width;
-    const unsigned int fb_height = (unsigned int)state->drawable.texture.height;
+    const unsigned int fb_width = (unsigned int)state.drawable.texture.width;
+    const unsigned int fb_height = (unsigned int)state.drawable.texture.height;
     MetalBackgroundGeometry geometry = {0};
     if (!metal_compute_background_geometry(
             fb_width,
@@ -2738,10 +2744,10 @@ metal_encode_background(
             PyErr_SetString(PyExc_RuntimeError, "Failed to allocate Metal render pass descriptor for background image");
             return false;
         }
-        pass.colorAttachments[0].texture = state->drawable.texture;
-        pass.colorAttachments[0].loadAction = state->frameHasContent ? MTLLoadActionLoad : MTLLoadActionClear;
+        pass.colorAttachments[0].texture = state.drawable.texture;
+        pass.colorAttachments[0].loadAction = state.frameHasContent ? MTLLoadActionLoad : MTLLoadActionClear;
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-        pass.colorAttachments[0].clearColor = state->clearColor;
+        pass.colorAttachments[0].clearColor = state.clearColor;
         id<MTLRenderCommandEncoder> encoder = [state.commandBuffer renderCommandEncoderWithDescriptor:pass];
         if (!encoder) {
             PyErr_SetString(PyExc_RuntimeError, "Failed to create Metal command encoder for background image");
@@ -2772,11 +2778,15 @@ metal_encode_background(
         };
         [encoder setViewport:viewport];
         [encoder setRenderPipelineState:g_metal.overlay_texture_pipeline];
+        const bool is_tiled = geometry.tiled != 0.f;
+        const float scale_x = (is_tiled && geometry.sizes[2] > 0.f)
+            ? geometry.sizes[0] / geometry.sizes[2]
+            : 1.f;
+        const float scale_y = (is_tiled && geometry.sizes[3] > 0.f)
+            ? geometry.sizes[1] / geometry.sizes[3]
+            : 1.f;
         MetalOverlayTextureUniforms uniforms = {
-            .tex_scale = {
-                (geometry.tiled && geometry.sizes[2] > 0.f) ? geometry.sizes[0] / geometry.sizes[2] : 1.f,
-                (geometry.tiled && geometry.sizes[3] > 0.f) ? geometry.sizes[1] / geometry.sizes[3] : 1.f,
-            },
+            .tex_scale = { scale_x, scale_y },
         };
         [encoder setVertexBytes:&uniforms length:sizeof uniforms atIndex:0];
         [encoder setFragmentTexture:background->texture atIndex:0];
@@ -2805,7 +2815,7 @@ metal_encode_background(
         [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
         encode_draw_end(encoder);
     }
-    state->frameHasContent = YES;
+    state.frameHasContent = YES;
     if (OPT(background_tint) > 0.f) {
         if (!metal_encode_background_tint(window, state, fallback_bg)) {
             return false;
@@ -2979,8 +2989,9 @@ metal_window_logo_ensure_texture(WindowLogo *logo) {
         if (logo->metal_texture) {
             CFRelease(logo->metal_texture);
         }
-        logo->metal_texture = CFBridgingRetain(new_texture);
+        logo->metal_texture = (void *)CFBridgingRetain(new_texture);
         texture = new_texture;
+        [new_texture release];
         if (logo->bitmap) {
             if (logo->mmap_size) {
                 munmap(logo->bitmap, logo->mmap_size);
@@ -3150,7 +3161,7 @@ metal_encode_visual_bell(GLFWwindow *window, MetalWindowState *state, Screen *sc
     if (intensity <= 0.f) {
         return true;
     }
-    if (!state->commandBuffer || !state->drawable) {
+    if (!state.commandBuffer || !state.drawable) {
         if (!ensure_command_primitives(window, state)) {
             return false;
         }
@@ -3193,12 +3204,12 @@ metal_encode_visual_bell(GLFWwindow *window, MetalWindowState *state, Screen *sc
         PyErr_SetString(PyExc_RuntimeError, "Failed to allocate Metal render pass descriptor for visual bell");
         return false;
     }
-    pass.colorAttachments[0].texture = state->drawable.texture;
+    pass.colorAttachments[0].texture = state.drawable.texture;
     pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
     pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-    pass.colorAttachments[0].clearColor = state->clearColor;
+    pass.colorAttachments[0].clearColor = state.clearColor;
 
-    id<MTLRenderCommandEncoder> encoder = [state->commandBuffer renderCommandEncoderWithDescriptor:pass];
+    id<MTLRenderCommandEncoder> encoder = [state.commandBuffer renderCommandEncoderWithDescriptor:pass];
     if (!encoder) {
         PyErr_SetString(PyExc_RuntimeError, "Failed to create Metal encoder for visual bell");
         return false;
@@ -3209,8 +3220,8 @@ metal_encode_visual_bell(GLFWwindow *window, MetalWindowState *state, Screen *sc
     [encoder setViewport:(MTLViewport){
         .originX = 0.0,
         .originY = 0.0,
-        .width = state->drawable.texture.width,
-        .height = state->drawable.texture.height,
+        .width = state.drawable.texture.width,
+        .height = state.drawable.texture.height,
         .znear = 0.0,
         .zfar = 1.0
     }];
@@ -3223,7 +3234,7 @@ metal_encode_visual_bell(GLFWwindow *window, MetalWindowState *state, Screen *sc
     [encoder setFragmentBytes:&uniforms length:sizeof uniforms atIndex:0];
     [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
     encode_draw_end(encoder);
-    state->frameHasContent = YES;
+    state.frameHasContent = YES;
     return true;
 }
 
@@ -3256,7 +3267,7 @@ metal_encode_scrollbar(
             &metrics) || !metrics.visible) {
         return true;
     }
-    if (!state->commandBuffer || !state->drawable) {
+    if (!state.commandBuffer || !state.drawable) {
         if (!ensure_command_primitives(window, state)) {
             return false;
         }
@@ -3278,11 +3289,11 @@ metal_encode_scrollbar(
             PyErr_SetString(PyExc_RuntimeError, "Failed to allocate Metal pass descriptor for scrollbar track");
             return false;
         }
-        pass.colorAttachments[0].texture = state->drawable.texture;
+        pass.colorAttachments[0].texture = state.drawable.texture;
         pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-        pass.colorAttachments[0].clearColor = state->clearColor;
-        id<MTLRenderCommandEncoder> encoder = [state->commandBuffer renderCommandEncoderWithDescriptor:pass];
+        pass.colorAttachments[0].clearColor = state.clearColor;
+        id<MTLRenderCommandEncoder> encoder = [state.commandBuffer renderCommandEncoderWithDescriptor:pass];
         if (!encoder) {
             PyErr_SetString(PyExc_RuntimeError, "Failed to create Metal encoder for scrollbar track");
             return false;
@@ -3293,8 +3304,8 @@ metal_encode_scrollbar(
         [encoder setViewport:(MTLViewport){
             .originX = 0.0,
             .originY = 0.0,
-            .width = state->drawable.texture.width,
-            .height = state->drawable.texture.height,
+            .width = state.drawable.texture.width,
+            .height = state.drawable.texture.height,
             .znear = 0.0,
             .zfar = 1.0
         }];
@@ -3307,7 +3318,7 @@ metal_encode_scrollbar(
         [encoder setFragmentBytes:&tint_uniforms length:sizeof tint_uniforms atIndex:0];
         [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
         encode_draw_end(encoder);
-        state->frameHasContent = YES;
+        state.frameHasContent = YES;
     }
 
     if (metrics.handle_opacity <= 0.f) {
@@ -3320,11 +3331,11 @@ metal_encode_scrollbar(
             PyErr_SetString(PyExc_RuntimeError, "Failed to allocate Metal pass descriptor for scrollbar handle");
             return false;
         }
-        pass.colorAttachments[0].texture = state->drawable.texture;
+        pass.colorAttachments[0].texture = state.drawable.texture;
         pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-        pass.colorAttachments[0].clearColor = state->clearColor;
-        id<MTLRenderCommandEncoder> encoder = [state->commandBuffer renderCommandEncoderWithDescriptor:pass];
+        pass.colorAttachments[0].clearColor = state.clearColor;
+        id<MTLRenderCommandEncoder> encoder = [state.commandBuffer renderCommandEncoderWithDescriptor:pass];
         if (!encoder) {
             PyErr_SetString(PyExc_RuntimeError, "Failed to create Metal encoder for rounded scrollbar handle");
             return false;
@@ -3352,18 +3363,18 @@ metal_encode_scrollbar(
         [encoder setFragmentBytes:&uniforms length:sizeof uniforms atIndex:1];
         [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
         encode_draw_end(encoder);
-        state->frameHasContent = YES;
+        state.frameHasContent = YES;
     } else {
         MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
         if (!pass) {
             PyErr_SetString(PyExc_RuntimeError, "Failed to allocate Metal pass descriptor for scrollbar handle");
             return false;
         }
-        pass.colorAttachments[0].texture = state->drawable.texture;
+        pass.colorAttachments[0].texture = state.drawable.texture;
         pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-        pass.colorAttachments[0].clearColor = state->clearColor;
-        id<MTLRenderCommandEncoder> encoder = [state->commandBuffer renderCommandEncoderWithDescriptor:pass];
+        pass.colorAttachments[0].clearColor = state.clearColor;
+        id<MTLRenderCommandEncoder> encoder = [state.commandBuffer renderCommandEncoderWithDescriptor:pass];
         if (!encoder) {
             PyErr_SetString(PyExc_RuntimeError, "Failed to create Metal encoder for scrollbar handle");
             return false;
@@ -3374,8 +3385,8 @@ metal_encode_scrollbar(
         [encoder setViewport:(MTLViewport){
             .originX = 0.0,
             .originY = 0.0,
-            .width = state->drawable.texture.width,
-            .height = state->drawable.texture.height,
+            .width = state.drawable.texture.width,
+            .height = state.drawable.texture.height,
             .znear = 0.0,
             .zfar = 1.0
         }];
@@ -3389,7 +3400,7 @@ metal_encode_scrollbar(
         [encoder setFragmentBytes:&tint_uniforms length:sizeof tint_uniforms atIndex:0];
         [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
         encode_draw_end(encoder);
-        state->frameHasContent = YES;
+        state.frameHasContent = YES;
     }
     return true;
 }
@@ -3452,7 +3463,7 @@ metal_encode_window_number(
     if (!metal_backend_upload_graphics_image(&metal_window_number_texture, &upload)) {
         return false;
     }
-    if (!state->commandBuffer || !state->drawable) {
+    if (!state.commandBuffer || !state.drawable) {
         if (!ensure_command_primitives(window, state)) {
             return false;
         }
@@ -3522,7 +3533,7 @@ metal_encode_hyperlink_target(
     int inner_left = rect_left + (int)border;
     int inner_top = rect_top + (int)border;
 
-    if (!state->commandBuffer || !state->drawable) {
+    if (!state.commandBuffer || !state.drawable) {
         if (!ensure_command_primitives(window, state)) {
             return false;
         }
@@ -3539,11 +3550,11 @@ metal_encode_hyperlink_target(
             PyErr_SetString(PyExc_RuntimeError, "Failed to allocate Metal pass descriptor for hyperlink border");
             return false;
         }
-        pass.colorAttachments[0].texture = state->drawable.texture;
+        pass.colorAttachments[0].texture = state.drawable.texture;
         pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-        pass.colorAttachments[0].clearColor = state->clearColor;
-        id<MTLRenderCommandEncoder> encoder = [state->commandBuffer renderCommandEncoderWithDescriptor:pass];
+        pass.colorAttachments[0].clearColor = state.clearColor;
+        id<MTLRenderCommandEncoder> encoder = [state.commandBuffer renderCommandEncoderWithDescriptor:pass];
         if (!encoder) {
             PyErr_SetString(PyExc_RuntimeError, "Failed to create Metal encoder for hyperlink border");
             return false;
@@ -3569,7 +3580,7 @@ metal_encode_hyperlink_target(
         [encoder setFragmentBytes:&tint_uniforms length:sizeof tint_uniforms atIndex:0];
         [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
         encode_draw_end(encoder);
-        state->frameHasContent = YES;
+        state.frameHasContent = YES;
     }
 
     {
@@ -3578,11 +3589,11 @@ metal_encode_hyperlink_target(
             PyErr_SetString(PyExc_RuntimeError, "Failed to allocate Metal pass descriptor for hyperlink background");
             return false;
         }
-        pass.colorAttachments[0].texture = state->drawable.texture;
+        pass.colorAttachments[0].texture = state.drawable.texture;
         pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-        pass.colorAttachments[0].clearColor = state->clearColor;
-        id<MTLRenderCommandEncoder> encoder = [state->commandBuffer renderCommandEncoderWithDescriptor:pass];
+        pass.colorAttachments[0].clearColor = state.clearColor;
+        id<MTLRenderCommandEncoder> encoder = [state.commandBuffer renderCommandEncoderWithDescriptor:pass];
         if (!encoder) {
             PyErr_SetString(PyExc_RuntimeError, "Failed to create Metal encoder for hyperlink background");
             return false;
@@ -3608,7 +3619,7 @@ metal_encode_hyperlink_target(
         [encoder setFragmentBytes:&tint_uniforms length:sizeof tint_uniforms atIndex:0];
         [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
         encode_draw_end(encoder);
-        state->frameHasContent = YES;
+        state.frameHasContent = YES;
     }
 
     RendererGraphicsImageUpload upload = {
@@ -3666,12 +3677,9 @@ metal_backend_upload_graphics_image(TextureRef *ref, const RendererGraphicsImage
     if (!validate_graphics_upload_args(ref, upload)) {
         return false;
     }
-    if (ref->backend_handle) {
-        MetalGraphicsTexture *existing = (__bridge_transfer MetalGraphicsTexture *)ref->backend_handle;
+    if (ref->backend_handle && ref->id) {
+        [graphics_texture_table() removeObjectForKey:@(ref->id)];
         ref->backend_handle = NULL;
-        if (existing && ref->id) {
-            [graphics_texture_table() removeObjectForKey:@(ref->id)];
-        }
     }
 
     const uint32_t width = (uint32_t)upload->width;
@@ -3761,7 +3769,8 @@ metal_backend_upload_graphics_image(TextureRef *ref, const RendererGraphicsImage
     }
 
     [graphics_texture_table() setObject:holder forKey:@(ref->id)];
-    ref->backend_handle = (__bridge_retained void *)holder;
+    ref->backend_handle = (void *)holder;
+    [holder release];
     return true;
 }
 
@@ -3770,13 +3779,9 @@ metal_backend_destroy_graphics_image(TextureRef *ref) {
     if (!ref) {
         return;
     }
-    if (ref->backend_handle) {
+    if (ref->backend_handle || ref->id) {
         [graphics_texture_table() removeObjectForKey:@(ref->id)];
-        MetalGraphicsTexture *texture = (__bridge_transfer MetalGraphicsTexture *)ref->backend_handle;
-        (void)texture;
         ref->backend_handle = NULL;
-    } else if (ref->id) {
-        [graphics_texture_table() removeObjectForKey:@(ref->id)];
     }
     ref->id = 0;
 }
