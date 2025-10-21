@@ -10,6 +10,10 @@ kitty is a fast, feature-rich, GPU-based terminal emulator written in a multi-la
 - **Go**: CLI tools and "kittens" (plugins)
 - **GLSL**: GPU shaders for rendering
 
+## Metal references
+- [Metal | Apple Developer Documentation](https://developer.apple.com/documentation/metal?language=objc)
+- [Migrating OpenGL code to Metal Sample Code](file:///Users/zchee/src/github.com/zchee/apple-metal-samples/MigratingOpenGLCodeToMetal)
+
 ## Build System
 
 The build system is Python-based using `setup.py` as the main orchestrator. It handles:
@@ -22,7 +26,7 @@ The build system is Python-based using `setup.py` as the main orchestrator. It h
 
 ```bash
 # Standard build
-python3 setup.py
+python3.13 setup.py
 
 # Development build (via Makefile)
 make devel          # Full development build with code signing (macOS)
@@ -30,18 +34,18 @@ make all            # Standard build
 make clean          # Clean build artifacts
 
 # Debug builds
-python3 setup.py build --debug                    # Debug build
-python3 setup.py build --debug --sanitize         # With ASAN/UBSAN
-python3 setup.py build --debug --extra-logging=event-loop  # Extra logging
+python3.13 setup.py build --debug                    # Debug build
+python3.13 setup.py build --debug --sanitize         # With ASAN/UBSAN
+python3.13 setup.py build --debug --extra-logging=event-loop  # Extra logging
 
 # Profile build
-python3 setup.py build --profile
+python3.13 setup.py build --profile
 
 # macOS app bundle
-python3 setup.py kitty.app
+python3.13 setup.py kitty.app
 
 # Linux package
-python3 setup.py linux-package
+python3.13 setup.py linux-package
 ```
 
 **Important**: The `setup.py` file is ~2000 lines and handles complex platform-specific logic. When modifying the build system, always check for platform-specific conditionals (`is_macos`, `is_windows`, `is_bsd`).
@@ -78,7 +82,7 @@ Tests are integrated across Python and Go codebases.
 
 ```bash
 # Python type checking (mypy with strict settings in pyproject.toml)
-python3 -m mypy --pretty
+python3.13 -m mypy --pretty
 
 # Python linting (ruff)
 ruff check .
@@ -276,11 +280,11 @@ Code generation happens during build:
 
 ```bash
 # Generate Go constants from Python
-python3 setup.py               # Runs during normal build
+python3.13 setup.py               # Runs during normal build
 
 # Force regeneration
 rm constants_generated.go gen/* build/*
-python3 setup.py
+python3.13 setup.py
 ```
 
 Generated files:
@@ -317,7 +321,7 @@ make cross-compile
 Install build dependencies as documented at: https://sw.kovidgoyal.net/kitty/build/#dependencies
 
 Required:
-- Python 3.10+ (see `pyproject.toml` for exact version)
+- Python 3.13+ (see `pyproject.toml` for exact version)
 - Go 1.24+ (see `go.mod` for exact version)
 - C compiler (clang preferred, gcc supported)
 - pkg-config
