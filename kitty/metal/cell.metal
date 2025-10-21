@@ -102,7 +102,9 @@ struct MetalDrawParams {
     float text_contrast;
     float text_gamma_adjustment;
     uint decorations_count;
-    uint padding;
+    uint draw_background_mask;
+    uint draw_foreground;
+    float extra_alpha;
     float viewport_scale_x;
     float viewport_scale_y;
     float viewport_origin_x;
@@ -392,9 +394,13 @@ vertex VertexOut cell_vertex(
     background_rgb = mix(background_rgb, mix(fg, color_to_vec(u.highlight_bg), u.use_cell_for_selection_bg), float(is_selected));
 
     out.background = background_rgb;
-    out.effective_background_premul = vec4_premul(background_rgb, bg_alpha);
+    float cell_has_non_default_bg = 1.f - cell_has_default_bg;
+    uint draw_bg_mask = uint(2.f * cell_has_non_default_bg + cell_has_default_bg);
+    float draw_bg = step(0.5f, float(params.draw_background_mask & draw_bg_mask));
+    out.effective_background_premul = vec4_premul(background_rgb, bg_alpha * draw_bg);
     out.cell_foreground = fg;
     out.decoration_fg = deco_fg;
+    out.effective_text_alpha *= float(params.draw_foreground);
 
     return out;
 }
@@ -407,13 +413,14 @@ fragment float4 cell_fragment(
     constant MetalDrawParams &params [[buffer(1)]]
 ) {
     float4 background = in.effective_background_premul;
+    float draw_foreground = float(params.draw_foreground);
     float4 text_sample = sprites.sample(atlas_sampler, in.sprite_pos.xy, uint(in.sprite_pos.z));
-    float4 text_fg = float4(mix(in.cell_foreground, text_sample.rgb, in.colored_sprite), text_sample.a * in.effective_text_alpha);
+    float4 text_fg = float4(mix(in.cell_foreground, text_sample.rgb, in.colored_sprite), text_sample.a * in.effective_text_alpha * draw_foreground);
     text_fg = foreground_contrast(text_fg, in.background, params.text_contrast, params.text_gamma_adjustment);
 
-    float strike_alpha = sprites.sample(atlas_sampler, in.strike_pos.xy, uint(in.strike_pos.z)).a * in.effective_text_alpha;
-    float underline_alpha = sprites.sample(atlas_sampler, in.underline_pos.xy, uint(in.underline_pos.z)).a * in.effective_text_alpha;
-    float cursor_alpha = sprites.sample(atlas_sampler, in.cursor_pos.xy, uint(in.cursor_pos.z)).a;
+    float strike_alpha = sprites.sample(atlas_sampler, in.strike_pos.xy, uint(in.strike_pos.z)).a * in.effective_text_alpha * draw_foreground;
+    float underline_alpha = sprites.sample(atlas_sampler, in.underline_pos.xy, uint(in.underline_pos.z)).a * in.effective_text_alpha * draw_foreground;
+    float cursor_alpha = sprites.sample(atlas_sampler, in.cursor_pos.xy, uint(in.cursor_pos.z)).a * draw_foreground;
 
     float4 cursor_color = in.cursor_color_premult;
     float4 decorations = float4(in.decoration_fg * underline_alpha, underline_alpha);
@@ -539,6 +546,80 @@ fragment float4 trail_fragment(
     uint b = color_raw & 0xffu;
     float3 color_rgb = float3(gamma_lut[r], gamma_lut[g], gamma_lut[b]);
     return float4(color_rgb * opacity, opacity);
+}
+
+struct GraphicsVertexOut {
+    float4 position [[position]];
+    float2 texcoord;
+};
+
+vertex GraphicsVertexOut
+graphics_vertex(uint vertex_id [[vertex_id]], constant MetalGraphicsUniforms &uniforms [[buffer(0)]]) {
+    const float2 dest_points[4] = {
+        float2(uniforms.dest_rect.x, uniforms.dest_rect.y),
+        float2(uniforms.dest_rect.x, uniforms.dest_rect.w),
+        float2(uniforms.dest_rect.z, uniforms.dest_rect.w),
+        float2(uniforms.dest_rect.z, uniforms.dest_rect.y)
+    };
+    const float2 src_points[4] = {
+        float2(uniforms.src_rect.x, uniforms.src_rect.y),
+        float2(uniforms.src_rect.x, uniforms.src_rect.w),
+        float2(uniforms.src_rect.z, uniforms.src_rect.w),
+        float2(uniforms.src_rect.z, uniforms.src_rect.y)
+    };
+    GraphicsVertexOut out;
+    uint idx = vertex_id & 3u;
+    out.position = float4(dest_points[idx], 0.0f, 1.0f);
+    out.texcoord = src_points[idx];
+    return out;
+}
+
+fragment float4
+graphics_fragment(GraphicsVertexOut in [[stage_in]], texture2d<float> image [[texture(0)]], sampler smp [[sampler(0)]], constant MetalGraphicsUniforms &uniforms [[buffer(1)]]) {
+    float4 color = image.sample(smp, in.texcoord);
+    color.a *= uniforms.extra_alpha;
+    color.rgb *= color.a;
+    return color;
+}
+
+fragment float4
+graphics_premult_fragment(GraphicsVertexOut in [[stage_in]], texture2d<float> image [[texture(0)]], sampler smp [[sampler(0)]], constant MetalGraphicsUniforms &uniforms [[buffer(1)]]) {
+    float4 color = image.sample(smp, in.texcoord);
+    color *= uniforms.extra_alpha;
+    return color;
+}
+
+struct GraphicsAlphaVertexOut {
+    float4 position [[position]];
+    float2 texcoord;
+};
+
+vertex GraphicsAlphaVertexOut
+graphics_alpha_vertex(uint vertex_id [[vertex_id]], constant MetalGraphicsAlphaUniforms &uniforms [[buffer(0)]]) {
+    const float2 dest_points[4] = {
+        float2(uniforms.dest_rect.x, uniforms.dest_rect.y),
+        float2(uniforms.dest_rect.x, uniforms.dest_rect.w),
+        float2(uniforms.dest_rect.z, uniforms.dest_rect.w),
+        float2(uniforms.dest_rect.z, uniforms.dest_rect.y)
+    };
+    const float2 src_points[4] = {
+        float2(uniforms.src_rect.x, uniforms.src_rect.y),
+        float2(uniforms.src_rect.x, uniforms.src_rect.w),
+        float2(uniforms.src_rect.z, uniforms.src_rect.w),
+        float2(uniforms.src_rect.z, uniforms.src_rect.y)
+    };
+    GraphicsAlphaVertexOut out;
+    uint idx = vertex_id & 3u;
+    out.position = float4(dest_points[idx], 0.0f, 1.0f);
+    out.texcoord = src_points[idx];
+    return out;
+}
+
+fragment float4
+graphics_alpha_fragment(GraphicsAlphaVertexOut in [[stage_in]], texture2d<float> image [[texture(0)]], sampler smp [[sampler(0)]], constant MetalGraphicsAlphaUniforms &uniforms [[buffer(1)]]) {
+    float mask = image.sample(smp, in.texcoord).r;
+    float4 fg = vec4_premul(float4(uniforms.foreground_rgb * mask, mask));
+    return alpha_blend_premul(fg, uniforms.background_premul);
 }
 
 struct OverlayTintUniforms {

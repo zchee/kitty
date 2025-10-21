@@ -885,9 +885,9 @@ PyInit_fast_data_types(void) {
     if (PyType_Ready(&StreamingBase64Encoder_Type) < 0) return NULL;
     if (PyModule_AddObject(m, "StreamingBase64Encoder", (PyObject *) &StreamingBase64Encoder_Type) < 0) return NULL;
 
-#ifdef Py_GIL_DISABLED
-    PyUnstable_Module_SetGIL(m, Py_MOD_GIL_NOT_USED);
-#endif
+// #ifdef Py_GIL_DISABLED
+//     PyUnstable_Module_SetGIL(m, Py_MOD_GIL_NOT_USED);
+// #endif
 
     return m;
 }

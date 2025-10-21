@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.13t -Xgil=0 -OO
+#!/usr/bin/env python3.13
 # vim:fileencoding=utf-8
 # License: GPL v3 Copyright: 2017, Kovid Goyal <kovid at kovidgoyal.net>
 

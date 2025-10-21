@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 
 #ifdef MAX
 #undef MAX
@@ -24,6 +25,8 @@
 #include "renderer_backend_types.h"
 #include "renderer_shared.h"
 #include "fonts.h"
+#include "animation.h"
+#include "graphics.h"
 #include "data-types.h"
 #include "line.h"
 #include "state.h"
@@ -46,6 +49,15 @@ color_to_linear_premult(color_type color, float alpha) {
     float b = srgb_channel_to_linear(color & 0xFF);
     vector_float4 result = { r * alpha, g * alpha, b * alpha, alpha };
     return result;
+}
+
+static inline vector_float3
+color_to_linear_rgb(color_type color) {
+    return (vector_float3){
+        srgb_channel_to_linear((color >> 16) & 0xFF),
+        srgb_channel_to_linear((color >> 8) & 0xFF),
+        srgb_channel_to_linear(color & 0xFF)
+    };
 }
 
 enum {
@@ -108,12 +120,29 @@ typedef struct {
     float text_contrast;
     float text_gamma_adjustment;
     uint32_t decorations_count;
-    uint32_t padding;
+    uint32_t draw_background_mask;
+    uint32_t draw_foreground;
+    float extra_alpha;
     float viewport_scale_x;
     float viewport_scale_y;
     float viewport_origin_x;
     float viewport_origin_y;
 } MetalDrawParams;
+
+typedef struct {
+    vector_float4 src_rect;
+    vector_float4 dest_rect;
+    float extra_alpha;
+    float _pad[3];
+} MetalGraphicsUniforms;
+
+typedef struct {
+    vector_float4 src_rect;
+    vector_float4 dest_rect;
+    vector_float3 foreground_rgb;
+    float _pad0;
+    vector_float4 background_premul;
+} MetalGraphicsAlphaUniforms;
 
 typedef struct {
     float rect[4];
@@ -212,6 +241,22 @@ metal_cell_draw_flag_defaults(void) {
            METAL_CELL_DRAW_FLAG_ALLOW_EFFECTS;
 }
 
+enum {
+    METAL_DRAW_BG_DEFAULT = 1u,
+    METAL_DRAW_BG_NON_DEFAULT = 2u,
+    METAL_DRAW_BG_BOTH = 3u,
+};
+
+static inline void
+metal_apply_draw_flags(MetalDrawParams *params, uint32_t draw_bg_mask, bool draw_foreground) {
+    if (!params) {
+        return;
+    }
+    uint32_t preserved = params->draw_background_mask & ~METAL_DRAW_BG_BOTH;
+    params->draw_background_mask = preserved | (draw_bg_mask & METAL_DRAW_BG_BOTH);
+    params->draw_foreground = draw_foreground ? 1u : 0u;
+}
+
 bool
 metal_compute_background_geometry(
     unsigned int framebuffer_width,
@@ -294,6 +339,9 @@ typedef struct {
     id<MTLRenderPipelineState> rounded_rect_pipeline;
     id<MTLRenderPipelineState> overlay_texture_pipeline;
     id<MTLRenderPipelineState> alpha_mask_pipeline;
+    id<MTLRenderPipelineState> graphics_pipeline;
+    id<MTLRenderPipelineState> graphics_premult_pipeline;
+    id<MTLRenderPipelineState> graphics_alpha_pipeline;
     id<MTLSamplerState> atlas_sampler;
     bool initialized;
     bool prefer_low_latency;
@@ -312,6 +360,9 @@ static MetalGlobalState g_metal = {
     .rounded_rect_pipeline = nil,
     .overlay_texture_pipeline = nil,
     .alpha_mask_pipeline = nil,
+    .graphics_pipeline = nil,
+    .graphics_premult_pipeline = nil,
+    .graphics_alpha_pipeline = nil,
     .atlas_sampler = nil,
     .initialized = false,
     .prefer_low_latency = false,
@@ -354,6 +405,9 @@ static bool sprite_hooks_registered = false;
 @end
 
 static uint32_t next_graphics_texture_id = 1;
+
+static TextureRef metal_window_number_texture = {0};
+static TextureRef metal_hyperlink_texture = {0};
 
 static NSMapTable<NSNumber *, MetalGraphicsTexture *> *
 graphics_texture_table(void) {
@@ -800,6 +854,9 @@ metal_record_failure(const char *reason) {
     g_metal.rounded_rect_pipeline = nil;
     g_metal.overlay_texture_pipeline = nil;
     g_metal.alpha_mask_pipeline = nil;
+    g_metal.graphics_pipeline = nil;
+    g_metal.graphics_premult_pipeline = nil;
+    g_metal.graphics_alpha_pipeline = nil;
     g_metal.library = nil;
     g_metal.atlas_sampler = nil;
     g_metal.command_queue = nil;
@@ -994,6 +1051,7 @@ metal_ensure_resources(void) {
             return false;
         }
         g_metal.trail_pipeline = pipeline;
+    }
     if (!g_metal.tint_pipeline) {
         id<MTLFunction> vertex = [g_metal.library newFunctionWithName:@"kitty::overlay_tint_vertex"];
         if (!vertex) {
@@ -1139,6 +1197,120 @@ metal_ensure_resources(void) {
         g_metal.alpha_mask_pipeline = pipeline;
     }
 
+    if (!g_metal.graphics_pipeline) {
+        id<MTLFunction> vertex = [g_metal.library newFunctionWithName:@"kitty::graphics_vertex"];
+        if (!vertex) {
+            vertex = [g_metal.library newFunctionWithName:@"graphics_vertex"];
+        }
+        id<MTLFunction> fragment = [g_metal.library newFunctionWithName:@"kitty::graphics_fragment"];
+        if (!fragment) {
+            fragment = [g_metal.library newFunctionWithName:@"graphics_fragment"];
+        }
+        if (!vertex || !fragment) {
+            PyErr_SetString(PyExc_RuntimeError, "Metal graphics shader functions missing from library");
+            metal_record_failure("Required Metal graphics shader functions missing; falling back to OpenGL");
+            return false;
+        }
+        MTLRenderPipelineDescriptor *descriptor = [[MTLRenderPipelineDescriptor alloc] init];
+        descriptor.label = @"kitty-graphics";
+        descriptor.vertexFunction = vertex;
+        descriptor.fragmentFunction = fragment;
+        descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        descriptor.colorAttachments[0].blendingEnabled = YES;
+        descriptor.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+        descriptor.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+        descriptor.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+        descriptor.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+        descriptor.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        descriptor.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        NSError *error = nil;
+        id<MTLRenderPipelineState> pipeline =
+            [g_metal.device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+        if (!pipeline) {
+            const char *utf8 = error.localizedDescription ? error.localizedDescription.UTF8String : "unknown";
+            PyErr_Format(PyExc_RuntimeError, "Failed to create Metal graphics pipeline state: %s", utf8);
+            metal_record_failure("Failed to create Metal graphics pipeline; falling back to OpenGL");
+            return false;
+        }
+        g_metal.graphics_pipeline = pipeline;
+    }
+
+    if (!g_metal.graphics_premult_pipeline) {
+        id<MTLFunction> vertex = [g_metal.library newFunctionWithName:@"kitty::graphics_vertex"];
+        if (!vertex) {
+            vertex = [g_metal.library newFunctionWithName:@"graphics_vertex"];
+        }
+        id<MTLFunction> fragment = [g_metal.library newFunctionWithName:@"kitty::graphics_premult_fragment"];
+        if (!fragment) {
+            fragment = [g_metal.library newFunctionWithName:@"graphics_premult_fragment"];
+        }
+        if (!vertex || !fragment) {
+            PyErr_SetString(PyExc_RuntimeError, "Metal graphics premult shader functions missing from library");
+            metal_record_failure("Required Metal graphics premult shader functions missing; falling back to OpenGL");
+            return false;
+        }
+        MTLRenderPipelineDescriptor *descriptor = [[MTLRenderPipelineDescriptor alloc] init];
+        descriptor.label = @"kitty-graphics-premult";
+        descriptor.vertexFunction = vertex;
+        descriptor.fragmentFunction = fragment;
+        descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        descriptor.colorAttachments[0].blendingEnabled = YES;
+        descriptor.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+        descriptor.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+        descriptor.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+        descriptor.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+        descriptor.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        descriptor.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        NSError *error = nil;
+        id<MTLRenderPipelineState> pipeline =
+            [g_metal.device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+        if (!pipeline) {
+            const char *utf8 = error.localizedDescription ? error.localizedDescription.UTF8String : "unknown";
+            PyErr_Format(PyExc_RuntimeError, "Failed to create Metal graphics premult pipeline state: %s", utf8);
+            metal_record_failure("Failed to create Metal graphics premult pipeline; falling back to OpenGL");
+            return false;
+        }
+        g_metal.graphics_premult_pipeline = pipeline;
+    }
+
+    if (!g_metal.graphics_alpha_pipeline) {
+        id<MTLFunction> vertex = [g_metal.library newFunctionWithName:@"kitty::graphics_alpha_vertex"];
+        if (!vertex) {
+            vertex = [g_metal.library newFunctionWithName:@"graphics_alpha_vertex"];
+        }
+        id<MTLFunction> fragment = [g_metal.library newFunctionWithName:@"kitty::graphics_alpha_fragment"];
+        if (!fragment) {
+            fragment = [g_metal.library newFunctionWithName:@"graphics_alpha_fragment"];
+        }
+        if (!vertex || !fragment) {
+            PyErr_SetString(PyExc_RuntimeError, "Metal graphics alpha shader functions missing from library");
+            metal_record_failure("Required Metal graphics alpha shader functions missing; falling back to OpenGL");
+            return false;
+        }
+        MTLRenderPipelineDescriptor *descriptor = [[MTLRenderPipelineDescriptor alloc] init];
+        descriptor.label = @"kitty-graphics-alpha";
+        descriptor.vertexFunction = vertex;
+        descriptor.fragmentFunction = fragment;
+        descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        descriptor.colorAttachments[0].blendingEnabled = YES;
+        descriptor.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+        descriptor.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+        descriptor.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+        descriptor.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+        descriptor.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        descriptor.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        NSError *error = nil;
+        id<MTLRenderPipelineState> pipeline =
+            [g_metal.device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+        if (!pipeline) {
+            const char *utf8 = error.localizedDescription ? error.localizedDescription.UTF8String : "unknown";
+            PyErr_Format(PyExc_RuntimeError, "Failed to create Metal graphics alpha pipeline state: %s", utf8);
+            metal_record_failure("Failed to create Metal graphics alpha pipeline; falling back to OpenGL");
+            return false;
+        }
+        g_metal.graphics_alpha_pipeline = pipeline;
+    }
+
     }
     if (!g_metal.atlas_sampler) {
         MTLSamplerDescriptor *sampler = [[MTLSamplerDescriptor alloc] init];
@@ -1215,7 +1387,9 @@ metal_populate_uniforms(MetalWindowState *state, Screen *screen, OSWindow *os_wi
         atlas = metal_font_atlas(os_window->fonts_data);
     }
     params.decorations_count = atlas ? (uint32_t)atlas->decorationsCount : 0u;
-    params.padding = 0u;
+    params.draw_background_mask = metal_cell_draw_flag_defaults();
+    params.draw_foreground = 1u;
+    params.extra_alpha = 1.0f;
     state.drawParams = params;
     return true;
 }
@@ -1313,6 +1487,7 @@ metal_encode_borders(
         os_window ? os_window->tab_bar_edge_color.right : 0,
         background_opacity
     );
+
     MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
     if (!pass) {
         PyErr_SetString(PyExc_RuntimeError, "Failed to allocate Metal render pass descriptor for borders");
@@ -1336,6 +1511,206 @@ metal_encode_borders(
     [encoder setVertexBytes:&uniforms length:sizeof(MetalBorderUniforms) atIndex:1];
     [encoder setFragmentBytes:&uniforms length:sizeof(MetalBorderUniforms) atIndex:0];
     [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:(NSUInteger)state.borderCount];
+    encode_draw_end(encoder);
+    state.frameHasContent = YES;
+    return true;
+}
+
+static inline MetalGraphicsUniforms
+metal_pack_graphics_uniforms(const ImageRenderData *rd, float extra_alpha) {
+    MetalGraphicsUniforms uniforms = {
+        .src_rect = { rd->src_rect.left, rd->src_rect.top, rd->src_rect.right, rd->src_rect.bottom },
+        .dest_rect = { rd->dest_rect.left, rd->dest_rect.top, rd->dest_rect.right, rd->dest_rect.bottom },
+        .extra_alpha = extra_alpha,
+        ._pad = {0.f, 0.f, 0.f},
+    };
+    return uniforms;
+}
+
+static inline MetalGraphicsAlphaUniforms
+metal_pack_graphics_alpha_uniforms(
+    const ImageRenderData *rd,
+    vector_float3 foreground_rgb,
+    vector_float4 background_premul
+) {
+    MetalGraphicsAlphaUniforms uniforms = {
+        .src_rect = { rd->src_rect.left, rd->src_rect.top, rd->src_rect.right, rd->src_rect.bottom },
+        .dest_rect = { rd->dest_rect.left, rd->dest_rect.top, rd->dest_rect.right, rd->dest_rect.bottom },
+        .foreground_rgb = foreground_rgb,
+        ._pad0 = 0.f,
+        .background_premul = background_premul,
+    };
+    return uniforms;
+}
+
+static id<MTLRenderPipelineState>
+metal_pipeline_for_graphics_texture(const MetalGraphicsTexture *texture) {
+    if (!texture) {
+        return nil;
+    }
+    if (texture.isOpaque) {
+        return g_metal.graphics_premult_pipeline ?: g_metal.graphics_pipeline;
+    }
+    return g_metal.graphics_pipeline;
+}
+
+static bool
+metal_encode_graphics_bucket(
+    GLFWwindow *window,
+    MetalWindowState *state,
+    const GraphicsRenderData *grd,
+    size_t start,
+    size_t count,
+    float extra_alpha
+) {
+    if (!grd || count == 0) {
+        return true;
+    }
+    if (!state.commandBuffer || !state.drawable) {
+        if (!ensure_command_primitives(window, state)) {
+            return false;
+        }
+    }
+    if (!metal_ensure_resources()) {
+        return false;
+    }
+
+    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    if (!pass) {
+        PyErr_SetString(PyExc_RuntimeError, "Failed to allocate Metal render pass descriptor for graphics bucket");
+        return false;
+    }
+    pass.colorAttachments[0].texture = state.drawable.texture;
+    pass.colorAttachments[0].loadAction = state.frameHasContent ? MTLLoadActionLoad : MTLLoadActionClear;
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    pass.colorAttachments[0].clearColor = state.clearColor;
+
+    id<MTLRenderCommandEncoder> encoder = [state.commandBuffer renderCommandEncoderWithDescriptor:pass];
+    if (!encoder) {
+        PyErr_SetString(PyExc_RuntimeError, "Failed to create Metal graphics bucket encoder");
+        return false;
+    }
+    if (g_metal.debug_labels) {
+        encoder.label = @"kitty-inline-graphics";
+    }
+
+    id<MTLRenderPipelineState> current_pipeline = nil;
+    id<MTLSamplerState> current_sampler = nil;
+
+    size_t index = 0;
+    while (index < count) {
+        const ImageRenderData *rd = grd->images + start + index;
+        size_t group = rd->group_count ? MIN((size_t)rd->group_count, count - index) : 1;
+        MetalGraphicsTexture *texture = [graphics_texture_table() objectForKey:@(rd->texture_id)];
+        if (!texture || !texture.texture) {
+            index += group;
+            continue;
+        }
+        id<MTLRenderPipelineState> pipeline = metal_pipeline_for_graphics_texture(texture);
+        if (!pipeline) {
+            index += group;
+            continue;
+        }
+        if (pipeline != current_pipeline) {
+            [encoder setRenderPipelineState:pipeline];
+            current_pipeline = pipeline;
+        }
+        id<MTLSamplerState> sampler = graphics_sampler_for(texture.linearFilter, texture.repeat);
+        if (sampler && sampler != current_sampler) {
+            [encoder setFragmentSamplerState:sampler atIndex:0];
+            current_sampler = sampler;
+        }
+        [encoder setFragmentTexture:texture.texture atIndex:0];
+
+        for (size_t i = 0; i < group && index + i < count; ++i) {
+            const ImageRenderData *item = grd->images + start + index + i;
+            MetalGraphicsUniforms uniforms = metal_pack_graphics_uniforms(item, extra_alpha);
+            [encoder setVertexBytes:&uniforms length:sizeof(MetalGraphicsUniforms) atIndex:0];
+            [encoder setFragmentBytes:&uniforms length:sizeof(MetalGraphicsUniforms) atIndex:1];
+            [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+        }
+
+        index += group;
+    }
+
+    encode_draw_end(encoder);
+    state.frameHasContent = YES;
+    return true;
+}
+
+static bool
+metal_encode_graphics_alpha_bucket(
+    GLFWwindow *window,
+    MetalWindowState *state,
+    const ImageRenderData *images,
+    size_t start,
+    size_t count,
+    vector_float3 foreground_rgb,
+    vector_float4 background_premul,
+    float extra_alpha
+) {
+    if (!images || count == 0) {
+        return true;
+    }
+    if (!state.commandBuffer || !state.drawable) {
+        if (!ensure_command_primitives(window, state)) {
+            return false;
+        }
+    }
+    if (!metal_ensure_resources()) {
+        return false;
+    }
+
+    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    if (!pass) {
+        PyErr_SetString(PyExc_RuntimeError, "Failed to allocate Metal render pass descriptor for graphics alpha bucket");
+        return false;
+    }
+    pass.colorAttachments[0].texture = state.drawable.texture;
+    pass.colorAttachments[0].loadAction = state.frameHasContent ? MTLLoadActionLoad : MTLLoadActionClear;
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    pass.colorAttachments[0].clearColor = state.clearColor;
+
+    id<MTLRenderCommandEncoder> encoder = [state.commandBuffer renderCommandEncoderWithDescriptor:pass];
+    if (!encoder) {
+        PyErr_SetString(PyExc_RuntimeError, "Failed to create Metal graphics alpha bucket encoder");
+        return false;
+    }
+    if (g_metal.debug_labels) {
+        encoder.label = @"kitty-inline-graphics-alpha";
+    }
+    [encoder setRenderPipelineState:g_metal.graphics_alpha_pipeline];
+
+    id<MTLSamplerState> current_sampler = nil;
+    size_t index = 0;
+    while (index < count) {
+        const ImageRenderData *rd = images + start + index;
+        size_t group = rd->group_count ? MIN((size_t)rd->group_count, count - index) : 1;
+        MetalGraphicsTexture *texture = [graphics_texture_table() objectForKey:@(rd->texture_id)];
+        if (!texture || !texture.texture) {
+            index += group;
+            continue;
+        }
+        id<MTLSamplerState> sampler = graphics_sampler_for(texture.linearFilter, texture.repeat);
+        if (sampler && sampler != current_sampler) {
+            [encoder setFragmentSamplerState:sampler atIndex:0];
+            current_sampler = sampler;
+        }
+        [encoder setFragmentTexture:texture.texture atIndex:0];
+
+        for (size_t i = 0; i < group && index + i < count; ++i) {
+            const ImageRenderData *item = images + start + index + i;
+            vector_float3 fg = foreground_rgb * extra_alpha;
+            vector_float4 bg = background_premul * extra_alpha;
+            MetalGraphicsAlphaUniforms uniforms = metal_pack_graphics_alpha_uniforms(item, fg, bg);
+            [encoder setVertexBytes:&uniforms length:sizeof(MetalGraphicsAlphaUniforms) atIndex:0];
+            [encoder setFragmentBytes:&uniforms length:sizeof(MetalGraphicsAlphaUniforms) atIndex:1];
+            [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+        }
+
+        index += group;
+    }
+
     encode_draw_end(encoder);
     state.frameHasContent = YES;
     return true;
@@ -1413,6 +1788,7 @@ metal_render_pass_for_render_data(
     MetalWindowState *state,
     OSWindow *os_window,
     WindowRenderData *render_data,
+    Window *render_window,
     bool is_active_window,
     bool is_tab_bar,
     bool is_single_window
@@ -1464,6 +1840,8 @@ metal_render_pass_for_render_data(
         return true;
     }
     const WindowGeometry *geometry = &render_data->geometry;
+    const unsigned int screen_width_px = geometry->right - geometry->left;
+    const unsigned int screen_height_px = geometry->bottom - geometry->top;
     float scale_x = 0.f, scale_y = 0.f, origin_x = 0.f, origin_y = 0.f;
     const unsigned int fb_width = state.drawable ? (unsigned int)state.drawable.texture.width : 0u;
     const unsigned int fb_height = state.drawable ? (unsigned int)state.drawable.texture.height : 0u;
@@ -1489,11 +1867,111 @@ metal_render_pass_for_render_data(
     if (!atlas || !atlas->spriteTexture) {
         return encode_clear_pass(window, state, state.clearColor);
     }
-    return metal_encode_cells(window, state, atlas, instance_count);
+    GraphicsManager *grman = screen->paused_rendering.expires_at && screen->paused_rendering.grman
+        ? screen->paused_rendering.grman
+        : screen->grman;
+    GraphicsRenderData grd = grman_render_data(grman);
+    const size_t graphics_below = grd.num_of_below_refs;
+    const size_t graphics_negative = grd.num_of_negative_refs;
+    const size_t graphics_positive = grd.num_of_positive_refs;
+    const bool has_background_image = os_window && os_window->bgimage && os_window->bgimage->texture_id > 0;
+    ImageRenderData window_logo_image = {0};
+    float window_logo_alpha = 0.f;
+    bool has_window_logo = false;
+    if (render_window) {
+        has_window_logo = metal_prepare_window_logo_image(
+            render_window,
+            screen_width_px,
+            screen_height_px,
+            inactive_alpha,
+            &window_logo_image,
+            &window_logo_alpha
+        );
+    }
+    const bool has_between_content = has_window_logo || graphics_below > 0 || graphics_negative > 0;
+
+    bool allow_clear = !state.frameHasContent;
+
+    if (has_between_content) {
+        if (!has_background_image) {
+            if (!metal_encode_cell_pass(window, state, atlas, instance_count, METAL_DRAW_BG_DEFAULT, false, allow_clear)) {
+                return false;
+            }
+            allow_clear = false;
+        }
+        if (has_window_logo) {
+            GraphicsRenderData logo_data = {
+                .count = 1,
+                .images = &window_logo_image,
+            };
+            if (!metal_encode_graphics_bucket(window, state, &logo_data, 0, 1, window_logo_alpha)) {
+                return false;
+            }
+            allow_clear = false;
+        }
+        if (!metal_encode_graphics_bucket(window, state, &grd, 0, graphics_below, inactive_alpha)) {
+            return false;
+        }
+        if (!metal_encode_cell_pass(window, state, atlas, instance_count, METAL_DRAW_BG_NON_DEFAULT, false, allow_clear)) {
+            return false;
+        }
+        allow_clear = false;
+        if (!metal_encode_graphics_bucket(window, state, &grd, graphics_below, graphics_negative, inactive_alpha)) {
+            return false;
+        }
+        if (!metal_encode_cell_pass(window, state, atlas, instance_count, 0u, true, false)) {
+            return false;
+        }
+    } else {
+        uint32_t draw_mask = has_background_image ? METAL_DRAW_BG_NON_DEFAULT : METAL_DRAW_BG_BOTH;
+        if (!metal_encode_cell_pass(window, state, atlas, instance_count, draw_mask, true, allow_clear)) {
+            return false;
+        }
+        if (has_window_logo) {
+            GraphicsRenderData logo_data = {
+                .count = 1,
+                .images = &window_logo_image,
+            };
+            if (!metal_encode_graphics_bucket(window, state, &logo_data, 0, 1, window_logo_alpha)) {
+                return false;
+            }
+        }
+    }
+
+    if (!metal_encode_graphics_bucket(
+            window,
+            state,
+            &grd,
+            graphics_below + graphics_negative,
+            graphics_positive,
+            inactive_alpha)) {
+        return false;
+    }
+    if (!metal_encode_visual_bell(window, state, screen)) {
+        return false;
+    }
+    if (!metal_encode_scrollbar(window, state, os_window, render_window, screen, geometry, screen_width_px, screen_height_px)) {
+        return false;
+    }
+    if (!metal_encode_hyperlink_target(window, state, os_window, render_window, screen, geometry, screen_width_px, screen_height_px)) {
+        return false;
+    }
+    if (!metal_encode_window_number(window, state, os_window, render_window, screen, geometry, screen_width_px, screen_height_px)) {
+        return false;
+    }
+    return true;
 }
 
 static bool
-metal_encode_cells(GLFWwindow *window, MetalWindowState *state, MetalSpriteAtlas *atlas, size_t instance_count) {
+metal_encode_cell_pass(
+    GLFWwindow *window,
+   MetalWindowState *state,
+    MetalSpriteAtlas *atlas,
+    size_t instance_count,
+    uint32_t draw_bg_mask,
+    bool draw_foreground,
+    bool allow_clear
+) {
     if (!state || !atlas || !instance_count) {
         return encode_clear_pass(window, state, state.clearColor);
     }
@@ -1514,7 +1992,8 @@ metal_encode_cells(GLFWwindow *window, MetalWindowState *state, MetalSpriteAtlas
         return false;
     }
     pass.colorAttachments[0].texture = state.drawable.texture;
-    pass.colorAttachments[0].loadAction = state.frameHasContent ? MTLLoadActionLoad : MTLLoadActionClear;
+    bool should_clear = !state.frameHasContent && allow_clear;
+    pass.colorAttachments[0].loadAction = should_clear ? MTLLoadActionClear : MTLLoadActionLoad;
     pass.colorAttachments[0].storeAction = MTLStoreActionStore;
     pass.colorAttachments[0].clearColor = state.clearColor;
 
@@ -1526,6 +2005,9 @@ metal_encode_cells(GLFWwindow *window, MetalWindowState *state, MetalSpriteAtlas
     if (g_metal.debug_labels) {
         encoder.label = @"kitty-cells";
     }
+
+    MetalDrawParams params = state.drawParams;
+    metal_apply_draw_flags(&params, draw_bg_mask, draw_foreground);
 
     MTLViewport viewport = {
         .originX = 0.0,
@@ -1545,7 +2027,6 @@ metal_encode_cells(GLFWwindow *window, MetalWindowState *state, MetalSpriteAtlas
         [encoder setVertexBuffer:nil offset:0 atIndex:2];
     }
     [encoder setVertexBuffer:state.uniformBuffer offset:0 atIndex:3];
-    MetalDrawParams params = state.drawParams;
     [encoder setVertexBytes:&params length:sizeof(MetalDrawParams) atIndex:4];
     [encoder setFragmentBuffer:state.uniformBuffer offset:0 atIndex:0];
     [encoder setFragmentBytes:&params length:sizeof(MetalDrawParams) atIndex:1];
@@ -1824,6 +2305,10 @@ metal_backend_shutdown(void) {
         GLFWwindow *window = (GLFWwindow *)window_key_value.pointerValue;
         destroy_window_state(window);
     }
+    metal_backend_destroy_graphics_image(&metal_window_number_texture);
+    metal_window_number_texture = (TextureRef){0};
+    metal_backend_destroy_graphics_image(&metal_hyperlink_texture);
+    metal_hyperlink_texture = (TextureRef){0};
     metal_unregister_sprite_hooks();
     g_metal.cell_pipeline = nil;
     g_metal.border_pipeline = nil;
@@ -1992,7 +2477,7 @@ metal_backend_render(GLFWwindow *window, const RendererRenderParams *params) {
     bool is_single_window = visible_windows <= 1u;
 
     if (os_window->num_tabs >= OPT(tab_bar_min_tabs) && os_window->tab_bar_render_data.screen) {
-        if (!metal_render_pass_for_render_data(window, state, os_window, &os_window->tab_bar_render_data, false, true, is_single_window)) {
+        if (!metal_render_pass_for_render_data(window, state, os_window, &os_window->tab_bar_render_data, NULL, false, true, is_single_window)) {
             return false;
         }
     }
@@ -2008,7 +2493,7 @@ metal_backend_render(GLFWwindow *window, const RendererRenderParams *params) {
             if (is_active) {
                 active_window_ptr = w;
             }
-            if (!metal_render_pass_for_render_data(window, state, os_window, &w->render_data, is_active, false, is_single_window)) {
+            if (!metal_render_pass_for_render_data(window, state, os_window, &w->render_data, w, is_active, false, is_single_window)) {
                 return false;
             }
         }
@@ -2327,6 +2812,701 @@ metal_background_image_release(BackgroundImage *bgimage) {
 }
 
 static bool
+metal_window_logo_ensure_texture(WindowLogo *logo) {
+    if (!logo || !g_metal.device) {
+        return false;
+    }
+    id<MTLTexture> texture = logo->metal_texture ? (__bridge id<MTLTexture>)logo->metal_texture : nil;
+    const size_t pixel_count = (size_t)logo->width * (size_t)logo->height;
+    const size_t byte_count = pixel_count * 4u;
+    const size_t delta = logo->mmap_size ? logo->mmap_size - byte_count : 0;
+    const void *pixels = logo->bitmap ? (const void *)(logo->bitmap + delta) : NULL;
+
+    if (!texture) {
+        if (!pixels) {
+            PyErr_SetString(PyExc_RuntimeError, "Window logo pixel buffer unavailable for Metal upload");
+            return false;
+        }
+        MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm_sRGB
+                                                                                              width:logo->width
+                                                                                             height:logo->height
+                                                                                          mipmapped:NO];
+        descriptor.storageMode = MTLStorageModeManaged;
+        descriptor.usage = MTLTextureUsageShaderRead;
+        id<MTLTexture> new_texture = [g_metal.device newTextureWithDescriptor:descriptor];
+        if (!new_texture) {
+            PyErr_NoMemory();
+            return false;
+        }
+        [new_texture replaceRegion:MTLRegionMake2D(0, 0, logo->width, logo->height)
+                        mipmapLevel:0
+                          withBytes:pixels
+                        bytesPerRow:4u * (size_t)logo->width];
+        if (logo->metal_texture) {
+            CFRelease(logo->metal_texture);
+        }
+        logo->metal_texture = CFBridgingRetain(new_texture);
+        texture = new_texture;
+        if (logo->bitmap) {
+            if (logo->mmap_size) {
+                munmap(logo->bitmap, logo->mmap_size);
+            } else {
+                free(logo->bitmap);
+            }
+            logo->bitmap = NULL;
+            logo->mmap_size = 0;
+        }
+    } else if (pixels) {
+        [texture replaceRegion:MTLRegionMake2D(0, 0, logo->width, logo->height)
+                    mipmapLevel:0
+                      withBytes:pixels
+                    bytesPerRow:4u * (size_t)logo->width];
+        if (logo->bitmap) {
+            if (logo->mmap_size) {
+                munmap(logo->bitmap, logo->mmap_size);
+            } else {
+                free(logo->bitmap);
+            }
+            logo->bitmap = NULL;
+            logo->mmap_size = 0;
+        }
+    }
+    return texture != nil;
+}
+
+static bool
+metal_register_window_logo_texture(WindowLogo *logo) {
+    if (!logo) {
+        return false;
+    }
+    if (!metal_window_logo_ensure_texture(logo)) {
+        return false;
+    }
+    if (!logo->texture_id) {
+        uint32_t new_id = 0;
+        do {
+            new_id = next_graphics_texture_id++;
+        } while (new_id == 0);
+        logo->texture_id = new_id;
+    }
+    MetalGraphicsTexture *holder = [graphics_texture_table() objectForKey:@(logo->texture_id)];
+    if (!holder) {
+        holder = [[MetalGraphicsTexture alloc] init];
+        [graphics_texture_table() setObject:holder forKey:@(logo->texture_id)];
+    }
+    holder.texture = logo->metal_texture ? (__bridge id<MTLTexture>)logo->metal_texture : nil;
+    holder.width = logo->width;
+    holder.height = logo->height;
+    holder.linearFilter = YES;
+    holder.isOpaque = NO;
+    holder.repeat = REPEAT_CLAMP;
+    return holder.texture != nil;
+}
+
+static bool
+metal_prepare_window_logo_image(
+    Window *window,
+    unsigned int screen_width,
+    unsigned int screen_height,
+    float inactive_alpha,
+    ImageRenderData *out_image,
+    float *out_extra_alpha
+) {
+    if (!window || !out_image || !out_extra_alpha) {
+        return false;
+    }
+    WindowLogoRenderData *wl = &window->window_logo;
+    if (!wl->id) {
+        return false;
+    }
+    wl->instance = find_window_logo(global_state.all_window_logos, wl->id);
+    if (!wl->instance || !wl->instance->load_from_disk_ok) {
+        return false;
+    }
+    if (!metal_register_window_logo_texture(wl->instance)) {
+        return false;
+    }
+
+    struct {
+        unsigned width;
+        unsigned height;
+        int left;
+        int top;
+    } geom = {
+        .width = wl->instance->width,
+        .height = wl->instance->height,
+        .left = 0,
+        .top = 0,
+    };
+    if (OPT(window_logo_scale.width) > 0.0 || OPT(window_logo_scale.height) > 0.0) {
+        unsigned scaled_width = screen_width;
+        unsigned scaled_height = screen_height;
+        if (OPT(window_logo_scale.height) < 0.0) {
+            if (screen_height < screen_width) {
+                scaled_height = (unsigned)(screen_height * OPT(window_logo_scale.width) / 100.0);
+                scaled_width = wl->instance->width * scaled_height / wl->instance->height;
+            } else {
+                scaled_width = (unsigned)(screen_width * OPT(window_logo_scale.width) / 100.0);
+                scaled_height = wl->instance->height * scaled_width / wl->instance->width;
+            }
+        } else if (OPT(window_logo_scale.width) == 0.0) {
+            scaled_height = (unsigned)(scaled_height * OPT(window_logo_scale.height) / 100.0);
+            scaled_width = wl->instance->width;
+        } else if (OPT(window_logo_scale.height) == 0.0) {
+            scaled_width = (unsigned)(scaled_width * OPT(window_logo_scale.width) / 100.0);
+            scaled_height = wl->instance->height;
+        } else {
+            scaled_height = (unsigned)(scaled_height * OPT(window_logo_scale.height) / 100.0);
+            scaled_width = (unsigned)(scaled_width * OPT(window_logo_scale.width) / 100.0);
+        }
+        geom.width = scaled_width;
+        geom.height = scaled_height;
+    }
+
+    geom.left = (int)((double)screen_width * wl->position.canvas_x - (double)geom.width * wl->position.image_x);
+    geom.top = (int)((double)screen_height * wl->position.canvas_y - (double)geom.height * wl->position.image_y);
+
+    float left = gl_pos_x(geom.left, screen_width);
+    float top = gl_pos_y(geom.top, screen_height);
+    float right = left + gl_size(geom.width, screen_width);
+    float bottom = top - gl_size(geom.height, screen_height);
+
+    memset(out_image, 0, sizeof(*out_image));
+    out_image->texture_id = wl->instance->texture_id;
+    out_image->group_count = 1;
+    gpu_data_for_image(out_image, left, top, right, bottom);
+    *out_extra_alpha = inactive_alpha * (float)OPT(window_logo_alpha);
+    return true;
+}
+
+static Animation *metal_default_visual_bell_animation = NULL;
+
+static float
+metal_visual_bell_intensity(Screen *screen) {
+    if (screen && screen->start_visual_bell_at > 0) {
+        if (!metal_default_visual_bell_animation) {
+            metal_default_visual_bell_animation = alloc_animation();
+            if (!metal_default_visual_bell_animation) {
+                PyErr_NoMemory();
+                return 0.0f;
+            }
+            add_cubic_bezier_animation(metal_default_visual_bell_animation, 0.0, 1.0, EASE_IN_OUT);
+            add_cubic_bezier_animation(metal_default_visual_bell_animation, 1.0, 0.0, EASE_IN_OUT);
+        }
+        const monotonic_t progress = monotonic() - screen->start_visual_bell_at;
+        const monotonic_t duration = OPT(visual_bell_duration) / 2;
+        if (progress <= duration) {
+            Animation *animation = animation_is_valid(OPT(animation.visual_bell))
+                ? OPT(animation.visual_bell)
+                : metal_default_visual_bell_animation;
+            double t = progress / (double)duration;
+            return (float)apply_easing_curve(animation, t, duration);
+        }
+        screen->start_visual_bell_at = 0;
+    }
+    return 0.0f;
+}
+
+static bool
+metal_encode_visual_bell(GLFWwindow *window, MetalWindowState *state, Screen *screen) {
+    if (!screen) {
+        return true;
+    }
+    float intensity = metal_visual_bell_intensity(screen);
+    if (intensity <= 0.f) {
+        return true;
+    }
+    if (!state->commandBuffer || !state->drawable) {
+        if (!ensure_command_primitives(window, state)) {
+            return false;
+        }
+    }
+    if (!metal_ensure_resources()) {
+        return false;
+    }
+    color_type flash = 0;
+#define METAL_IS_SPECIAL_COLOR(field) \
+    (screen->color_profile->overridden.field.type == COLOR_IS_SPECIAL || \
+    (screen->color_profile->overridden.field.type == COLOR_NOT_SET && \
+     screen->color_profile->configured.field.type == COLOR_IS_SPECIAL))
+#define METAL_COLOR(field, fallback) \
+    colorprofile_to_color_with_fallback(screen->color_profile, \
+        screen->color_profile->overridden.field, \
+        screen->color_profile->configured.field, \
+        screen->color_profile->overridden.fallback, \
+        screen->color_profile->configured.fallback)
+    if (!METAL_IS_SPECIAL_COLOR(highlight_bg)) {
+        flash = METAL_COLOR(visual_bell_color, highlight_bg);
+    } else {
+        flash = METAL_COLOR(visual_bell_color, default_fg);
+    }
+#undef METAL_COLOR
+#undef METAL_IS_SPECIAL_COLOR
+
+    float attenuation = 0.4f;
+    float r = srgb_channel_to_linear((flash >> 16) & 0xFF);
+    float g = srgb_channel_to_linear((flash >> 8) & 0xFF);
+    float b = srgb_channel_to_linear(flash & 0xFF);
+    float max_channel = fmaxf(r, fmaxf(g, b));
+    if (max_channel > 0.45f) {
+        attenuation = 0.6f;
+    }
+    float alpha = intensity * attenuation;
+    vector_float4 color = { r * alpha, g * alpha, b * alpha, alpha };
+
+    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    if (!pass) {
+        PyErr_SetString(PyExc_RuntimeError, "Failed to allocate Metal render pass descriptor for visual bell");
+        return false;
+    }
+    pass.colorAttachments[0].texture = state->drawable.texture;
+    pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    pass.colorAttachments[0].clearColor = state->clearColor;
+
+    id<MTLRenderCommandEncoder> encoder = [state->commandBuffer renderCommandEncoderWithDescriptor:pass];
+    if (!encoder) {
+        PyErr_SetString(PyExc_RuntimeError, "Failed to create Metal encoder for visual bell");
+        return false;
+    }
+    if (g_metal.debug_labels) {
+        encoder.label = @"kitty-visual-bell";
+    }
+    [encoder setViewport:(MTLViewport){
+        .originX = 0.0,
+        .originY = 0.0,
+        .width = state->drawable.texture.width,
+        .height = state->drawable.texture.height,
+        .znear = 0.0,
+        .zfar = 1.0
+    }];
+    [encoder setRenderPipelineState:g_metal.tint_pipeline];
+    MetalTintUniforms uniforms = {
+        .edges = (vector_float4){ -1.f, 1.f, 1.f, -1.f },
+        .color = color,
+    };
+    [encoder setVertexBytes:&uniforms length:sizeof uniforms atIndex:0];
+    [encoder setFragmentBytes:&uniforms length:sizeof uniforms atIndex:0];
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+    encode_draw_end(encoder);
+    state->frameHasContent = YES;
+    return true;
+}
+
+static bool
+metal_encode_scrollbar(
+    GLFWwindow *window,
+    MetalWindowState *state,
+    OSWindow *os_window,
+    Window *render_window,
+    Screen *screen,
+    const WindowGeometry *geometry,
+    unsigned int screen_width_px,
+    unsigned int screen_height_px
+) {
+    if (!os_window || !os_window->fonts_data || !render_window || !screen || !geometry) {
+        return true;
+    }
+    RendererSharedScrollbarMetrics metrics = {0};
+    if (!renderer_shared_prepare_scrollbar_metrics(
+            screen,
+            render_window,
+            &render_window->render_data,
+            geometry->left,
+            geometry->top,
+            screen_width_px,
+            screen_height_px,
+            os_window->fonts_data->fcm.cell_width,
+            os_window->fonts_data->fcm.cell_height,
+            os_window->viewport_height,
+            &metrics) || !metrics.visible) {
+        return true;
+    }
+    if (!state->commandBuffer || !state->drawable) {
+        if (!ensure_command_primitives(window, state)) {
+            return false;
+        }
+    }
+    if (!metal_ensure_resources()) {
+        return false;
+    }
+    const unsigned int viewport_width = os_window->viewport_width;
+    const unsigned int viewport_height = os_window->viewport_height;
+
+    float track_left = gl_pos_x(metrics.left_px, viewport_width);
+    float track_right = gl_pos_x(metrics.left_px + metrics.width_px, viewport_width);
+    float track_top = gl_pos_y(metrics.top_px, viewport_height);
+    float track_bottom = gl_pos_y(metrics.top_px + metrics.height_px, viewport_height);
+
+    if (metrics.track_opacity > 0.f) {
+        MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        if (!pass) {
+            PyErr_SetString(PyExc_RuntimeError, "Failed to allocate Metal pass descriptor for scrollbar track");
+            return false;
+        }
+        pass.colorAttachments[0].texture = state->drawable.texture;
+        pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        pass.colorAttachments[0].clearColor = state->clearColor;
+        id<MTLRenderCommandEncoder> encoder = [state->commandBuffer renderCommandEncoderWithDescriptor:pass];
+        if (!encoder) {
+            PyErr_SetString(PyExc_RuntimeError, "Failed to create Metal encoder for scrollbar track");
+            return false;
+        }
+        if (g_metal.debug_labels) {
+            encoder.label = @"kitty-scrollbar-track";
+        }
+        [encoder setViewport:(MTLViewport){
+            .originX = 0.0,
+            .originY = 0.0,
+            .width = state->drawable.texture.width,
+            .height = state->drawable.texture.height,
+            .znear = 0.0,
+            .zfar = 1.0
+        }];
+        [encoder setRenderPipelineState:g_metal.tint_pipeline];
+        MetalTintUniforms tint_uniforms = {
+            .edges = (vector_float4){ track_left, track_top, track_right, track_bottom },
+            .color = color_to_linear_premult(metrics.track_color, metrics.track_opacity),
+        };
+        [encoder setVertexBytes:&tint_uniforms length:sizeof tint_uniforms atIndex:0];
+        [encoder setFragmentBytes:&tint_uniforms length:sizeof tint_uniforms atIndex:0];
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+        encode_draw_end(encoder);
+        state->frameHasContent = YES;
+    }
+
+    if (metrics.handle_opacity <= 0.f) {
+        return true;
+    }
+
+    if (metrics.corner_radius_px > 0u) {
+        MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        if (!pass) {
+            PyErr_SetString(PyExc_RuntimeError, "Failed to allocate Metal pass descriptor for scrollbar handle");
+            return false;
+        }
+        pass.colorAttachments[0].texture = state->drawable.texture;
+        pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        pass.colorAttachments[0].clearColor = state->clearColor;
+        id<MTLRenderCommandEncoder> encoder = [state->commandBuffer renderCommandEncoderWithDescriptor:pass];
+        if (!encoder) {
+            PyErr_SetString(PyExc_RuntimeError, "Failed to create Metal encoder for rounded scrollbar handle");
+            return false;
+        }
+        if (g_metal.debug_labels) {
+            encoder.label = @"kitty-scrollbar-handle-rounded";
+        }
+        double origin_y = (double)viewport_height - (double)(metrics.thumb_top_px + metrics.thumb_height_px);
+        [encoder setViewport:(MTLViewport){
+            .originX = metrics.left_px,
+            .originY = origin_y,
+            .width = metrics.width_px,
+            .height = metrics.thumb_height_px,
+            .znear = 0.0,
+            .zfar = 1.0
+        }];
+        [encoder setRenderPipelineState:g_metal.rounded_rect_pipeline];
+        MetalRoundedRectUniforms uniforms = {
+            .size = (vector_float2){ (float)metrics.width_px, (float)metrics.thumb_height_px },
+            .thickness = (float)MAX((int)metrics.width_px, (int)metrics.thumb_height_px),
+            .radius = (float)metrics.corner_radius_px,
+            .color = color_to_linear_premult(metrics.handle_color, metrics.handle_opacity),
+        };
+        [encoder setVertexBytes:&uniforms length:sizeof uniforms atIndex:0];
+        [encoder setFragmentBytes:&uniforms length:sizeof uniforms atIndex:1];
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+        encode_draw_end(encoder);
+        state->frameHasContent = YES;
+    } else {
+        MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        if (!pass) {
+            PyErr_SetString(PyExc_RuntimeError, "Failed to allocate Metal pass descriptor for scrollbar handle");
+            return false;
+        }
+        pass.colorAttachments[0].texture = state->drawable.texture;
+        pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        pass.colorAttachments[0].clearColor = state->clearColor;
+        id<MTLRenderCommandEncoder> encoder = [state->commandBuffer renderCommandEncoderWithDescriptor:pass];
+        if (!encoder) {
+            PyErr_SetString(PyExc_RuntimeError, "Failed to create Metal encoder for scrollbar handle");
+            return false;
+        }
+        if (g_metal.debug_labels) {
+            encoder.label = @"kitty-scrollbar-handle";
+        }
+        [encoder setViewport:(MTLViewport){
+            .originX = 0.0,
+            .originY = 0.0,
+            .width = state->drawable.texture.width,
+            .height = state->drawable.texture.height,
+            .znear = 0.0,
+            .zfar = 1.0
+        }];
+        float thumb_top_gl = 1.f - 2.f * metrics.thumb_top_fraction;
+        float thumb_bottom_gl = 1.f - 2.f * metrics.thumb_bottom_fraction;
+        MetalTintUniforms tint_uniforms = {
+            .edges = (vector_float4){ track_left, thumb_top_gl, track_right, thumb_bottom_gl },
+            .color = color_to_linear_premult(metrics.handle_color, metrics.handle_opacity),
+        };
+        [encoder setVertexBytes:&tint_uniforms length:sizeof tint_uniforms atIndex:0];
+        [encoder setFragmentBytes:&tint_uniforms length:sizeof tint_uniforms atIndex:0];
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+        encode_draw_end(encoder);
+        state->frameHasContent = YES;
+    }
+    return true;
+}
+
+static bool
+metal_encode_window_number(
+    GLFWwindow *window,
+    MetalWindowState *state,
+    OSWindow *os_window,
+    Window *render_window,
+    Screen *screen,
+    const WindowGeometry *geometry,
+    unsigned int screen_width_px,
+    unsigned int screen_height_px
+) {
+    if (!os_window || !render_window || !screen || !geometry || !os_window->fonts_data) {
+        return true;
+    }
+    unsigned int title_bar_height = 0;
+    if (render_window->title && PyUnicode_Check(render_window->title) &&
+        screen_height_px > (os_window->fonts_data->fcm.cell_height + 1u) * 2u) {
+        RendererSharedBarSurface surface = {0};
+        if (renderer_shared_prepare_bar_surface(
+                screen,
+                os_window,
+                &render_window->title_bar_data,
+                render_window->title,
+                screen_width_px,
+                screen_height_px,
+                os_window->fonts_data->fcm.cell_height,
+                false,
+                &surface) && surface.visible) {
+            title_bar_height = surface.height_px + 2u * surface.border_width_px;
+        }
+    }
+
+    RendererSharedWindowNumber info = {0};
+    if (!renderer_shared_prepare_window_number(
+            screen,
+            screen_width_px,
+            screen_height_px,
+            geometry->left,
+            geometry->top,
+            os_window->viewport_height,
+            os_window->fonts_data->fcm.cell_width,
+            os_window->fonts_data->fcm.cell_height,
+            title_bar_height,
+            &info) || !info.visible || !info.pixels) {
+        return true;
+    }
+    RendererGraphicsImageUpload upload = {
+        .pixels = info.pixels,
+        .width = (int32_t)info.width_px,
+        .height = (int32_t)info.height_px,
+        .is_opaque = false,
+        .is_4byte_aligned = true,
+        .linear_filter = true,
+        .repeat = REPEAT_CLAMP,
+    };
+    if (!metal_backend_upload_graphics_image(&metal_window_number_texture, &upload)) {
+        return false;
+    }
+    if (!state->commandBuffer || !state->drawable) {
+        if (!ensure_command_primitives(window, state)) {
+            return false;
+        }
+    }
+    if (!metal_ensure_resources()) {
+        return false;
+    }
+    float left = gl_pos_x(info.offset_x_px, os_window->viewport_width);
+    float top = gl_pos_y(info.offset_y_px, os_window->viewport_height);
+    float right = left + gl_size(info.width_px, os_window->viewport_width);
+    float bottom = top - gl_size(info.height_px, os_window->viewport_height);
+
+    ImageRenderData image = {0};
+    image.texture_id = metal_window_number_texture.id;
+    image.group_count = 1;
+    gpu_data_for_image(&image, left, top, right, bottom);
+
+    vector_float3 fg = color_to_linear_rgb(info.glyph_color);
+    vector_float4 bg = {0.f, 0.f, 0.f, 0.f};
+    return metal_encode_graphics_alpha_bucket(window, state, &image, 0, 1, fg, bg, 1.f);
+}
+
+static bool
+metal_encode_hyperlink_target(
+    GLFWwindow *window,
+    MetalWindowState *state,
+    OSWindow *os_window,
+    Window *render_window,
+    Screen *screen,
+    const WindowGeometry *geometry,
+    unsigned int screen_width_px,
+    unsigned int screen_height_px
+) {
+    if (!os_window || !render_window || !screen || !geometry || !os_window->fonts_data) {
+        return true;
+    }
+    bool along_bottom = false;
+    PyObject *title = renderer_shared_get_hyperlink_title(screen, render_window, os_window, &along_bottom);
+    if (!title) {
+        return true;
+    }
+    RendererSharedBarSurface surface = {0};
+    bool surface_ok = renderer_shared_prepare_bar_surface(
+        screen,
+        os_window,
+        &render_window->title_bar_data,
+        title,
+        screen_width_px,
+        screen_height_px,
+        os_window->fonts_data->fcm.cell_height,
+        along_bottom,
+        &surface
+    );
+    Py_DECREF(title);
+    if (!surface_ok || !surface.visible || !surface.pixels) {
+        return true;
+    }
+
+    unsigned int border = surface.border_width_px;
+    unsigned int total_width = surface.width_px + 2u * border;
+    unsigned int total_height = surface.height_px + 2u * border;
+    int rect_left = geometry->left;
+    int rect_top = geometry->top;
+    if (along_bottom) {
+        rect_top += screen_height_px - (int)total_height;
+    }
+    int inner_left = rect_left + (int)border;
+    int inner_top = rect_top + (int)border;
+
+    if (!state->commandBuffer || !state->drawable) {
+        if (!ensure_command_primitives(window, state)) {
+            return false;
+        }
+    }
+    if (!metal_ensure_resources()) {
+        return false;
+    }
+
+    const unsigned int viewport_height = os_window->viewport_height;
+
+    if (border > 0) {
+        MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        if (!pass) {
+            PyErr_SetString(PyExc_RuntimeError, "Failed to allocate Metal pass descriptor for hyperlink border");
+            return false;
+        }
+        pass.colorAttachments[0].texture = state->drawable.texture;
+        pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        pass.colorAttachments[0].clearColor = state->clearColor;
+        id<MTLRenderCommandEncoder> encoder = [state->commandBuffer renderCommandEncoderWithDescriptor:pass];
+        if (!encoder) {
+            PyErr_SetString(PyExc_RuntimeError, "Failed to create Metal encoder for hyperlink border");
+            return false;
+        }
+        if (g_metal.debug_labels) {
+            encoder.label = @"kitty-hyperlink-border";
+        }
+        double origin_y = (double)viewport_height - (double)(rect_top + (int)total_height);
+        [encoder setViewport:(MTLViewport){
+            .originX = rect_left,
+            .originY = origin_y,
+            .width = total_width,
+            .height = total_height,
+            .znear = 0.0,
+            .zfar = 1.0
+        }];
+        [encoder setRenderPipelineState:g_metal.tint_pipeline];
+        MetalTintUniforms tint_uniforms = {
+            .edges = (vector_float4){ -1.f, 1.f, 1.f, -1.f },
+            .color = color_to_linear_premult(surface.foreground_color, 1.f),
+        };
+        [encoder setVertexBytes:&tint_uniforms length:sizeof tint_uniforms atIndex:0];
+        [encoder setFragmentBytes:&tint_uniforms length:sizeof tint_uniforms atIndex:0];
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+        encode_draw_end(encoder);
+        state->frameHasContent = YES;
+    }
+
+    {
+        MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        if (!pass) {
+            PyErr_SetString(PyExc_RuntimeError, "Failed to allocate Metal pass descriptor for hyperlink background");
+            return false;
+        }
+        pass.colorAttachments[0].texture = state->drawable.texture;
+        pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        pass.colorAttachments[0].clearColor = state->clearColor;
+        id<MTLRenderCommandEncoder> encoder = [state->commandBuffer renderCommandEncoderWithDescriptor:pass];
+        if (!encoder) {
+            PyErr_SetString(PyExc_RuntimeError, "Failed to create Metal encoder for hyperlink background");
+            return false;
+        }
+        if (g_metal.debug_labels) {
+            encoder.label = @"kitty-hyperlink-background";
+        }
+        double origin_y = (double)viewport_height - (double)(inner_top + (int)surface.height_px);
+        [encoder setViewport:(MTLViewport){
+            .originX = inner_left,
+            .originY = origin_y,
+            .width = surface.width_px,
+            .height = surface.height_px,
+            .znear = 0.0,
+            .zfar = 1.0
+        }];
+        [encoder setRenderPipelineState:g_metal.tint_pipeline];
+        MetalTintUniforms tint_uniforms = {
+            .edges = (vector_float4){ -1.f, 1.f, 1.f, -1.f },
+            .color = color_to_linear_premult(surface.background_color, 1.f),
+        };
+        [encoder setVertexBytes:&tint_uniforms length:sizeof tint_uniforms atIndex:0];
+        [encoder setFragmentBytes:&tint_uniforms length:sizeof tint_uniforms atIndex:0];
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+        encode_draw_end(encoder);
+        state->frameHasContent = YES;
+    }
+
+    RendererGraphicsImageUpload upload = {
+        .pixels = surface.pixels,
+        .width = (int32_t)surface.width_px,
+        .height = (int32_t)surface.height_px,
+        .is_opaque = false,
+        .is_4byte_aligned = true,
+        .linear_filter = true,
+        .repeat = REPEAT_CLAMP,
+    };
+    if (!metal_backend_upload_graphics_image(&metal_hyperlink_texture, &upload)) {
+        return false;
+    }
+
+    float tex_left = gl_pos_x(inner_left, os_window->viewport_width);
+    float tex_top = gl_pos_y(inner_top, os_window->viewport_height);
+    float tex_right = gl_pos_x(inner_left + (int)surface.width_px, os_window->viewport_width);
+    float tex_bottom = gl_pos_y(inner_top + (int)surface.height_px, os_window->viewport_height);
+
+    ImageRenderData image = {0};
+    image.texture_id = metal_hyperlink_texture.id;
+    image.group_count = 1;
+    gpu_data_for_image(&image, tex_left, tex_top, tex_right, tex_bottom);
+    GraphicsRenderData grd = {
+        .count = 1,
+        .images = &image,
+    };
+    return metal_encode_graphics_bucket(window, state, &grd, 0, 1, 1.f);
+}
+
+static bool
 validate_graphics_upload_args(TextureRef *ref, const RendererGraphicsImageUpload *upload) {
     if (!ref || !upload) {
         PyErr_SetString(PyExc_RuntimeError, "Metal graphics upload received invalid arguments");
@@ -2540,6 +3720,54 @@ metal_renderer_prepare_trail_uniforms_for_tests(
         color,
         opacity
     );
+}
+
+EXPORTED void
+metal_renderer_pack_graphics_uniforms_for_tests(
+    const ImageRenderData *data,
+    float extra_alpha,
+    MetalGraphicsUniforms *out_uniforms
+) {
+    if (!data || !out_uniforms) {
+        PyErr_SetString(PyExc_ValueError, "metal_renderer_pack_graphics_uniforms_for_tests requires data and output");
+        return;
+    }
+    *out_uniforms = metal_pack_graphics_uniforms(data, extra_alpha);
+}
+
+EXPORTED void
+metal_renderer_pack_graphics_alpha_uniforms_for_tests(
+    const ImageRenderData *data,
+    float fg_r,
+    float fg_g,
+    float fg_b,
+    float bg_r,
+    float bg_g,
+    float bg_b,
+    float bg_a,
+    float extra_alpha,
+    MetalGraphicsAlphaUniforms *out_uniforms
+) {
+    if (!data || !out_uniforms) {
+        PyErr_SetString(PyExc_ValueError, "metal_renderer_pack_graphics_alpha_uniforms_for_tests requires data and output");
+        return;
+    }
+    vector_float3 fg = { fg_r * extra_alpha, fg_g * extra_alpha, fg_b * extra_alpha };
+    vector_float4 bg = { bg_r * extra_alpha, bg_g * extra_alpha, bg_b * extra_alpha, bg_a * extra_alpha };
+    *out_uniforms = metal_pack_graphics_alpha_uniforms(data, fg, bg);
+}
+
+EXPORTED void
+metal_renderer_apply_draw_params_for_tests(
+    MetalDrawParams *params,
+    uint32_t draw_bg_mask,
+    bool draw_foreground
+) {
+    if (!params) {
+        PyErr_SetString(PyExc_ValueError, "metal_renderer_apply_draw_params_for_tests requires params");
+        return;
+    }
+    metal_apply_draw_flags(params, draw_bg_mask, draw_foreground);
 }
 
 bool
