@@ -527,7 +527,7 @@ draw_graphics(int program, ImageRenderData *data, GLuint start, GLuint count, fl
 }
 
 static ImageRenderData*
-load_alpha_mask_texture(size_t width, size_t height, uint8_t *canvas) {
+load_alpha_mask_texture(size_t width, size_t height, const uint8_t *canvas) {
     static ImageRenderData data = {.group_count=1};
     if (!data.texture_id) { glGenTextures(1, &data.texture_id); }
     glBindTexture(GL_TEXTURE_2D, data.texture_id);
@@ -747,8 +747,6 @@ render_a_bar(const UIRenderData *ui, WindowBarData *bar, PyObject *title, bool a
     return border_rect.height;
 }
 
-}
-
 static bool
 has_hyperlink_target(OSWindow *os_window, Window *w, Screen *screen) {
     return OPT(show_hyperlink_targets) && screen->current_hyperlink_under_mouse.id && w && !is_mouse_hidden(os_window) && global_state.mouse_hover_in_window == w->id;
@@ -761,9 +759,6 @@ draw_hyperlink_target(const UIRenderData *ui) {
     if (!title) return;
     render_a_bar(ui, &ui->window->title_bar_data, title, along_bottom);
     Py_DECREF(title);
-}
-
-
 }
 
 static bool
@@ -806,7 +801,6 @@ draw_window_number(const UIRenderData *ui) {
     restore_viewport();
 }
 
-}
 
 // Helper function to extract and apply opacity to color components
 static void

@@ -6,8 +6,8 @@
 #include "compiler.h"
 #include "renderer_backend_types.h"
 
-typedef enum BackgroundImageLayout BackgroundImageLayout;
-typedef struct BackgroundImage BackgroundImage;
+struct BackgroundImage;
+enum BackgroundImageLayout;
 
 #ifdef __cplusplus
 extern "C" {
@@ -76,11 +76,11 @@ EXPORTED bool metal_compute_background_geometry(
     unsigned int framebuffer_height,
     unsigned int image_width,
     unsigned int image_height,
-    BackgroundImageLayout layout,
+    enum BackgroundImageLayout layout,
     MetalBackgroundGeometry *out_geometry);
 
-EXPORTED void metal_background_image_uploaded(BackgroundImage *bgimage, BackgroundImageLayout layout, bool linear_filter);
-EXPORTED void metal_background_image_release(BackgroundImage *bgimage);
+EXPORTED void metal_background_image_uploaded(struct BackgroundImage *bgimage, enum BackgroundImageLayout layout, bool linear_filter);
+EXPORTED void metal_background_image_release(struct BackgroundImage *bgimage);
 
 typedef struct MetalGraphicsTextureDebugInfo {
     uint32_t width;
@@ -94,6 +94,23 @@ EXPORTED bool metal_renderer_debug_get_graphics_texture(
     uint32_t texture_id,
     MetalGraphicsTextureDebugInfo *out_info
 );
+
+typedef struct MetalCapturedFrameDebugInfo {
+    uint32_t width;
+    uint32_t height;
+    uint32_t bytes_per_row;
+    const uint8_t *pixels;
+} MetalCapturedFrameDebugInfo;
+
+EXPORTED bool metal_renderer_copy_captured_frame_for_tests(MetalCapturedFrameDebugInfo *out_info);
+EXPORTED bool metal_renderer_debug_set_captured_frame_for_tests(
+    const uint8_t *pixels,
+    uint32_t width,
+    uint32_t height,
+    uint32_t bytes_per_row,
+    bool pixels_are_bgra
+);
+EXPORTED void metal_renderer_debug_clear_captured_frame_for_tests(void);
 
 #ifdef __cplusplus
 }

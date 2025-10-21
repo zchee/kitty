@@ -36,7 +36,7 @@ typedef struct {
     id_type image_id, ref_id;
 } ImageRenderData;
 
-typedef struct {
+typedef struct BackgroundImage {
     uint32_t texture_id;
     unsigned int height, width;
     uint8_t* bitmap;

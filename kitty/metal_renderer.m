@@ -371,6 +371,17 @@ static MetalGlobalState g_metal = {
 };
 
 typedef struct {
+    uint32_t width;
+    uint32_t height;
+    uint32_t bytes_per_row;
+    const uint8_t *pixels;
+    size_t length;
+    bool owns_memory;
+} MetalCapturedFrameState;
+
+static MetalCapturedFrameState g_metal_capture = {0};
+
+typedef struct {
     id<MTLTexture> texture;
     void *pixels;
     size_t length;
@@ -494,6 +505,11 @@ graphics_sampler_for(bool linear_filter, RepeatStrategy repeat) {
 @property (nonatomic) size_t borderBufferCapacity;
 @property (nonatomic) size_t borderCount;
 @property (nonatomic) MetalDrawParams drawParams;
+@property (nonatomic, strong) id<MTLBuffer> captureBuffer;
+@property (nonatomic) NSUInteger captureWidth;
+@property (nonatomic) NSUInteger captureHeight;
+@property (nonatomic) NSUInteger captureBytesPerRow;
+@property (nonatomic) BOOL captureValid;
 @end
 
 static bool ensure_command_primitives(GLFWwindow *window, MetalWindowState *state);
@@ -506,6 +522,10 @@ static bool encode_clear_pass(GLFWwindow *window, MetalWindowState *state, MTLCl
 static MetalBackgroundTexture* metal_background_texture(BackgroundImage *bgimage);
 static bool metal_background_texture_ensure_ready(MetalBackgroundTexture *background);
 static void metal_background_texture_dispose(MetalBackgroundTexture *background);
+static void metal_clear_last_capture(void);
+static void metal_set_last_capture(const uint8_t *pixels, size_t length, uint32_t width, uint32_t height, uint32_t bytes_per_row, bool owns_memory);
+static bool metal_capture_framebuffer(MetalWindowState *state);
+static void metal_finalize_capture(MetalWindowState *state);
 
 static void *
 metal_shared_buffer_map(RendererSharedBufferType type, size_t size, void *user) {
@@ -845,6 +865,25 @@ metal_background_texture_dispose(MetalBackgroundTexture *background) {
 }
 
 static void
+metal_clear_last_capture(void) {
+    if (g_metal_capture.owns_memory && g_metal_capture.pixels) {
+        free((void *)g_metal_capture.pixels);
+    }
+    g_metal_capture = (MetalCapturedFrameState){0};
+}
+
+static void
+metal_set_last_capture(const uint8_t *pixels, size_t length, uint32_t width, uint32_t height, uint32_t bytes_per_row, bool owns_memory) {
+    metal_clear_last_capture();
+    g_metal_capture.width = width;
+    g_metal_capture.height = height;
+    g_metal_capture.bytes_per_row = bytes_per_row;
+    g_metal_capture.pixels = pixels;
+    g_metal_capture.length = length;
+    g_metal_capture.owns_memory = owns_memory;
+}
+
+static void
 metal_record_failure(const char *reason) {
     metal_unregister_sprite_hooks();
     g_metal.cell_pipeline = nil;
@@ -862,6 +901,7 @@ metal_record_failure(const char *reason) {
     g_metal.command_queue = nil;
     g_metal.device = nil;
     g_metal.initialized = false;
+    metal_clear_last_capture();
     set_preflight_failure(reason);
 }
 
@@ -2194,6 +2234,17 @@ destroy_window_state(GLFWwindow *window) {
     state.borderBufferCapacity = 0;
     state.borderCount = 0;
     state.sharedFrame = (RendererSharedFrameResult){0};
+    if (state.captureBuffer) {
+        const void *buffer_ptr = state.captureBuffer.contents;
+        if (!g_metal_capture.owns_memory && g_metal_capture.pixels == buffer_ptr) {
+            metal_clear_last_capture();
+        }
+        state.captureBuffer = nil;
+    }
+    state.captureValid = NO;
+    state.captureWidth = 0;
+    state.captureHeight = 0;
+    state.captureBytesPerRow = 0;
     state.layer = nil;
     remove_state_for_window(window);
 }
@@ -2322,6 +2373,7 @@ metal_backend_shutdown(void) {
     g_metal.command_queue = nil;
     g_metal.device = nil;
     g_metal.initialized = false;
+    metal_clear_last_capture();
 }
 
 static void*
@@ -2522,26 +2574,33 @@ metal_backend_present(GLFWwindow *window, const RendererPresentParams *params) {
         metal_log("present_failed", "reason=unknown_window window=%p", window);
         return false;
     }
-    if (params && params->capture_framebuffer) {
-        PyErr_SetString(PyExc_RuntimeError, "Metal framebuffer capture is not supported yet");
-        metal_log("present_failed", "reason=capture_not_supported");
-        return false;
-    }
     if (!state.commandBuffer || !state.drawable) {
         metal_log("present_retry", "cause=missing_primitives command_buffer=%p drawable=%p", state.commandBuffer, state.drawable);
         if (!encode_clear_pass(window, state, state.clearColor)) {
             return false;
         }
     }
+    const bool wants_capture = params && params->capture_framebuffer;
+    if (wants_capture) {
+        if (!metal_capture_framebuffer(state)) {
+            return false;
+        }
+    }
     @autoreleasepool {
         [state.commandBuffer presentDrawable:state.drawable];
         [state.commandBuffer commit];
-        if (!params || params->blocking) {
+        const bool blocking = params ? params->blocking : true;
+        if (wants_capture || blocking) {
+            [state.commandBuffer waitUntilCompleted];
+        } else {
             [state.commandBuffer waitUntilScheduled];
         }
     }
+    if (wants_capture) {
+        metal_finalize_capture(state);
+    }
     if (g_metal.debug_labels) {
-        const bool blocking = params ? params->blocking : true;
+        const bool blocking = wants_capture ? true : (params ? params->blocking : true);
         metal_log("present", "drawable=%p blocking=%d", state.drawable, blocking ? 1 : 0);
     }
     reset_command_primitives(state);
@@ -2809,6 +2868,81 @@ metal_background_image_release(BackgroundImage *bgimage) {
         metal_background_texture_dispose(background);
         bgimage->metal_texture = NULL;
     }
+}
+
+static bool
+metal_capture_framebuffer(MetalWindowState *state) {
+    if (!state || !state.commandBuffer || !state.drawable) {
+        PyErr_SetString(PyExc_RuntimeError, "Metal capture called with incomplete window state");
+        return false;
+    }
+    id<MTLTexture> texture = state.drawable.texture;
+    if (!texture) {
+        PyErr_SetString(PyExc_RuntimeError, "Metal drawable texture unavailable for capture");
+        return false;
+    }
+    const NSUInteger width = texture.width;
+    const NSUInteger height = texture.height;
+    if (width == 0 || height == 0) {
+        state.captureValid = NO;
+        return true;
+    }
+    const size_t bytes_per_row = (size_t)width * 4u;
+    const size_t required_length = bytes_per_row * height;
+    if (!state.captureBuffer || state.captureBuffer.length < required_length) {
+        state.captureBuffer = [g_metal.device newBufferWithLength:required_length options:MTLResourceStorageModeShared];
+        if (!state.captureBuffer) {
+            PyErr_SetString(PyExc_RuntimeError, "Metal failed to allocate capture buffer");
+            metal_log("capture_buffer_alloc_failed", "length=%zu", required_length);
+            return false;
+        }
+    }
+    id<MTLBlitCommandEncoder> blit = [state.commandBuffer blitCommandEncoder];
+    if (!blit) {
+        PyErr_SetString(PyExc_RuntimeError, "Metal failed to create blit encoder for capture");
+        return false;
+    }
+    state.captureWidth = width;
+    state.captureHeight = height;
+    state.captureBytesPerRow = (NSUInteger)bytes_per_row;
+    state.captureValid = YES;
+
+    MTLOrigin origin = MTLOriginMake(0, 0, 0);
+    MTLSize size = MTLSizeMake(width, height, 1);
+    const size_t bytes_per_image = bytes_per_row * height;
+    [blit copyFromTexture:texture
+              sourceSlice:0
+              sourceLevel:0
+             sourceOrigin:origin
+               sourceSize:size
+                toBuffer:state.captureBuffer
+       destinationOffset:0
+      destinationBytesPerRow:bytes_per_row
+    destinationBytesPerImage:bytes_per_image];
+    [blit endEncoding];
+    return true;
+}
+
+static void
+metal_finalize_capture(MetalWindowState *state) {
+    if (!state || !state.captureValid || !state.captureBuffer) {
+        return;
+    }
+    uint8_t *bytes = state.captureBuffer.contents;
+    if (!bytes) {
+        state.captureValid = NO;
+        metal_clear_last_capture();
+        return;
+    }
+    const size_t bytes_per_row = (size_t)state.captureBytesPerRow;
+    const size_t height = state.captureHeight;
+    const size_t length = bytes_per_row * height;
+    for (size_t offset = 0; offset + 3 < length; offset += 4) {
+        uint8_t b = bytes[offset];
+        bytes[offset] = bytes[offset + 2];
+        bytes[offset + 2] = b;
+    }
+    metal_set_last_capture(bytes, length, (uint32_t)state.captureWidth, (uint32_t)state.captureHeight, (uint32_t)bytes_per_row, false);
 }
 
 static bool
@@ -3666,6 +3800,70 @@ metal_renderer_debug_get_graphics_texture(
     out_info->is_opaque = texture.isOpaque;
     out_info->repeat = texture.repeat;
     return true;
+}
+
+EXPORTED bool
+metal_renderer_copy_captured_frame_for_tests(MetalCapturedFrameDebugInfo *out_info) {
+    if (!out_info) {
+        PyErr_SetString(PyExc_ValueError, "metal_renderer_copy_captured_frame_for_tests requires output struct");
+        return false;
+    }
+    if (!g_metal_capture.pixels) {
+        memset(out_info, 0, sizeof(*out_info));
+        return false;
+    }
+    out_info->width = g_metal_capture.width;
+    out_info->height = g_metal_capture.height;
+    out_info->bytes_per_row = g_metal_capture.bytes_per_row;
+    out_info->pixels = g_metal_capture.pixels;
+    return true;
+}
+
+EXPORTED bool
+metal_renderer_debug_set_captured_frame_for_tests(
+    const uint8_t *pixels,
+    uint32_t width,
+    uint32_t height,
+    uint32_t bytes_per_row,
+    bool pixels_are_bgra
+) {
+    if (!pixels) {
+        PyErr_SetString(PyExc_ValueError, "metal_renderer_debug_set_captured_frame_for_tests requires pixel data");
+        return false;
+    }
+    if (width == 0 || height == 0) {
+        PyErr_SetString(PyExc_ValueError, "metal_renderer_debug_set_captured_frame_for_tests requires non-zero dimensions");
+        return false;
+    }
+    if (bytes_per_row == 0 || (size_t)bytes_per_row < (size_t)width * 4u) {
+        PyErr_SetString(PyExc_ValueError, "metal_renderer_debug_set_captured_frame_for_tests received invalid row stride");
+        return false;
+    }
+    size_t length = (size_t)bytes_per_row * height;
+    uint8_t *copy = malloc(length);
+    if (!copy) {
+        PyErr_NoMemory();
+        return false;
+    }
+    memcpy(copy, pixels, length);
+    if (pixels_are_bgra) {
+        for (uint32_t y = 0; y < height; y++) {
+            uint8_t *row = copy + (size_t)y * bytes_per_row;
+            for (uint32_t x = 0; x < width; x++) {
+                size_t idx = (size_t)x * 4u;
+                uint8_t b = row[idx];
+                row[idx] = row[idx + 2];
+                row[idx + 2] = b;
+            }
+        }
+    }
+    metal_set_last_capture(copy, length, width, height, bytes_per_row, true);
+    return true;
+}
+
+EXPORTED void
+metal_renderer_debug_clear_captured_frame_for_tests(void) {
+    metal_clear_last_capture();
 }
 
 EXPORTED void
