@@ -25,6 +25,7 @@ from typing import Callable, Dict, FrozenSet, Iterable, Iterator, List, Optional
 from glfw import glfw
 from glfw.glfw import ISA, BinaryArch, Command, CompileKey, CompilerType
 
+from kitty.python_build_helpers import resolve_framework_library
 src_base = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -377,13 +378,18 @@ def get_python_include_paths() -> List[str]:
 def get_python_flags(args: Options, cflags: List[str], for_main_executable: bool = False) -> List[str]:
     if args.python_compiler_flags:
         cflags.extend(shlex.split(args.python_compiler_flags))
+        include_paths: List[str] = []
     else:
-        cflags.extend(f'-I{x}' for x in get_python_include_paths())
+        include_paths = get_python_include_paths()
+        cflags.extend(f'-I{x}' for x in include_paths)
     if args.python_linker_flags:
         return shlex.split(args.python_linker_flags)
     libs: List[str] = []
     libs += (sysconfig.get_config_var('LIBS') or '').split()
     libs += (sysconfig.get_config_var('SYSLIBS') or '').split()
+    gil_disabled = bool(sysconfig.get_config_var('Py_GIL_DISABLED'))
+    if not gil_disabled:
+        gil_disabled = any('PythonT.framework' in path or path.endswith('python3.13t') for path in include_paths)
     fw = sysconfig.get_config_var('PYTHONFRAMEWORK')
     if fw:
         for var in 'data include stdlib'.split():
@@ -399,7 +405,15 @@ def get_python_flags(args: Options, cflags: List[str], for_main_executable: bool
             raise SystemExit('Failed to find Python framework')
         ldlib = sysconfig.get_config_var('LDLIBRARY')
         if ldlib:
-            libs.append(os.path.join(framework_dir, ldlib))
+            resolved = resolve_framework_library(
+                framework_dir,
+                sysconfig.get_config_var('VERSION'),
+                fw,
+                ldlib,
+                gil_disabled,
+            )
+            if resolved:
+                libs.append(resolved)
     else:
         ldlib = sysconfig.get_config_var('LIBDIR')
         if ldlib:
