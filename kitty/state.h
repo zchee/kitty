@@ -10,6 +10,7 @@
 #include "screen.h"
 #include "monotonic.h"
 #include "window_logo.h"
+#include "graphics.h"
 #include "renderer_backend_types.h"
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
@@ -141,6 +142,19 @@ typedef struct Options {
     struct { float thickness; int unit; } underline_exclusion;
     float box_drawing_scale[4];
 } Options;
+
+static inline bool
+background_image_ready(const BackgroundImage *bgimage) {
+    if (!bgimage) {
+        return false;
+    }
+#ifdef __APPLE__
+    if (bgimage->metal_texture) {
+        return true;
+    }
+#endif
+    return bgimage->texture_id > 0;
+}
 
 typedef struct WindowLogoRenderData {
     window_logo_id_t id;

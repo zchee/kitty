@@ -193,9 +193,17 @@ send_bgimage_to_gpu(BackgroundImageLayout layout, BackgroundImage *bgimage) {
             r = REPEAT_DEFAULT; break;
     }
     bgimage->texture_id = 0;
+#ifndef __APPLE__
     size_t delta = bgimage->mmap_size ? bgimage->mmap_size - ((size_t)4) * bgimage->width * bgimage->height : 0;
     send_image_to_gpu(&bgimage->texture_id, bgimage->bitmap + delta, bgimage->width,
             bgimage->height, false, true, OPT(background_image_linear), r);
+#else
+    if (OPT(metal_renderer) == RENDERER_BACKEND_PREFERENCE_OPENGL) {
+        size_t delta = bgimage->mmap_size ? bgimage->mmap_size - ((size_t)4) * bgimage->width * bgimage->height : 0;
+        send_image_to_gpu(&bgimage->texture_id, bgimage->bitmap + delta, bgimage->width,
+                bgimage->height, false, true, OPT(background_image_linear), r);
+    }
+#endif
 #ifdef __APPLE__
     metal_background_image_uploaded(bgimage, layout, OPT(background_image_linear));
 #endif
@@ -239,7 +247,7 @@ add_os_window(void) {
                 send_bgimage_to_gpu(OPT(background_image_layout), global_state.bgimage);
             }
         }
-        if (global_state.bgimage->texture_id) {
+        if (background_image_ready(global_state.bgimage)) {
             ans->bgimage = global_state.bgimage;
             ans->bgimage->refcnt++;
         }
@@ -881,7 +889,7 @@ PYWRAP1(os_window_has_background_image) {
     id_type os_window_id;
     PA("K", &os_window_id);
     WITH_OS_WINDOW(os_window_id)
-        if (os_window->bgimage && os_window->bgimage->texture_id > 0) { Py_RETURN_TRUE; }
+        if (background_image_ready(os_window->bgimage)) { Py_RETURN_TRUE; }
     END_WITH_OS_WINDOW
     Py_RETURN_FALSE;
 }

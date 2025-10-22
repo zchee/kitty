@@ -1511,7 +1511,7 @@ metal_encode_borders(
         return false;
     }
     MetalBorderUniforms uniforms = {0};
-    const bool has_background_image = os_window && os_window->bgimage && os_window->bgimage->texture_id > 0;
+    const bool has_background_image = os_window && metal_background_texture(os_window->bgimage);
     float background_opacity = os_window ? effective_os_window_alpha(os_window) : 1.0f;
     if (has_background_image) {
         background_opacity = OPT(background_tint) * OPT(background_tint_gaps);
@@ -1920,7 +1920,7 @@ metal_render_pass_for_render_data(
     const size_t graphics_below = grd.num_of_below_refs;
     const size_t graphics_negative = grd.num_of_negative_refs;
     const size_t graphics_positive = grd.num_of_positive_refs;
-    const bool has_background_image = os_window && os_window->bgimage && os_window->bgimage->texture_id > 0;
+    const bool has_background_image = os_window && metal_background_texture(os_window->bgimage);
     ImageRenderData window_logo_image = {0};
     float window_logo_alpha = 0.f;
     bool has_window_logo = false;

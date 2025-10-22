@@ -1,3 +1,4 @@
+import ctypes
 import math
 import sys
 
@@ -54,3 +55,47 @@ class TestMetalBackgroundGeometry(BaseTest):
             geometry.sizes,
             (800.0, 600.0, 800.0, expected_scaled_height),
         )
+
+
+class TestMetalBackgroundUpload(BaseTest):
+    def setUp(self) -> None:
+        super().setUp()
+        if not ffi.has_metal:
+            self.skipTest("Metal backend not available")
+        if not hasattr(ffi, "BackgroundImage") or not hasattr(
+            ffi.lib, "metal_background_image_uploaded"
+        ):
+            self.skipTest("Metal background upload helpers unavailable")
+        self.addCleanup(ffi.reset)
+        ffi.reset()
+
+    @staticmethod
+    def _make_pixels(width: int, height: int) -> ctypes.Array[ctypes.c_uint8]:
+        count = width * height * 4
+        pixels = (ctypes.c_uint8 * count)()
+        for i in range(count):
+            pixels[i] = ctypes.c_uint8((17 * i) & 0xFF)
+        return pixels
+
+    def test_upload_sets_metal_texture_without_gl_id(self) -> None:
+        bg = ffi.BackgroundImage()
+        bg.width = 2
+        bg.height = 1
+        pixels = self._make_pixels(bg.width, bg.height)
+        bg.bitmap = pixels
+        bg.mmap_size = 0
+
+        ffi.lib.metal_background_image_uploaded(
+            ctypes.byref(bg),
+            ffi.BackgroundImageLayout.TILING,
+            ctypes.c_bool(False),
+        )
+        self.addCleanup(ffi.lib.metal_background_image_release, ctypes.byref(bg))
+
+        # Metal path should not rely on a GL texture id.
+        self.assertEqual(bg.texture_id, 0)
+        self.assertNotEqual(bg.metal_texture, None)
+        self.assertNotEqual(bg.metal_texture, 0)
+
+        ffi.lib.metal_background_image_release(ctypes.byref(bg))
+        self.assertEqual(bg.metal_texture, None)

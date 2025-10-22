@@ -196,10 +196,23 @@ class BackendFFI:
                     CLAMP = 1
                     DEFAULT = 2
 
+                class BackgroundImage(ctypes.Structure):
+                    _fields_ = [
+                        ("texture_id", ctypes.c_uint32),
+                        ("height", ctypes.c_uint),
+                        ("width", ctypes.c_uint),
+                        ("bitmap", ctypes.POINTER(ctypes.c_uint8)),
+                        ("refcnt", ctypes.c_uint32),
+                        ("id", ctypes.c_uint32),
+                        ("mmap_size", ctypes.c_size_t),
+                        ("metal_texture", ctypes.c_void_p),
+                    ]
+
                 self.TextureRef = TextureRef
                 self.RendererGraphicsImageUpload = RendererGraphicsImageUpload
                 self.MetalGraphicsTextureInfo = MetalGraphicsTextureInfo
                 self.RepeatStrategy = RepeatStrategy
+                self.BackgroundImage = BackgroundImage
 
                 self.lib.renderer_backend_upload_graphics_image.argtypes = [
                     ctypes.POINTER(TextureRef),
@@ -218,6 +231,18 @@ class BackendFFI:
                     self.lib.metal_renderer_debug_get_graphics_texture.restype = ctypes.c_bool
                 else:
                     self.has_metal = False
+                if self.has_metal and hasattr(self.lib, "metal_background_image_uploaded"):
+                    self.lib.metal_background_image_uploaded.argtypes = [
+                        ctypes.POINTER(BackgroundImage),
+                        ctypes.c_uint,
+                        ctypes.c_bool,
+                    ]
+                    self.lib.metal_background_image_uploaded.restype = None
+                if self.has_metal and hasattr(self.lib, "metal_background_image_release"):
+                    self.lib.metal_background_image_release.argtypes = [
+                        ctypes.POINTER(BackgroundImage)
+                    ]
+                    self.lib.metal_background_image_release.restype = None
         else:
             self.has_metal = False
 
