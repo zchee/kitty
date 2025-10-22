@@ -101,10 +101,6 @@ typedef struct MetalCapturedFrameDebugInfo {
     const uint8_t *pixels;
 } MetalCapturedFrameDebugInfo;
 
-_Static_assert(sizeof(MetalTrailUniforms) == 64, "MetalTrailUniforms layout mismatch");
-_Static_assert(sizeof(MetalGraphicsUniforms) == 48, "MetalGraphicsUniforms layout mismatch");
-_Static_assert(sizeof(MetalGraphicsAlphaUniforms) == 64, "MetalGraphicsAlphaUniforms layout mismatch");
-
 EXPORTED bool metal_renderer_copy_captured_frame_for_tests(MetalCapturedFrameDebugInfo *out_info);
 EXPORTED bool metal_renderer_debug_set_captured_frame_for_tests(
     const uint8_t *pixels,

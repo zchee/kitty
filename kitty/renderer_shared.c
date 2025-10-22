@@ -12,6 +12,16 @@
 
 #define IS_SPECIAL_COLOR(scr, name) ((scr)->color_profile->overridden.name.type == COLOR_IS_SPECIAL || ((scr)->color_profile->overridden.name.type == COLOR_NOT_SET && (scr)->color_profile->configured.name.type == COLOR_IS_SPECIAL))
 
+EXPORTED float
+renderer_shared_visual_bell_alpha_scale_for_tests(uint32_t flash_rgb, float intensity) {
+    if (intensity < 0.0f) intensity = 0.0f;
+    if (intensity > 1.0f) intensity = 1.0f;
+    ARGB32 flash = {.rgb = flash_rgb};
+    const double luminance = rgb_luminance(flash);
+    const float base = luminance >= 128.0 ? 0.6f : 0.4f;
+    return intensity * base;
+}
+
 static void
 pick_cursor_color(
     color_type cell_fg,

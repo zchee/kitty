@@ -11,9 +11,10 @@ This document is the ground-truth reference for the macOS Metal migration. Overw
 - Rendering passes (background, tab bar, window cells, graphics overlays, visual bell, scrollbar, hyperlink highlights, window numbers) execute entirely through the Metal backend with shared state cached per window.
 - Background rendering is now backend-neutral: OpenGL texture IDs are no longer required on macOS. Detection uses `background_image_ready()` (Metal texture pointer or GL id), and the Metal backend manages uploads through `metal_background_image_uploaded`.
 - Added regression coverage (`kitty_tests.test_metal_background.TestMetalBackgroundUpload`) that ensures Metal background uploads succeed even when `texture_id == 0`.
-- Metallib artifacts (`kitty/metal/cell.metallib`) are still produced manually using `xcrun metal` + `xcrun metallib`; automation remains outstanding.
-- The local `python3.13` interpreter segfaults when running the bundled unittest runner (`python3.13 -m unittest ...`). Use an alternate runtime/container for automated test execution until the crash is resolved.
-- `kitty_tests/test_metal_helpers` is still skipped because it assumes the OpenGL shared object. The Metal backend now provides the required symbols; the suite needs an updated loader plus a stable interpreter.
+- Metallib artifacts (`kitty/metal/cell.metallib`) are now generated automatically by `setup.py`'s `compile_metal_shaders`; stale or missing outputs cause the build to abort with a clear failure message.
+- `metal_renderer_preflight()` now checks for the packaged `cell.metallib` and reports a descriptive failure when the artifact is missing, ensuring fallback logic actually triggers.
+- The build now links against `Python.framework` when `Py_GIL_DISABLED` reports false, preventing the previous `python3.13` unittest segfaults. Kitty’s bundled test runner is stable again on the local toolchain.
+- All Metal-focused Python suites (`test_metal_background`, `test_metal_geometry`, `test_metal_resources`, `test_metal_helpers`, `test_metal_fallback`) execute successfully under `./.venv/bin/python3.13 test.py`.
 
 ---
 
@@ -28,15 +29,14 @@ This document is the ground-truth reference for the macOS Metal migration. Overw
 
 ## Immediate Roadmap (highest priority first)
 
-1. **Automate Metallib Generation**
-   - Extend `setup.py` to invoke `xcrun metal` / `xcrun metallib` when `.metal` sources change.
-   - Emit clear failures when the packaged `kitty/metal/*.metallib` is stale relative to source.
-   - Ensure artifacts are copied into the Python package and app bundles.
+1. **Metallib Build Enforcement (DONE 2025-10-22)**
+   - `compile_metal_shaders` now invokes `xcrun metal` / `xcrun metallib`, copies outputs into `kitty/metal/`, and raises on stale or failed builds.
+   - Follow-up: surface the new failure mode in CI logs (no code work pending here).
 
-2. **Stabilize Test Execution**
-   - Re-run Metal suites inside a known-good interpreter (or container) to avoid the current macOS `python3.13` segfault.
-   - Once stable, re-enable `kitty_tests/test_metal_helpers` and expand coverage for sampler caches, geometry helpers, capture flows, and font sprite hooks.
-   - Integrate the new background upload regression into the standard continuous test set.
+2. **Stabilize Test Execution (DONE 2025-10-22)**
+   - Updated Python linking logic to respect disabled-GIL toolchains without forcing `PythonT.framework`; unittest runner no longer crashes.
+   - Restored Metal helper exports (`renderer_shared_visual_bell_alpha_scale_for_tests` et al.) so `kitty_tests/test_metal_helpers` runs end-to-end.
+   - Verified all Metal test modules via `./.venv/bin/python3.13 test.py --module test_metal_*`.
 
 3. **Capture & Teardown Audit**
    - Verify `metal_capture_framebuffer`, `metal_finalize_capture`, and shutdown paths release command buffers, textures, and copied pixel buffers in all edge cases (resize, layer loss, capture cancellation).
@@ -64,8 +64,8 @@ This document is the ground-truth reference for the macOS Metal migration. Overw
 
 ## Testing Strategy
 
-- **Unit / Component Tests**: Reactivate Metal helper tests once the segfault issue is mitigated. Ensure every exported helper (background uploads, sampler caches, capture routines) has direct coverage.
-- **Integration**: Run targeted Metal test modules (`test_metal_background`, `test_metal_geometry`, `test_metal_resources`, `test_metal_helpers`) under a reliable interpreter. Record results in CI artifacts.
+- **Unit / Component Tests**: Metal helper suite is active again; extend it with additional coverage for sampler caches, geometry helpers, capture flows, and font sprite hooks.
+- **Integration**: Continue running the Metal modules (`test_metal_background`, `test_metal_geometry`, `test_metal_resources`, `test_metal_helpers`, `test_metal_fallback`) under `./.venv/bin/python3.13 test.py` and track results in CI artifacts.
 - **Manual QA**: Exercise macOS live-resize, background image toggles, window logo rendering, capture workflows, and fallback selection.
 - **Regression Monitoring**: Track metallib timestamps and include them in release builds to prevent stale shader binaries.
 

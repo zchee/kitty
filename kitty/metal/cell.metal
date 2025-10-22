@@ -563,7 +563,7 @@ struct MetalGraphicsUniforms {
 struct MetalGraphicsAlphaUniforms {
     float4 src_rect;
     float4 dest_rect;
-    float3 foreground_rgb;
+    packed_float3 foreground_rgb;
     float _pad0;
     float4 background_premul;
 };
@@ -633,7 +633,7 @@ graphics_alpha_vertex(uint vertex_id [[vertex_id]], constant MetalGraphicsAlphaU
 fragment float4
 graphics_alpha_fragment(GraphicsAlphaVertexOut in [[stage_in]], texture2d<float> image [[texture(0)]], sampler smp [[sampler(0)]], constant MetalGraphicsAlphaUniforms &uniforms [[buffer(1)]]) {
     float mask = image.sample(smp, in.texcoord).r;
-    float4 fg = vec4_premul(uniforms.foreground_rgb, mask);
+    float4 fg = vec4_premul(float3(uniforms.foreground_rgb), mask);
     return alpha_blend_premul(fg, uniforms.background_premul);
 }
 

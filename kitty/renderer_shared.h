@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "color_type.h"
 #include "compiler.h"
@@ -239,6 +240,8 @@ EXPORTED bool renderer_shared_test_prepare_window_number(
     color_type glyph_color,
     RendererSharedWindowNumber *out_info
 );
+
+EXPORTED float renderer_shared_visual_bell_alpha_scale_for_tests(uint32_t flash_rgb, float intensity);
 
 #ifdef __cplusplus
 }

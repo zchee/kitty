@@ -387,9 +387,17 @@ def get_python_flags(args: Options, cflags: List[str], for_main_executable: bool
     libs: List[str] = []
     libs += (sysconfig.get_config_var('LIBS') or '').split()
     libs += (sysconfig.get_config_var('SYSLIBS') or '').split()
-    gil_disabled = bool(sysconfig.get_config_var('Py_GIL_DISABLED'))
+    gil_flag = sysconfig.get_config_var('Py_GIL_DISABLED')
+    gil_disabled = False
+    if gil_flag not in (None, ''):
+        try:
+            gil_disabled = int(gil_flag) != 0
+        except (TypeError, ValueError):
+            gil_disabled = bool(gil_flag)
     if not gil_disabled:
         gil_disabled = any('PythonT.framework' in path or path.endswith('python3.13t') for path in include_paths)
+        if '-UPy_GIL_DISABLED' not in cflags:
+            cflags.append('-UPy_GIL_DISABLED')
     fw = sysconfig.get_config_var('PYTHONFRAMEWORK')
     if fw:
         for var in 'data include stdlib'.split():
@@ -1282,12 +1290,15 @@ def compile_metal_shaders(args: Options) -> None:
     metal_build_dir = os.path.join(build_dir, 'metal')
     safe_makedirs(metal_build_dir)
     failures: List[Tuple[str, str, Union[int, None]]] = []
+    stale_paths: Dict[str, str] = {}
+    expected_packages: List[Tuple[str, str, str]] = []
     min_macos_version = '13.0'
     for src in metal_sources:
         name = os.path.splitext(os.path.basename(src))[0]
         air = os.path.join(metal_build_dir, f'{name}.air')
         metallib_output = os.path.join(metal_build_dir, f'{name}.metallib')
         package_metallib = os.path.join(metal_src_dir, f'{name}.metallib')
+        expected_packages.append((name, src, package_metallib))
 
         def cleanup_outputs(remove_air: bool = False) -> None:
             if remove_air:
@@ -1322,11 +1333,24 @@ def compile_metal_shaders(args: Options) -> None:
                 continue
         if newer(package_metallib, metallib_output):
             shutil.copy2(metallib_output, package_metallib)
+    for name, src, package_metallib in expected_packages:
+        if newer(package_metallib, src):
+            stale_paths.setdefault(name, package_metallib)
+            if not any(existing_name == name for existing_name, _, _ in failures):
+                failures.append((name, 'stale', None))
     if failures:
         print(error('Metal shader build failed; the Metal renderer will fall back to OpenGL.'), file=sys.stderr)
         for shader, stage, code in failures:
+            if stage == 'stale':
+                location = stale_paths.get(shader)
+                detail = 'packaged metallib missing or stale'
+                if location:
+                    detail = f'{detail} ({location})'
+                print(error(f'  - {shader}: {detail}'), file=sys.stderr)
+                continue
             reason = f'exit code {code}' if code is not None else 'unknown error'
             print(error(f'  - {shader}: {stage} step failed ({reason})'), file=sys.stderr)
+        raise SystemExit('Metal shader build failed; see errors above')
 
 
 def update_go_generated_files(args: Options, kitty_exe: str) -> None:

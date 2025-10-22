@@ -137,9 +137,15 @@ typedef struct {
 } MetalGraphicsUniforms;
 
 typedef struct {
+    float x;
+    float y;
+    float z;
+} MetalPackedFloat3;
+
+typedef struct {
     vector_float4 src_rect;
     vector_float4 dest_rect;
-    vector_float3 foreground_rgb;
+    MetalPackedFloat3 foreground_rgb;
     float _pad0;
     vector_float4 background_premul;
 } MetalGraphicsAlphaUniforms;
@@ -170,6 +176,10 @@ typedef struct {
     vector_float2 tex_scale;
     vector_float4 color;
 } MetalOverlayAlphaUniforms;
+
+_Static_assert(sizeof(MetalTrailUniforms) == 64, "MetalTrailUniforms layout mismatch");
+_Static_assert(sizeof(MetalGraphicsUniforms) == 48, "MetalGraphicsUniforms layout mismatch");
+_Static_assert(sizeof(MetalGraphicsAlphaUniforms) == 64, "MetalGraphicsAlphaUniforms layout mismatch");
 
 static inline size_t
 metal_aligned_buffer_length(size_t size) {
@@ -1576,7 +1586,7 @@ metal_pack_graphics_uniforms(const ImageRenderData *rd, float extra_alpha) {
 static inline MetalGraphicsAlphaUniforms
 metal_pack_graphics_alpha_uniforms(
     const ImageRenderData *rd,
-    vector_float3 foreground_rgb,
+    MetalPackedFloat3 foreground_rgb,
     vector_float4 background_premul
 ) {
     MetalGraphicsAlphaUniforms uniforms = {
@@ -1746,7 +1756,8 @@ metal_encode_graphics_alpha_bucket(
 
         for (size_t i = 0; i < group && index + i < count; ++i) {
             const ImageRenderData *item = images + start + index + i;
-            vector_float3 fg = foreground_rgb * extra_alpha;
+            vector_float3 fg_vec = foreground_rgb * extra_alpha;
+            MetalPackedFloat3 fg = { fg_vec.x, fg_vec.y, fg_vec.z };
             vector_float4 bg = background_premul * extra_alpha;
             MetalGraphicsAlphaUniforms uniforms = metal_pack_graphics_alpha_uniforms(item, fg, bg);
             [encoder setVertexBytes:&uniforms length:sizeof(MetalGraphicsAlphaUniforms) atIndex:0];
@@ -2299,8 +2310,13 @@ metal_renderer_preflight(const char **failure_reason) {
         if (@available(macOS 13.0, *)) {
             id<MTLDevice> device = MTLCreateSystemDefaultDevice();
             if (device) {
-                preflight_success = true;
-                preflight_failure_reason = NULL;
+                NSString *library_path = metal_library_path();
+                if (!library_path || ![[NSFileManager defaultManager] fileExistsAtPath:library_path]) {
+                    set_preflight_failure("Metal shader library missing; falling back to OpenGL.");
+                } else {
+                    preflight_success = true;
+                    preflight_failure_reason = NULL;
+                }
             } else {
                 set_preflight_failure("Metal renderer unavailable: no compatible GPU reported by Metal.");
             }
@@ -3955,7 +3971,7 @@ metal_renderer_pack_graphics_alpha_uniforms_for_tests(
         PyErr_SetString(PyExc_ValueError, "metal_renderer_pack_graphics_alpha_uniforms_for_tests requires data and output");
         return;
     }
-    vector_float3 fg = { fg_r * extra_alpha, fg_g * extra_alpha, fg_b * extra_alpha };
+    MetalPackedFloat3 fg = { fg_r * extra_alpha, fg_g * extra_alpha, fg_b * extra_alpha };
     vector_float4 bg = { bg_r * extra_alpha, bg_g * extra_alpha, bg_b * extra_alpha, bg_a * extra_alpha };
     *out_uniforms = metal_pack_graphics_alpha_uniforms(data, fg, bg);
 }
