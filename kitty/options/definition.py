@@ -3731,14 +3731,11 @@ config is not supported.
     )
 
 opt('metal_renderer', 'auto',
-    choices=('auto', 'metal', 'opengl'), ctype='renderer_backend_preference',
+    choices=('auto', 'metal'), ctype='renderer_backend_preference',
     long_text='''
 macOS only. Controls which renderer backend kitty uses. The default of
-:code:`auto` prefers Apple's Metal backend on macOS 13 or later and falls back
-to OpenGL when Metal is unavailable. Use :code:`metal` to force an attempt to
-use Metal even when automatic detection would fall back, and :code:`opengl`
-to continue using OpenGL. When Metal initialization fails kitty logs the
-reason and continues with OpenGL.
+:code:`auto` always uses Apple's Metal backend and exits with an error if Metal
+initialization fails. Use :code:`metal` to request the same behavior explicitly.
 '''
     )
 

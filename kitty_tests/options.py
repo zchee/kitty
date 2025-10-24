@@ -40,12 +40,14 @@ class TestConfParsing(BaseTest):
 class TestRendererPreferenceOptions(BaseTest):
 
     def test_metal_renderer_option_accepts_valid_values(self) -> None:
-        opts = self.set_options({'metal_renderer': 'opengl'})
-        self.assertEqual('opengl', opts.metal_renderer)
+        opts = self.set_options({'metal_renderer': 'metal'})
+        self.assertEqual('metal', opts.metal_renderer)
+        opts = self.set_options({'metal_renderer': 'auto'})
+        self.assertEqual('auto', opts.metal_renderer)
 
     def test_metal_renderer_option_rejects_invalid_value(self) -> None:
-        with self.assertRaisesRegex(ValueError, 'bogus.*metal_renderer'):
-            self.set_options({'metal_renderer': 'bogus'})
+        with self.assertRaisesRegex(ValueError, 'opengl.*metal_renderer'):
+            self.set_options({'metal_renderer': 'opengl'})
 
 
 def cli_parsing(self):

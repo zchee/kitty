@@ -7,7 +7,7 @@
 
 ## Goals
 1. Deliver Metal backend for macOS with full feature parity to the current OpenGL renderer.
-2. Maintain OpenGL backend for non-macOS platforms and as fallback on macOS.
+2. Maintain OpenGL backend for non-macOS platforms; macOS runs exclusively on Metal.
 3. Avoid regression in performance, latency, and visual fidelity.
 4. Preserve test and CI coverage while adding backend-specific validation.
 
@@ -165,7 +165,7 @@ typedef struct RendererBackendOps {
 
 ### Python Integration
 - `kitty/glfw.py` (and any Python callers) interact with renderer through a thin C API exported from `kitty/glwrapper` module.
-- Introduce configuration flag (`metal_renderer = auto|always|never`) stored in `kitty/options/definition.py` and exposed via CLI; default `auto` attempts Metal on macOS 13+ with fallback to OpenGL.
+- Introduce configuration flag (`metal_renderer = auto|metal`) stored in `kitty/options/definition.py` and exposed via CLI; `auto` enforces Metal on macOS 13+ and fails fast if initialization is unavailable.
 
 ## GLFW / Windowing Changes
 - Replace direct NSOpenGLView usage with backend-owned view stacks.

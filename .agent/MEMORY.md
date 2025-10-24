@@ -12,15 +12,15 @@ This document is the ground-truth reference for the macOS Metal migration. Overw
 - Background rendering is now backend-neutral: OpenGL texture IDs are no longer required on macOS. Detection uses `background_image_ready()` (Metal texture pointer or GL id), and the Metal backend manages uploads through `metal_background_image_uploaded`.
 - Added regression coverage (`kitty_tests.test_metal_background.TestMetalBackgroundUpload`) that ensures Metal background uploads succeed even when `texture_id == 0`.
 - Metallib artifacts (`kitty/metal/cell.metallib`) are now generated automatically by `setup.py`'s `compile_metal_shaders`; stale or missing outputs cause the build to abort with a clear failure message.
-- `metal_renderer_preflight()` now checks for the packaged `cell.metallib` and reports a descriptive failure when the artifact is missing, ensuring fallback logic actually triggers.
-- The build now links against `Python.framework` when `Py_GIL_DISABLED` reports false, preventing the previous `python3.13` unittest segfaults. Kitty’s bundled test runner is stable again on the local toolchain.
-- All Metal-focused Python suites (`test_metal_background`, `test_metal_geometry`, `test_metal_resources`, `test_metal_helpers`, `test_metal_fallback`) execute successfully under `./.venv/bin/python3.13 test.py`.
+- `metal_renderer_preflight()` now checks for the packaged `cell.metallib` and fails fast with a fatal error when the artifact is missing; macOS no longer attempts an OpenGL fallback.
+- The build now links against `Python.framework` when `Py_GIL_DISABLED` reports false, preventing the previous `python3.13` unittest segfaults. (Note: current local invocations of `./.venv/bin/python3.13 test.py` crash while importing `kitty.conf.utils`; investigation pending.)
+- Metal-focused Python suites (`test_metal_background`, `test_metal_geometry`, `test_metal_resources`, `test_metal_helpers`, `test_metal_fallback`) previously passed under `./.venv/bin/python3.13 test.py`; as of Oct 22 2025 the run exits via segmentation fault before execution.
 
 ---
 
 ## Implementation Snapshot
 
-- Renderer backend registration is two-path (OpenGL + Metal). macOS defaults obey `metal_renderer = auto|metal|opengl`, with CAMetalLayer creation handled in `metal_backend_attach_window`.
+- Renderer backend registration is two-path (OpenGL + Metal). macOS defaults now expose `metal_renderer = auto|metal`; `auto` enforces Metal with CAMetalLayer creation handled in `metal_backend_attach_window`.
 - Metal state hoists per-window buffers (cell, selection, uniform, border), sprite atlases, and capture buffers with explicit teardown in `destroy_window_state`.
 - Sprite uploads and window logos use Metal textures through the shared graphics texture table; background image uploads mirror this flow.
 - Shared renderer utilities (`renderer_shared_prepare_frame`, scrollbar metrics, glyph caches) are fully consumed by the Metal backend.
@@ -57,7 +57,6 @@ This document is the ground-truth reference for the macOS Metal migration. Overw
 - Integrate metallib compilation into CI (Apple Silicon + Intel runners) and cache artifacts for test reuse.
 - Expand acceptance testing with image-diff comparisons between OpenGL and Metal to guard against visual regressions.
 - Provide Metal-specific logging and GPU capture toggles analogous to existing OpenGL debug flags.
-- Finalize fallback logic: when Metal initialization fails, confirm graceful downgrade to OpenGL and add negative tests.
 - Review sprite-atlas growth policies and buffer eviction to ensure parity with OpenGL’s GPU memory management.
 
 ---

@@ -37,32 +37,24 @@ static bool
 select_metal_if_preferred(void) {
     RendererBackendPreference pref = OPT(metal_renderer);
     if (pref == RENDERER_BACKEND_PREFERENCE_OPENGL) {
-        if (renderer_backend_current_type() != RENDERER_BACKEND_OPENGL) {
-            renderer_backend_select(RENDERER_BACKEND_OPENGL);
-        }
-        return false;
+        fatal("Metal renderer preference 'opengl' is not supported on macOS; use 'auto' or 'metal'");
     }
-    if (metal_preflight_attempted) {
-        if (!metal_preflight_succeeded) {
-            renderer_backend_select(RENDERER_BACKEND_OPENGL);
-            return false;
-        }
-        renderer_backend_select(RENDERER_BACKEND_METAL);
+    if (renderer_backend_current_type() == RENDERER_BACKEND_METAL && metal_preflight_succeeded) {
         return true;
+    }
+    if (metal_preflight_attempted && !metal_preflight_succeeded) {
+        fatal("Metal renderer unavailable: previous initialization attempt failed");
     }
     metal_preflight_attempted = true;
     RendererBackendType metal_type = renderer_backend_type_from_name("metal");
     if (metal_type == (RendererBackendType)-1) {
-        renderer_backend_select(RENDERER_BACKEND_OPENGL);
-        return false;
+        fatal("Metal renderer unavailable: backend not registered");
     }
     renderer_backend_select(metal_type);
     const char *reason = NULL;
     if (!metal_renderer_preflight(&reason)) {
-        if (reason) log_error("Metal renderer unavailable: %s", reason);
-        renderer_backend_select(RENDERER_BACKEND_OPENGL);
-        metal_preflight_succeeded = false;
-        return false;
+        if (reason) fatal("Metal renderer unavailable: %s", reason);
+        fatal("Metal renderer unavailable");
     }
     metal_preflight_succeeded = true;
     return true;
@@ -1402,8 +1394,8 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
     static bool is_first_window = true;
 #ifdef __APPLE__
     select_metal_if_preferred();
-    const bool using_metal = renderer_backend_current_type() == RENDERER_BACKEND_METAL;
-    glfwWindowHint(GLFW_CLIENT_API, using_metal ? GLFW_NO_API : GLFW_OPENGL_API);
+    const bool using_metal = true;
+    glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
 #else
     select_metal_if_preferred();
     const bool using_metal = false;

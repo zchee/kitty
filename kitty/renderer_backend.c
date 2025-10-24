@@ -15,7 +15,11 @@ typedef struct {
 } RegisteredBackend;
 
 static RegisteredBackend registered_backends[RENDERER_BACKEND_COUNT];
+#ifdef __APPLE__
+static RendererBackendType selected_backend = RENDERER_BACKEND_METAL;
+#else
 static RendererBackendType selected_backend = RENDERER_BACKEND_OPENGL;
+#endif
 static bool backend_selected = false;
 static const char *const renderer_backend_names[RENDERER_BACKEND_COUNT] = {
     [RENDERER_BACKEND_OPENGL] = "opengl",

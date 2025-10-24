@@ -198,11 +198,7 @@ send_bgimage_to_gpu(BackgroundImageLayout layout, BackgroundImage *bgimage) {
     send_image_to_gpu(&bgimage->texture_id, bgimage->bitmap + delta, bgimage->width,
             bgimage->height, false, true, OPT(background_image_linear), r);
 #else
-    if (OPT(metal_renderer) == RENDERER_BACKEND_PREFERENCE_OPENGL) {
-        size_t delta = bgimage->mmap_size ? bgimage->mmap_size - ((size_t)4) * bgimage->width * bgimage->height : 0;
-        send_image_to_gpu(&bgimage->texture_id, bgimage->bitmap + delta, bgimage->width,
-                bgimage->height, false, true, OPT(background_image_linear), r);
-    }
+    (void)r;
 #endif
 #ifdef __APPLE__
     metal_background_image_uploaded(bgimage, layout, OPT(background_image_linear));

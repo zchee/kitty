@@ -83,9 +83,6 @@ renderer_backend_preference(PyObject *value) {
     if (strcmp(backend, "metal") == 0) {
         return RENDERER_BACKEND_PREFERENCE_METAL;
     }
-    if (strcmp(backend, "opengl") == 0) {
-        return RENDERER_BACKEND_PREFERENCE_OPENGL;
-    }
     PyErr_Format(PyExc_ValueError, "The value %s is not a valid choice for metal_renderer", backend);
     return RENDERER_BACKEND_PREFERENCE_AUTO;
 }
