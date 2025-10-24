@@ -972,48 +972,30 @@ static NSString *
 metal_library_path(void) {
     NSString *result = nil;
     PyGILState_STATE gil = PyGILState_Ensure();
-    PyObject *resources_mod = PyImport_ImportModule("importlib.resources");
-    if (resources_mod) {
-        PyObject *files_fn = PyObject_GetAttrString(resources_mod, "files");
-        if (files_fn) {
-            PyObject *package_name = PyUnicode_FromString("kitty.metal");
-            if (package_name) {
-                PyObject *files_obj = PyObject_CallFunctionObjArgs(files_fn, package_name, NULL);
-                if (files_obj) {
-                    PyObject *path_obj = PyObject_CallMethod(files_obj, "joinpath", "s", "cell.metallib");
-                    if (path_obj) {
-                        PyObject *fspath = PyObject_CallMethod(path_obj, "__fspath__", NULL);
-                        if (fspath && PyUnicode_Check(fspath)) {
-                            const char *fs = PyUnicode_AsUTF8(fspath);
-                            if (fs) {
-                                result = [NSString stringWithUTF8String:fs];
-                            } else {
-                                PyErr_Clear();
-                            }
-                        } else {
-                            PyErr_Clear();
-                        }
-                        Py_XDECREF(fspath);
-                        Py_DECREF(path_obj);
-                    } else {
-                        PyErr_Clear();
-                    }
-                    Py_DECREF(files_obj);
-                } else {
-                    PyErr_Clear();
-                }
-                Py_DECREF(package_name);
-            } else {
-                PyErr_Clear();
-            }
-            Py_DECREF(files_fn);
+    PyObject *metal_module = PyImport_ImportModule("kitty.metal");
+    if (!metal_module) {
+        PyErr_Clear();
+        PyGILState_Release(gil);
+        return result;
+    }
+    PyObject *path_obj = PyObject_CallMethod(metal_module, "get_cell_metallib_path", NULL);
+    Py_DECREF(metal_module);
+    if (!path_obj) {
+        PyErr_Clear();
+        PyGILState_Release(gil);
+        return result;
+    }
+    if (PyUnicode_Check(path_obj)) {
+        const char *fs = PyUnicode_AsUTF8(path_obj);
+        if (fs) {
+            result = [NSString stringWithUTF8String:fs];
         } else {
             PyErr_Clear();
         }
-        Py_DECREF(resources_mod);
     } else {
         PyErr_Clear();
     }
+    Py_DECREF(path_obj);
     PyGILState_Release(gil);
     return result;
 }
