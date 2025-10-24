@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import atexit
+import json
 import threading
 from contextlib import ExitStack
 from importlib import resources
 from pathlib import Path
 
-__all__ = ["get_cell_metallib_path"]
+__all__ = ["get_cell_metallib_path", "get_shader_metadata"]
 
 _METALLIB_NAME = "cell.metallib"
 _metallib_lock = threading.RLock()
 _metallib_exit_stack: ExitStack | None = None
 _metallib_path: str | None = None
 _atexit_registered = False
+_shader_metadata_lock = threading.RLock()
+_shader_metadata: dict | None = None
 
 
 def _close_metallib_stack() -> None:
@@ -72,3 +75,26 @@ def get_cell_metallib_path() -> str:
 def _reset_cell_metallib_cache_for_tests() -> None:
     with _metallib_lock:
         _close_metallib_stack()
+
+
+def get_shader_metadata() -> dict:
+    """
+    Load cached shader metadata emitted during the build.
+    """
+    global _shader_metadata
+    with _shader_metadata_lock:
+        if _shader_metadata is not None:
+            return _shader_metadata
+
+        pkg_files = resources.files(__name__)
+        traversable = pkg_files / "shader_metadata.json"
+        with resources.as_file(traversable) as metadata_path:
+            data = Path(metadata_path).read_text(encoding="utf-8")
+        _shader_metadata = json.loads(data)
+        return _shader_metadata
+
+
+def _reset_shader_metadata_cache_for_tests() -> None:
+    global _shader_metadata
+    with _shader_metadata_lock:
+        _shader_metadata = None

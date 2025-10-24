@@ -70,6 +70,10 @@ class MetalWindowDebugState(ctypes.Structure):
         ('capture_width', ctypes.c_uint32),
         ('capture_height', ctypes.c_uint32),
         ('capture_bytes_per_row', ctypes.c_uint32),
+        ('contents_scale', ctypes.c_float),
+        ('drawable_width', ctypes.c_uint32),
+        ('drawable_height', ctypes.c_uint32),
+        ('layer_attached', ctypes.c_bool),
     ]
 
 
@@ -614,6 +618,10 @@ class TestMetalCaptureLifecycle(BaseTest):
         state.capture_width = 120
         state.capture_height = 60
         state.capture_bytes_per_row = 480
+        state.contents_scale = 1.0
+        state.drawable_width = 320
+        state.drawable_height = 200
+        state.layer_attached = False
         ffi.lib.metal_renderer_debug_set_window_state_for_tests(None, ctypes.byref(state))
 
         src = (ctypes.c_uint8 * 16)(*range(16))
@@ -643,6 +651,10 @@ class TestMetalCaptureLifecycle(BaseTest):
         self.assertEqual(out_state.capture_width, 0)
         self.assertEqual(out_state.capture_height, 0)
         self.assertEqual(out_state.capture_bytes_per_row, 0)
+        self.assertAlmostEqual(out_state.contents_scale, 2.0)
+        self.assertEqual(out_state.drawable_width, 640)
+        self.assertEqual(out_state.drawable_height, 480)
+        self.assertFalse(out_state.layer_attached)
 
         info = MetalCapturedFrameDebugInfo()
         self.assertFalse(ffi.lib.metal_renderer_copy_captured_frame_for_tests(ctypes.byref(info)))

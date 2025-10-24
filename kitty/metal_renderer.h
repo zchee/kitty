@@ -118,6 +118,10 @@ typedef struct MetalWindowDebugState {
     uint32_t capture_width;
     uint32_t capture_height;
     uint32_t capture_bytes_per_row;
+    float contents_scale;
+    uint32_t drawable_width;
+    uint32_t drawable_height;
+    bool layer_attached;
 } MetalWindowDebugState;
 
 typedef struct MetalRuntimeDebugFlags {

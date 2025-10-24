@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "shaders": {
+    "cell": {
+      "constants": {
+        "DECORATION_MASK": "0x7u",
+        "MARK_MASK": "0x3u",
+        "MetalCellColorTableEntries": "MetalCellNumColors + MARK_MASK + MARK_MASK + 2u",
+        "MetalCellNumColors": "256u",
+        "SPRITE_COLORED_MASK": "0x80000000u",
+        "SPRITE_COLORED_SHIFT": "31u",
+        "SPRITE_INDEX_MASK": "0x7fffffffu"
+      },
+      "metallib": "cell.metallib",
+      "source": "cell.metal",
+      "source_hash": "56a6817b471a8affc26b973dcbb9a6f654777d38e4eb458d039784d15d8b2d7f"
+    }
+  }
+}

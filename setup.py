@@ -3,6 +3,7 @@
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import platform
@@ -1275,6 +1276,73 @@ def metal_tool_cmd(xcrun: str, tool: str, sdk: str = 'macosx') -> List[str]:
     return [xcrun, '--sdk', sdk, tool]
 
 
+EXPECTED_METAL_CONSTANTS: FrozenSet[str] = frozenset({
+    'MetalCellNumColors',
+    'MetalCellColorTableEntries',
+    'SPRITE_INDEX_MASK',
+    'SPRITE_COLORED_MASK',
+    'SPRITE_COLORED_SHIFT',
+    'DECORATION_MASK',
+    'MARK_MASK',
+})
+
+
+def extract_metal_constants(source: str, path: str) -> Dict[str, str]:
+    constants: Dict[str, str] = {}
+    for line in source.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith('constant '):
+            continue
+        without_prefix = stripped[len('constant '):]
+        if '=' not in without_prefix:
+            continue
+        lhs, rhs = without_prefix.split('=', 1)
+        name_tokens = lhs.strip().split()
+        if not name_tokens:
+            continue
+        name = name_tokens[-1]
+        if name not in EXPECTED_METAL_CONSTANTS:
+            continue
+        value = rhs.rstrip(';').strip()
+        constants[name] = value
+    missing = EXPECTED_METAL_CONSTANTS.difference(constants.keys())
+    if missing:
+        raise SystemExit(f"Metal shader metadata missing constants in {path}: {', '.join(sorted(missing))}")
+    return constants
+
+
+def emit_metal_shader_metadata(metal_sources: Sequence[str]) -> None:
+    if not metal_sources:
+        return
+    metal_src_dir = os.path.join(src_base, 'kitty', 'metal')
+    metadata_path = os.path.join(metal_src_dir, 'shader_metadata.json')
+    shaders: Dict[str, Dict[str, Union[str, Dict[str, str]]]] = {}
+    for src in metal_sources:
+        name = os.path.splitext(os.path.basename(src))[0]
+        with open(src, 'r', encoding='utf-8') as f:
+            contents = f.read()
+        shader_entry = {
+            'metallib': f'{name}.metallib',
+            'source': os.path.relpath(src, metal_src_dir),
+            'source_hash': hashlib.sha256(contents.encode('utf-8')).hexdigest(),
+            'constants': extract_metal_constants(contents, src),
+        }
+        shaders[name] = shader_entry
+    metadata = {
+        'schema': 1,
+        'shaders': shaders,
+    }
+    serialized = json.dumps(metadata, indent=2, sort_keys=True) + '\n'
+    try:
+        with open(metadata_path, 'r', encoding='utf-8') as existing:
+            if existing.read() == serialized:
+                return
+    except FileNotFoundError:
+        pass
+    with open(metadata_path, 'w', encoding='utf-8') as f:
+        f.write(serialized)
+
+
 def compile_metal_shaders(args: Options) -> None:
     if not is_macos:
         return
@@ -1351,6 +1419,8 @@ def compile_metal_shaders(args: Options) -> None:
             reason = f'exit code {code}' if code is not None else 'unknown error'
             print(error(f'  - {shader}: {stage} step failed ({reason})'), file=sys.stderr)
         raise SystemExit('Metal shader build failed; see errors above')
+
+    emit_metal_shader_metadata(metal_sources)
 
 
 def update_go_generated_files(args: Options, kitty_exe: str) -> None:

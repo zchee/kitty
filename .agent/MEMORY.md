@@ -21,6 +21,12 @@ This file tracks the authoritative state of kitty’s renderer architecture, cur
 - Renderer backend tests expanded with `test_tab_bar_upload_without_screen_returns_false`, `test_macos_reports_only_metal_backend`, and `test_macos_rejects_opengl_selection` to guard the new behaviour.
 - Full rebuild via `./.venv/bin/python3.13 setup.py build` followed by `./.venv/bin/python3.13 test.py --module renderer_backend` verifies the crash fix and macOS-only backend policy.
 
+### Updates (2025-10-24)
+
+- CAMetalLayer lifecycle is now centralized in `metal_backend_attach_window` with tracked drawable metrics, plus debug/state APIs exposing contents scale and attachments for tests.
+- `test_metal_helpers` gains coverage to ensure resize-driven Metal state invalidation updates recorded scale/dimensions.
+- Metal shader packaging now emits `kitty/metal/shader_metadata.json` during `setup.py build`, with runtime access via `kitty.metal.get_shader_metadata()` and dedicated metadata tests.
+
 ---
 
 ## Current Testing Status
@@ -65,4 +71,3 @@ This file tracks the authoritative state of kitty’s renderer architecture, cur
 - Keep `renderer_backend_select()` code in sync with tests; macOS policy relies on ValueError text for user-facing messaging.
 - When adding new tests that touch renderer state, prefer the existing debug helpers (`state_debug_*`) instead of bespoke ctypes plumbing.
 - Always rebuild C extensions (`setup.py build`) after touching renderer C files, then rerun focused tests before committing.
-

@@ -234,6 +234,10 @@ class BackendFFI:
                             ("capture_width", ctypes.c_uint32),
                             ("capture_height", ctypes.c_uint32),
                             ("capture_bytes_per_row", ctypes.c_uint32),
+                            ("contents_scale", ctypes.c_float),
+                            ("drawable_width", ctypes.c_uint32),
+                            ("drawable_height", ctypes.c_uint32),
+                            ("layer_attached", ctypes.c_bool),
                         ]
 
                     self.MetalWindowDebugState = MetalWindowDebugState

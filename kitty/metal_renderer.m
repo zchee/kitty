@@ -528,6 +528,9 @@ graphics_sampler_for(bool linear_filter, RepeatStrategy repeat) {
 @property (nonatomic) MTLClearColor clearColor;
 @property (nonatomic) float backgroundOpacity;
 @property (nonatomic) color_type fallbackBackground;
+@property (nonatomic, assign) NSView *attachedView;
+@property (nonatomic) CGSize lastDrawableSize;
+@property (nonatomic) CGFloat lastContentsScale;
 @property (nonatomic, strong) id closeObserver;
 @property (nonatomic) RendererSharedFrameResult sharedFrame;
 @property (nonatomic, strong) id<MTLBuffer> cellBuffer;
@@ -549,6 +552,28 @@ graphics_sampler_for(bool linear_filter, RepeatStrategy repeat) {
 @property (nonatomic) NSUInteger captureBytesPerRow;
 @property (nonatomic) BOOL captureValid;
 @end
+
+static inline void
+metal_record_layer_metrics(MetalWindowState *state, CAMetalLayer *layer) {
+    if (!state) return;
+    if (layer) {
+        state.lastContentsScale = layer.contentsScale;
+        state.lastDrawableSize = layer.drawableSize;
+    } else {
+        state.lastContentsScale = 0.0;
+        state.lastDrawableSize = CGSizeZero;
+    }
+}
+
+static inline void
+metal_detach_layer_from_view(MetalWindowState *state) {
+    if (!state) return;
+    NSView *view = state.attachedView;
+    if (view && view.layer == state.layer) {
+        view.layer = nil;
+    }
+    state.attachedView = nil;
+}
 
 static bool ensure_command_primitives(GLFWwindow *window, MetalWindowState *state);
 static void encode_draw_end(id<MTLRenderCommandEncoder> encoder);
@@ -2279,16 +2304,23 @@ destroy_window_state(GLFWwindow *window) {
     state.borderCount = 0;
     state.sharedFrame = (RendererSharedFrameResult){0};
     metal_reset_capture_state(state, true);
+    metal_detach_layer_from_view(state);
     state.layer = nil;
+    metal_record_layer_metrics(state, nil);
     remove_state_for_window(window);
 }
 
 static void
-update_layer_properties(CAMetalLayer *layer, const RendererResizeParams *params) {
-    if (!layer) return;
+update_layer_properties(MetalWindowState *state, CAMetalLayer *layer, const RendererResizeParams *params) {
+    if (!layer) {
+        metal_record_layer_metrics(state, nil);
+        return;
+    }
     if (params) {
         layer.contentsScale = params->framebuffer_scale > 0.f ? params->framebuffer_scale : 1.f;
-        CGSize drawable_size = CGSizeMake((CGFloat)params->framebuffer_width, (CGFloat)params->framebuffer_height);
+        const int width = params->framebuffer_width > 0 ? params->framebuffer_width : 0;
+        const int height = params->framebuffer_height > 0 ? params->framebuffer_height : 0;
+        CGSize drawable_size = CGSizeMake((CGFloat)width, (CGFloat)height);
         layer.drawableSize = drawable_size;
     } else {
         layer.contentsScale = layer.contentsScale > 0.0 ? layer.contentsScale : 1.0;
@@ -2296,6 +2328,7 @@ update_layer_properties(CAMetalLayer *layer, const RendererResizeParams *params)
             layer.frame = layer.superlayer.bounds;
         }
     }
+    metal_record_layer_metrics(state, layer);
 }
 
 static void
@@ -2451,17 +2484,18 @@ metal_backend_attach_window(GLFWwindow *window, const RendererWindowConfig *conf
         state.closeObserver = nil;
     }
     reset_command_primitives(state);
-    if (state.layer) {
-        [state.layer removeFromSuperlayer];
-        state.layer = nil;
-    }
+    metal_detach_layer_from_view(state);
 
+    CAMetalLayer *layer = state.layer;
     @autoreleasepool {
-        CAMetalLayer *layer = [CAMetalLayer layer];
         if (!layer) {
-            PyErr_SetString(PyExc_RuntimeError, "Failed to create CAMetalLayer");
-            destroy_window_state(window);
-            return false;
+            layer = [CAMetalLayer layer];
+            if (!layer) {
+                PyErr_SetString(PyExc_RuntimeError, "Failed to create CAMetalLayer");
+                destroy_window_state(window);
+                return false;
+            }
+            state.layer = layer;
         }
         layer.device = g_metal.device;
         layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
@@ -2471,14 +2505,25 @@ metal_backend_attach_window(GLFWwindow *window, const RendererWindowConfig *conf
         layer.opaque = config ? !config->wants_transparency : YES;
         layer.displaySyncEnabled = g_metal.display_sync_enabled;
         const CGFloat backing_scale = ns_window.backingScaleFactor;
-        layer.contentsScale = backing_scale > 0.0 ? backing_scale : 1.0;
-        layer.drawableSize = CGSizeMake(content_view.bounds.size.width * layer.contentsScale,
-                                        content_view.bounds.size.height * layer.contentsScale);
+        const CGFloat contents_scale = backing_scale > 0.0 ? backing_scale : 1.0;
+        layer.contentsScale = contents_scale;
+        CGSize bounds_size = content_view.bounds.size;
+        CGSize drawable_size = CGSizeMake(bounds_size.width * contents_scale,
+                                          bounds_size.height * contents_scale);
+        layer.drawableSize = drawable_size;
 
         content_view.wantsLayer = YES;
         content_view.layer = layer;
+        state.attachedView = content_view;
         state.layer = layer;
         state.frameHasContent = NO;
+
+        RendererResizeParams initial_params = {
+            .framebuffer_width = (int)lround(drawable_size.width),
+            .framebuffer_height = (int)lround(drawable_size.height),
+            .framebuffer_scale = (float)contents_scale,
+        };
+        update_layer_properties(state, layer, &initial_params);
     }
 
     state.backgroundOpacity = config ? config->background_opacity : 1.0f;
@@ -2655,9 +2700,15 @@ metal_backend_on_resize(GLFWwindow *window, const RendererResizeParams *params) 
     metal_reset_capture_state(state, false);
     reset_command_primitives(state);
     state.frameHasContent = NO;
+    if (params) {
+        state.lastContentsScale = params->framebuffer_scale > 0.f ? params->framebuffer_scale : 1.f;
+        const int width = params->framebuffer_width > 0 ? params->framebuffer_width : 0;
+        const int height = params->framebuffer_height > 0 ? params->framebuffer_height : 0;
+        state.lastDrawableSize = CGSizeMake((CGFloat)width, (CGFloat)height);
+    }
     if (!state.layer) return;
     @autoreleasepool {
-        update_layer_properties(state.layer, params);
+        update_layer_properties(state, state.layer, params);
     }
 }
 
@@ -3934,6 +3985,10 @@ metal_renderer_debug_get_window_state_for_tests(GLFWwindow *window, MetalWindowD
     out_state->capture_width = (uint32_t)state.captureWidth;
     out_state->capture_height = (uint32_t)state.captureHeight;
     out_state->capture_bytes_per_row = (uint32_t)state.captureBytesPerRow;
+    out_state->contents_scale = (float)state.lastContentsScale;
+    out_state->drawable_width = (uint32_t)lround(state.lastDrawableSize.width);
+    out_state->drawable_height = (uint32_t)lround(state.lastDrawableSize.height);
+    out_state->layer_attached = (state.layer != nil) && (state.attachedView != nil);
     return true;
 }
 
@@ -3949,6 +4004,12 @@ metal_renderer_debug_set_window_state_for_tests(GLFWwindow *window, const MetalW
     state.captureWidth = state_info->capture_width;
     state.captureHeight = state_info->capture_height;
     state.captureBytesPerRow = state_info->capture_bytes_per_row;
+    state.lastContentsScale = state_info->contents_scale;
+    state.lastDrawableSize = CGSizeMake((CGFloat)state_info->drawable_width, (CGFloat)state_info->drawable_height);
+    if (!state_info->layer_attached) {
+        metal_detach_layer_from_view(state);
+        state.layer = nil;
+    }
 }
 
 EXPORTED void
