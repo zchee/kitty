@@ -214,6 +214,18 @@ class BackendFFI:
                 self.RepeatStrategy = RepeatStrategy
                 self.BackgroundImage = BackgroundImage
 
+                if self.has_metal:
+                    class MetalWindowDebugState(ctypes.Structure):
+                        _fields_ = [
+                            ("frame_has_content", ctypes.c_bool),
+                            ("capture_valid", ctypes.c_bool),
+                            ("capture_width", ctypes.c_uint32),
+                            ("capture_height", ctypes.c_uint32),
+                            ("capture_bytes_per_row", ctypes.c_uint32),
+                        ]
+
+                    self.MetalWindowDebugState = MetalWindowDebugState
+
                 self.lib.renderer_backend_upload_graphics_image.argtypes = [
                     ctypes.POINTER(TextureRef),
                     ctypes.POINTER(RendererGraphicsImageUpload),
@@ -243,6 +255,29 @@ class BackendFFI:
                         ctypes.POINTER(BackgroundImage)
                     ]
                     self.lib.metal_background_image_release.restype = None
+                if self.has_metal and hasattr(self.lib, "metal_renderer_debug_seed_window_state_for_tests"):
+                    self.lib.metal_renderer_debug_seed_window_state_for_tests.argtypes = [
+                        ctypes.c_void_p
+                    ]
+                    self.lib.metal_renderer_debug_seed_window_state_for_tests.restype = None
+                if self.has_metal and hasattr(self.lib, "metal_renderer_debug_get_window_state_for_tests"):
+                    self.lib.metal_renderer_debug_get_window_state_for_tests.argtypes = [
+                        ctypes.c_void_p,
+                        ctypes.POINTER(self.MetalWindowDebugState),
+                    ]
+                    self.lib.metal_renderer_debug_get_window_state_for_tests.restype = ctypes.c_bool
+                if self.has_metal and hasattr(self.lib, "metal_renderer_debug_set_window_state_for_tests"):
+                    self.lib.metal_renderer_debug_set_window_state_for_tests.argtypes = [
+                        ctypes.c_void_p,
+                        ctypes.POINTER(self.MetalWindowDebugState),
+                    ]
+                    self.lib.metal_renderer_debug_set_window_state_for_tests.restype = None
+                if self.has_metal and hasattr(self.lib, "metal_renderer_debug_reset_capture_state_for_tests"):
+                    self.lib.metal_renderer_debug_reset_capture_state_for_tests.argtypes = [
+                        ctypes.c_void_p,
+                        ctypes.c_bool,
+                    ]
+                    self.lib.metal_renderer_debug_reset_capture_state_for_tests.restype = None
         else:
             self.has_metal = False
 

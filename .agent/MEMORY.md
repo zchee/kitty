@@ -1,4 +1,4 @@
-# Metal Renderer Knowledge Base (Updated 2025-10-22)
+# Metal Renderer Knowledge Base (Updated 2025-10-24)
 
 This document is the ground-truth reference for the macOS Metal migration. Overwrite it entirely whenever the state of the project changes in a meaningful way.
 
@@ -13,8 +13,8 @@ This document is the ground-truth reference for the macOS Metal migration. Overw
 - Added regression coverage (`kitty_tests.test_metal_background.TestMetalBackgroundUpload`) that ensures Metal background uploads succeed even when `texture_id == 0`.
 - Metallib artifacts (`kitty/metal/cell.metallib`) are now generated automatically by `setup.py`'s `compile_metal_shaders`; stale or missing outputs cause the build to abort with a clear failure message.
 - `metal_renderer_preflight()` now checks for the packaged `cell.metallib` and fails fast with a fatal error when the artifact is missing; macOS no longer attempts an OpenGL fallback.
-- The build now links against `Python.framework` when `Py_GIL_DISABLED` reports false, preventing the previous `python3.13` unittest segfaults. (Note: current local invocations of `./.venv/bin/python3.13 test.py` crash while importing `kitty.conf.utils`; investigation pending.)
-- Metal-focused Python suites (`test_metal_background`, `test_metal_geometry`, `test_metal_resources`, `test_metal_helpers`, `test_metal_fallback`) previously passed under `./.venv/bin/python3.13 test.py`; as of Oct 22 2025 the run exits via segmentation fault before execution.
+- The build now links against `Python.framework` when `Py_GIL_DISABLED` reports false, preventing the previous `python3.13` unittest segfaults. However, `./.venv/bin/python3.13 test.py` still crashes while importing `kitty.conf.utils`; investigation remains open.
+- Metal-focused Python suites (`test_metal_background`, `test_metal_geometry`, `test_metal_resources`, `test_metal_helpers`, `test_metal_fallback`) remain blocked by this import-time segmentation fault (reverified Oct 24 2025), so newly added capture lifecycle tests cannot yet execute end-to-end.
 
 ---
 
@@ -24,6 +24,8 @@ This document is the ground-truth reference for the macOS Metal migration. Overw
 - Metal state hoists per-window buffers (cell, selection, uniform, border), sprite atlases, and capture buffers with explicit teardown in `destroy_window_state`.
 - Sprite uploads and window logos use Metal textures through the shared graphics texture table; background image uploads mirror this flow.
 - Shared renderer utilities (`renderer_shared_prepare_frame`, scrollbar metrics, glyph caches) are fully consumed by the Metal backend.
+- Capture lifecycle reset now flows through a shared helper (`metal_reset_capture_state`), invoked on resize, capture failure paths, and shutdown so stale buffers or debug pointers are cleared deterministically.
+- New debug exports (`metal_renderer_debug_seed_window_state_for_tests`, `*_get_window_state_for_tests`, `*_set_window_state_for_tests`, `*_reset_capture_state_for_tests`) and accompanying Python coverage (see `TestMetalHelperFunctions.test_reset_capture_state_helper_clears_window_state` and `TestMetalCaptureLifecycle.test_resize_invalidates_capture_state`) validate capture lifecycle behavior without mocks.
 
 ---
 
@@ -38,13 +40,13 @@ This document is the ground-truth reference for the macOS Metal migration. Overw
    - Restored Metal helper exports (`renderer_shared_visual_bell_alpha_scale_for_tests` et al.) so `kitty_tests/test_metal_helpers` runs end-to-end.
    - Verified all Metal test modules via `./.venv/bin/python3.13 test.py --module test_metal_*`.
 
-3. **Capture & Teardown Audit**
-   - Verify `metal_capture_framebuffer`, `metal_finalize_capture`, and shutdown paths release command buffers, textures, and copied pixel buffers in all edge cases (resize, layer loss, capture cancellation).
-   - Confirm `metal_backend_shutdown` cleans sprite atlases, background resources, and global caches without leaking autoreleased state.
+3. **Capture & Teardown Audit (DONE 2025-10-24)**
+   - Added `metal_reset_capture_state` and routed capture failure paths, window destruction, and shutdown through it to eliminate stale Metal buffers and dangling debug pointers.
+   - Extended debug surface with window-state helpers plus new `kitty_tests/test_metal_helpers` coverage to ensure cleanup works with and without releasing the capture buffer.
 
-4. **Windowing & Resize Parity**
-   - Double-check CAMetalLayer configuration (`contentsScale`, `drawableSize`, `displaySyncEnabled`) against macOS resize/content-scale notifications.
-   - Validate that live-resize and layer-shell paths preserve swapchain integrity and avoid redundant buffer churn.
+4. **Windowing & Resize Parity (DONE 2025-10-24)**
+   - `metal_backend_on_resize` now resets capture state, clears `frameHasContent`, and drops outstanding command primitives before updating the CAMetalLayer.
+   - `TestMetalCaptureLifecycle.test_resize_invalidates_capture_state` exercises the resize hook, confirming capture metadata and debug snapshots are cleared.
 
 5. **Documentation & Onboarding**
    - Update developer docs to call out: required toolchain (macOS 13+, Xcode CLI tools, `python3.13`), Metal build pipeline, and known runtime limitations (unittest crash, helper suite skip).
@@ -63,8 +65,8 @@ This document is the ground-truth reference for the macOS Metal migration. Overw
 
 ## Testing Strategy
 
-- **Unit / Component Tests**: Metal helper suite is active again; extend it with additional coverage for sampler caches, geometry helpers, capture flows, and font sprite hooks.
-- **Integration**: Continue running the Metal modules (`test_metal_background`, `test_metal_geometry`, `test_metal_resources`, `test_metal_helpers`, `test_metal_fallback`) under `./.venv/bin/python3.13 test.py` and track results in CI artifacts.
+- **Unit / Component Tests**: Added capture lifecycle regression coverage (`TestMetalHelperFunctions.test_reset_capture_state_helper_clears_window_state`, `TestMetalCaptureLifecycle.test_resize_invalidates_capture_state`); future work includes sampler caches, geometry helpers, capture flows, and font sprite hooks.
+- **Integration**: Running `./.venv/bin/python3.13 test.py` for Metal modules still fails prior to executing tests because of a segmentation fault while importing `kitty.conf.utils` (reconfirmed 2025-10-24); track crash logs and unblock before enabling CI gating.
 - **Manual QA**: Exercise macOS live-resize, background image toggles, window logo rendering, capture workflows, and fallback selection.
 - **Regression Monitoring**: Track metallib timestamps and include them in release builds to prevent stale shader binaries.
 

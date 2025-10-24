@@ -7,6 +7,7 @@
 #include "renderer_backend_types.h"
 
 struct BackgroundImage;
+struct GLFWwindow;
 
 #ifdef __cplusplus
 extern "C" {
@@ -110,6 +111,19 @@ EXPORTED bool metal_renderer_debug_set_captured_frame_for_tests(
     bool pixels_are_bgra
 );
 EXPORTED void metal_renderer_debug_clear_captured_frame_for_tests(void);
+
+typedef struct MetalWindowDebugState {
+    bool frame_has_content;
+    bool capture_valid;
+    uint32_t capture_width;
+    uint32_t capture_height;
+    uint32_t capture_bytes_per_row;
+} MetalWindowDebugState;
+
+EXPORTED void metal_renderer_debug_seed_window_state_for_tests(struct GLFWwindow *window);
+EXPORTED bool metal_renderer_debug_get_window_state_for_tests(struct GLFWwindow *window, MetalWindowDebugState *out_state);
+EXPORTED void metal_renderer_debug_set_window_state_for_tests(struct GLFWwindow *window, const MetalWindowDebugState *state);
+EXPORTED void metal_renderer_debug_reset_capture_state_for_tests(struct GLFWwindow *window, bool release_buffer);
 
 #ifdef __cplusplus
 }

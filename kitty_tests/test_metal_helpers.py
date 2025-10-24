@@ -7,6 +7,7 @@ from typing import Sequence
 import kitty.fast_data_types as fast_data_types
 
 from . import BaseTest
+from .renderer_backend import ffi, renderer_backend_select
 
 
 class MetalBorderUniforms(ctypes.Structure):
@@ -58,6 +59,16 @@ class MetalCapturedFrameDebugInfo(ctypes.Structure):
         ('height', ctypes.c_uint32),
         ('bytes_per_row', ctypes.c_uint32),
         ('pixels', ctypes.c_void_p),
+    ]
+
+
+class MetalWindowDebugState(ctypes.Structure):
+    _fields_ = [
+        ('frame_has_content', ctypes.c_bool),
+        ('capture_valid', ctypes.c_bool),
+        ('capture_width', ctypes.c_uint32),
+        ('capture_height', ctypes.c_uint32),
+        ('capture_bytes_per_row', ctypes.c_uint32),
     ]
 
 
@@ -120,6 +131,10 @@ class TestMetalHelperFunctions(BaseTest):
                 'metal_renderer_copy_captured_frame_for_tests',
                 'metal_renderer_debug_set_captured_frame_for_tests',
                 'metal_renderer_debug_clear_captured_frame_for_tests',
+                'metal_renderer_debug_seed_window_state_for_tests',
+                'metal_renderer_debug_get_window_state_for_tests',
+                'metal_renderer_debug_set_window_state_for_tests',
+                'metal_renderer_debug_reset_capture_state_for_tests',
             )
         )
         if cls.has_helpers:
@@ -192,6 +207,25 @@ class TestMetalHelperFunctions(BaseTest):
             cls.lib.metal_renderer_debug_set_captured_frame_for_tests.restype = ctypes.c_bool
             cls.lib.metal_renderer_debug_clear_captured_frame_for_tests.argtypes = []
             cls.lib.metal_renderer_debug_clear_captured_frame_for_tests.restype = None
+            cls.lib.metal_renderer_debug_seed_window_state_for_tests.argtypes = [
+                ctypes.c_void_p,
+            ]
+            cls.lib.metal_renderer_debug_seed_window_state_for_tests.restype = None
+            cls.lib.metal_renderer_debug_get_window_state_for_tests.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(MetalWindowDebugState),
+            ]
+            cls.lib.metal_renderer_debug_get_window_state_for_tests.restype = ctypes.c_bool
+            cls.lib.metal_renderer_debug_set_window_state_for_tests.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(MetalWindowDebugState),
+            ]
+            cls.lib.metal_renderer_debug_set_window_state_for_tests.restype = None
+            cls.lib.metal_renderer_debug_reset_capture_state_for_tests.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_bool,
+            ]
+            cls.lib.metal_renderer_debug_reset_capture_state_for_tests.restype = None
 
     def setUp(self) -> None:
         super().setUp()
@@ -453,3 +487,102 @@ class TestMetalHelperFunctions(BaseTest):
         self.assertTrue(self.lib.metal_renderer_copy_captured_frame_for_tests(ctypes.byref(info)))
         data = ctypes.string_at(info.pixels, info.bytes_per_row * info.height)
         self.assertEqual(list(data[:8]), [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08])
+
+    def test_reset_capture_state_helper_clears_window_state(self) -> None:
+        window = ctypes.c_void_p()
+        self.lib.metal_renderer_debug_seed_window_state_for_tests(window)
+
+        state = MetalWindowDebugState()
+        state.frame_has_content = True
+        state.capture_valid = True
+        state.capture_width = 64
+        state.capture_height = 32
+        state.capture_bytes_per_row = 256
+        self.lib.metal_renderer_debug_set_window_state_for_tests(window, ctypes.byref(state))
+
+        sample = (ctypes.c_uint8 * 4)(0xAA, 0xBB, 0xCC, 0xDD)
+        self.assertTrue(
+            self.lib.metal_renderer_debug_set_captured_frame_for_tests(  # type: ignore[arg-type]
+                sample,
+                ctypes.c_uint32(1),
+                ctypes.c_uint32(1),
+                ctypes.c_uint32(4),
+                ctypes.c_bool(False),
+            )
+        )
+
+        self.lib.metal_renderer_debug_reset_capture_state_for_tests(window, ctypes.c_bool(True))
+
+        out_state = MetalWindowDebugState()
+        self.assertTrue(
+            self.lib.metal_renderer_debug_get_window_state_for_tests(window, ctypes.byref(out_state))
+        )
+        self.assertFalse(out_state.frame_has_content)
+        self.assertFalse(out_state.capture_valid)
+        self.assertEqual(out_state.capture_width, 0)
+        self.assertEqual(out_state.capture_height, 0)
+        self.assertEqual(out_state.capture_bytes_per_row, 0)
+
+        info = MetalCapturedFrameDebugInfo()
+        self.assertFalse(self.lib.metal_renderer_copy_captured_frame_for_tests(ctypes.byref(info)))
+
+
+class TestMetalCaptureLifecycle(BaseTest):
+    def setUp(self) -> None:
+        super().setUp()
+        if not ffi.has_metal:
+            self.skipTest('Metal backend not available')
+        required = (
+            hasattr(ffi.lib, 'metal_renderer_debug_seed_window_state_for_tests')
+            and hasattr(ffi.lib, 'metal_renderer_debug_get_window_state_for_tests')
+            and hasattr(ffi.lib, 'metal_renderer_debug_set_window_state_for_tests')
+            and hasattr(ffi.lib, 'metal_renderer_debug_reset_capture_state_for_tests')
+        )
+        if not required:
+            self.skipTest('Metal debug helpers unavailable')
+        self.addCleanup(ffi.reset)
+        ffi.reset()
+        renderer_backend_select('metal')
+        self.addCleanup(renderer_backend_select, 'opengl')
+        ffi.lib.metal_renderer_debug_seed_window_state_for_tests(ctypes.c_void_p())
+        ffi.lib.metal_renderer_debug_clear_captured_frame_for_tests()
+
+    def test_resize_invalidates_capture_state(self) -> None:
+        state = ffi.MetalWindowDebugState()
+        state.frame_has_content = True
+        state.capture_valid = True
+        state.capture_width = 120
+        state.capture_height = 60
+        state.capture_bytes_per_row = 480
+        ffi.lib.metal_renderer_debug_set_window_state_for_tests(None, ctypes.byref(state))
+
+        src = (ctypes.c_uint8 * 16)(*range(16))
+        self.assertTrue(
+            ffi.lib.metal_renderer_debug_set_captured_frame_for_tests(  # type: ignore[arg-type]
+                src,
+                ctypes.c_uint32(2),
+                ctypes.c_uint32(2),
+                ctypes.c_uint32(8),
+                ctypes.c_bool(False),
+            )
+        )
+
+        resize_params = ffi.RendererResizeParams(
+            framebuffer_width=640,
+            framebuffer_height=480,
+            framebuffer_scale=2.0,
+        )
+        ffi.lib.renderer_backend_on_resize(None, ctypes.byref(resize_params))
+
+        out_state = ffi.MetalWindowDebugState()
+        self.assertTrue(
+            ffi.lib.metal_renderer_debug_get_window_state_for_tests(None, ctypes.byref(out_state))
+        )
+        self.assertFalse(out_state.frame_has_content)
+        self.assertFalse(out_state.capture_valid)
+        self.assertEqual(out_state.capture_width, 0)
+        self.assertEqual(out_state.capture_height, 0)
+        self.assertEqual(out_state.capture_bytes_per_row, 0)
+
+        info = MetalCapturedFrameDebugInfo()
+        self.assertFalse(ffi.lib.metal_renderer_copy_captured_frame_for_tests(ctypes.byref(info)))

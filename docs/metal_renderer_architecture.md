@@ -81,6 +81,8 @@ To keep the OpenGL and Metal implementations aligned, the backend API has to sur
    - Centralize buffer/texture allocation and destruction to replace direct OpenGL calls (`create_buffer`, `free_texture`, etc.).
    - Coordinate shader/pipeline cache management so GLSL → MSL translation stays consistent across backends.
 
+> **Status (Oct 24 2025)**: The Metal backend now routes capture cleanup through `metal_reset_capture_state`, and debug-only exports expose per-window capture metadata so tests can assert lifecycle correctness without mocks.
+
 ### Proposed Backend API Shape
 The expanded C surface pairs the lifecycle above with explicit data carriers so that higher-level code calls a uniform contract regardless of backend.
 
