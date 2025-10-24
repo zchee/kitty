@@ -57,6 +57,12 @@ This document remains the single source of truth for kitty’s Metal migration. 
 
 ---
 
+## Known Issues
+
+- macOS launch currently segfaults in `send_cell_data_to_gpu` because the recent VAO guard leaves OpenGL windows without VAOs when the backend falls back to GL. Need to reintroduce VAO allocation for OpenGL paths (or delay the guard until after backend selection is final).
+
+---
+
 ## Backlog / Longer-Term Ideas
 
 - Metal remote-control commands for toggling debug logging and capture at runtime.
