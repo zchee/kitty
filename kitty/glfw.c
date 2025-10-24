@@ -30,6 +30,14 @@ typedef struct mouse_cursor {
 
 static mouse_cursor cursors[GLFW_INVALID_CURSOR+1] = {0};
 
+static inline GLFWwindow*
+share_window_for_backend(GLFWwindow *temp_window, GLFWwindow *common_context, bool using_metal) {
+    if (using_metal) {
+        return NULL;
+    }
+    return temp_window ? temp_window : common_context;
+}
+
 #ifdef __APPLE__
 static bool metal_preflight_attempted = false;
 static bool metal_preflight_succeeded = false;
@@ -1456,7 +1464,7 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
     // creation, which causes a resize event and all the associated processing.
     // The temp window is used to get the DPI. On Wayland no temp window can be
     // used, so start with window visible unless hidden window requested.
-    GLFWwindow *common_context = global_state.num_os_windows ? global_state.os_windows[0].handle : NULL;
+    GLFWwindow *common_context = (!using_metal && global_state.num_os_windows) ? global_state.os_windows[0].handle : NULL;
     GLFWwindow *temp_window = NULL;
     glfwWindowHint(GLFW_VISIBLE, window_state != WINDOW_HIDDEN && global_state.is_wayland);
     float xscale, yscale;
@@ -1473,7 +1481,11 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
         }
     } else {
 #define glfw_failure { \
-        PyErr_Format(PyExc_OSError, "Failed to create GLFWwindow. This usually happens because of old/broken OpenGL drivers. kitty requires working OpenGL %d.%d drivers.", OPENGL_REQUIRED_VERSION_MAJOR, OPENGL_REQUIRED_VERSION_MINOR); \
+        if (using_metal) { \
+            PyErr_SetString(PyExc_OSError, "Failed to create GLFWwindow. Metal initialization failed or CAMetalLayer is unavailable."); \
+        } else { \
+            PyErr_Format(PyExc_OSError, "Failed to create GLFWwindow. This usually happens because of old/broken OpenGL drivers. kitty requires working OpenGL %d.%d drivers.", OPENGL_REQUIRED_VERSION_MAJOR, OPENGL_REQUIRED_VERSION_MINOR); \
+        } \
         return NULL; }
 
         temp_window = glfwCreateWindow(640, 480, "temp", NULL, common_context, NULL);
@@ -1489,7 +1501,7 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
         if (!layer_shell_config_from_python(layer_shell_config, lsc)) return NULL;
         lsc->expected.xscale = xscale; lsc->expected.yscale = yscale;
     }
-    GLFWwindow *glfw_window = glfwCreateWindow(width, height, title, NULL, temp_window ? temp_window : common_context, lsc);
+    GLFWwindow *glfw_window = glfwCreateWindow(width, height, title, NULL, share_window_for_backend(temp_window, common_context, using_metal), lsc);
     if (temp_window) { glfwDestroyWindow(temp_window); temp_window = NULL; }
     if (glfw_window == NULL) glfw_failure;
 #undef glfw_failure
@@ -1531,7 +1543,7 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
             Py_DECREF(ret);
         }
         get_platform_dependent_config_values(glfw_window);
-        if (!global_state.supports_framebuffer_srgb) {
+        if (!using_metal && !global_state.supports_framebuffer_srgb) {
             log_error("The OpenGL drivers dont support GL_FRAMEBUFFER_SRGB this will cause a small rendering performance penalty");
         }
         is_first_window = false;
@@ -2656,6 +2668,29 @@ grab_keyboard(PyObject *self UNUSED, PyObject *action) {
     return Py_NewRef(glfwGrabKeyboard(action == Py_None ? 2 : PyObject_IsTrue(action)) ? Py_True : Py_False);
 }
 
+static PyObject*
+glfw_share_window_hint_for_tests(PyObject *self UNUSED, PyObject *args) {
+    int using_metal_int = 0;
+    int temp_non_null = 0;
+    int common_non_null = 0;
+    if (!PyArg_ParseTuple(args, "ppp", &using_metal_int, &temp_non_null, &common_non_null)) {
+        return NULL;
+    }
+    GLFWwindow *temp = temp_non_null ? (GLFWwindow*)1 : NULL;
+    GLFWwindow *common = common_non_null ? (GLFWwindow*)2 : NULL;
+    GLFWwindow *share = share_window_for_backend(temp, common, using_metal_int != 0);
+    if (!share) {
+        return PyLong_FromLong(0);
+    }
+    if (share == temp) {
+        return PyLong_FromLong(1);
+    }
+    if (share == common) {
+        return PyLong_FromLong(2);
+    }
+    return PyLong_FromLong(3);
+}
+
 // Boilerplate {{{
 
 static PyMethodDef module_methods[] = {
@@ -2706,6 +2741,7 @@ static PyMethodDef module_methods[] = {
     {"glfw_get_monitor_workarea", (PyCFunction)get_monitor_workarea, METH_NOARGS, ""},
     {"glfw_get_monitor_names", (PyCFunction)get_monitor_names, METH_NOARGS, ""},
     {"glfw_primary_monitor_content_scale", (PyCFunction)primary_monitor_content_scale, METH_NOARGS, ""},
+    {"_share_window_hint_for_tests", (PyCFunction)glfw_share_window_hint_for_tests, METH_VARARGS, ""},
     {NULL, NULL, 0, NULL}        /* Sentinel */
 };
 

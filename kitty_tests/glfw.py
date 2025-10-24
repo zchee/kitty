@@ -58,6 +58,20 @@ class TestGLFW(BaseTest):
         else:
             self.assertIsNone(backend)
 
+    def test_share_window_hint(self):
+        from kitty import fast_data_types as fdt
+
+        share = getattr(fdt, '_share_window_hint_for_tests', None)
+        self.assertIsNotNone(share, 'share window helper unavailable')
+        with self.subTest(using_metal=True):
+            self.assertEqual(share(True, True, True), 0)
+            self.assertEqual(share(True, False, True), 0)
+            self.assertEqual(share(True, False, False), 0)
+        with self.subTest(using_metal=False):
+            self.assertEqual(share(False, True, True), 1)
+            self.assertEqual(share(False, False, True), 2)
+            self.assertEqual(share(False, False, False), 0)
+
     def test_os_window_size_calculation(self):
         from kitty.utils import get_new_os_window_size
 
