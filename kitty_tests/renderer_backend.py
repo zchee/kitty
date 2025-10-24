@@ -22,6 +22,8 @@ class BackendFFI:
     def __init__(self) -> None:
         self.lib = ctypes.CDLL(fast_data_types.__file__)
         self.stub_helper = getattr(fast_data_types, "renderer_backend_register_stub_for_tests", None)
+        self._should_register_opengl = sys.platform != "darwin"
+        self.has_opengl = False
 
         class RendererFrameParams(ctypes.Structure):
             _fields_ = [
@@ -291,11 +293,19 @@ class BackendFFI:
 
     def reset(self) -> None:
         self.lib.renderer_backend_reset_for_tests()
-        if not self.lib.register_opengl_renderer_backend():
-            raise RuntimeError("Failed to register OpenGL backend for tests")
+        registered: list[str] = []
+        self.has_opengl = False
+        if self._should_register_opengl:
+            if not self.lib.register_opengl_renderer_backend():
+                raise RuntimeError("Failed to register OpenGL backend for tests")
+            self.has_opengl = True
+            registered.append('opengl')
         if self.has_metal:
-            self.lib.register_metal_renderer_backend()
-        renderer_backend_select('opengl')
+            if not self.lib.register_metal_renderer_backend():
+                raise RuntimeError("Failed to register Metal backend for tests")
+            registered.append('metal')
+        if registered:
+            renderer_backend_select(registered[0])
 
         class BackgroundImageLayout:
             TILING = 0
@@ -411,20 +421,33 @@ class TestRendererBackend(BaseTest):
     def setUp(self) -> None:
         super().setUp()
         ffi.reset()
-        renderer_backend_select('opengl')
+        self.available = renderer_backends_available()
+        self.has_opengl = 'opengl' in self.available
+        if self.has_opengl:
+            renderer_backend_select('opengl')
+        elif 'metal' in self.available:
+            renderer_backend_select('metal')
+        self.default_backend = renderer_backend_current()
+        self.addCleanup(renderer_backend_select, self.default_backend)
 
     def test_available_backends_contains_opengl(self) -> None:
         available = renderer_backends_available()
-        self.assertIn('opengl', available)
+        if self.has_opengl:
+            self.assertIn('opengl', available)
+        else:
+            self.assertNotIn('opengl', available)
 
     def test_current_backend_defaults_to_opengl(self) -> None:
-        self.assertEqual('opengl', renderer_backend_current())
+        expected = 'opengl' if self.has_opengl else 'metal'
+        self.assertEqual(expected, renderer_backend_current())
 
     def test_select_invalid_backend_raises(self) -> None:
         with self.assertRaisesRegex(ValueError, 'Unknown renderer backend'):
             renderer_backend_select('invalid-backend')
 
     def test_select_opengl_idempotent(self) -> None:
+        if not self.has_opengl:
+            self.skipTest('OpenGL backend unavailable on this platform')
         renderer_backend_select('opengl')
         self.assertEqual('opengl', renderer_backend_current())
 
@@ -470,7 +493,8 @@ class TestRendererBackend(BaseTest):
             return
         renderer_backend_select('metal')
         self.assertEqual('metal', renderer_backend_current())
-        renderer_backend_select('opengl')
+        if self.has_opengl:
+            renderer_backend_select('opengl')
 
     def test_backend_render_hook_invocation_order(self) -> None:
         self.addCleanup(ffi.reset)
@@ -627,8 +651,9 @@ class TestMetalGraphicsTextures(BaseTest):
         if not ffi.has_metal or sys.platform != 'darwin':
             self.skipTest("Metal backend unavailable on this platform")
         ffi.reset()
+        previous = renderer_backend_current()
         renderer_backend_select('metal')
-        self.addCleanup(renderer_backend_select, 'opengl')
+        self.addCleanup(renderer_backend_select, previous)
 
     def _make_upload(
         self,

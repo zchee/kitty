@@ -9,6 +9,7 @@ import unittest
 from contextlib import contextmanager
 from importlib import resources
 from pathlib import Path
+from subprocess import PIPE, run
 
 
 @contextmanager
@@ -74,6 +75,20 @@ if reason.value:
         self.assertEqual(output[0], "0", msg=f"preflight unexpectedly succeeded: {output}")
         if len(output) > 1:
             self.assertIn("Metal", output[1], msg=f"unexpected reason string: {output[1]}")
+            self.assertNotIn("OpenGL", output[1], msg=f"reason should not reference OpenGL: {output[1]}")
+
+    def test_fast_data_types_links_against_python_framework(self) -> None:
+        fast_data_types = self.fast_data_types
+        proc = run([
+            "otool",
+            "-L",
+            fast_data_types.__file__,
+        ], check=True, stdout=PIPE, stderr=PIPE, text=True)
+        self.assertNotIn(
+            "PythonT.framework",
+            proc.stdout,
+            msg=f"fast_data_types unexpectedly linked against PythonT.framework: {proc.stdout}",
+        )
 
 
 if __name__ == "__main__":

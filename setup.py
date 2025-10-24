@@ -1339,7 +1339,7 @@ def compile_metal_shaders(args: Options) -> None:
             if not any(existing_name == name for existing_name, _, _ in failures):
                 failures.append((name, 'stale', None))
     if failures:
-        print(error('Metal shader build failed; the Metal renderer will fall back to OpenGL.'), file=sys.stderr)
+        print(error('Metal shader build failed; the Metal renderer cannot continue.'), file=sys.stderr)
         for shader, stage, code in failures:
             if stage == 'stale':
                 location = stale_paths.get(shader)

@@ -192,7 +192,11 @@ renderer_backend_select(RendererBackendType type) {
 RendererBackendType
 renderer_backend_current_type(void) {
     if (!backend_selected) {
+#ifdef __APPLE__
+        return RENDERER_BACKEND_METAL;
+#else
         return RENDERER_BACKEND_OPENGL;
+#endif
     }
     return selected_backend;
 }

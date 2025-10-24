@@ -25,6 +25,9 @@ This document is the ground-truth reference for the macOS Metal migration. Overw
 - Sprite uploads and window logos use Metal textures through the shared graphics texture table; background image uploads mirror this flow.
 - Shared renderer utilities (`renderer_shared_prepare_frame`, scrollbar metrics, glyph caches) are fully consumed by the Metal backend.
 - Capture lifecycle reset now flows through a shared helper (`metal_reset_capture_state`), invoked on resize, capture failure paths, and shutdown so stale buffers or debug pointers are cleared deterministically.
+- `fast_data_types` is rebuilt with the non-GIL python3.13 framework; `TestMetalFallback.test_fast_data_types_links_against_python_framework` ensures we never link against `PythonT.framework`, avoiding the import-time segfault that previously blocked Metal suites.
+- macOS builds no longer register the OpenGL renderer; backend availability tests assert `'opengl'` is absent and the Python option parser rejects that preference on macOS.
+- `metal_record_failure` now reports fatal errors without mentioning OpenGL; `TestMetalFallback` asserts the reason string omits any OpenGL fallback language.
 - New debug exports (`metal_renderer_debug_seed_window_state_for_tests`, `*_get_window_state_for_tests`, `*_set_window_state_for_tests`, `*_reset_capture_state_for_tests`) and accompanying Python coverage (see `TestMetalHelperFunctions.test_reset_capture_state_helper_clears_window_state` and `TestMetalCaptureLifecycle.test_resize_invalidates_capture_state`) validate capture lifecycle behavior without mocks.
 
 ---

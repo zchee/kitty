@@ -1077,7 +1077,7 @@ class Parser:
             raise ValueError(f"The value {val} is not a valid choice for metal_renderer")
         ans["metal_renderer"] = val
 
-    choices_for_metal_renderer = frozenset(('auto', 'metal', 'opengl'))
+    choices_for_metal_renderer = frozenset(('auto', 'metal'))
 
     def listen_on(self, val: str, ans: dict[str, typing.Any]) -> None:
         ans['listen_on'] = str(val)

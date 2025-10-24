@@ -7,7 +7,7 @@ from typing import Sequence
 import kitty.fast_data_types as fast_data_types
 
 from . import BaseTest
-from .renderer_backend import ffi, renderer_backend_select
+from .renderer_backend import ffi, renderer_backend_current, renderer_backend_select
 
 
 class MetalBorderUniforms(ctypes.Structure):
@@ -231,6 +231,11 @@ class TestMetalHelperFunctions(BaseTest):
         super().setUp()
         if not self.has_helpers:
             self.skipTest('Metal helper exports not available')
+        self.addCleanup(ffi.reset)
+        ffi.reset()
+        previous = renderer_backend_current()
+        renderer_backend_select('metal')
+        self.addCleanup(renderer_backend_select, previous)
         self.lib.metal_renderer_debug_clear_captured_frame_for_tests()
 
     def tearDown(self) -> None:
@@ -542,8 +547,9 @@ class TestMetalCaptureLifecycle(BaseTest):
             self.skipTest('Metal debug helpers unavailable')
         self.addCleanup(ffi.reset)
         ffi.reset()
+        previous = renderer_backend_current()
         renderer_backend_select('metal')
-        self.addCleanup(renderer_backend_select, 'opengl')
+        self.addCleanup(renderer_backend_select, previous)
         ffi.lib.metal_renderer_debug_seed_window_state_for_tests(ctypes.c_void_p())
         ffi.lib.metal_renderer_debug_clear_captured_frame_for_tests()
 

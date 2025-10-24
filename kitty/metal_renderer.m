@@ -899,6 +899,7 @@ metal_reset_capture_state(MetalWindowState *state, bool release_buffer) {
     if (release_buffer && state.captureBuffer) {
         state.captureBuffer = nil;
     }
+    state.frameHasContent = NO;
     state.captureValid = NO;
     state.captureWidth = 0;
     state.captureHeight = 0;
@@ -993,7 +994,7 @@ static bool
 metal_ensure_resources(void) {
     if (!g_metal.device) {
         PyErr_SetString(PyExc_RuntimeError, "Metal device unavailable");
-        metal_record_failure("Metal device unavailable; falling back to OpenGL");
+        metal_record_failure("Metal device unavailable; Metal renderer cannot continue");
         return false;
     }
     if (!g_metal.library) {
@@ -1001,7 +1002,7 @@ metal_ensure_resources(void) {
         if (!path) {
             PyErr_SetString(PyExc_RuntimeError, "Unable to locate Metal shader library");
             metal_log("library_path_failed", "reason=not_found");
-            metal_record_failure("Metal shader library missing; falling back to OpenGL");
+            metal_record_failure("Metal shader library missing; Metal renderer cannot continue");
             return false;
         }
         NSError *error = nil;
@@ -1011,7 +1012,7 @@ metal_ensure_resources(void) {
             const char *utf8 = error.localizedDescription ? error.localizedDescription.UTF8String : "unknown";
             PyErr_Format(PyExc_RuntimeError, "Failed to load Metal shader library: %s", utf8);
             metal_log("library_load_failed", "path=%s", path.UTF8String);
-            metal_record_failure("Failed to load Metal shader library; falling back to OpenGL");
+            metal_record_failure("Failed to load Metal shader library; Metal renderer cannot continue");
             return false;
         }
         g_metal.library = library;
@@ -1028,7 +1029,7 @@ metal_ensure_resources(void) {
         if (!vertex || !fragment) {
             PyErr_SetString(PyExc_RuntimeError, "Metal shader functions missing from library");
             metal_log("shader_missing", "vertex=%p fragment=%p", vertex, fragment);
-            metal_record_failure("Required Metal shader functions missing; falling back to OpenGL");
+            metal_record_failure("Required Metal shader functions missing; Metal renderer cannot continue");
             return false;
         }
         MTLRenderPipelineDescriptor *descriptor = [[MTLRenderPipelineDescriptor alloc] init];
@@ -1049,7 +1050,7 @@ metal_ensure_resources(void) {
             const char *utf8 = error.localizedDescription ? error.localizedDescription.UTF8String : "unknown";
             PyErr_Format(PyExc_RuntimeError, "Failed to create Metal pipeline state: %s", utf8);
             metal_log("pipeline_create_failed", "desc=%s", utf8);
-            metal_record_failure("Failed to create Metal pipeline state; falling back to OpenGL");
+            metal_record_failure("Failed to create Metal pipeline state; Metal renderer cannot continue");
             return false;
         }
         g_metal.cell_pipeline = pipeline;
@@ -1065,7 +1066,7 @@ metal_ensure_resources(void) {
         }
         if (!vertex || !fragment) {
             PyErr_SetString(PyExc_RuntimeError, "Metal border shader functions missing from library");
-            metal_record_failure("Required Metal border shader functions missing; falling back to OpenGL");
+            metal_record_failure("Required Metal border shader functions missing; Metal renderer cannot continue");
             return false;
         }
         MTLRenderPipelineDescriptor *descriptor = [[MTLRenderPipelineDescriptor alloc] init];
@@ -1085,7 +1086,7 @@ metal_ensure_resources(void) {
         if (!pipeline) {
             const char *utf8 = error.localizedDescription ? error.localizedDescription.UTF8String : "unknown";
             PyErr_Format(PyExc_RuntimeError, "Failed to create Metal border pipeline state: %s", utf8);
-            metal_record_failure("Failed to create Metal border pipeline; falling back to OpenGL");
+            metal_record_failure("Failed to create Metal border pipeline; Metal renderer cannot continue");
             return false;
         }
         g_metal.border_pipeline = pipeline;
@@ -1101,7 +1102,7 @@ metal_ensure_resources(void) {
         }
         if (!vertex || !fragment) {
             PyErr_SetString(PyExc_RuntimeError, "Metal cursor trail shader functions missing from library");
-            metal_record_failure("Required Metal trail shader functions missing; falling back to OpenGL");
+            metal_record_failure("Required Metal trail shader functions missing; Metal renderer cannot continue");
             return false;
         }
         MTLRenderPipelineDescriptor *descriptor = [[MTLRenderPipelineDescriptor alloc] init];
@@ -1121,7 +1122,7 @@ metal_ensure_resources(void) {
         if (!pipeline) {
             const char *utf8 = error.localizedDescription ? error.localizedDescription.UTF8String : "unknown";
             PyErr_Format(PyExc_RuntimeError, "Failed to create Metal trail pipeline state: %s", utf8);
-            metal_record_failure("Failed to create Metal trail pipeline; falling back to OpenGL");
+            metal_record_failure("Failed to create Metal trail pipeline; Metal renderer cannot continue");
             return false;
         }
         g_metal.trail_pipeline = pipeline;
@@ -1137,7 +1138,7 @@ metal_ensure_resources(void) {
         }
         if (!vertex || !fragment) {
             PyErr_SetString(PyExc_RuntimeError, "Metal tint shader functions missing from library");
-            metal_record_failure("Required Metal tint shader functions missing; falling back to OpenGL");
+            metal_record_failure("Required Metal tint shader functions missing; Metal renderer cannot continue");
             return false;
         }
         MTLRenderPipelineDescriptor *descriptor = [[MTLRenderPipelineDescriptor alloc] init];
@@ -1157,7 +1158,7 @@ metal_ensure_resources(void) {
         if (!pipeline) {
             const char *utf8 = error.localizedDescription ? error.localizedDescription.UTF8String : "unknown";
             PyErr_Format(PyExc_RuntimeError, "Failed to create Metal tint pipeline state: %s", utf8);
-            metal_record_failure("Failed to create Metal tint pipeline; falling back to OpenGL");
+            metal_record_failure("Failed to create Metal tint pipeline; Metal renderer cannot continue");
             return false;
         }
         g_metal.tint_pipeline = pipeline;
@@ -1173,7 +1174,7 @@ metal_ensure_resources(void) {
         }
         if (!vertex || !fragment) {
             PyErr_SetString(PyExc_RuntimeError, "Metal rounded-rect shader functions missing from library");
-            metal_record_failure("Required Metal rounded-rect shader functions missing; falling back to OpenGL");
+            metal_record_failure("Required Metal rounded-rect shader functions missing; Metal renderer cannot continue");
             return false;
         }
         MTLRenderPipelineDescriptor *descriptor = [[MTLRenderPipelineDescriptor alloc] init];
@@ -1193,7 +1194,7 @@ metal_ensure_resources(void) {
         if (!pipeline) {
             const char *utf8 = error.localizedDescription ? error.localizedDescription.UTF8String : "unknown";
             PyErr_Format(PyExc_RuntimeError, "Failed to create Metal rounded-rect pipeline state: %s", utf8);
-            metal_record_failure("Failed to create Metal rounded-rect pipeline; falling back to OpenGL");
+            metal_record_failure("Failed to create Metal rounded-rect pipeline; Metal renderer cannot continue");
             return false;
         }
         g_metal.rounded_rect_pipeline = pipeline;
@@ -1209,7 +1210,7 @@ metal_ensure_resources(void) {
         }
         if (!vertex || !fragment) {
             PyErr_SetString(PyExc_RuntimeError, "Metal overlay texture shader functions missing from library");
-            metal_record_failure("Required Metal overlay texture shader functions missing; falling back to OpenGL");
+            metal_record_failure("Required Metal overlay texture shader functions missing; Metal renderer cannot continue");
             return false;
         }
         MTLRenderPipelineDescriptor *descriptor = [[MTLRenderPipelineDescriptor alloc] init];
@@ -1229,7 +1230,7 @@ metal_ensure_resources(void) {
         if (!pipeline) {
             const char *utf8 = error.localizedDescription ? error.localizedDescription.UTF8String : "unknown";
             PyErr_Format(PyExc_RuntimeError, "Failed to create Metal overlay texture pipeline state: %s", utf8);
-            metal_record_failure("Failed to create Metal overlay texture pipeline; falling back to OpenGL");
+            metal_record_failure("Failed to create Metal overlay texture pipeline; Metal renderer cannot continue");
             return false;
         }
         g_metal.overlay_texture_pipeline = pipeline;
@@ -1245,7 +1246,7 @@ metal_ensure_resources(void) {
         }
         if (!vertex || !fragment) {
             PyErr_SetString(PyExc_RuntimeError, "Metal overlay alpha shader functions missing from library");
-            metal_record_failure("Required Metal overlay alpha shader functions missing; falling back to OpenGL");
+            metal_record_failure("Required Metal overlay alpha shader functions missing; Metal renderer cannot continue");
             return false;
         }
         MTLRenderPipelineDescriptor *descriptor = [[MTLRenderPipelineDescriptor alloc] init];
@@ -1265,7 +1266,7 @@ metal_ensure_resources(void) {
         if (!pipeline) {
             const char *utf8 = error.localizedDescription ? error.localizedDescription.UTF8String : "unknown";
             PyErr_Format(PyExc_RuntimeError, "Failed to create Metal overlay alpha pipeline state: %s", utf8);
-            metal_record_failure("Failed to create Metal overlay alpha pipeline; falling back to OpenGL");
+            metal_record_failure("Failed to create Metal overlay alpha pipeline; Metal renderer cannot continue");
             return false;
         }
         g_metal.alpha_mask_pipeline = pipeline;
@@ -1282,7 +1283,7 @@ metal_ensure_resources(void) {
         }
         if (!vertex || !fragment) {
             PyErr_SetString(PyExc_RuntimeError, "Metal graphics shader functions missing from library");
-            metal_record_failure("Required Metal graphics shader functions missing; falling back to OpenGL");
+            metal_record_failure("Required Metal graphics shader functions missing; Metal renderer cannot continue");
             return false;
         }
         MTLRenderPipelineDescriptor *descriptor = [[MTLRenderPipelineDescriptor alloc] init];
@@ -1303,7 +1304,7 @@ metal_ensure_resources(void) {
         if (!pipeline) {
             const char *utf8 = error.localizedDescription ? error.localizedDescription.UTF8String : "unknown";
             PyErr_Format(PyExc_RuntimeError, "Failed to create Metal graphics pipeline state: %s", utf8);
-            metal_record_failure("Failed to create Metal graphics pipeline; falling back to OpenGL");
+            metal_record_failure("Failed to create Metal graphics pipeline; Metal renderer cannot continue");
             return false;
         }
         g_metal.graphics_pipeline = pipeline;
@@ -1320,7 +1321,7 @@ metal_ensure_resources(void) {
         }
         if (!vertex || !fragment) {
             PyErr_SetString(PyExc_RuntimeError, "Metal graphics premult shader functions missing from library");
-            metal_record_failure("Required Metal graphics premult shader functions missing; falling back to OpenGL");
+            metal_record_failure("Required Metal graphics premult shader functions missing; Metal renderer cannot continue");
             return false;
         }
         MTLRenderPipelineDescriptor *descriptor = [[MTLRenderPipelineDescriptor alloc] init];
@@ -1341,7 +1342,7 @@ metal_ensure_resources(void) {
         if (!pipeline) {
             const char *utf8 = error.localizedDescription ? error.localizedDescription.UTF8String : "unknown";
             PyErr_Format(PyExc_RuntimeError, "Failed to create Metal graphics premult pipeline state: %s", utf8);
-            metal_record_failure("Failed to create Metal graphics premult pipeline; falling back to OpenGL");
+            metal_record_failure("Failed to create Metal graphics premult pipeline; Metal renderer cannot continue");
             return false;
         }
         g_metal.graphics_premult_pipeline = pipeline;
@@ -1358,7 +1359,7 @@ metal_ensure_resources(void) {
         }
         if (!vertex || !fragment) {
             PyErr_SetString(PyExc_RuntimeError, "Metal graphics alpha shader functions missing from library");
-            metal_record_failure("Required Metal graphics alpha shader functions missing; falling back to OpenGL");
+            metal_record_failure("Required Metal graphics alpha shader functions missing; Metal renderer cannot continue");
             return false;
         }
         MTLRenderPipelineDescriptor *descriptor = [[MTLRenderPipelineDescriptor alloc] init];
@@ -1379,7 +1380,7 @@ metal_ensure_resources(void) {
         if (!pipeline) {
             const char *utf8 = error.localizedDescription ? error.localizedDescription.UTF8String : "unknown";
             PyErr_Format(PyExc_RuntimeError, "Failed to create Metal graphics alpha pipeline state: %s", utf8);
-            metal_record_failure("Failed to create Metal graphics alpha pipeline; falling back to OpenGL");
+            metal_record_failure("Failed to create Metal graphics alpha pipeline; Metal renderer cannot continue");
             return false;
         }
         g_metal.graphics_alpha_pipeline = pipeline;
@@ -1396,7 +1397,7 @@ metal_ensure_resources(void) {
         if (!samplerState) {
             PyErr_SetString(PyExc_RuntimeError, "Failed to create Metal sampler state");
             metal_log("sampler_create_failed", "reason=unknown");
-            metal_record_failure("Failed to create Metal sampler state; falling back to OpenGL");
+            metal_record_failure("Failed to create Metal sampler state; Metal renderer cannot continue");
             return false;
         }
         g_metal.atlas_sampler = samplerState;
@@ -2318,7 +2319,7 @@ metal_renderer_preflight(const char **failure_reason) {
             if (device) {
                 NSString *library_path = metal_library_path();
                 if (!library_path || ![[NSFileManager defaultManager] fileExistsAtPath:library_path]) {
-                    set_preflight_failure("Metal shader library missing; falling back to OpenGL.");
+                    set_preflight_failure("Metal shader library missing; Metal renderer cannot continue.");
                 } else {
                     preflight_success = true;
                     preflight_failure_reason = NULL;
@@ -2349,14 +2350,14 @@ metal_backend_ensure_initialized(const RendererInitConfig *cfg) {
             if (!device) {
                 PyErr_SetString(PyExc_RuntimeError, "Metal device creation failed after preflight success");
                 metal_log("device_create_failed", "reason=MTLCreateSystemDefaultDevice_null");
-                metal_record_failure("Metal device creation failed; falling back to OpenGL");
+                metal_record_failure("Metal device creation failed; Metal renderer cannot continue");
                 return false;
             }
             id<MTLCommandQueue> queue = [device newCommandQueue];
             if (!queue) {
                 PyErr_SetString(PyExc_RuntimeError, "Failed to create Metal command queue");
                 metal_log("command_queue_create_failed", "device=%p", device);
-                metal_record_failure("Metal command queue creation failed; falling back to OpenGL");
+                metal_record_failure("Metal command queue creation failed; Metal renderer cannot continue");
                 return false;
             }
             g_metal.device = device;
@@ -2638,10 +2639,11 @@ metal_backend_present(GLFWwindow *window, const RendererPresentParams *params) {
 static void
 metal_backend_on_resize(GLFWwindow *window, const RendererResizeParams *params) {
     MetalWindowState *state = state_for_window(window);
-    if (!state || !state.layer) return;
+    if (!state) return;
     metal_reset_capture_state(state, false);
     reset_command_primitives(state);
     state.frameHasContent = NO;
+    if (!state.layer) return;
     @autoreleasepool {
         update_layer_properties(state.layer, params);
     }

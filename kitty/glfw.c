@@ -2722,9 +2722,10 @@ void cleanup_glfw(void) {
 
 bool
 init_glfw(PyObject *m) {
-    if (!register_opengl_renderer_backend()) return false;
 #ifdef __APPLE__
     if (!register_metal_renderer_backend()) return false;
+#else
+    if (!register_opengl_renderer_backend()) return false;
 #endif
     if (PyModule_AddFunctions(m, module_methods) != 0) return false;
     register_at_exit_cleanup_func(GLFW_CLEANUP_FUNC, cleanup_glfw);

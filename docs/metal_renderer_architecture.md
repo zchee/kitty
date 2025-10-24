@@ -1,7 +1,7 @@
 # Metal Renderer Architecture Plan
 
 ## Status
-- Phase: 0 (Design Gate)
+- Phase: 2 (Implementation – Metal fail-fast enforcement)
 - Maintainers: TBD (requires assignment of Metal specialist, renderer generalist, macOS build/CI, QA automation)
 - Inputs: `.agent/MEMORY.md` roadmap, existing OpenGL implementation under `kitty/` and `glfw/`
 
@@ -21,6 +21,7 @@
 - No code duplication: abstractions must reuse existing logic where possible.
 - Metal backend must run on macOS 13+ (Apple Silicon and Intel with supported GPUs).
 - Build system continues to support cross-platform targets without Metal dependencies.
+- macOS Metal initialization failures must surface fatal errors; do not fall back to OpenGL.
 
 ## Current OpenGL Touch Points
 | Area | File(s) | Notes |
@@ -130,7 +131,7 @@ typedef struct RendererBackendOps {
 - `ensure_initialized` gates global device/context creation. It should be idempotent.
 - `make_context_current`/`restore_context` are no-ops for Metal but remain required to keep the OpenGL path functioning.
 - `encode_pass` operates on the existing backend-neutral render-pass description produced by `graphics.c`.
-- All hooks return `bool` when failure is meaningful so the caller can fall back to OpenGL or terminate promptly.
+- All hooks return `bool` when failure is meaningful so the caller can surface fatal errors promptly.
 
 ### OpenGL Compatibility Checklist
 To ensure the existing renderer slots cleanly into this interface, every hook maps to code that already runs today:
@@ -186,6 +187,7 @@ typedef struct RendererBackendOps {
   - Detect Xcode toolchain and run `xcrun metal`/`metallib` for `.metal` generation.
   - Package metallib inside app bundle and standalone build.
   - Link `Metal`, `MetalKit`, `QuartzCore` frameworks when Metal backend enabled.
+  - Validate that the build uses the same Python framework as the runtime (no accidental `PythonT.framework` linkage) and fail fast otherwise.
 - CI enhancements:
   - macOS runners with Metal support (Apple Silicon + Intel).
   - Artifact upload of metallibs for test reuse.
