@@ -180,12 +180,23 @@ renderer_backend_register_stub_for_tests(
 
 bool
 renderer_backend_select(RendererBackendType type) {
-    if (!validate_backend_type(type) || !registered_backends[type].registered) {
+    if (!validate_backend_type(type)) {
+        PyErr_SetString(PyExc_ValueError, "renderer backend is not registered");
+        return false;
+    }
+#ifdef __APPLE__
+    if (type == RENDERER_BACKEND_OPENGL) {
+        PyErr_SetString(PyExc_ValueError, "OpenGL renderer backend is not available on macOS");
+        return false;
+    }
+#endif
+    if (!registered_backends[type].registered) {
         PyErr_SetString(PyExc_ValueError, "renderer backend is not registered");
         return false;
     }
     selected_backend = type;
     backend_selected = true;
+    state_on_renderer_backend_selected(type);
     return true;
 }
 
@@ -215,11 +226,13 @@ renderer_backend_type_from_name(const char *name) {
         return (RendererBackendType)-1;
     }
     for (RendererBackendType t = 0; t < RENDERER_BACKEND_COUNT; t++) {
+        const char *candidate = renderer_backend_names[t];
+        if (candidate && strcmp(candidate, name) == 0) {
+            return t;
+        }
+    }
+    for (RendererBackendType t = 0; t < RENDERER_BACKEND_COUNT; t++) {
         if (registered_backends[t].registered) {
-            const char *candidate = renderer_backend_names[t];
-            if (candidate && strcmp(candidate, name) == 0) {
-                return t;
-            }
             const char *alt = registered_backends[t].ops->name;
             if (alt && strcmp(alt, name) == 0) {
                 return t;

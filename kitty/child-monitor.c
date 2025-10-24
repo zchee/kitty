@@ -721,16 +721,20 @@ prepare_to_render_os_window(OSWindow *os_window, monotonic_t now, unsigned int *
         !global_state.supports_framebuffer_srgb || effective_os_window_alpha(os_window) < 1.f ||
         os_window->live_resize.in_progress || background_image_ready(os_window->bgimage)
     );
-    if (TD.screen && os_window->num_tabs >= OPT(tab_bar_min_tabs)) {
+    Screen *tab_bar_screen = TD.screen;
+    if (tab_bar_screen && os_window->num_tabs >= OPT(tab_bar_min_tabs)) {
         if (!os_window->tab_bar_data_updated) {
             call_boss(update_tab_bar_data, "K", os_window->id);
             os_window->tab_bar_data_updated = true;
+            tab_bar_screen = os_window->tab_bar_render_data.screen;
         }
-        // we never render a cursor in the tab bar
-        CursorRenderInfo *cri = &TD.screen->cursor_render_info;
-        zero_at_ptr(cri); cri->x = TD.screen->cursor->x; cri->y = TD.screen->cursor->y;
-        if (send_cell_data_to_gpu(TD.vao_idx, TD.screen, os_window)) needs_render = true;
-        os_window->needs_layers = os_window->needs_layers || screen_needs_rendering_in_layers(os_window, NULL, TD.screen);
+        if (tab_bar_screen) {
+            // we never render a cursor in the tab bar
+            CursorRenderInfo *cri = &tab_bar_screen->cursor_render_info;
+            zero_at_ptr(cri); cri->x = tab_bar_screen->cursor->x; cri->y = tab_bar_screen->cursor->y;
+            if (send_cell_data_to_gpu(TD.vao_idx, tab_bar_screen, os_window)) needs_render = true;
+            os_window->needs_layers = os_window->needs_layers || screen_needs_rendering_in_layers(os_window, NULL, tab_bar_screen);
+        }
     }
     if (OPT(mouse_hide.hide_wait) > 0 && !is_mouse_hidden(os_window)) {
         if (now - os_window->last_mouse_activity_at >= OPT(mouse_hide.hide_wait)) hide_mouse(os_window);

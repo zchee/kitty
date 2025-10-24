@@ -1012,9 +1012,8 @@ blank_canvas(float background_opacity, color_type color_in_srgb, bool for_final_
 bool
 send_cell_data_to_gpu(ssize_t vao_idx, Screen *screen, OSWindow *os_window) {
     bool changed = false;
-    if (os_window->fonts_data) {
-        if (cell_prepare_to_render(vao_idx, screen, os_window->fonts_data)) changed = true;
-    }
+    if (!screen || !os_window || !os_window->fonts_data) return false;
+    if (cell_prepare_to_render(vao_idx, screen, os_window->fonts_data)) changed = true;
     return changed;
 }
 

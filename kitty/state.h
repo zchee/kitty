@@ -432,6 +432,8 @@ OSWindow* current_os_window(void);
 EXPORTED ssize_t state_debug_get_tab_bar_vao_for_tests(id_type os_window_id);
 EXPORTED ssize_t state_debug_get_window_vao_for_tests(id_type os_window_id, id_type tab_id, id_type window_id);
 EXPORTED id_type state_debug_add_os_window_for_tests(void);
+EXPORTED bool state_debug_upload_tab_bar_for_tests(id_type os_window_id);
+void state_on_renderer_backend_selected(RendererBackendType type);
 void os_window_regions(OSWindow*, Region *main, Region *tab_bar);
 bool drag_scroll(Window *, OSWindow*);
 ssize_t create_cell_vao(void);

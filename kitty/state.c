@@ -293,6 +293,37 @@ release_gpu_resources_for_window(Window *w) {
     w->render_data.vao_idx = -1;
 }
 
+void
+state_on_renderer_backend_selected(RendererBackendType type) {
+    if (type != RENDERER_BACKEND_OPENGL) return;
+    for (size_t o = 0; o < global_state.num_os_windows; o++) {
+        OSWindow *os_window = global_state.os_windows + o;
+        make_os_window_context_current(os_window);
+        if (os_window->tab_bar_render_data.vao_idx < 0) {
+            os_window->tab_bar_render_data.vao_idx = create_cell_vao();
+            if (os_window->tab_bar_render_data.screen) {
+                os_window->tab_bar_render_data.screen->reload_all_gpu_data = true;
+            }
+        }
+        for (unsigned int t = 0; t < os_window->num_tabs; t++) {
+            Tab *tab = os_window->tabs + t;
+            if (tab->border_rects.vao_idx < 0) {
+                tab->border_rects.vao_idx = create_border_vao();
+                tab->border_rects.is_dirty = true;
+            }
+            for (unsigned int w = 0; w < tab->num_windows; w++) {
+                Window *window = tab->windows + w;
+                if (window->render_data.vao_idx < 0) {
+                    create_gpu_resources_for_window(window);
+                    if (window->render_data.screen) {
+                        window->render_data.screen->reload_all_gpu_data = true;
+                    }
+                }
+            }
+        }
+    }
+}
+
 static bool
 set_window_logo(Window *w, const char *path, const ImageAnchorPosition pos, float alpha, bool is_default, char *png_data, size_t png_data_size) {
     bool ok = false;
@@ -1522,6 +1553,16 @@ state_debug_get_window_vao_for_tests(id_type os_window_id, id_type tab_id, id_ty
         ans = window->render_data.vao_idx;
     END_WITH_WINDOW
     return ans;
+}
+
+EXPORTED bool
+state_debug_upload_tab_bar_for_tests(id_type os_window_id) {
+    bool changed = false;
+    WITH_OS_WINDOW(os_window_id)
+        Screen *screen = os_window->tab_bar_render_data.screen;
+        changed = send_cell_data_to_gpu(os_window->tab_bar_render_data.vao_idx, screen, os_window);
+    END_WITH_OS_WINDOW
+    return changed;
 }
 
 EXPORTED id_type

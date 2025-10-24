@@ -489,6 +489,20 @@ class TestRendererBackend(BaseTest):
         else:
             self.assertNotIn('metal', available)
 
+    def test_macos_reports_only_metal_backend(self) -> None:
+        if sys.platform != 'darwin':
+            self.skipTest('macOS-only behaviour')
+        available = renderer_backends_available()
+        self.assertIn('metal', available)
+        self.assertNotIn('opengl', available)
+
+    def test_macos_rejects_opengl_selection(self) -> None:
+        if sys.platform != 'darwin':
+            self.skipTest('macOS-only behaviour')
+        with self.assertRaises(ValueError) as exc:
+            renderer_backend_select('opengl')
+        self.assertIn('macOS', str(exc.exception))
+
     def test_metal_preflight_reports_status(self) -> None:
         if not ffi.has_metal:
             self.skipTest("Metal backend not compiled in this build")
@@ -526,6 +540,100 @@ class TestRendererBackend(BaseTest):
         self.assertEqual('metal', renderer_backend_current())
         if self.has_opengl:
             renderer_backend_select('opengl')
+
+    def test_select_opengl_after_metal_rebuilds_vaos(self) -> None:
+        if 'metal' not in self.available or 'opengl' not in self.available:
+            self.skipTest('Requires both Metal and OpenGL backends')
+        if not ffi.has_metal or not hasattr(ffi.lib, 'state_debug_add_os_window_for_tests'):
+            self.skipTest('Renderer state debug helpers unavailable')
+
+        renderer_backend_select('metal')
+
+        create_os_window = ffi.lib.state_debug_add_os_window_for_tests
+        create_os_window.argtypes = []
+        create_os_window.restype = ctypes.c_ulonglong
+        os_window_id = create_os_window()
+        self.assertGreater(os_window_id, 0)
+
+        remove_os_window = ffi.lib.remove_os_window
+        remove_os_window.argtypes = [ctypes.c_ulonglong]
+        remove_os_window.restype = ctypes.c_bool
+        os_window_id_c = ctypes.c_ulonglong(os_window_id)
+        self.addCleanup(lambda: remove_os_window(os_window_id_c))
+
+        tab_id = fast_data_types.add_tab(os_window_id)
+        self.assertIsInstance(tab_id, int)
+        window_id = fast_data_types.add_window(os_window_id, tab_id, 'opengl-fallback')
+        self.assertIsInstance(window_id, int)
+
+        get_tab_bar_vao = ffi.lib.state_debug_get_tab_bar_vao_for_tests
+        get_tab_bar_vao.argtypes = [ctypes.c_ulonglong]
+        get_tab_bar_vao.restype = ctypes.c_longlong
+
+        get_window_vao = ffi.lib.state_debug_get_window_vao_for_tests
+        get_window_vao.argtypes = [ctypes.c_ulonglong, ctypes.c_ulonglong, ctypes.c_ulonglong]
+        get_window_vao.restype = ctypes.c_longlong
+
+        tab_id_c = ctypes.c_ulonglong(tab_id)
+        window_id_c = ctypes.c_ulonglong(window_id)
+
+        self.assertEqual(
+            get_tab_bar_vao(os_window_id_c),
+            -1,
+            'Metal-backed tab bar should not allocate an OpenGL VAO',
+        )
+        self.assertEqual(
+            get_window_vao(os_window_id_c, tab_id_c, window_id_c),
+            -1,
+            'Metal-backed window should not allocate an OpenGL VAO',
+        )
+
+        renderer_backend_select('opengl')
+
+        window_vao = get_window_vao(os_window_id_c, tab_id_c, window_id_c)
+        tab_bar_vao = get_tab_bar_vao(os_window_id_c)
+
+        self.assertGreaterEqual(
+            window_vao,
+            0,
+            'OpenGL fallback must allocate a window VAO',
+        )
+        self.assertGreaterEqual(
+            tab_bar_vao,
+            0,
+            'OpenGL fallback must allocate a tab bar VAO',
+        )
+
+    def test_tab_bar_upload_without_screen_returns_false(self) -> None:
+        if 'metal' not in self.available or 'opengl' not in self.available:
+            self.skipTest('Requires both Metal and OpenGL backends')
+        if not hasattr(ffi.lib, 'state_debug_upload_tab_bar_for_tests'):
+            self.skipTest('Tab bar upload debug helper unavailable')
+
+        renderer_backend_select('metal')
+
+        create_os_window = ffi.lib.state_debug_add_os_window_for_tests
+        create_os_window.argtypes = []
+        create_os_window.restype = ctypes.c_ulonglong
+        os_window_id = create_os_window()
+        self.assertGreater(os_window_id, 0)
+        os_window_id_c = ctypes.c_ulonglong(os_window_id)
+
+        remove_os_window = ffi.lib.remove_os_window
+        remove_os_window.argtypes = [ctypes.c_ulonglong]
+        remove_os_window.restype = ctypes.c_bool
+        self.addCleanup(lambda: remove_os_window(os_window_id_c))
+
+        renderer_backend_select('opengl')
+
+        upload_tab_bar = ffi.lib.state_debug_upload_tab_bar_for_tests
+        upload_tab_bar.argtypes = [ctypes.c_ulonglong]
+        upload_tab_bar.restype = ctypes.c_bool
+
+        self.assertFalse(
+            upload_tab_bar(os_window_id_c),
+            'Tab bar upload should be a no-op when the screen is unset',
+        )
 
     def test_backend_render_hook_invocation_order(self) -> None:
         self.addCleanup(ffi.reset)
