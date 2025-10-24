@@ -28,6 +28,8 @@ This document remains the single source of truth for kitty’s Metal migration. 
 - Capture lifecycle still flows through `metal_reset_capture_state()` on resize/failure/destroy, so no dangling capture buffers remain between frames.
 - Diagnostics: `metal_record_failure()` and friends emit Metal-specific logs, and debug toggles (`--debug-metal`, `--metal-gpu-capture`) surface through `RendererInitConfig` and the debug helper API.
 - Font sprite flows respect backend selection; OpenGL resources are never created when Metal drives rendering.
+- OS window lifecycle skips OpenGL VAO allocation/destruction whenever the Metal backend is active; `state.c` now conditionally creates and frees GPU resources based on the selected renderer.
+- Test helpers expose `state_debug_add_os_window_for_tests()` so Python Metal suites can instantiate OS windows without platform-specific glue.
 
 ---
 
@@ -41,6 +43,8 @@ This document remains the single source of truth for kitty’s Metal migration. 
 | 2025-10-23 | Capture lifecycle parity with OpenGL verified; debugger exports added. |
 | 2025-10-24 | Metal debug toggles and GPU capture plumbing complete; metallib helper validated under zip import. | 
 | 2025-10-24 | **New:** GLFW window creation now routes through `share_window_for_backend()`, preventing Metal from inheriting stale GL share contexts. `_share_window_hint_for_tests` exposes the decision to Python, and `kitty_tests.glfw.TestGLFW.test_share_window_hint` guards the behaviour. |
+| 2025-10-24 | **New:** `state.c` no longer creates or destroys OpenGL VAOs when Metal drives rendering; helper exports added so tests can assert VAO-free state. |
+| 2025-10-24 | **New:** `state_debug_add_os_window_for_tests()` returns stable OS window IDs, allowing Metal regression tests to instantiate windows via ctypes. |
 
 ---
 

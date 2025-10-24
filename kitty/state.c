@@ -6,6 +6,7 @@
  */
 
 #include "cleanup.h"
+#include "compiler.h"
 #include "options/to-c-generated.h"
 #include "renderer_backend.h"
 #ifdef __APPLE__
@@ -15,6 +16,11 @@
 #include <sys/mman.h>
 
 GlobalState global_state = {{0}};
+
+static inline bool
+using_opengl_backend(void) {
+    return renderer_backend_current_type() == RENDERER_BACKEND_OPENGL;
+}
 
 #define REMOVER(array, qid, count, destroy, capacity) { \
     for (size_t i = 0; i < count; i++) { \
@@ -215,21 +221,26 @@ free_bgimage(BackgroundImage **bgimage, bool release_texture) {
 #ifdef __APPLE__
             metal_background_image_release(*bgimage);
 #endif
-            if (release_texture) free_texture(&(*bgimage)->texture_id);
+            if (release_texture && using_opengl_backend()) {
+                free_texture(&(*bgimage)->texture_id);
+            } else {
+                (*bgimage)->texture_id = 0;
+            }
             free(*bgimage);
         }
     }
     bgimage = NULL;
 }
 
-OSWindow*
+EXPORTED OSWindow*
 add_os_window(void) {
     WITH_OS_WINDOW_REFS
     ensure_space_for(&global_state, os_windows, OSWindow, global_state.num_os_windows + 1, capacity, 1, true);
     OSWindow *ans = global_state.os_windows + global_state.num_os_windows++;
     zero_at_ptr(ans);
     ans->id = ++global_state.os_window_id_counter;
-    ans->tab_bar_render_data.vao_idx = create_cell_vao();
+    if (using_opengl_backend()) ans->tab_bar_render_data.vao_idx = create_cell_vao();
+    else ans->tab_bar_render_data.vao_idx = -1;
     ans->background_opacity.alpha = OPT(background_opacity);
     ans->created_at = monotonic();
 
@@ -260,7 +271,11 @@ add_tab(id_type os_window_id) {
         ensure_space_for(os_window, tabs, Tab, os_window->num_tabs + 1, capacity, 1, true);
         zero_at_i(os_window->tabs, os_window->num_tabs);
         os_window->tabs[os_window->num_tabs].id = ++global_state.tab_id_counter;
-        os_window->tabs[os_window->num_tabs].border_rects.vao_idx = create_border_vao();
+        if (using_opengl_backend()) {
+            os_window->tabs[os_window->num_tabs].border_rects.vao_idx = create_border_vao();
+        } else {
+            os_window->tabs[os_window->num_tabs].border_rects.vao_idx = -1;
+        }
         return os_window->tabs[os_window->num_tabs++].id;
     END_WITH_OS_WINDOW
     return 0;
@@ -268,12 +283,13 @@ add_tab(id_type os_window_id) {
 
 static void
 create_gpu_resources_for_window(Window *w) {
-    w->render_data.vao_idx = create_cell_vao();
+    if (using_opengl_backend()) w->render_data.vao_idx = create_cell_vao();
+    else w->render_data.vao_idx = -1;
 }
 
 static void
 release_gpu_resources_for_window(Window *w) {
-    if (w->render_data.vao_idx > -1) remove_vao(w->render_data.vao_idx);
+    if (using_opengl_backend() && w->render_data.vao_idx > -1) remove_vao(w->render_data.vao_idx);
     w->render_data.vao_idx = -1;
 }
 
@@ -467,7 +483,8 @@ attach_window(id_type os_window_id, id_type tab_id, id_type id) {
 static void
 destroy_tab(Tab *tab) {
     for (size_t i = tab->num_windows; i > 0; i--) remove_window_inner(tab, tab->windows[i - 1].id);
-    remove_vao(tab->border_rects.vao_idx);
+    if (using_opengl_backend() && tab->border_rects.vao_idx > -1) remove_vao(tab->border_rects.vao_idx);
+    tab->border_rects.vao_idx = -1;
     free(tab->border_rects.rect_buf); tab->border_rects.rect_buf = NULL;
     free(tab->windows); tab->windows = NULL;
 }
@@ -501,15 +518,21 @@ destroy_os_window_item(OSWindow *w) {
         remove_tab_inner(w, tab->id);
     }
     Py_CLEAR(w->window_title); Py_CLEAR(w->tab_bar_render_data.screen);
-    remove_vao(w->tab_bar_render_data.vao_idx);
+    if (using_opengl_backend() && w->tab_bar_render_data.vao_idx > -1) remove_vao(w->tab_bar_render_data.vao_idx);
+    w->tab_bar_render_data.vao_idx = -1;
     free(w->tabs); w->tabs = NULL;
     free_bgimage(&w->bgimage, true);
     zero_at_ptr(&w->bgimage);
-    if (w->indirect_output.texture_id) free_texture(&w->indirect_output.texture_id);
-    if (w->indirect_output.framebuffer_id) free_framebuffer(&w->indirect_output.framebuffer_id);
+    if (using_opengl_backend()) {
+        if (w->indirect_output.texture_id) free_texture(&w->indirect_output.texture_id);
+        if (w->indirect_output.framebuffer_id) free_framebuffer(&w->indirect_output.framebuffer_id);
+    } else {
+        w->indirect_output.texture_id = 0;
+        w->indirect_output.framebuffer_id = 0;
+    }
 }
 
-bool
+EXPORTED bool
 remove_os_window(id_type os_window_id) {
     bool found = false;
     WITH_OS_WINDOW(os_window_id)
@@ -1481,6 +1504,33 @@ get_mouse_data_for_window(PyObject *self UNUSED, PyObject *args) {
                 "in_left_half_of_cell", window->mouse_pos.in_left_half_of_cell ? Py_True: Py_False);
     END_WITH_WINDOW
     Py_RETURN_NONE;
+}
+
+EXPORTED ssize_t
+state_debug_get_tab_bar_vao_for_tests(id_type os_window_id) {
+    ssize_t ans = -2;
+    WITH_OS_WINDOW(os_window_id)
+        ans = os_window->tab_bar_render_data.vao_idx;
+    END_WITH_OS_WINDOW
+    return ans;
+}
+
+EXPORTED ssize_t
+state_debug_get_window_vao_for_tests(id_type os_window_id, id_type tab_id, id_type window_id) {
+    ssize_t ans = -2;
+    WITH_WINDOW(os_window_id, tab_id, window_id)
+        ans = window->render_data.vao_idx;
+    END_WITH_WINDOW
+    return ans;
+}
+
+EXPORTED id_type
+state_debug_add_os_window_for_tests(void) {
+    OSWindow *window = add_os_window();
+    if (!window) {
+        return 0;
+    }
+    return window->id;
 }
 
 #define M(name, arg_type) {#name, (PyCFunction)name, arg_type, NULL}

@@ -2,6 +2,7 @@
 # License: GPL v3
 
 import ctypes
+import sys
 from typing import Sequence
 
 import kitty.fast_data_types as fast_data_types
@@ -530,6 +531,59 @@ class TestMetalHelperFunctions(BaseTest):
 
         info = MetalCapturedFrameDebugInfo()
         self.assertFalse(self.lib.metal_renderer_copy_captured_frame_for_tests(ctypes.byref(info)))
+
+    def test_metal_windows_do_not_allocate_opengl_vaos(self) -> None:
+        if sys.platform != 'darwin':
+            self.skipTest('Metal backend not available on this platform')
+        if not ffi.has_metal or not hasattr(ffi.lib, 'state_debug_add_os_window_for_tests'):
+            self.skipTest('Metal backend helpers unavailable')
+
+        previous = renderer_backend_current()
+        renderer_backend_select('metal')
+        self.addCleanup(renderer_backend_select, previous)
+
+        create_os_window = ffi.lib.state_debug_add_os_window_for_tests
+        create_os_window.argtypes = []
+        create_os_window.restype = ctypes.c_ulonglong
+        os_window_id = create_os_window()
+        self.assertGreater(os_window_id, 0, 'Failed to create an OS window for Metal tests')
+
+        remove_os_window = ffi.lib.remove_os_window
+        remove_os_window.argtypes = [ctypes.c_ulonglong]
+        remove_os_window.restype = ctypes.c_bool
+        self.addCleanup(lambda: remove_os_window(ctypes.c_ulonglong(os_window_id)))
+
+        tab_id = fast_data_types.add_tab(os_window_id)
+        self.assertIsInstance(tab_id, int)
+
+        window_id = fast_data_types.add_window(os_window_id, tab_id, 'metal-test')
+        self.assertIsInstance(window_id, int)
+
+        ffi.lib.state_debug_get_tab_bar_vao_for_tests.argtypes = [ctypes.c_ulonglong]
+        ffi.lib.state_debug_get_tab_bar_vao_for_tests.restype = ctypes.c_longlong
+        tab_bar_vao = ffi.lib.state_debug_get_tab_bar_vao_for_tests(ctypes.c_ulonglong(os_window_id))
+        self.assertEqual(
+            tab_bar_vao,
+            -1,
+            'Metal tab bar should not allocate an OpenGL VAO',
+        )
+
+        ffi.lib.state_debug_get_window_vao_for_tests.argtypes = [
+            ctypes.c_ulonglong,
+            ctypes.c_ulonglong,
+            ctypes.c_ulonglong,
+        ]
+        ffi.lib.state_debug_get_window_vao_for_tests.restype = ctypes.c_longlong
+        vao_idx = ffi.lib.state_debug_get_window_vao_for_tests(
+            ctypes.c_ulonglong(os_window_id),
+            ctypes.c_ulonglong(tab_id),
+            ctypes.c_ulonglong(window_id),
+        )
+        self.assertEqual(
+            vao_idx,
+            -1,
+            'Metal window render data should not allocate an OpenGL VAO',
+        )
 
 
 class TestMetalCaptureLifecycle(BaseTest):
