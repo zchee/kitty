@@ -530,6 +530,16 @@ Debug rendering commands. This will cause all OpenGL calls to check for errors
 instead of ignoring them. Also prints out miscellaneous debug information.
 Useful when debugging rendering problems.
 
+--debug-metal
+type=bool-set
+Enable verbose Metal renderer diagnostics on macOS. Emits lifecycle and
+command logging to help track GPU issues. Has no effect on other platforms.
+
+--metal-gpu-capture
+type=bool-set
+Capture the Metal swapchain framebuffer every frame for debugging on macOS.
+This introduces overhead and should only be used for investigation.
+
 
 --debug-input --debug-keyboard
 dest=debug_keyboard

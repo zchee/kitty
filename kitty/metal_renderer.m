@@ -30,6 +30,9 @@
 #include "data-types.h"
 #include "line.h"
 #include "state.h"
+#include "monotonic.h"
+
+static bool metal_debug_events_enabled(void);
 
 extern void log_error(const char *fmt, ...);
 
@@ -196,7 +199,23 @@ metal_log(const char *event, const char *fmt, ...) {
     char detail[256];
     vsnprintf(detail, sizeof(detail), fmt, args);
     va_end(args);
+    if (metal_debug_events_enabled()) {
+        timed_debug_print("metal_event=%s %s", event, detail);
+    }
     log_error("metal_event=%s %s", event, detail);
+}
+
+static void
+metal_debug_event(const char *event, const char *fmt, ...) {
+    if (!metal_debug_events_enabled()) {
+        return;
+    }
+    va_list args;
+    va_start(args, fmt);
+    char detail[256];
+    vsnprintf(detail, sizeof(detail), fmt, args);
+    va_end(args);
+    timed_debug_print("metal_event=%s %s", event, detail);
 }
 
 bool
@@ -356,6 +375,8 @@ typedef struct {
     bool initialized;
     bool prefer_low_latency;
     bool debug_labels;
+    bool debug_events;
+    bool capture_frames;
     bool display_sync_enabled;
 } MetalGlobalState;
 
@@ -377,8 +398,15 @@ static MetalGlobalState g_metal = {
     .initialized = false,
     .prefer_low_latency = false,
     .debug_labels = false,
+    .debug_events = false,
+    .capture_frames = false,
     .display_sync_enabled = true,
 };
+
+static inline bool
+metal_debug_events_enabled(void) {
+    return g_metal.debug_events;
+}
 
 typedef struct {
     uint32_t width;
@@ -2200,8 +2228,8 @@ ensure_command_primitives(GLFWwindow *window, MetalWindowState *state) {
             command_buffer.label = @"kitty-frame";
         }
         state.commandBuffer = command_buffer;
-        if (g_metal.debug_labels) {
-            metal_log("command_primitives_ready", "drawable=%p command_buffer=%p", state.drawable, state.commandBuffer);
+        if (g_metal.debug_labels || g_metal.debug_events) {
+            metal_debug_event("command_primitives_ready", "drawable=%p command_buffer=%p", state.drawable, state.commandBuffer);
         }
     }
     return true;
@@ -2367,6 +2395,8 @@ metal_backend_ensure_initialized(const RendererInitConfig *cfg) {
     }
     g_metal.prefer_low_latency = cfg ? cfg->prefer_low_latency : false;
     g_metal.debug_labels = cfg ? cfg->enable_debug_labels : false;
+    g_metal.debug_events = cfg ? cfg->enable_debug_logging : false;
+    g_metal.capture_frames = cfg ? cfg->enable_frame_capture : false;
     g_metal.display_sync_enabled = !g_metal.prefer_low_latency;
     set_display_sync_for_all_layers();
     metal_register_sprite_hooks();
@@ -2604,12 +2634,12 @@ metal_backend_present(GLFWwindow *window, const RendererPresentParams *params) {
         return false;
     }
     if (!state.commandBuffer || !state.drawable) {
-        metal_log("present_retry", "cause=missing_primitives command_buffer=%p drawable=%p", state.commandBuffer, state.drawable);
+        metal_debug_event("present_retry", "cause=missing_primitives command_buffer=%p drawable=%p", state.commandBuffer, state.drawable);
         if (!encode_clear_pass(window, state, state.clearColor)) {
             return false;
         }
     }
-    const bool wants_capture = params && params->capture_framebuffer;
+    const bool wants_capture = g_metal.capture_frames || (params && params->capture_framebuffer);
     if (wants_capture) {
         if (!metal_capture_framebuffer(state)) {
             return false;
@@ -2628,9 +2658,9 @@ metal_backend_present(GLFWwindow *window, const RendererPresentParams *params) {
     if (wants_capture) {
         metal_finalize_capture(state);
     }
-    if (g_metal.debug_labels) {
+    if (g_metal.debug_labels || g_metal.debug_events) {
         const bool blocking = wants_capture ? true : (params ? params->blocking : true);
-        metal_log("present", "drawable=%p blocking=%d", state.drawable, blocking ? 1 : 0);
+        metal_debug_event("present", "drawable=%p blocking=%d", state.drawable, blocking ? 1 : 0);
     }
     reset_command_primitives(state);
     return true;
@@ -3943,6 +3973,20 @@ EXPORTED void
 metal_renderer_debug_reset_capture_state_for_tests(GLFWwindow *window, bool release_buffer) {
     MetalWindowState *state = state_for_window(window);
     metal_reset_capture_state(state, release_buffer);
+}
+
+EXPORTED void
+metal_renderer_debug_get_runtime_flags_for_tests(MetalRuntimeDebugFlags *out_flags) {
+    if (!out_flags) {
+        PyErr_SetString(PyExc_ValueError, "metal_renderer_debug_get_runtime_flags_for_tests requires output struct");
+        return;
+    }
+    MetalRuntimeDebugFlags flags = {
+        .debug_labels = g_metal.debug_labels,
+        .debug_events = g_metal.debug_events,
+        .capture_frames = g_metal.capture_frames,
+    };
+    *out_flags = flags;
 }
 
 EXPORTED void

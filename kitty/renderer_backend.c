@@ -234,6 +234,8 @@ current_init_config(void) {
     RendererInitConfig cfg = {
         .prefer_low_latency = !OPT(sync_to_monitor),
         .enable_debug_labels = global_state.debug_rendering,
+        .enable_debug_logging = global_state.debug_metal_events,
+        .enable_frame_capture = global_state.metal_capture_enabled,
     };
     return cfg;
 }
@@ -399,6 +401,10 @@ renderer_backend_swap_buffers(GLFWwindow *window) {
         .blocking = true,
         .capture_framebuffer = false,
     };
+    if (global_state.metal_capture_enabled &&
+        renderer_backend_current_type() == RENDERER_BACKEND_METAL) {
+        params.capture_framebuffer = true;
+    }
     (void)renderer_backend_present(window, &params);
 }
 

@@ -791,9 +791,12 @@ PYWRAP0(get_options) {
 PYWRAP1(set_options) {
     PyObject *opts;
     int is_wayland = 0, debug_rendering = 0, debug_font_fallback = 0;
-    PA("O|ppp", &opts, &is_wayland, &debug_rendering, &debug_font_fallback);
+    int debug_metal = 0, metal_capture = 0;
+    PA("O|ppppp", &opts, &is_wayland, &debug_rendering, &debug_font_fallback, &debug_metal, &metal_capture);
     if (opts == Py_None) {
         Py_CLEAR(global_state.options_object);
+        global_state.debug_metal_events = false;
+        global_state.metal_capture_enabled = false;
         Py_RETURN_NONE;
     }
 #ifdef __APPLE__
@@ -804,6 +807,8 @@ PYWRAP1(set_options) {
     if (global_state.is_wayland) global_state.has_render_frames = true;
     global_state.debug_rendering = debug_rendering ? true : false;
     global_state.debug_font_fallback = debug_font_fallback ? true : false;
+    global_state.debug_metal_events = debug_metal ? true : false;
+    global_state.metal_capture_enabled = metal_capture ? true : false;
     if (!convert_opts_from_python_opts(opts, &global_state.opts)) return NULL;
     global_state.options_object = opts;
     Py_INCREF(global_state.options_object);

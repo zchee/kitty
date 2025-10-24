@@ -200,6 +200,11 @@ typedef struct RendererBackendOps {
 - Agreement on shader translation approach and testing methodology.
 - Identified owners for each subsequent phase and estimated timelines approved by project lead.
 
+## Debugging Controls
+- `kitty --debug-metal` enables verbose Metal renderer logging on macOS. When active, Metal device lifecycle, drawable acquisitions, and command submission events emit via `timed_debug_print`, mirroring existing OpenGL debug flags without muting fatal error reporting.
+- `kitty --metal-gpu-capture` forces every swap to capture the CAMetalLayer framebuffer for offline inspection. Captured frames remain available through `metal_renderer_copy_captured_frame_for_tests` and the runtime flag diagnostics, and the toggle automatically blocks until command buffers complete.
+- Both toggles surface through the renderer backend configuration so tests and integrations can verify runtime state via `metal_renderer_debug_get_runtime_flags_for_tests`.
+
 ## Risks & Mitigations
 - **Shader parity risk**: complex GLSL features may not map directly to MSL. Mitigation: spike transpilation early, maintain automated shader tests.
 - **Performance regression**: Metal path may expose bottlenecks. Mitigation: integrate profiling tools (Metal System Trace) during Phase 4.

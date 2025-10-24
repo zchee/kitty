@@ -639,7 +639,9 @@ def set_options(
     opts: Optional[Options],
     is_wayland: bool = False,
     debug_rendering: bool = False,
-    debug_font_fallback: bool = False
+    debug_font_fallback: bool = False,
+    debug_metal: bool = False,
+    metal_gpu_capture: bool = False
 ) -> None:
     pass
 

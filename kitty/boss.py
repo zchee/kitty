@@ -2864,7 +2864,14 @@ class Boss:
     def apply_new_options(self, opts: Options) -> None:
         bg_colors_before = {w.id: w.screen.color_profile.default_bg for w in self.all_windows}
         # Update options storage
-        set_options(opts, is_wayland(), self.args.debug_rendering, self.args.debug_font_fallback)
+        set_options(
+            opts,
+            is_wayland(),
+            self.args.debug_rendering,
+            self.args.debug_font_fallback,
+            getattr(self.args, 'debug_metal', False),
+            getattr(self.args, 'metal_gpu_capture', False),
+        )
         apply_options_update()
         set_layout_options(opts)
         set_default_env(opts.env.copy())

@@ -120,10 +120,17 @@ typedef struct MetalWindowDebugState {
     uint32_t capture_bytes_per_row;
 } MetalWindowDebugState;
 
+typedef struct MetalRuntimeDebugFlags {
+    bool debug_labels;
+    bool debug_events;
+    bool capture_frames;
+} MetalRuntimeDebugFlags;
+
 EXPORTED void metal_renderer_debug_seed_window_state_for_tests(struct GLFWwindow *window);
 EXPORTED bool metal_renderer_debug_get_window_state_for_tests(struct GLFWwindow *window, MetalWindowDebugState *out_state);
 EXPORTED void metal_renderer_debug_set_window_state_for_tests(struct GLFWwindow *window, const MetalWindowDebugState *state);
 EXPORTED void metal_renderer_debug_reset_capture_state_for_tests(struct GLFWwindow *window, bool release_buffer);
+EXPORTED void metal_renderer_debug_get_runtime_flags_for_tests(MetalRuntimeDebugFlags *out_flags);
 
 #ifdef __cplusplus
 }

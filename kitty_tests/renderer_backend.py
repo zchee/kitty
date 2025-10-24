@@ -57,6 +57,16 @@ class BackendFFI:
         self.RendererPresentParams = RendererPresentParams
         self.RendererResizeParams = RendererResizeParams
         self.RendererRenderParams = RendererRenderParams
+        class RendererInitConfig(ctypes.Structure):
+            _pack_ = 1
+            _fields_ = [
+                ("prefer_low_latency", ctypes.c_uint8),
+                ("enable_debug_labels", ctypes.c_uint8),
+                ("enable_debug_logging", ctypes.c_uint8),
+                ("enable_frame_capture", ctypes.c_uint8),
+            ]
+
+        self.RendererInitConfig = RendererInitConfig
 
         class MetalBackgroundGeometry(ctypes.Structure):
             _fields_ = [
@@ -227,6 +237,14 @@ class BackendFFI:
                         ]
 
                     self.MetalWindowDebugState = MetalWindowDebugState
+                    class MetalRuntimeDebugFlags(ctypes.Structure):
+                        _fields_ = [
+                            ("debug_labels", ctypes.c_bool),
+                            ("debug_events", ctypes.c_bool),
+                            ("capture_frames", ctypes.c_bool),
+                        ]
+
+                    self.MetalRuntimeDebugFlags = MetalRuntimeDebugFlags
 
                 self.lib.renderer_backend_upload_graphics_image.argtypes = [
                     ctypes.POINTER(TextureRef),
@@ -280,6 +298,11 @@ class BackendFFI:
                         ctypes.c_bool,
                     ]
                     self.lib.metal_renderer_debug_reset_capture_state_for_tests.restype = None
+                if self.has_metal and hasattr(self.lib, "metal_renderer_debug_get_runtime_flags_for_tests"):
+                    self.lib.metal_renderer_debug_get_runtime_flags_for_tests.argtypes = [
+                        ctypes.POINTER(self.MetalRuntimeDebugFlags),
+                    ]
+                    self.lib.metal_renderer_debug_get_runtime_flags_for_tests.restype = None
         else:
             self.has_metal = False
 
@@ -322,6 +345,7 @@ class BackendFFI:
         self,
         name: str,
         *,
+        ensure_initialized=DEFAULT,
         begin_frame=DEFAULT,
         render=DEFAULT,
         present=DEFAULT,
@@ -330,7 +354,14 @@ class BackendFFI:
         ops.name = name.encode()
         refs = []
 
-        ops.ensure_initialized = self._ensure_true
+        if ensure_initialized is self.DEFAULT:
+            ops.ensure_initialized = self._ensure_true
+        elif ensure_initialized is None:
+            ops.ensure_initialized = ctypes.cast(None, self.EnsureFunc)
+        else:
+            cb = self.EnsureFunc(ensure_initialized)
+            refs.append(cb)
+            ops.ensure_initialized = cb
         ops.shutdown = self._shutdown_noop
         ops.attach_window = self._attach_true
         ops.make_context_current = self._make_context_null

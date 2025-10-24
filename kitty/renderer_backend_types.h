@@ -26,6 +26,8 @@ typedef enum {
 typedef struct RendererInitConfig {
     bool prefer_low_latency;
     bool enable_debug_labels;
+    bool enable_debug_logging;
+    bool enable_frame_capture;
 } RendererInitConfig;
 
 typedef struct RendererFrameParams {
