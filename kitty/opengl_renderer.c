@@ -1,5 +1,7 @@
 #include "opengl_renderer.h"
 
+#include <stdio.h>
+
 #include "glfw-wrapper.h"
 #include "renderer_backend.h"
 #include "state.h"
@@ -8,11 +10,17 @@
 
 #ifdef KITTY_DISABLE_NSGL
 
+static char opengl_disabled_reason_buf[256] = "OpenGL renderer backend is not supported on macOS";
+
+const char *
+opengl_renderer_disabled_reason(void) {
+    return opengl_disabled_reason_buf[0] ? opengl_disabled_reason_buf : NULL;
+}
+
 bool
 register_opengl_renderer_backend(void) {
-    PyGILState_STATE gil = PyGILState_Ensure();
-    PyErr_SetString(PyExc_RuntimeError, "OpenGL renderer backend is not supported on macOS");
-    PyGILState_Release(gil);
+    static const char *message = "OpenGL renderer backend is not supported on macOS";
+    snprintf(opengl_disabled_reason_buf, sizeof(opengl_disabled_reason_buf), "%s", message);
     return false;
 }
 
@@ -218,6 +226,11 @@ register_opengl_renderer_backend(void) {
         .destroy_graphics_image = opengl_backend_destroy_graphics_image,
     };
     return renderer_backend_register(RENDERER_BACKEND_OPENGL, &opengl_ops);
+}
+
+const char *
+opengl_renderer_disabled_reason(void) {
+    return NULL;
 }
 
 #endif /* KITTY_DISABLE_NSGL */

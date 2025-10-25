@@ -99,6 +99,59 @@ class GetPythonFlagsTests(unittest.TestCase):
         self.assertTrue(all('PythonT' not in lib for lib in libs))
 
 
+class CreateMinimalBundleTests(unittest.TestCase):
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.launcher_root = Path(self.tmpdir.name) / 'launcher'
+        self.launcher_root.mkdir()
+        self._orig_src_base = setup.src_base
+        setup.src_base = os.path.join(self.tmpdir.name, 'src')
+        src_root = Path(setup.src_base)
+        src_root.mkdir(parents=True, exist_ok=True)
+        (src_root / 'fonts').mkdir(exist_ok=True)
+        (src_root / 'shell-integration').mkdir(exist_ok=True)
+        (src_root / 'shell-integration' / 'README').write_text('stub', encoding='utf-8')
+
+    def tearDown(self) -> None:
+        setup.src_base = self._orig_src_base
+
+    @mock.patch('setup.create_quick_access_bundle')
+    @mock.patch('setup.create_macos_app_icon')
+    def test_minimal_bundle_symlinks_resources_before_kittens(
+        self,
+        mock_icon: mock.Mock,
+        mock_quake: mock.Mock,
+    ) -> None:
+        resources_symlink_checked: list[Path] = []
+
+        def fake_build_launcher(args: setup.Options, launcher_dir: str, bundle_type: str = 'source') -> None:
+            Path(launcher_dir).mkdir(parents=True, exist_ok=True)
+            (Path(launcher_dir) / 'kitty').touch()
+
+        def fake_build_static(args: setup.Options, launcher_dir: str, **_: object) -> None:
+            resources_dir = Path(launcher_dir).parent / 'Resources'
+            dest = resources_dir / 'kitty'
+            self.assertTrue(dest.is_symlink(), 'Resources/kitty should be a symlink before kittens build')
+            resources_symlink_checked.append(dest)
+
+        with mock.patch('setup.build_launcher', side_effect=fake_build_launcher) as mock_launcher, \
+             mock.patch('setup.build_static_kittens', side_effect=fake_build_static) as mock_kittens:
+            setup.create_minimal_macos_bundle(setup.Options(), str(self.launcher_root))
+
+        self.assertTrue(mock_launcher.called)
+        self.assertTrue(mock_kittens.called)
+        resources_dir = self.launcher_root / 'kitty.app' / 'Contents' / 'Resources'
+        dest = resources_dir / 'kitty'
+        self.assertTrue(dest.is_symlink())
+        expected_target = os.path.relpath(setup.src_base, str(resources_dir))
+        self.assertEqual(os.readlink(dest), expected_target)
+        self.assertTrue((dest / 'fonts').exists(), 'fonts directory should be reachable via symlink')
+        self.assertTrue((dest / 'shell-integration').exists(), 'shell-integration should be reachable via symlink')
+        self.assertTrue(resources_symlink_checked, 'Test should observe build_static_kittens execution')
+
+
 class KittyEnvMetalTests(unittest.TestCase):
 
     @mock.patch('setup.xxhash_flags', return_value=([], []))

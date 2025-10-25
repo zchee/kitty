@@ -2027,6 +2027,24 @@ def create_quick_access_bundle(kapp: str, quake_desc: str = 'Quick access to kit
         os.symlink(f'../../{x}', os.path.join(qapp, 'Contents', x))
 
 
+def ensure_macos_development_resources(resources_dir: str) -> None:
+    """
+    Ensure the minimal developer bundle has a Resources/kitty entry that points
+    back to the source checkout so the launcher can locate Python modules and
+    helper scripts before packaging populates the final payload.
+    """
+    target = os.path.relpath(src_base, resources_dir)
+    dest = os.path.join(resources_dir, 'kitty')
+    if os.path.lexists(dest):
+        if os.path.islink(dest):
+            if os.readlink(dest) == target:
+                return
+            os.unlink(dest)
+        else:
+            shutil.rmtree(dest)
+    os.symlink(target, dest)
+
+
 def create_minimal_macos_bundle(args: Options, launcher_dir: str, relocate: bool = False) -> None:
     kapp = os.path.join(launcher_dir, 'kitty.app')
     if os.path.exists(kapp):
@@ -2040,8 +2058,10 @@ def create_minimal_macos_bundle(args: Options, launcher_dir: str, relocate: bool
     if relocate:
         shutil.copy2(os.path.join(launcher_dir, "kitty"), bin_dir)
         shutil.copy2(os.path.join(launcher_dir, "kitten"), bin_dir)
+        ensure_macos_development_resources(resources_dir)
     else:
         build_launcher(args, bin_dir)
+        ensure_macos_development_resources(resources_dir)
         build_static_kittens(args, launcher_dir=bin_dir)
         kitty_exe = os.path.join(launcher_dir, appname)
         with suppress(FileNotFoundError):

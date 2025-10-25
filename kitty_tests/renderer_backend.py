@@ -155,6 +155,12 @@ class BackendFFI:
         self.lib.renderer_backend_reset_for_tests.restype = None
         self.lib.register_opengl_renderer_backend.argtypes = []
         self.lib.register_opengl_renderer_backend.restype = ctypes.c_bool
+        if hasattr(self.lib, "opengl_renderer_disabled_reason"):
+            self.lib.opengl_renderer_disabled_reason.argtypes = []
+            self.lib.opengl_renderer_disabled_reason.restype = ctypes.c_char_p
+            self._has_opengl_disabled_reason = True
+        else:
+            self._has_opengl_disabled_reason = False
         if hasattr(self.lib, "register_metal_renderer_backend"):
             self.lib.register_metal_renderer_backend.argtypes = []
             self.lib.register_metal_renderer_backend.restype = ctypes.c_bool
@@ -515,9 +521,21 @@ class TestRendererBackend(BaseTest):
         err_traceback = ctypes.py_object()
         result = ffi.lib.register_opengl_renderer_backend()
         self.assertFalse(result)
+        self.assertTrue(
+            getattr(ffi, "_has_opengl_disabled_reason", False),
+            "OpenGL disabled builds must expose a disabled reason helper",
+        )
+        reason_bytes = ffi.lib.opengl_renderer_disabled_reason()
+        self.assertIsNotNone(reason_bytes)
+        reason = reason_bytes.decode('utf-8', errors='ignore')
+        self.assertIn('not supported', reason)
         ffi._pyerr_fetch(ctypes.byref(err_type), ctypes.byref(err_value), ctypes.byref(err_traceback))
-        self.assertIsNotNone(err_type.value)
-        self.assertIn('not supported', str(err_value.value))
+        for fetched in (err_type, err_value, err_traceback):
+            try:
+                value = fetched.value
+            except ValueError:
+                value = None
+            self.assertIsNone(value)
 
     def test_metal_preflight_reports_status(self) -> None:
         if not ffi.has_metal:
