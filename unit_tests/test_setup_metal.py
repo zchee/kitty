@@ -99,5 +99,37 @@ class GetPythonFlagsTests(unittest.TestCase):
         self.assertTrue(all('PythonT' not in lib for lib in libs))
 
 
+class KittyEnvMetalTests(unittest.TestCase):
+
+    @mock.patch('setup.xxhash_flags', return_value=([], []))
+    @mock.patch('setup.libcrypto_flags', return_value=([], []))
+    @mock.patch('setup.get_python_flags', return_value=[])
+    @mock.patch('setup.pkg_config', return_value=[])
+    @mock.patch('setup.homebrew_prefix', return_value='/opt/homebrew')
+    @mock.patch('setup.at_least_version', return_value=None)
+    def test_kitty_env_drops_opengl_framework(
+        self,
+        mock_at_least_version: mock.Mock,
+        mock_homebrew_prefix: mock.Mock,
+        mock_pkg_config: mock.Mock,
+        mock_get_python_flags: mock.Mock,
+        mock_libcrypto_flags: mock.Mock,
+        mock_xxhash_flags: mock.Mock,
+    ) -> None:
+        original_env = setup.env
+        original_is_macos = setup.is_macos
+        try:
+            setup.is_macos = True
+            setup.env = setup.Env()
+            env = setup.kitty_env(setup.Options())
+        finally:
+            setup.env = original_env
+            setup.is_macos = original_is_macos
+
+        ldflags_combined = ' '.join(env.ldpaths)
+        self.assertNotIn('OpenGL', ldflags_combined)
+        self.assertIn('Metal', ldflags_combined)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -1572,7 +1572,9 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
     glfwSetCocoaToggleFullscreenIntercept(glfw_window, intercept_cocoa_fullscreen);
     glfwCocoaSetWindowResizeCallback(glfw_window, cocoa_os_window_resized);
 #endif
+#ifndef KITTY_DISABLE_NSGL
     send_prerendered_sprites_for_window(w, !using_metal);
+#endif
     if (logo.pixels && logo.width && logo.height) glfwSetWindowIcon(glfw_window, 1, &logo);
     set_glfw_mouse_pointer_shape_in_window(glfw_window, OPT(default_pointer_shape));
     update_os_window_viewport(w, false);

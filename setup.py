@@ -654,6 +654,9 @@ def init_env(
     if control_flow_protection:
         cflags.append(control_flow_protection)
 
+    if is_macos:
+        cppflags.append('-DKITTY_DISABLE_NSGL=1')
+
     if native_optimizations and ba.isa in (ISA.AMD64, ISA.X86):
         cflags.extend('-march=native -mtune=native'.split())
 
@@ -715,7 +718,7 @@ def kitty_env(args: Options) -> Env:
     cflags.extend(pkg_config('harfbuzz', '--cflags-only-I'))
     platform_libs.extend([f'-L{homebrew_prefix()}/opt/harfbuzz/lib', '-lharfbuzz', f'-L{homebrew_prefix()}/opt/graphite2/lib', '-lgraphite2'])
     pylib = get_python_flags(args, cflags)
-    gl_libs = ['-framework', 'OpenGL'] if is_macos else pkg_config('gl', '--libs')
+    gl_libs = [] if is_macos else pkg_config('gl', '--libs')
     libpng = [f'{homebrew_prefix()}/opt/libpng/lib/libpng16.a']
     lcms2 = [f'{homebrew_prefix()}/opt/lcms2/lib/liblcms2.a']
     ans.ldpaths += pylib + platform_libs + gl_libs + libpng + lcms2 + libcrypto_ldflags + xxhash[1]
@@ -1063,7 +1066,8 @@ def find_c_files() -> Tuple[List[str], List[str]]:
     if is_macos:
         allowed_exts.add('.mm')
     exclude = {
-        'fontconfig.c', 'freetype.c', 'desktop.c', 'freetype_render_ui_text.c'
+        'fontconfig.c', 'freetype.c', 'desktop.c', 'freetype_render_ui_text.c',
+        'gl.c', 'gl-wrapper.c', 'shaders.c'
     } if is_macos else {
         'core_text.m', 'cocoa_window.m', 'macos_process_info.c'
     }
@@ -1074,6 +1078,8 @@ def find_c_files() -> Tuple[List[str], List[str]]:
         elif ext == '.h':
             headers.append(os.path.join('kitty', x))
     ans.append('kitty/vt-parser-dump.c')
+    if is_macos and 'kitty/opengl_disabled.c' not in ans:
+        ans.append('kitty/opengl_disabled.c')
 
     # ringbuf
     ans.append('3rdparty/ringbuf/ringbuf.c')

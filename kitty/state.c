@@ -17,10 +17,12 @@
 
 GlobalState global_state = {{0}};
 
+#ifndef KITTY_DISABLE_NSGL
 static inline bool
 using_opengl_backend(void) {
     return renderer_backend_current_type() == RENDERER_BACKEND_OPENGL;
 }
+#endif
 
 #define REMOVER(array, qid, count, destroy, capacity) { \
     for (size_t i = 0; i < count; i++) { \
@@ -214,6 +216,9 @@ send_bgimage_to_gpu(BackgroundImageLayout layout, BackgroundImage *bgimage) {
 
 static void
 free_bgimage(BackgroundImage **bgimage, bool release_texture) {
+#ifdef KITTY_DISABLE_NSGL
+    (void)release_texture;
+#endif
     if (*bgimage && (*bgimage)->refcnt) {
         (*bgimage)->refcnt--;
         if ((*bgimage)->refcnt == 0) {
@@ -221,9 +226,12 @@ free_bgimage(BackgroundImage **bgimage, bool release_texture) {
 #ifdef __APPLE__
             metal_background_image_release(*bgimage);
 #endif
+#ifndef KITTY_DISABLE_NSGL
             if (release_texture && using_opengl_backend()) {
                 free_texture(&(*bgimage)->texture_id);
-            } else {
+            } else
+#endif
+            {
                 (*bgimage)->texture_id = 0;
             }
             free(*bgimage);
@@ -239,8 +247,12 @@ add_os_window(void) {
     OSWindow *ans = global_state.os_windows + global_state.num_os_windows++;
     zero_at_ptr(ans);
     ans->id = ++global_state.os_window_id_counter;
+#ifdef KITTY_DISABLE_NSGL
+    ans->tab_bar_render_data.vao_idx = -1;
+#else
     if (using_opengl_backend()) ans->tab_bar_render_data.vao_idx = create_cell_vao();
     else ans->tab_bar_render_data.vao_idx = -1;
+#endif
     ans->background_opacity.alpha = OPT(background_opacity);
     ans->created_at = monotonic();
 
@@ -271,11 +283,15 @@ add_tab(id_type os_window_id) {
         ensure_space_for(os_window, tabs, Tab, os_window->num_tabs + 1, capacity, 1, true);
         zero_at_i(os_window->tabs, os_window->num_tabs);
         os_window->tabs[os_window->num_tabs].id = ++global_state.tab_id_counter;
+#ifdef KITTY_DISABLE_NSGL
+        os_window->tabs[os_window->num_tabs].border_rects.vao_idx = -1;
+#else
         if (using_opengl_backend()) {
             os_window->tabs[os_window->num_tabs].border_rects.vao_idx = create_border_vao();
         } else {
             os_window->tabs[os_window->num_tabs].border_rects.vao_idx = -1;
         }
+#endif
         return os_window->tabs[os_window->num_tabs++].id;
     END_WITH_OS_WINDOW
     return 0;
@@ -283,18 +299,29 @@ add_tab(id_type os_window_id) {
 
 static void
 create_gpu_resources_for_window(Window *w) {
+#ifdef KITTY_DISABLE_NSGL
+    w->render_data.vao_idx = -1;
+#else
     if (using_opengl_backend()) w->render_data.vao_idx = create_cell_vao();
     else w->render_data.vao_idx = -1;
+#endif
 }
 
 static void
 release_gpu_resources_for_window(Window *w) {
+#ifdef KITTY_DISABLE_NSGL
+    w->render_data.vao_idx = -1;
+#else
     if (using_opengl_backend() && w->render_data.vao_idx > -1) remove_vao(w->render_data.vao_idx);
     w->render_data.vao_idx = -1;
+#endif
 }
 
 void
 state_on_renderer_backend_selected(RendererBackendType type) {
+#ifdef KITTY_DISABLE_NSGL
+    (void) type;
+#else
     if (type != RENDERER_BACKEND_OPENGL) return;
     for (size_t o = 0; o < global_state.num_os_windows; o++) {
         OSWindow *os_window = global_state.os_windows + o;
@@ -322,6 +349,7 @@ state_on_renderer_backend_selected(RendererBackendType type) {
             }
         }
     }
+#endif
 }
 
 static bool
@@ -514,7 +542,9 @@ attach_window(id_type os_window_id, id_type tab_id, id_type id) {
 static void
 destroy_tab(Tab *tab) {
     for (size_t i = tab->num_windows; i > 0; i--) remove_window_inner(tab, tab->windows[i - 1].id);
+#ifndef KITTY_DISABLE_NSGL
     if (using_opengl_backend() && tab->border_rects.vao_idx > -1) remove_vao(tab->border_rects.vao_idx);
+#endif
     tab->border_rects.vao_idx = -1;
     free(tab->border_rects.rect_buf); tab->border_rects.rect_buf = NULL;
     free(tab->windows); tab->windows = NULL;
@@ -549,15 +579,20 @@ destroy_os_window_item(OSWindow *w) {
         remove_tab_inner(w, tab->id);
     }
     Py_CLEAR(w->window_title); Py_CLEAR(w->tab_bar_render_data.screen);
+#ifndef KITTY_DISABLE_NSGL
     if (using_opengl_backend() && w->tab_bar_render_data.vao_idx > -1) remove_vao(w->tab_bar_render_data.vao_idx);
+#endif
     w->tab_bar_render_data.vao_idx = -1;
     free(w->tabs); w->tabs = NULL;
     free_bgimage(&w->bgimage, true);
     zero_at_ptr(&w->bgimage);
+#ifndef KITTY_DISABLE_NSGL
     if (using_opengl_backend()) {
         if (w->indirect_output.texture_id) free_texture(&w->indirect_output.texture_id);
         if (w->indirect_output.framebuffer_id) free_framebuffer(&w->indirect_output.framebuffer_id);
-    } else {
+    } else
+#endif
+    {
         w->indirect_output.texture_id = 0;
         w->indirect_output.framebuffer_id = 0;
     }
@@ -1161,7 +1196,9 @@ PYWRAP1(os_window_font_size) {
     WITH_OS_WINDOW(os_window_id)
         if (new_sz > 0 && (force || new_sz != os_window->fonts_data->font_sz_in_pts)) {
             on_os_window_font_size_change(os_window, new_sz);
+#ifndef KITTY_DISABLE_NSGL
             send_prerendered_sprites_for_window(os_window, renderer_backend_current_type() == RENDERER_BACKEND_OPENGL);
+#endif
             resize_screen(os_window, os_window->tab_bar_render_data.screen, false);
             for (size_t ti = 0; ti < os_window->num_tabs; ti++) {
                 Tab *tab = os_window->tabs + ti;
@@ -1560,7 +1597,11 @@ state_debug_upload_tab_bar_for_tests(id_type os_window_id) {
     bool changed = false;
     WITH_OS_WINDOW(os_window_id)
         Screen *screen = os_window->tab_bar_render_data.screen;
+#ifndef KITTY_DISABLE_NSGL
         changed = send_cell_data_to_gpu(os_window->tab_bar_render_data.vao_idx, screen, os_window);
+#else
+        (void) screen;
+#endif
     END_WITH_OS_WINDOW
     return changed;
 }

@@ -507,6 +507,18 @@ class TestRendererBackend(BaseTest):
             renderer_backend_select('opengl')
         self.assertIn('macOS', str(exc.exception))
 
+    def test_macos_register_opengl_backend_returns_false(self) -> None:
+        if sys.platform != 'darwin':
+            self.skipTest('macOS-only behaviour')
+        err_type = ctypes.py_object()
+        err_value = ctypes.py_object()
+        err_traceback = ctypes.py_object()
+        result = ffi.lib.register_opengl_renderer_backend()
+        self.assertFalse(result)
+        ffi._pyerr_fetch(ctypes.byref(err_type), ctypes.byref(err_value), ctypes.byref(err_traceback))
+        self.assertIsNotNone(err_type.value)
+        self.assertIn('not supported', str(err_value.value))
+
     def test_metal_preflight_reports_status(self) -> None:
         if not ffi.has_metal:
             self.skipTest("Metal backend not compiled in this build")

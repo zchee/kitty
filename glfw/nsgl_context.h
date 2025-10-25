@@ -27,6 +27,27 @@
 #define _GLFW_PLATFORM_CONTEXT_STATE            _GLFWcontextNSGL nsgl;
 #define _GLFW_PLATFORM_LIBRARY_CONTEXT_STATE    _GLFWlibraryNSGL nsgl;
 
+#ifdef KITTY_DISABLE_NSGL
+
+typedef struct _GLFWcontextNSGL
+{
+    id pixelFormat;
+    id object;
+} _GLFWcontextNSGL;
+
+typedef struct _GLFWlibraryNSGL
+{
+    void *framework;
+} _GLFWlibraryNSGL;
+
+bool _glfwInitNSGL(void);
+void _glfwTerminateNSGL(void);
+bool _glfwCreateContextNSGL(_GLFWwindow* window,
+                                const _GLFWctxconfig* ctxconfig,
+                                const _GLFWfbconfig* fbconfig);
+void _glfwDestroyContextNSGL(_GLFWwindow* window);
+
+#else
 
 // NSGL-specific per-context data
 //
@@ -53,3 +74,5 @@ bool _glfwCreateContextNSGL(_GLFWwindow* window,
                                 const _GLFWctxconfig* ctxconfig,
                                 const _GLFWfbconfig* fbconfig);
 void _glfwDestroyContextNSGL(_GLFWwindow* window);
+
+#endif

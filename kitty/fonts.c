@@ -2072,6 +2072,7 @@ initialize_font_group(FontGroup *fg) {
 }
 
 
+#ifndef KITTY_DISABLE_NSGL
 void
 send_prerendered_sprites_for_window(OSWindow *w, bool ensure_opengl_resources) {
     FontGroup *fg = (FontGroup*)w->fonts_data;
@@ -2086,6 +2087,7 @@ send_prerendered_sprites_for_window(OSWindow *w, bool ensure_opengl_resources) {
         send_prerendered_sprites(fg);
     }
 }
+#endif
 
 FONTS_DATA_HANDLE
 load_fonts_data(double font_sz_in_pts, double dpi_x, double dpi_y) {

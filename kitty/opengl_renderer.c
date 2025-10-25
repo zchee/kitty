@@ -6,6 +6,15 @@
 #include "gl.h"
 #include "opengl_renderer_priv.h"
 
+#ifdef KITTY_DISABLE_NSGL
+
+bool
+register_opengl_renderer_backend(void) {
+    PyErr_SetString(PyExc_RuntimeError, "OpenGL renderer backend is not supported on macOS");
+    return false;
+}
+
+#else
 #ifndef __APPLE__
 static bool gl_backend_initialized = false;
 
@@ -189,10 +198,6 @@ opengl_backend_destroy_graphics_image(TextureRef *ref) {
 
 bool
 register_opengl_renderer_backend(void) {
-#ifdef __APPLE__
-    PyErr_SetString(PyExc_RuntimeError, "OpenGL renderer backend is not supported on macOS");
-    return false;
-#else
     static const RendererBackendOps opengl_ops = {
         .name = "opengl",
         .ensure_initialized = opengl_backend_ensure_initialized,
@@ -211,5 +216,6 @@ register_opengl_renderer_backend(void) {
         .destroy_graphics_image = opengl_backend_destroy_graphics_image,
     };
     return renderer_backend_register(RENDERER_BACKEND_OPENGL, &opengl_ops);
-#endif
 }
+
+#endif /* KITTY_DISABLE_NSGL */

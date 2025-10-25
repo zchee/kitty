@@ -30,6 +30,36 @@
 #include <assert.h>
 
 
+#ifdef KITTY_DISABLE_NSGL
+
+bool _glfwInitNSGL(void)
+{
+    _glfwInputError(GLFW_API_UNAVAILABLE,
+                    "NSGL: OpenGL backend disabled; Metal renderer required.");
+    return false;
+}
+
+void _glfwTerminateNSGL(void)
+{
+}
+
+bool _glfwCreateContextNSGL(_GLFWwindow* window,
+                                const _GLFWctxconfig* ctxconfig UNUSED,
+                                const _GLFWfbconfig* fbconfig UNUSED)
+{
+    (void) window;
+    _glfwInputError(GLFW_API_UNAVAILABLE,
+                    "NSGL: OpenGL backend disabled; Metal renderer required.");
+    return false;
+}
+
+void _glfwDestroyContextNSGL(_GLFWwindow* window)
+{
+    (void) window;
+}
+
+#else
+
 static void makeContextCurrentNSGL(_GLFWwindow* window)
 {
     if (window)
@@ -345,3 +375,5 @@ GLFWAPI id glfwGetNSGLContext(GLFWwindow* handle)
 
     return window->context.nsgl.object;
 }
+
+#endif /* KITTY_DISABLE_NSGL */
