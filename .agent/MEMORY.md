@@ -1,58 +1,91 @@
 # Renderer & Backend Knowledge Base (Updated 2025-10-25)
 
-Authoritative snapshot of the macOS Metal migration, OpenGL stubs, and gating issues. Refresh this file whenever policy, behaviour, or test expectations change.
+Authoritative snapshot of the macOS Metal migration state, OpenGL stubs, and validation expectations. Refresh this file whenever behavior or test intent changes.
 
 ---
 
 ## Platform & Backend Policy
 
-- **macOS (Darwin) ships Metal-only.** Build scripts define `KITTY_DISABLE_NSGL=1`, drop `-framework OpenGL`, and exclude NSGL source files. OpenGL symbols remain available only via stub object files.
-- Attempting to register or select the OpenGL backend on macOS must raise a descriptive `RuntimeError`/`ValueError`. Tests `TestRendererBackend.test_macos_register_opengl_backend_returns_false` and `test_macos_rejects_opengl_selection` enforce this.
-- Non-macOS builds continue to provide the full OpenGL backend; cross-platform behaviour remains unchanged and must be validated by existing tests.
+- **macOS (Darwin) is Metal-only.** Build scripts set `KITTY_DISABLE_NSGL=1`, drop `-framework OpenGL`, and only ship the Metal backend. The OpenGL API surface remains available as stubs for non-macOS platforms and for tests that assert failure paths.
+- Registering or selecting the OpenGL backend on macOS must fail cleanly. `renderer_backend_select("opengl")` returns `False` and exposes the reason via `opengl_renderer_disabled_reason()`. Tests cover these expectations.
+- Non-macOS builds continue to provide the full OpenGL backend; cross-platform behavior is verified by existing suites.
 
 ---
 
-## Current Implementation State (Metal Phase 2)
+## Current Implementation Highlights (Metal Phase 2.1)
 
-- **Shared shader metadata:** New header `kitty/shader_shared.h` centralises shader program IDs, GL constants, and exported helper method lists. The OpenGL implementation (`shaders.c`) and the Metal/OpenGL stubs now pull definitions from the same source.
-- **OpenGL stubs aligned:** `kitty/opengl_disabled.c` exports the same constants and stubbed helpers as the legacy OpenGL module, raising structured `RuntimeError`s when invoked on macOS.
-- **Metal tests expanded:** Added `kitty_tests/test_opengl_disabled.py` to ensure shader program constants are present via `fast_data_types` and that stub helpers fail loudly when OpenGL is disabled.
-- **OpenGL registration guard returns cleanly:** macOS implementation of `register_opengl_renderer_backend` now reports `False` without surfacing a Python exception, and exposes `opengl_renderer_disabled_reason()` so ctypes callers can fetch the message.
+1. **Drawable clearing path**  
+   - `metal_renderer_blank_drawable()` performs CAMetalLayer clears via `encode_clear_pass()` and is used by `blank_os_window()` whenever the active backend is Metal.  
+   - A debug stub is available through `metal_renderer_debug_enable_blank_stub_for_tests(bool)` so unit tests can validate state mutation without creating real windows.
+
+2. **Shared shader metadata**  
+   - `kitty/shader_shared.h` remains the single source of shader constants. Both the Metal module and the OpenGL stubs consume it to guarantee parity.
+
+3. **Metal background & sprites**  
+   - Background image uploads populate Metal textures with retry semantics if the device is unavailable at load time.  
+   - Sprite atlas management mirrors the OpenGL flow; hooks are registered only when the Metal backend is initialized.
+
+4. **Debug & capture helpers**  
+   - Tests interact with the renderer via `MetalWindowDebugState`, capture helpers, and the new blank-drawable stub to assert lifecycle invariants without mocks.
 
 ---
 
-## Known Regressions / Open Issues
+## Test Coverage Mandates
 
-1. **Metal feature completeness (OPEN):**
-   - Sprite uploads, blank canvas handling, and layered rendering still rely on placeholder Metal implementations. Full parity with OpenGL not yet reached.
+- `kitty_tests/test_metal_helpers.py` covers:  
+  - Drawable blanking (new stub path).  
+  - Capture lifecycle, uniform packing, and texture bookkeeping.  
+  - Regression that Metal windows do not allocate OpenGL VAOs.  
+- `kitty_tests/test_metal_background.py` validates geometry calculations and ensures Metal uploads do not depend on GL IDs.  
+- `kitty_tests/test_metal_resources.py` verifies metallib presence and caching.
+- When new Metal functions are added, extend the helper suite with deterministic assertions; do not depend on live windows or GUI state in CI.
 
-2. **fast_data_types parity guard (WATCH):**
-   - Although shared headers align constants today, any addition to `shaders.c` requires corresponding updates to the shared header and stub exporters. Add regression coverage when new exports appear.
+---
+
+## Known Gaps / Open Issues
+
+1. **Manual verification still required**  
+   - Automated tests cannot validate live CAMetalLayer behavior (e.g., window creation, live resize). Manual smoke tests on macOS must be part of release candidates.
+
+2. **Sprite atlas parity**  
+   - Growth/eviction logic mirrors the OpenGL path but still lacks stress tests for extreme resizing or font churn. Add targeted cases once profiler output is available.
+
+3. **Visual-diff infrastructure**  
+   - No automated comparison between historical OpenGL renders and current Metal output exists yet. Long-term goal remains to integrate a visual diff harness.
 
 ---
 
 ## Immediate Roadmap
 
-1. **Harden minimal macOS bundle tooling:**
-   - Monitor the new `Resources/kitty` development symlink for regressions; add follow-up coverage if additional assets (fonts, shell integration) require inclusion.
+1. **Manual smoke checklist for macOS (post-build)**  
+   - Launch kitty, create multiple windows, trigger live resize, and observe clears.  
+   - Enable `--debug-metal --metal-gpu-capture` to confirm command submission and capture toggles work.
 
-2. **Metal renderer functionality parity:**
-   - Incrementally replace remaining no-op Metal paths (`blank_os_window`, `screen_needs_rendering_in_layers`, sprite atlas management).
-   - Ensure Metal resource creation/destroy hooks match OpenGL semantics and add regression tests where feasible.
+2. **Extend regression coverage**  
+   - Add integration that exercises background tinting and layer rendering in Metal (currently only unit-level coverage).
+   - Cover sprite atlas growth/eviction once deterministic data fixtures are available.
+
+3. **Tooling hygiene**  
+   - Ensure `setup.py` rebuilds metallibs when shaders change and fails fast if the toolchain is missing. Monitor CI logs for skipped metal tests.
 
 ---
 
 ## Longer-Term Backlog
 
-- Implement Metal sprite atlas growth & eviction mirroring OpenGL behaviour, with unit/integration coverage.
-- Provide remote-control toggles and logging hooks for Metal GPU capture/debug (parity with OpenGL debug flags).
-- Develop automated visual-diff tooling comparing Metal output to archived OpenGL frames.
-- Bring Metal-capable CI runners online; cache metallib outputs for faster builds.
+- Implement automated visual diffing against archived OpenGL frames.
+- Add remote-control toggles for Metal debugging (parity with OpenGL debug flags).
+- Bring Metal-capable CI runners online; cache metallibs for faster builds.
+- Explore image-based regression for cursor trails, background tint, and window logos under Metal.
 
 ---
 
 ## Operational Notes
 
- - After any change to renderer C/ObjC sources, rebuild via `./.venv/bin/python3.13 setup.py build` and rerun targeted tests to ensure the developer bundle stays healthy.
-- Keep error messaging in `renderer_backend_select()` and registration paths in sync with test expectations; macOS-specific strings are asserted in the test suite.
-- When adding new shader programs or GL constants, update `kitty/shader_shared.h`, both backends, and tests simultaneously to keep parity.
+- Always rebuild native components with `./.venv/bin/python3.13 setup.py build` after touching Metal C/ObjC sources; tests rely on freshly linked `fast_data_types`.
+- macOS-only tests are guarded with `@unittest.skipUnless(sys.platform == 'darwin')`. Keep those decorators accurate when expanding coverage.
+- When adding new renderer exports:  
+  1. Declare in `metal_renderer.h`.  
+  2. Implement in `metal_renderer.m` with proper Python error reporting.  
+  3. Provide test hooks in `test_metal_helpers.py`.  
+  4. Update docs or this memory file with behavioral notes.
+- Do not introduce GL fallbacks in Metal paths; failing fast with descriptive errors is preferred.

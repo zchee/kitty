@@ -2,6 +2,7 @@
 # License: GPL v3
 
 import ctypes
+import unittest
 import sys
 from typing import Sequence
 
@@ -140,6 +141,7 @@ class TestMetalHelperFunctions(BaseTest):
                 'metal_renderer_debug_get_window_state_for_tests',
                 'metal_renderer_debug_set_window_state_for_tests',
                 'metal_renderer_debug_reset_capture_state_for_tests',
+                'metal_renderer_blank_drawable',
             )
         )
         if cls.has_helpers:
@@ -231,6 +233,12 @@ class TestMetalHelperFunctions(BaseTest):
                 ctypes.c_bool,
             ]
             cls.lib.metal_renderer_debug_reset_capture_state_for_tests.restype = None
+            cls.lib.metal_renderer_blank_drawable.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_float,
+            ]
+            cls.lib.metal_renderer_blank_drawable.restype = ctypes.c_bool
 
     def setUp(self) -> None:
         super().setUp()
@@ -535,6 +543,44 @@ class TestMetalHelperFunctions(BaseTest):
 
         info = MetalCapturedFrameDebugInfo()
         self.assertFalse(self.lib.metal_renderer_copy_captured_frame_for_tests(ctypes.byref(info)))
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'Metal backend only available on macOS')
+    def test_blank_drawable_sets_frame_has_content(self) -> None:
+        if not ffi.has_metal:
+            self.skipTest('Metal backend not available')
+
+        previous = renderer_backend_current()
+        renderer_backend_select('metal')
+        self.addCleanup(renderer_backend_select, previous)
+
+        stub_window = ctypes.c_void_p(0xDEADBEEF)
+        self.lib.metal_renderer_debug_enable_blank_stub_for_tests(True)
+        self.addCleanup(
+            lambda: self.lib.metal_renderer_debug_enable_blank_stub_for_tests(False)
+        )
+        self.lib.metal_renderer_debug_seed_window_state_for_tests(stub_window)
+
+        initial = MetalWindowDebugState()
+        self.assertTrue(
+            self.lib.metal_renderer_debug_get_window_state_for_tests(
+                stub_window, ctypes.byref(initial)
+            )
+        )
+        self.assertFalse(initial.frame_has_content)
+
+        color = ctypes.c_uint32(0x224466)
+        opacity = ctypes.c_float(0.5)
+        self.assertTrue(
+            self.lib.metal_renderer_blank_drawable(stub_window, color, opacity)
+        )
+
+        updated = MetalWindowDebugState()
+        self.assertTrue(
+            self.lib.metal_renderer_debug_get_window_state_for_tests(
+                stub_window, ctypes.byref(updated)
+            )
+        )
+        self.assertTrue(updated.frame_has_content)
 
     def test_metal_windows_do_not_allocate_opengl_vaos(self) -> None:
         if sys.platform != 'darwin':

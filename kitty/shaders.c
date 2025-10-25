@@ -7,6 +7,7 @@
 
 #include "fonts.h"
 #include "gl.h"
+#include "glfw-wrapper.h"
 #include "cleanup.h"
 #include "colors.h"
 #include <stddef.h>
@@ -19,6 +20,10 @@
 #include "opengl_renderer_priv.h"
 #include "shader_shared.h"
 #include "renderer_shared.h"
+#include "renderer_backend.h"
+#ifdef __APPLE__
+#include "metal_renderer.h"
+#endif
 
 typedef struct UIRenderData {
     unsigned screen_width, screen_height, cell_width, cell_height, screen_left, screen_top, full_framebuffer_width, full_framebuffer_height;
@@ -1226,7 +1231,16 @@ blank_os_window(OSWindow *osw) {
             }
         }
     }
-    blank_canvas(effective_os_window_alpha(osw), color, true);
+    float background_alpha = effective_os_window_alpha(osw);
+#ifdef __APPLE__
+    if (renderer_backend_current_type() == RENDERER_BACKEND_METAL) {
+        GLFWwindow *handle = (GLFWwindow *)osw->handle;
+        if (handle && metal_renderer_blank_drawable(handle, color, background_alpha)) {
+            return;
+        }
+    }
+#endif
+    blank_canvas(background_alpha, color, true);
 }
 
 static void

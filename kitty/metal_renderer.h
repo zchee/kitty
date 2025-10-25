@@ -8,6 +8,7 @@
 
 struct BackgroundImage;
 struct GLFWwindow;
+struct OSWindow;
 
 #ifdef __cplusplus
 extern "C" {
@@ -135,6 +136,8 @@ EXPORTED bool metal_renderer_debug_get_window_state_for_tests(struct GLFWwindow 
 EXPORTED void metal_renderer_debug_set_window_state_for_tests(struct GLFWwindow *window, const MetalWindowDebugState *state);
 EXPORTED void metal_renderer_debug_reset_capture_state_for_tests(struct GLFWwindow *window, bool release_buffer);
 EXPORTED void metal_renderer_debug_get_runtime_flags_for_tests(MetalRuntimeDebugFlags *out_flags);
+EXPORTED bool metal_renderer_blank_drawable(struct GLFWwindow *window, color_type color, float background_opacity);
+EXPORTED void metal_renderer_debug_enable_blank_stub_for_tests(bool enabled);
 
 #ifdef __cplusplus
 }

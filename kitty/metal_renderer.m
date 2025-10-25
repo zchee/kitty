@@ -440,6 +440,7 @@ typedef struct {
 } MetalSpriteAtlas;
 
 static bool sprite_hooks_registered = false;
+static bool metal_blank_stub_for_tests = false;
 
 @interface MetalGraphicsTexture : NSObject
 @property (nonatomic, strong) id<MTLTexture> texture;
@@ -2970,6 +2971,38 @@ metal_background_image_release(BackgroundImage *bgimage) {
     }
 }
 
+EXPORTED bool
+metal_renderer_blank_drawable(GLFWwindow *window, color_type color, float background_opacity) {
+    if (metal_blank_stub_for_tests) {
+        MetalWindowState *state = ensure_state_for_window(window);
+        if (!state) {
+            PyErr_SetString(PyExc_RuntimeError, "Metal blank drawable called on unknown window");
+            return false;
+        }
+        state.backgroundOpacity = background_opacity;
+        state.fallbackBackground = color;
+        state.clearColor = clear_color_from(color, background_opacity);
+        state.frameHasContent = YES;
+        state.commandBuffer = nil;
+        state.drawable = nil;
+        return true;
+    }
+    if (!window) {
+        PyErr_SetString(PyExc_ValueError, "Metal blank drawable requires window handle");
+        return false;
+    }
+    MetalWindowState *state = ensure_state_for_window(window);
+    if (!state) {
+        PyErr_SetString(PyExc_RuntimeError, "Metal blank drawable called on unknown window");
+        return false;
+    }
+    state.backgroundOpacity = background_opacity;
+    state.fallbackBackground = color;
+    state.clearColor = clear_color_from(color, background_opacity);
+    state.frameHasContent = NO;
+    return encode_clear_pass(window, state, state.clearColor);
+}
+
 static bool
 metal_capture_framebuffer(MetalWindowState *state) {
     if (!state || !state.commandBuffer || !state.drawable) {
@@ -4030,6 +4063,11 @@ metal_renderer_debug_get_runtime_flags_for_tests(MetalRuntimeDebugFlags *out_fla
         .capture_frames = g_metal.capture_frames,
     };
     *out_flags = flags;
+}
+
+EXPORTED void
+metal_renderer_debug_enable_blank_stub_for_tests(bool enabled) {
+    metal_blank_stub_for_tests = enabled;
 }
 
 EXPORTED void
