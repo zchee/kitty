@@ -1,74 +1,74 @@
-# Renderer & Backend Knowledge Base (Updated 2025-10-25 – Metal migration in progress)
+# Renderer & Backend Knowledge Base (Updated 2025-10-25)
 
-This file captures the authoritative status of the Metal port, outstanding gaps, and the agreed path forward. Update whenever behaviour, build policy, or testing expectations change.
+Authoritative snapshot of the macOS Metal migration, OpenGL stubs, and gating issues. Refresh this file whenever policy, behaviour, or test expectations change.
 
 ---
 
 ## Platform & Backend Policy
 
-- **macOS is Metal-only at build time and runtime.** `setup.py` no longer links `-framework OpenGL` on Darwin, defines `KITTY_DISABLE_NSGL=1`, excludes OpenGL sources, and adds a Metal stub translation unit that supplies no-op OpenGL APIs to satisfy fast-data-types symbols.
-- Registering or selecting the OpenGL backend on macOS hard-fails with a descriptive `RuntimeError`/`ValueError`. Tests `test_macos_register_opengl_backend_returns_false` and `test_macos_rejects_opengl_selection` assert this behaviour.
-- Non-macOS platforms continue to ship the OpenGL backend. Cross-platform registry behaviour is unchanged, and tests must confirm OpenGL remains selectable where supported.
+- **macOS (Darwin) ships Metal-only.** Build scripts define `KITTY_DISABLE_NSGL=1`, drop `-framework OpenGL`, and exclude NSGL source files. OpenGL symbols remain available only via stub object files.
+- Attempting to register or select the OpenGL backend on macOS must raise a descriptive `RuntimeError`/`ValueError`. Tests `TestRendererBackend.test_macos_register_opengl_backend_returns_false` and `test_macos_rejects_opengl_selection` enforce this.
+- Non-macOS builds continue to provide the full OpenGL backend; cross-platform behaviour remains unchanged and must be validated by existing tests.
 
 ---
 
 ## Current Implementation State (Metal Phase 2)
 
-- GLFW’s NSGL path is stubbed behind `KITTY_DISABLE_NSGL`, ensuring no Objective‑C OpenGL contexts are created when building for Metal.
-- `kitty/state.c`, `kitty/fonts.c`, and dependent helpers avoid VAO/TBO manipulation when Metal is active, preventing unused OpenGL code from running on macOS.
-- `kitty/opengl_renderer.c` now compiles to a minimal stub on macOS; the full backend remains available elsewhere.
-- New Python unit test (`KittyEnvMetalTests.test_kitty_env_drops_opengl_framework`) validates that the build script omits the OpenGL framework while retaining Metal linkage.
-- Renderer backend Python tests assert macOS-only failure modes for the OpenGL backend.
+- **Shared shader metadata:** New header `kitty/shader_shared.h` centralises shader program IDs, GL constants, and exported helper method lists. The OpenGL implementation (`shaders.c`) and the Metal/OpenGL stubs now pull definitions from the same source.
+- **OpenGL stubs aligned:** `kitty/opengl_disabled.c` exports the same constants and stubbed helpers as the legacy OpenGL module, raising structured `RuntimeError`s when invoked on macOS.
+- **Metal tests expanded:** Added `kitty_tests/test_opengl_disabled.py` to ensure shader program constants are present via `fast_data_types` and that stub helpers fail loudly when OpenGL is disabled.
+- **Renderer backend tests still failing:** `kitty_tests/renderer_backend` remains red on macOS because `ctypes` interprets the raised `RuntimeError` from `register_opengl_renderer_backend` as an error return, producing a `SystemError`. No wrapper fix merged yet.
+- **OpenGL stub declaration updated:** macOS implementation of `register_opengl_renderer_backend` now raises via the Python C API; no valid OpenGL registration path remains.
 
 ---
 
-## Known Regressions / Outstanding Work
+## Known Regressions / Open Issues
 
-1. **Launcher Packaging Failure**
-   - `./.venv/bin/python3.13 setup.py build` currently aborts during the app bundle phase: `kitty/launcher/kitty.app/Contents/Resources/kitty` is missing.
-   - Action: Decide whether to restore the resource packaging step for Metal builds or conditionally skip app bundling during CLI-driven builds. Owner TBD.
+1. **Launcher packaging failure (KNOWN):**
+   - `./.venv/bin/python3.13 setup.py build` stops when packaging the app bundle: `kitty/launcher/kitty.app/Contents/Resources/kitty` missing.
+   - Decision pending: restore resource packaging for Metal builds or skip launcher packaging for developer builds.
 
-2. **fast_data_types Shader Constants**
-   - The Metal stub (`opengl_disabled.c`) now supplies no-op exports, but we must ensure every symbol expected by `kitty.fast_data_types` is implemented. Initial build failures cited missing GLSL program constants; confirm the stub exports remain exhaustive after future changes.
-   - Action: Maintain parity between stub exports and the real OpenGL module. Add regression coverage if additional constants are introduced.
+2. **Renderer backend ctypes error (BLOCKING):**
+   - `kitty_tests.renderer_backend` crashes with `SystemError: <_FuncPtr ...> returned a result with an exception set` because the ctypes wrapper for `register_opengl_renderer_backend` expects success while the C stub raises `RuntimeError`.
+   - Need a disciplined strategy: either expose a no-throw C return and move the error message elsewhere, or adjust the test/FFI wrapper to handle exceptions cleanly.
 
-3. **Renderer Tests**
-   - `./.venv/bin/python3.13 test.py --module renderer_backend` currently fails because `kitty.fast_data_types` lacks certain shader constants when OpenGL is stubbed. Need to reconcile stubbed constants with test expectations or gate the imports on macOS.
+3. **Metal feature completeness (OPEN):**
+   - Sprite uploads, blank canvas handling, and layered rendering still rely on placeholder Metal implementations. Full parity with OpenGL not yet reached.
 
-4. **Metal Feature Completeness**
-   - Sprite uploads, blanking, and layered rendering are stubbed out in the Metal-only build. Implement Metal-native equivalents before enabling full macOS packaging.
+4. **fast_data_types parity guard (WATCH):**
+   - Although shared headers align constants today, any addition to `shaders.c` requires corresponding updates to the shared header and stub exporters. Add regression coverage when new exports appear.
 
 ---
 
 ## Immediate Roadmap
 
-1. **fast_data_types parity**
-   - Audit `kitty/shaders.c` exports vs. `kitty/opengl_disabled.c` stubs; add any missing constants/functions to prevent ImportError on macOS.
-   - Extend renderer backend tests (or add new ones) to confirm stub exports exist when KITTY_DISABLE_NSGL is defined.
+1. **Resolve ctypes/SystemError boundary:**
+   - Design an approach so `register_opengl_renderer_backend` communicates “unsupported on macOS” without causing `SystemError` in ctypes callers.
+   - Update `kitty_tests/renderer_backend` accordingly; ensure macOS path still asserts the descriptive error message.
 
-2. **Launcher build fix**
-   - Determine minimal assets required for `kitty/launcher/kitty.app` during developer builds. Either restore packaging of `Resources/kitty` under Metal or gate the launcher build behind an explicit flag when not producing a distributable bundle.
+2. **Stabilise renderer_backend test suite:**
+   - Run `./.venv/bin/python3.13 test.py --module renderer_backend` (or the unittest entry point) once the ctypes boundary is fixed; confirm all Metal tests, including the new `_disabled` suite, pass on macOS.
 
-3. **Re-enable renderer_backend test module**
-   - Once stub exports are complete, rerun `test.py --module renderer_backend` and ensure it passes on macOS, skipping OpenGL-specific cases gracefully.
+3. **Launcher packaging decision:**
+   - Either restore the missing `Resources/kitty` asset to unblock `setup.py build` or add skip logic for developer builds. Document whichever path is chosen.
 
-4. **Metal renderer functionality**
-   - Replace no-op implementations (e.g., `blank_os_window`, `screen_needs_rendering_in_layers`) with real Metal versions as the port progresses.
-   - Track shader-program parity and resource lifecycle (CAMetalLayer, pipelines) against the OpenGL reference.
+4. **Metal renderer functionality parity:**
+   - Incrementally replace remaining no-op Metal paths (`blank_os_window`, `screen_needs_rendering_in_layers`, sprite atlas management).
+   - Ensure Metal resource creation/destroy hooks match OpenGL semantics and add regression tests where feasible.
 
 ---
 
 ## Longer-Term Backlog
 
-- Integrate Metal sprite atlas growth/eviction logic and add parity tests against legacy OpenGL behaviour.
-- Provide remote-control toggles for Metal debug logging and GPU capture.
-- Build visual diff infrastructure comparing Metal output to archived OpenGL frames.
-- Add CI runners with Metal capability; cache metallib artifacts for incremental builds.
+- Implement Metal sprite atlas growth & eviction mirroring OpenGL behaviour, with unit/integration coverage.
+- Provide remote-control toggles and logging hooks for Metal GPU capture/debug (parity with OpenGL debug flags).
+- Develop automated visual-diff tooling comparing Metal output to archived OpenGL frames.
+- Bring Metal-capable CI runners online; cache metallib outputs for faster builds.
 
 ---
 
 ## Operational Notes
 
-- After editing renderer C/ObjC sources, always rebuild via `./.venv/bin/python3.13 setup.py build` and re-run targeted tests.
-- Keep `renderer_backend_select()` error messaging synchronized with tests; macOS-specific messaging is asserted.
-- Prefer existing debug helpers (`state_debug_*`, Metal debug APIs) when writing new tests that touch renderer state.
+- After any change to renderer C/ObjC sources, rebuild via `./.venv/bin/python3.13 setup.py build` (acknowledging current launcher failure) and rerun targeted tests.
+- Keep error messaging in `renderer_backend_select()` and registration paths in sync with test expectations; macOS-specific strings are asserted in the test suite.
+- When adding new shader programs or GL constants, update `kitty/shader_shared.h`, both backends, and tests simultaneously to keep parity.
