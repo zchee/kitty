@@ -17,20 +17,8 @@
 #include "uniforms_generated.h"
 #include "state.h"
 #include "opengl_renderer_priv.h"
+#include "shader_shared.h"
 #include "renderer_shared.h"
-
-enum {
-    CELL_PROGRAM, CELL_FG_PROGRAM, CELL_BG_PROGRAM, CELL_PROGRAM_SENTINEL,
-    BORDERS_PROGRAM,
-    GRAPHICS_PROGRAM, GRAPHICS_PREMULT_PROGRAM, GRAPHICS_ALPHA_MASK_PROGRAM,
-    BGIMAGE_PROGRAM,
-    TINT_PROGRAM,
-    TRAIL_PROGRAM,
-    BLIT_PROGRAM,
-    ROUNDED_RECT_PROGRAM,
-    NUM_PROGRAMS
-};
-enum { SPRITE_MAP_UNIT, GRAPHICS_UNIT, SPRITE_DECORATIONS_MAP_UNIT };
 
 typedef struct UIRenderData {
     unsigned screen_width, screen_height, cell_width, cell_height, screen_left, screen_top, full_framebuffer_width, full_framebuffer_height;
@@ -1381,18 +1369,11 @@ sprite_map_set_limits(PyObject UNUSED *self, PyObject *args) {
 #define M(name, arg_type) {#name, (PyCFunction)name, arg_type, NULL}
 #define MW(name, arg_type) {#name, (PyCFunction)py##name, arg_type, NULL}
 static PyMethodDef module_methods[] = {
-    M(compile_program, METH_VARARGS),
-    M(sprite_map_set_limits, METH_VARARGS),
-    MW(create_vao, METH_NOARGS),
-    MW(gpu_driver_version_string, METH_NOARGS),
-    MW(bind_vertex_array, METH_O),
-    MW(unbind_vertex_array, METH_NOARGS),
-    MW(unmap_vao_buffer, METH_VARARGS),
-    MW(bind_program, METH_O),
-    MW(unbind_program, METH_NOARGS),
-    MW(init_borders_program, METH_NOARGS),
-    MW(init_cell_program, METH_NOARGS),
-
+#define SHADER_METHOD_ENTRY(name, flags) M(name, flags),
+#define SHADER_WRAPPED_ENTRY(name, flags) MW(name, flags),
+    RENDERER_SHADER_MODULE_METHODS(SHADER_METHOD_ENTRY, SHADER_WRAPPED_ENTRY)
+#undef SHADER_METHOD_ENTRY
+#undef SHADER_WRAPPED_ENTRY
     {NULL, NULL, 0, NULL}        /* Sentinel */
 };
 
@@ -1403,37 +1384,11 @@ finalize(void) {
 
 bool
 init_shaders(PyObject *module) {
-#define C(x) if (PyModule_AddIntConstant(module, #x, x) != 0) { PyErr_NoMemory(); return false; }
-    C(CELL_PROGRAM); C(CELL_FG_PROGRAM); C(CELL_BG_PROGRAM); C(BORDERS_PROGRAM);
-    C(GRAPHICS_PROGRAM); C(GRAPHICS_PREMULT_PROGRAM); C(GRAPHICS_ALPHA_MASK_PROGRAM);
-    C(BGIMAGE_PROGRAM); C(TINT_PROGRAM); C(TRAIL_PROGRAM); C(BLIT_PROGRAM); C(ROUNDED_RECT_PROGRAM);
-    C(GLSL_VERSION);
-    C(GL_VERSION);
-    C(GL_VENDOR);
-    C(GL_SHADING_LANGUAGE_VERSION);
-    C(GL_RENDERER);
-    C(GL_TRIANGLE_FAN); C(GL_TRIANGLE_STRIP); C(GL_TRIANGLES); C(GL_LINE_LOOP);
-    C(GL_COLOR_BUFFER_BIT);
-    C(GL_VERTEX_SHADER);
-    C(GL_FRAGMENT_SHADER);
-    C(GL_TRUE);
-    C(GL_FALSE);
-    C(GL_COMPILE_STATUS);
-    C(GL_LINK_STATUS);
-    C(GL_MAX_ARRAY_TEXTURE_LAYERS); C(GL_TEXTURE_BINDING_BUFFER); C(GL_MAX_TEXTURE_BUFFER_SIZE);
-    C(GL_MAX_TEXTURE_SIZE);
-    C(GL_TEXTURE_2D_ARRAY);
-    C(GL_LINEAR); C(GL_CLAMP_TO_EDGE); C(GL_NEAREST);
-    C(GL_TEXTURE_MIN_FILTER); C(GL_TEXTURE_MAG_FILTER);
-    C(GL_TEXTURE_WRAP_S); C(GL_TEXTURE_WRAP_T);
-    C(GL_UNPACK_ALIGNMENT);
-    C(GL_R8); C(GL_RED); C(GL_UNSIGNED_BYTE); C(GL_UNSIGNED_SHORT); C(GL_R32UI); C(GL_RGB32UI); C(GL_RGBA);
-    C(GL_TEXTURE_BUFFER); C(GL_STATIC_DRAW); C(GL_STREAM_DRAW); C(GL_DYNAMIC_DRAW);
-    C(GL_SRC_ALPHA); C(GL_ONE_MINUS_SRC_ALPHA);
-    C(GL_WRITE_ONLY); C(GL_READ_ONLY); C(GL_READ_WRITE);
-    C(GL_BLEND); C(GL_FLOAT); C(GL_UNSIGNED_INT); C(GL_ARRAY_BUFFER); C(GL_UNIFORM_BUFFER);
-
-#undef C
+#define ADD_CONST(name) \
+    if (PyModule_AddIntConstant(module, #name, name) != 0) { PyErr_NoMemory(); return false; }
+    RENDERER_SHADER_PROGRAM_CONSTANTS(ADD_CONST);
+    RENDERER_GL_COMPAT_CONSTANTS(ADD_CONST);
+#undef ADD_CONST
     if (PyModule_AddFunctions(module, module_methods) != 0) return false;
     register_at_exit_cleanup_func(SHADERS_CLEANUP_FUNC, finalize);
     return true;

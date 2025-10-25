@@ -5,6 +5,8 @@
 #include "data-types.h"
 #include "fonts.h"
 #include "renderer_backend.h"
+#include "gl-wrapper.h"
+#include "shader_shared.h"
 
 #ifdef KITTY_DISABLE_NSGL
 
@@ -104,6 +106,49 @@ free_sprite_data(FONTS_DATA_HANDLE fg) {
     (void)fg;
 }
 
+static PyObject *
+opengl_disabled_error(const char *name) {
+    PyErr_Format(
+        PyExc_RuntimeError,
+        "%s is unavailable because the OpenGL renderer is disabled on this platform",
+        name
+    );
+    return NULL;
+}
+
+#define DECLARE_STUB(name, flags) \
+    static PyObject *name(PyObject *self, PyObject *args) { \
+        (void)self; \
+        (void)args; \
+        return opengl_disabled_error(#name); \
+    }
+#define DECLARE_STUB_WRAPPED(name, flags) \
+    static PyObject *py##name(PyObject *self, PyObject *args) { \
+        (void)self; \
+        (void)args; \
+        return opengl_disabled_error(#name); \
+    }
+
+RENDERER_SHADER_MODULE_METHODS(DECLARE_STUB, DECLARE_STUB_WRAPPED)
+
+#undef DECLARE_STUB
+#undef DECLARE_STUB_WRAPPED
+
+#define M(name, arg_type) {#name, (PyCFunction)name, arg_type, NULL}
+#define MW(name, arg_type) {#name, (PyCFunction)py##name, arg_type, NULL}
+
+static PyMethodDef shader_stub_methods[] = {
+#define SHADER_METHOD_ENTRY(name, flags) M(name, flags),
+#define SHADER_WRAPPED_ENTRY(name, flags) MW(name, flags),
+    RENDERER_SHADER_MODULE_METHODS(SHADER_METHOD_ENTRY, SHADER_WRAPPED_ENTRY)
+#undef SHADER_METHOD_ENTRY
+#undef SHADER_WRAPPED_ENTRY
+    {NULL, NULL, 0, NULL}
+};
+
+#undef M
+#undef MW
+
 void
 draw_borders(
     ssize_t vao_idx,
@@ -164,7 +209,17 @@ blank_os_window(OSWindow *os_window) {
 
 bool
 init_shaders(PyObject *module) {
-    (void)module;
+#define ADD_CONST(name) \
+    if (PyModule_AddIntConstant(module, #name, name) != 0) { \
+        PyErr_NoMemory(); \
+        return false; \
+    }
+    RENDERER_SHADER_PROGRAM_CONSTANTS(ADD_CONST);
+    RENDERER_GL_COMPAT_CONSTANTS(ADD_CONST);
+#undef ADD_CONST
+    if (PyModule_AddFunctions(module, shader_stub_methods) != 0) {
+        return false;
+    }
     return true;
 }
 

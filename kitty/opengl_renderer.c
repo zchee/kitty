@@ -10,7 +10,9 @@
 
 bool
 register_opengl_renderer_backend(void) {
+    PyGILState_STATE gil = PyGILState_Ensure();
     PyErr_SetString(PyExc_RuntimeError, "OpenGL renderer backend is not supported on macOS");
+    PyGILState_Release(gil);
     return false;
 }
 
