@@ -867,6 +867,16 @@ PYWRAP1(handle_for_window_id) {
     return NULL;
 }
 
+PYWRAP1(get_os_window_struct_for_tests) {
+    id_type os_window_id;
+    PA("K", &os_window_id);
+    WITH_OS_WINDOW(os_window_id)
+        return PyLong_FromVoidPtr(os_window);
+    END_WITH_OS_WINDOW
+    PyErr_SetString(PyExc_ValueError, "No such window");
+    return NULL;
+}
+
 
 PYWRAP0(get_options) {
     if (!global_state.options_object) {
@@ -1637,6 +1647,7 @@ static PyMethodDef module_methods[] = {
     MW(get_window_logo_settings_if_not_default, METH_VARARGS),
     MW(set_ignore_os_keyboard_processing, METH_O),
     MW(handle_for_window_id, METH_VARARGS),
+    MW(get_os_window_struct_for_tests, METH_VARARGS),
     MW(update_ime_position_for_window, METH_VARARGS),
     MW(pt_to_px, METH_VARARGS),
     MW(add_tab, METH_O),

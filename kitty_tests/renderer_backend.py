@@ -57,6 +57,15 @@ class BackendFFI:
         self.RendererPresentParams = RendererPresentParams
         self.RendererResizeParams = RendererResizeParams
         self.RendererRenderParams = RendererRenderParams
+        class RendererWindowConfig(ctypes.Structure):
+            _fields_ = [
+                ("is_first_window", ctypes.c_bool),
+                ("wants_transparency", ctypes.c_bool),
+                ("background_opacity", ctypes.c_float),
+                ("background_color", ctypes.c_uint32),
+            ]
+
+        self.RendererWindowConfig = RendererWindowConfig
         class RendererInitConfig(ctypes.Structure):
             _pack_ = 1
             _fields_ = [
@@ -136,6 +145,11 @@ class BackendFFI:
             ctypes.POINTER(self.RendererBackendOps),
         ]
         self.lib.renderer_backend_register.restype = ctypes.c_bool
+        self.lib.renderer_backend_attach_window.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(self.RendererWindowConfig),
+        ]
+        self.lib.renderer_backend_attach_window.restype = ctypes.c_bool
         self.lib.renderer_backend_begin_frame.argtypes = [
             ctypes.c_void_p,
             ctypes.POINTER(self.RendererFrameParams),
@@ -155,6 +169,15 @@ class BackendFFI:
         self.lib.renderer_backend_reset_for_tests.restype = None
         self.lib.register_opengl_renderer_backend.argtypes = []
         self.lib.register_opengl_renderer_backend.restype = ctypes.c_bool
+        if hasattr(self.lib, "renderer_backend_shutdown_active"):
+            self.lib.renderer_backend_shutdown_active.argtypes = []
+            self.lib.renderer_backend_shutdown_active.restype = None
+        if hasattr(self.lib, "handle_for_window_id"):
+            self.lib.handle_for_window_id.argtypes = [ctypes.c_ulonglong]
+            self.lib.handle_for_window_id.restype = ctypes.c_void_p
+        if hasattr(self.lib, "get_os_window_struct_for_tests"):
+            self.lib.get_os_window_struct_for_tests.argtypes = [ctypes.c_ulonglong]
+            self.lib.get_os_window_struct_for_tests.restype = ctypes.c_void_p
         if hasattr(self.lib, "opengl_renderer_disabled_reason"):
             self.lib.opengl_renderer_disabled_reason.argtypes = []
             self.lib.opengl_renderer_disabled_reason.restype = ctypes.c_char_p

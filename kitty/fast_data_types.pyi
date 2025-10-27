@@ -1067,6 +1067,10 @@ def next_window_id() -> int:
     pass
 
 
+def get_os_window_struct_for_tests(os_window_id: int) -> int:
+    pass
+
+
 def mark_tab_bar_dirty(os_window_id: int) -> None:
     pass
 

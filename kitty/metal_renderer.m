@@ -160,11 +160,6 @@ typedef struct {
 } MetalBorderRect;
 
 typedef struct {
-    vector_float4 edges;
-    vector_float4 color;
-} MetalTintUniforms;
-
-typedef struct {
     vector_float2 size;
     float thickness;
     float radius;
@@ -183,6 +178,14 @@ typedef struct {
 _Static_assert(sizeof(MetalTrailUniforms) == 64, "MetalTrailUniforms layout mismatch");
 _Static_assert(sizeof(MetalGraphicsUniforms) == 48, "MetalGraphicsUniforms layout mismatch");
 _Static_assert(sizeof(MetalGraphicsAlphaUniforms) == 64, "MetalGraphicsAlphaUniforms layout mismatch");
+
+static inline MetalTintUniforms
+metal_make_tint_uniforms(vector_float4 edges, vector_float4 color) {
+    MetalTintUniforms uniforms = {0};
+    memcpy(uniforms.edges, &edges, sizeof(uniforms.edges));
+    memcpy(uniforms.color, &color, sizeof(uniforms.color));
+    return uniforms;
+}
 
 static inline size_t
 metal_aligned_buffer_length(size_t size) {
@@ -2768,10 +2771,9 @@ metal_encode_background_tint(GLFWwindow *window, MetalWindowState *state, color_
             .zfar = 1.0
         }];
         [encoder setRenderPipelineState:g_metal.tint_pipeline];
-        MetalTintUniforms uniforms = {
-            .edges = (vector_float4){ -1.f, 1.f, 1.f, -1.f },
-            .color = color_to_linear_premult(background_color, (float)OPT(background_tint)),
-        };
+        vector_float4 tint_edges = { -1.f, 1.f, 1.f, -1.f };
+        vector_float4 tint_color = color_to_linear_premult(background_color, (float)OPT(background_tint));
+        MetalTintUniforms uniforms = metal_make_tint_uniforms(tint_edges, tint_color);
         [encoder setVertexBytes:&uniforms length:sizeof uniforms atIndex:0];
         [encoder setFragmentBytes:&uniforms length:sizeof uniforms atIndex:0];
         [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
@@ -3352,10 +3354,8 @@ metal_encode_visual_bell(GLFWwindow *window, MetalWindowState *state, Screen *sc
         .zfar = 1.0
     }];
     [encoder setRenderPipelineState:g_metal.tint_pipeline];
-    MetalTintUniforms uniforms = {
-        .edges = (vector_float4){ -1.f, 1.f, 1.f, -1.f },
-        .color = color,
-    };
+    vector_float4 tint_edges = { -1.f, 1.f, 1.f, -1.f };
+    MetalTintUniforms uniforms = metal_make_tint_uniforms(tint_edges, color);
     [encoder setVertexBytes:&uniforms length:sizeof uniforms atIndex:0];
     [encoder setFragmentBytes:&uniforms length:sizeof uniforms atIndex:0];
     [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
@@ -3436,10 +3436,9 @@ metal_encode_scrollbar(
             .zfar = 1.0
         }];
         [encoder setRenderPipelineState:g_metal.tint_pipeline];
-        MetalTintUniforms tint_uniforms = {
-            .edges = (vector_float4){ track_left, track_top, track_right, track_bottom },
-            .color = color_to_linear_premult(metrics.track_color, metrics.track_opacity),
-        };
+        vector_float4 track_edges = { track_left, track_top, track_right, track_bottom };
+        vector_float4 track_color = color_to_linear_premult(metrics.track_color, metrics.track_opacity);
+        MetalTintUniforms tint_uniforms = metal_make_tint_uniforms(track_edges, track_color);
         [encoder setVertexBytes:&tint_uniforms length:sizeof tint_uniforms atIndex:0];
         [encoder setFragmentBytes:&tint_uniforms length:sizeof tint_uniforms atIndex:0];
         [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
@@ -3518,10 +3517,9 @@ metal_encode_scrollbar(
         }];
         float thumb_top_gl = 1.f - 2.f * metrics.thumb_top_fraction;
         float thumb_bottom_gl = 1.f - 2.f * metrics.thumb_bottom_fraction;
-        MetalTintUniforms tint_uniforms = {
-            .edges = (vector_float4){ track_left, thumb_top_gl, track_right, thumb_bottom_gl },
-            .color = color_to_linear_premult(metrics.handle_color, metrics.handle_opacity),
-        };
+        vector_float4 handle_edges = { track_left, thumb_top_gl, track_right, thumb_bottom_gl };
+        vector_float4 handle_color = color_to_linear_premult(metrics.handle_color, metrics.handle_opacity);
+        MetalTintUniforms tint_uniforms = metal_make_tint_uniforms(handle_edges, handle_color);
         [encoder setVertexBytes:&tint_uniforms length:sizeof tint_uniforms atIndex:0];
         [encoder setFragmentBytes:&tint_uniforms length:sizeof tint_uniforms atIndex:0];
         [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
@@ -3698,10 +3696,9 @@ metal_encode_hyperlink_target(
             .zfar = 1.0
         }];
         [encoder setRenderPipelineState:g_metal.tint_pipeline];
-        MetalTintUniforms tint_uniforms = {
-            .edges = (vector_float4){ -1.f, 1.f, 1.f, -1.f },
-            .color = color_to_linear_premult(surface.foreground_color, 1.f),
-        };
+        vector_float4 border_edges = { -1.f, 1.f, 1.f, -1.f };
+        vector_float4 border_color = color_to_linear_premult(surface.foreground_color, 1.f);
+        MetalTintUniforms tint_uniforms = metal_make_tint_uniforms(border_edges, border_color);
         [encoder setVertexBytes:&tint_uniforms length:sizeof tint_uniforms atIndex:0];
         [encoder setFragmentBytes:&tint_uniforms length:sizeof tint_uniforms atIndex:0];
         [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
@@ -3737,10 +3734,9 @@ metal_encode_hyperlink_target(
             .zfar = 1.0
         }];
         [encoder setRenderPipelineState:g_metal.tint_pipeline];
-        MetalTintUniforms tint_uniforms = {
-            .edges = (vector_float4){ -1.f, 1.f, 1.f, -1.f },
-            .color = color_to_linear_premult(surface.background_color, 1.f),
-        };
+        vector_float4 background_edges = { -1.f, 1.f, 1.f, -1.f };
+        vector_float4 background_color = color_to_linear_premult(surface.background_color, 1.f);
+        MetalTintUniforms tint_uniforms = metal_make_tint_uniforms(background_edges, background_color);
         [encoder setVertexBytes:&tint_uniforms length:sizeof tint_uniforms atIndex:0];
         [encoder setFragmentBytes:&tint_uniforms length:sizeof tint_uniforms atIndex:0];
         [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
@@ -4122,6 +4118,24 @@ metal_renderer_prepare_trail_uniforms_for_tests(
         color,
         opacity
     );
+}
+
+EXPORTED void
+metal_renderer_prepare_tint_uniforms_for_tests(
+    color_type background_color,
+    float tint_amount,
+    MetalTintUniforms *out_uniforms
+) {
+    if (!out_uniforms) {
+        PyErr_SetString(PyExc_ValueError, "metal_renderer_prepare_tint_uniforms_for_tests requires output struct");
+        return;
+    }
+    float clamped = tint_amount;
+    if (clamped < 0.f) clamped = 0.f;
+    if (clamped > 1.f) clamped = 1.f;
+    vector_float4 edges = { -1.f, 1.f, 1.f, -1.f };
+    vector_float4 color = color_to_linear_premult(background_color, clamped);
+    *out_uniforms = metal_make_tint_uniforms(edges, color);
 }
 
 EXPORTED void

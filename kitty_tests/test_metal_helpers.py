@@ -2,8 +2,10 @@
 # License: GPL v3
 
 import ctypes
-import unittest
+import struct
 import sys
+import unittest
+import zlib
 from typing import Sequence
 
 import kitty.fast_data_types as fast_data_types
@@ -31,6 +33,13 @@ class MetalTrailUniforms(ctypes.Structure):
         ('opacity', ctypes.c_float),
         ('_pad0', ctypes.c_float),
         ('_pad1', ctypes.c_float),
+    ]
+
+
+class MetalTintUniforms(ctypes.Structure):
+    _fields_ = [
+        ('edges', ctypes.c_float * 4),
+        ('color', ctypes.c_float * 4),
     ]
 
 
@@ -129,6 +138,7 @@ class TestMetalHelperFunctions(BaseTest):
             for symbol in (
                 'metal_renderer_prepare_border_uniforms_for_tests',
                 'metal_renderer_prepare_trail_uniforms_for_tests',
+                'metal_renderer_prepare_tint_uniforms_for_tests',
                 'metal_cell_draw_flag_defaults',
                 'metal_renderer_pack_graphics_uniforms_for_tests',
                 'metal_renderer_pack_graphics_alpha_uniforms_for_tests',
@@ -168,6 +178,12 @@ class TestMetalHelperFunctions(BaseTest):
                 ctypes.POINTER(MetalTrailUniforms),
             ]
             cls.lib.metal_renderer_prepare_trail_uniforms_for_tests.restype = None
+            cls.lib.metal_renderer_prepare_tint_uniforms_for_tests.argtypes = [
+                ctypes.c_uint32,
+                ctypes.c_float,
+                ctypes.POINTER(MetalTintUniforms),
+            ]
+            cls.lib.metal_renderer_prepare_tint_uniforms_for_tests.restype = None
             cls.lib.metal_cell_draw_flag_defaults.argtypes = []
             cls.lib.metal_cell_draw_flag_defaults.restype = ctypes.c_uint32
             cls.lib.metal_renderer_pack_graphics_uniforms_for_tests.argtypes = [
@@ -256,6 +272,13 @@ class TestMetalHelperFunctions(BaseTest):
             self.lib.metal_renderer_debug_clear_captured_frame_for_tests()
         super().tearDown()
 
+    @staticmethod
+    def _srgb_channel_to_linear(channel: int) -> float:
+        value = channel / 255.0
+        if value <= 0.04045:
+            return value / 12.92
+        return ((value + 0.055) / 1.055) ** 2.4
+
     def _make_draw_params(self, mask: int, draw_fg: int = 1) -> MetalDrawParams:
         params = MetalDrawParams()
         params.text_contrast = 1.25
@@ -337,12 +360,47 @@ class TestMetalHelperFunctions(BaseTest):
             self.assertAlmostEqual(actual, expected, places=6)
         for actual, expected in zip(uniforms.y_coords, [-0.5, -0.6, -0.7, -0.8]):
             self.assertAlmostEqual(actual, expected, places=6)
-        for actual, expected in zip(uniforms.cursor_edge_x, [-0.25, 0.25]):
+
+    def test_prepare_tint_uniforms_converts_linear_premultiplied(self) -> None:
+        uniforms = MetalTintUniforms()
+        background = 0x336699
+        tint_amount = 0.5
+        self.lib.metal_renderer_prepare_tint_uniforms_for_tests(
+            ctypes.c_uint32(background),
+            ctypes.c_float(tint_amount),
+            ctypes.byref(uniforms),
+        )
+        for actual, expected in zip(uniforms.edges, (-1.0, 1.0, 1.0, -1.0)):
             self.assertAlmostEqual(actual, expected, places=6)
-        for actual, expected in zip(uniforms.cursor_edge_y, [0.75, -0.75]):
+        channels = [
+            (background >> 16) & 0xFF,
+            (background >> 8) & 0xFF,
+            background & 0xFF,
+        ]
+        expected_color = [self._srgb_channel_to_linear(value) * tint_amount for value in channels]
+        expected_color.append(tint_amount)
+        for actual, expected in zip(uniforms.color, expected_color):
             self.assertAlmostEqual(actual, expected, places=6)
-        self.assertEqual(uniforms.color, color)
-        self.assertAlmostEqual(uniforms.opacity, opacity, places=6)
+
+    def test_prepare_tint_uniforms_clamps_amount(self) -> None:
+        uniforms = MetalTintUniforms()
+        self.lib.metal_renderer_prepare_tint_uniforms_for_tests(
+            ctypes.c_uint32(0xFFFFFF),
+            ctypes.c_float(3.0),
+            ctypes.byref(uniforms),
+        )
+        for component in uniforms.color[:3]:
+            self.assertAlmostEqual(component, 1.0, places=6)
+        self.assertAlmostEqual(uniforms.color[3], 1.0, places=6)
+
+        uniforms = MetalTintUniforms()
+        self.lib.metal_renderer_prepare_tint_uniforms_for_tests(
+            ctypes.c_uint32(0x112233),
+            ctypes.c_float(-0.25),
+            ctypes.byref(uniforms),
+        )
+        for component in uniforms.color:
+            self.assertAlmostEqual(component, 0.0, places=6)
 
     def test_draw_flag_defaults(self) -> None:
         defaults = self.lib.metal_cell_draw_flag_defaults()
@@ -634,6 +692,134 @@ class TestMetalHelperFunctions(BaseTest):
             -1,
             'Metal window render data should not allocate an OpenGL VAO',
         )
+
+class TestMetalBackgroundTintRendering(BaseTest):
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        if not ffi.has_metal:
+            raise unittest.SkipTest('Metal backend not available')
+        cls.lib = ctypes.CDLL(fast_data_types.__file__)
+        required_symbols = (
+            'metal_renderer_copy_captured_frame_for_tests',
+            'metal_renderer_debug_clear_captured_frame_for_tests',
+        )
+        if not all(hasattr(cls.lib, symbol) for symbol in required_symbols):
+            raise unittest.SkipTest('Metal capture helpers unavailable')
+
+    def setUp(self) -> None:
+        super().setUp()
+        if sys.platform != 'darwin':
+            self.skipTest('Metal tint rendering requires macOS')
+        required = (
+            hasattr(ffi.lib, 'state_debug_add_os_window_for_tests')
+            and hasattr(ffi.lib, 'remove_os_window')
+            and hasattr(ffi.lib, 'handle_for_window_id')
+            and hasattr(ffi.lib, 'renderer_backend_attach_window')
+            and hasattr(ffi.lib, 'renderer_backend_begin_frame')
+            and hasattr(ffi.lib, 'renderer_backend_render')
+            and hasattr(ffi.lib, 'renderer_backend_present')
+            and hasattr(ffi.lib, 'renderer_backend_shutdown_active')
+            and hasattr(ffi.lib, 'get_os_window_struct_for_tests')
+        )
+        if not required:
+            self.skipTest('Required renderer helpers unavailable')
+        self.addCleanup(ffi.reset)
+        ffi.reset()
+        renderer_backend_select('metal')
+        self.lib.metal_renderer_debug_clear_captured_frame_for_tests()
+
+    @staticmethod
+    def _png_chunk(tag: bytes, payload: bytes) -> bytes:
+        length = struct.pack(">I", len(payload))
+        crc = struct.pack(">I", zlib.crc32(tag + payload) & 0xFFFFFFFF)
+        return length + tag + payload + crc
+
+    @classmethod
+    def _solid_rgba_png(cls, width: int, height: int, color: tuple[int, int, int, int]) -> bytes:
+        r, g, b, a = color
+        row = bytes([r, g, b, a] * width)
+        raw = b''.join(b'\x00' + row for _ in range(height))
+        ihdr = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+        return (
+            b"\x89PNG\r\n\x1a\n"
+            + cls._png_chunk(b'IHDR', ihdr)
+            + cls._png_chunk(b'IDAT', zlib.compress(raw, 9))
+            + cls._png_chunk(b'IEND', b'')
+        )
+
+    def _render_and_capture_pixel(self, tint_value: float) -> tuple[int, int, int, int]:
+        self.set_options({'background_tint': tint_value})
+        options_obj = fast_data_types.get_options()
+        fast_data_types.set_options(options_obj, False, False, False, False, True)
+        os_window_id = ffi.lib.state_debug_add_os_window_for_tests()
+        self.assertGreater(os_window_id, 0)
+        remove_os_window = ffi.lib.remove_os_window
+        remove_os_window.argtypes = [ctypes.c_ulonglong]
+        remove_os_window.restype = ctypes.c_bool
+        def cleanup_window() -> None:
+            fast_data_types.set_background_image(None, (os_window_id,), True)
+            remove_os_window(ctypes.c_ulonglong(os_window_id))
+        self.addCleanup(cleanup_window)
+
+        tab_id = fast_data_types.add_tab(os_window_id)
+        window_id = fast_data_types.add_window(os_window_id, tab_id, 'tint-test')
+
+        png = self._solid_rgba_png(2, 2, (255, 255, 255, 255))
+        fast_data_types.set_background_image(
+            "memory.png",
+            (os_window_id,),
+            True,
+            "tiled",
+            png,
+            False,
+            None,
+            None,
+        )
+
+        os_window_ptr = ffi.lib.get_os_window_struct_for_tests(ctypes.c_ulonglong(os_window_id))
+        window_handle = ffi.lib.handle_for_window_id(ctypes.c_ulonglong(os_window_id))
+
+        config = ffi.RendererWindowConfig()
+        config.is_first_window = True
+        config.wants_transparency = False
+        config.background_opacity = 1.0
+        config.background_color = 0
+        self.assertTrue(ffi.lib.renderer_backend_attach_window(window_handle, ctypes.byref(config)))
+
+        frame_params = ffi.RendererFrameParams()
+        frame_params.frame_start_time = 0.0
+        frame_params.vsync_enabled = True
+        self.assertTrue(ffi.lib.renderer_backend_begin_frame(window_handle, ctypes.byref(frame_params)))
+
+        render_params = ffi.RendererRenderParams()
+        render_params.os_window = ctypes.c_void_p(os_window_ptr)
+        render_params.active_window_id = window_id
+        render_params.active_window_bg = 0x006400  # dark green
+        render_params.num_visible_windows = 1
+        render_params.all_windows_have_same_bg = True
+        self.assertTrue(ffi.lib.renderer_backend_render(window_handle, ctypes.byref(render_params)))
+
+        present_params = ffi.RendererPresentParams()
+        present_params.blocking = True
+        present_params.capture_framebuffer = True
+        self.assertTrue(ffi.lib.renderer_backend_present(window_handle, ctypes.byref(present_params)))
+
+        info = MetalCapturedFrameDebugInfo()
+        self.assertTrue(self.lib.metal_renderer_copy_captured_frame_for_tests(ctypes.byref(info)))
+        data = bytes(ctypes.string_at(info.pixels, info.bytes_per_row * info.height))
+        pixel = tuple(data[:4])
+        self.lib.metal_renderer_debug_clear_captured_frame_for_tests()
+        ffi.lib.renderer_backend_shutdown_active()
+        return pixel
+
+    def test_background_tint_changes_captured_frame(self) -> None:
+        baseline = self._render_and_capture_pixel(0.0)
+        tinted = self._render_and_capture_pixel(0.5)
+        self.assertNotEqual(tinted, baseline, 'Tinted frame should differ from baseline')
+        # Expect tint to push the pixel towards green.
+        self.assertGreater(tinted[1], tinted[0])
+        self.assertGreater(tinted[1], tinted[2])
 
 
 class TestMetalCaptureLifecycle(BaseTest):

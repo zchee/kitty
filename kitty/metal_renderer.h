@@ -45,6 +45,11 @@ typedef struct {
     float _pad[2];
 } MetalTrailUniforms;
 
+typedef struct {
+    float edges[4];
+    float color[4];
+} MetalTintUniforms;
+
 EXPORTED void metal_renderer_prepare_border_uniforms_for_tests(
     color_type default_bg,
     color_type active_border_color,
@@ -65,6 +70,11 @@ EXPORTED void metal_renderer_prepare_trail_uniforms_for_tests(
     color_type color,
     float opacity,
     MetalTrailUniforms *out_uniforms);
+
+EXPORTED void metal_renderer_prepare_tint_uniforms_for_tests(
+    color_type background_color,
+    float tint_amount,
+    MetalTintUniforms *out_uniforms);
 
 typedef struct {
     float tiled;
