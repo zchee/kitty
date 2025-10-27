@@ -275,6 +275,7 @@ class BackendFFI:
                             ("debug_labels", ctypes.c_bool),
                             ("debug_events", ctypes.c_bool),
                             ("capture_frames", ctypes.c_bool),
+                            ("display_sync_enabled", ctypes.c_bool),
                         ]
 
                     self.MetalRuntimeDebugFlags = MetalRuntimeDebugFlags

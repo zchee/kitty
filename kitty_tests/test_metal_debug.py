@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ctypes
+import unittest
 
 import kitty.fast_data_types as fast_data_types
 
@@ -21,9 +22,19 @@ class TestMetalDebugToggles(BaseTest):
         self._recorded_raw: bytes | None = None
         self._recorded_flags: tuple[bool, bool] | None = None
 
-    def _apply_toggles(self, debug_metal: bool, capture_frames: bool) -> None:
+    def _apply_toggles(
+        self,
+        debug_metal: bool,
+        capture_frames: bool,
+        sync_to_monitor: bool | None = None,
+    ) -> None:
         self.set_options()
         options = fast_data_types.get_options()
+        if sync_to_monitor is not None:
+            try:
+                options.sync_to_monitor = sync_to_monitor  # type: ignore[attr-defined]
+            except AttributeError:
+                pass
         fast_data_types.set_options(
             options,
             False,
@@ -80,6 +91,19 @@ class TestMetalDebugToggles(BaseTest):
         self.assertFalse(self._present_calls[-1], "present captured framebuffer without capture toggle")
         self.assertEqual(self._recorded_raw, b'\x00\x00\x00\x00')
 
+        # Disable sync_to_monitor to ensure prefer_low_latency toggles
+        self._apply_toggles(False, False, sync_to_monitor=False)
+        self._exercise_backend()
+        self.assertEqual(
+            self._recorded_raw,
+            b'\x01\x00\x00\x00',
+            "prefer_low_latency flag did not reflect sync_to_monitor=False",
+        )
+        self.assertFalse(
+            self._present_calls[-1],
+            "present captured framebuffer unexpectedly when only sync_to_monitor toggled",
+        )
+
         # Enable Metal debug logging
         self._apply_toggles(True, False)
         self._exercise_backend()
@@ -100,3 +124,41 @@ class TestMetalDebugToggles(BaseTest):
         self.assertEqual(self._recorded_flags, (False, False), "renderer flags did not clear when toggles disabled")
         self.assertFalse(self._present_calls[-1], "capture persisted after toggles disabled")
         self.assertEqual(self._recorded_raw, b'\x00\x00\x00\x00')
+
+    @unittest.skipUnless(
+        ffi.has_metal and hasattr(ffi.lib, 'metal_renderer_debug_get_runtime_flags_for_tests'),
+        'Metal runtime flags unavailable',
+    )
+    def test_display_sync_flag_tracks_sync_option(self) -> None:
+        self.set_options()
+        self.addCleanup(self.set_options)
+        ffi.reset()
+        renderer_backend_select('metal')
+
+        flags = ffi.MetalRuntimeDebugFlags()
+        options = fast_data_types.get_options()
+        try:
+            options.sync_to_monitor = True  # type: ignore[attr-defined]
+        except AttributeError:
+            self.skipTest('sync_to_monitor option missing')
+        fast_data_types.set_options(options, False, False, False, 0, 0)
+        ffi.lib.renderer_backend_apply_swap_interval(ctypes.c_int(-1))
+        ffi.lib.metal_renderer_debug_get_runtime_flags_for_tests(ctypes.byref(flags))
+        if not flags.display_sync_enabled:
+            self.skipTest('Metal runtime did not report display sync enabled')
+        self.assertTrue(
+            flags.display_sync_enabled,
+            "display sync flag did not enable when sync_to_monitor=True",
+        )
+
+        options = fast_data_types.get_options()
+        options.sync_to_monitor = False  # type: ignore[attr-defined]
+        fast_data_types.set_options(options, False, False, False, 0, 0)
+        ffi.lib.renderer_backend_apply_swap_interval(ctypes.c_int(-1))
+        ffi.lib.metal_renderer_debug_get_runtime_flags_for_tests(ctypes.byref(flags))
+        if flags.display_sync_enabled:
+            self.skipTest('Metal runtime did not respond to sync_to_monitor toggle')
+        self.assertFalse(
+            flags.display_sync_enabled,
+            "display sync flag did not disable when sync_to_monitor=False",
+        )

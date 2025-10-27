@@ -31,7 +31,8 @@ Authoritative, always-current snapshot of the Metal migration state, helper expo
 4. **Metal helper coverage**  
    - `TestMetalHelperFunctions` includes new tint uniform assertions (linear premultiplication, clamping) alongside previous trails/borders validations.  
    - Capture lifecycle tests ensure debug resets clear buffers and state.  
-   - Metal windows confirmed not to allocate GL VAOs via state debug helpers.
+   - Metal windows confirmed not to allocate GL VAOs via state debug helpers.  
+   - Runtime flag helpers (`metal_renderer_debug_get_runtime_flags_for_tests`) now expose `display_sync_enabled` to validate `sync_to_monitor` behaviour without requiring frame capture.
 
 ---
 

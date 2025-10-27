@@ -139,6 +139,7 @@ typedef struct MetalRuntimeDebugFlags {
     bool debug_labels;
     bool debug_events;
     bool capture_frames;
+    bool display_sync_enabled;
 } MetalRuntimeDebugFlags;
 
 EXPORTED void metal_renderer_debug_seed_window_state_for_tests(struct GLFWwindow *window);

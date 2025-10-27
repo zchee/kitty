@@ -4057,6 +4057,7 @@ metal_renderer_debug_get_runtime_flags_for_tests(MetalRuntimeDebugFlags *out_fla
         .debug_labels = g_metal.debug_labels,
         .debug_events = g_metal.debug_events,
         .capture_frames = g_metal.capture_frames,
+        .display_sync_enabled = g_metal.display_sync_enabled,
     };
     *out_flags = flags;
 }
