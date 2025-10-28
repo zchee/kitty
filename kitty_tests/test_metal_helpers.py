@@ -925,6 +925,26 @@ class TestMetalBackgroundTintRendering(BaseTest):
         ffi.lib.renderer_backend_shutdown_active()
         return pixel
 
+    @staticmethod
+    def _expected_tinted_pixel(background: int, tint: float) -> tuple[int, int, int, int]:
+        def srgb_to_linear(channel: int) -> float:
+            value = channel / 255.0
+            if value <= 0.04045:
+                return value / 12.92
+            return ((value + 0.055) / 1.055) ** 2.4
+
+        def channel_mix(channel: int) -> int:
+            base = channel / 255.0
+            tinted = srgb_to_linear(channel) * tint
+            mixed = tinted + base * (1.0 - tint)
+            mixed = max(0.0, min(1.0, mixed))
+            return int(round(mixed * 255.0))
+
+        r = (background >> 16) & 0xFF
+        g = (background >> 8) & 0xFF
+        b = background & 0xFF
+        return channel_mix(r), channel_mix(g), channel_mix(b), 255
+
     def test_background_tint_changes_captured_frame(self) -> None:
         background = 0x006400  # dark green
         baseline = self._render_and_capture_pixel(0.0, background)
@@ -993,6 +1013,19 @@ class TestMetalBackgroundTintRendering(BaseTest):
         )
         for actual, exp in zip(pixel, expected):
             self.assertLessEqual(abs(actual - exp), 1, f'channel mismatch: got {pixel} expected {expected}')
+
+    def test_background_tint_without_image_uses_clear_load_action(self) -> None:
+        background = 0x224466
+        tint = 0.5
+        pixel = self._render_and_capture_pixel(tint, background, background_image=False)
+        expected = self._expected_tinted_pixel(background, tint)
+        for idx, (actual, exp) in enumerate(zip(pixel, expected)):
+            tolerance = 2 if idx < 3 else 0
+            self.assertLessEqual(
+                abs(actual - exp),
+                tolerance,
+                f'channel {idx} mismatch: got {pixel} expected {expected}',
+            )
 
 
 class TestMetalCaptureLifecycle(BaseTest):

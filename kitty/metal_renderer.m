@@ -2833,7 +2833,8 @@ metal_encode_background_tint(GLFWwindow *window, MetalWindowState *state, color_
             return false;
         }
         pass.colorAttachments[0].texture = state.drawable.texture;
-        pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+        const bool should_clear = !state.frameHasContent;
+        pass.colorAttachments[0].loadAction = should_clear ? MTLLoadActionClear : MTLLoadActionLoad;
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
         pass.colorAttachments[0].clearColor = state.clearColor;
         id<MTLRenderCommandEncoder> encoder = [state.commandBuffer renderCommandEncoderWithDescriptor:pass];

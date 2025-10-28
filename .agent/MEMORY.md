@@ -1,95 +1,75 @@
-# Kitty Metal Crash-Triage Playbook (written 2025-10-28)
+## Kitty Metal Renderer Knowledge Base (updated 2025-10-29)
 
-Authoritative notebook for analysing kitty Metal crashes on macOS. Use it to avoid rediscovering the workflow every time a core dump appears.
+Authoritative playbook for diagnosing and fixing Metal rendering issues in kitty on macOS. This supersedes all earlier guidance—always follow these steps first.
 
 ---
 
-## 1. Core Dump Intake Checklist
-1. List new cores inside `./.cores` and the repo root (`ls -l ./.cores`).
-2. Capture size/mtime (`ls -l core.*`), and keep originals read-only.
-3. Always identify the file type with a known-good magic database:
+### 1. Reproduction Checklist
+1. Launch kitty with Metal debug logging enabled:  
    ```bash
-   MAGIC=/usr/share/file/magic.mgc /usr/bin/file path/to/core
+   KITTY_ENABLE_METAL_GUI_TESTS=1 ./kitty.app/Contents/MacOS/kitty --debug-rendering 2>kitty-metal.log
    ```
-4. Note the PID timestamp encoded in the filename; you’ll need it to match crash reports or logs.
+2. When the bug concerns background tint or first-frame artifacts, ensure no background image is configured so the fallback tint path is exercised.
+3. Capture a screenshot immediately after launch; compare for alternating stripes or unexpected colors.
 
 ---
 
-## 2. Standard LLDB Commands
-Use the shipping app bundle unless you intentionally built another binary.
-```bash
-/usr/bin/lldb -c path/to/core /Applications/kitty.app/Contents/MacOS/kitty \
-  --batch \
-  -o "thread list" \
-  -o "bt all" \
-  > core_bt.txt
-```
-
-If you need extra details:
-```bash
-/usr/bin/lldb -c core exec --batch -o "process status" -o "image list" > core_status.txt
-```
-
-Interpretation rules:
-- **Stop reason absent** → snapshot while idle (not a crash).
-- **Stop reason `EXC_BAD_ACCESS` or `SIGSEGV`** → real fault; inspect the crashing thread first.
-- Thread #1 inside `mach_msg` + AppKit run-loop is usually harmless unless the stop reason points elsewhere.
+### 2. Immediate Data Collection
+1. Save `kitty-metal.log` alongside the screenshot; this log contains window geometry, drawable acquisition, and swap diagnostics.
+2. Record the exact command line, git commit, and macOS build (run `sw_vers -productVersion`).
+3. Archive relevant Metal capture data if `--metal-gpu-capture` was enabled; note whether command buffers finished (`waitUntilCompleted` vs `waitUntilScheduled`).
 
 ---
 
-## 3. Supporting Artifacts to Collect
-1. `kitty-metal.log` from the same run (if present). Provides renderer-side warnings and occlusion events.
-2. macOS unified log window for the last five minutes:
+### 3. Diagnostic Workflow
+1. Inspect `kitty-metal.log` for occlusion events or repeated drawable acquisition failures (`metal_event=drawable_acquire_failed`).
+2. Use `rg --threads=6` to locate the active Metal pipeline in `kitty/metal_renderer.m`; prioritise passes that set `pass.colorAttachments[0].loadAction`.
+3. Compare Metal pass ordering against OpenGL implementation (see `kitty/shaders.c`) to verify parity in clear/load semantics.
+4. When investigating tint issues, focus on `metal_encode_background_tint` and confirm that the first frame clears the drawable when `frameHasContent` is false.
+
+---
+
+### 4. Known Fix Patterns
+* **First-frame stripes without background image**: ensure tint pass sets `loadAction` to `MTLLoadActionClear` when no prior content exists (`state.frameHasContent == NO`).
+* **Persistent dirty captures**: after every presentation, reset command primitives (`state.commandBuffer = nil; state.drawable = nil; state.frameHasContent = NO;`).
+* **Sprite atlas corruption**: zero shared buffers via `metal_zero_buffer` whenever the allocation grows.
+
+---
+
+### 5. Regression Tests (Python 3.14)
+All Metal tests must run under `.venv/bin/python3.14`.
+1. Full module:
    ```bash
-   log show --last 5m --predicate 'process == "kitty"' > unified_kitty.log
+   KITTY_ENABLE_METAL_GUI_TESTS=1 ./.venv/bin/python3.14 ./test.py --module test_metal_helpers --verbose --failfast
    ```
-3. Crash reports:
+2. Targeted regression:
    ```bash
-   ls -t ~/Library/Logs/DiagnosticReports/kitty*.crash | head
+   KITTY_ENABLE_METAL_GUI_TESTS=1 ./.venv/bin/python3.14 ./test.py \
+     test_metal_helpers.TestMetalTintRendering.test_background_tint_without_image_uses_clear_load_action --verbose
    ```
-   If none appear, macOS may have auto-terminated before a crash. Reproduce with `ulimit -c unlimited`.
-
-4. Record active kitty PIDs via `pgrep -fl "kitty"`; useful when correlating multiple instances.
+3. If the environment lacks a Metal-capable display (common on CI), document the failure and request rerun on macOS hardware. Never mark the test as skipped locally without analysing the root cause.
 
 ---
 
-## 4. Determining Next Actions
-Use the following decision tree after LLDB:
-
-| Observation | Next Step |
-|-------------|-----------|
-| No stop reason + AppKit run-loop | Core is idle sample — capture a new one at the actual crash. |
-| Crash in `metal_renderer` / Metal frameworks | Open matching source file, check recent changes, and design targeted tests. |
-| Crash in Python eval path | Inspect the Python caller (often a failing helper). |
-| Thread stuck in `poll` with non-zero stop reason | Investigate native IO loops (`talk_loop`, `io_loop`). |
-
-Always document findings (core path, stop reason, top frames, suggested fix) in your working notes and update this playbook only if the process changes.
+### 6. Metal Debugging Tools
+* Enable verbose event logging through renderer configuration (`global_state.debug_metal_events = True`).
+* Use `metal_renderer_debug_*` helpers exposed via `kitty_tests.test_metal_helpers` for seeding window state, capturing frames, and validating buffer contents.
+* For shader parity research, cross-reference `kitty/metal/cell.metal` with the corresponding GLSL definitions and keep `shader_metadata.json` in sync.
 
 ---
 
-## 5. Quick Commands Reference
-- Build launcher: `python3.13 setup.py build-launcher`
-- Run Metal GUI test: `KITTY_ENABLE_METAL_GUI_TESTS=1 ./test.py --module test_metal_helpers test_initial_blank_frame_uses_active_window_background`
-- Launch debug kitty that keeps window alive:
-  ```bash
-  KITTY_ENABLE_METAL_GUI_TESTS=1 ./kitty.app/Contents/MacOS/kitty --debug-rendering 2>kitty-metal.log
-  ```
+### 7. Step-by-Step Incident Response
+1. Reproduce with `--debug-rendering`; capture log + screenshot.
+2. Run regression tests listed above.
+3. If tests fail, prioritise fixing `kitty/metal_renderer.m` before touching Python callers to avoid API drift.
+4. After code changes, rerun the targeted test and confirm `kitty-metal.log` is regenerated.
+5. Update this document if the workflow materially changes (new commands, logging flags, or modules).
 
 ---
 
-## 6. Guidelines
-- Never delete or modify cores before archiving essential data.
-- Keep LLDB outputs (`core_bt.txt`, `core_status.txt`) under version control only if needed; otherwise stash locally.
-- When you find the root cause, update the relevant source comments/tests instead of only documenting here.
-- Refresh this file immediately if the triage workflow changes (new build path, different LLDB commands, etc.).
-
----
-
-## 7. Future Enhancements
-- Automate LLDB triage with a small script (`scripts/analyse_core.py`) that:
-  - Validates magic database availability.
-  - Runs `thread list`, `bt all`, `process status`.
-  - Highlights stop reasons.
-- Add a shell alias `kitty-core` pointing to the command bundle above.
-- Investigate structured logging (`log show --style compact`) when Metal prints GPU errors.
+### 8. Future Enhancements Backlog
+1. Teach `kitty_tests/test_metal_helpers` to dump per-pass load actions, catching regressions earlier.
+2. Add automated diffing between Metal and OpenGL frame captures for first-frame draw.
+3. Expand capture helpers to assert `frameHasContent` transitions after every pass.
+4. Investigate headless Metal CI runners or fallback simulation to unblock automated test execution.
 
