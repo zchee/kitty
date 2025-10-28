@@ -867,6 +867,24 @@ PYWRAP1(handle_for_window_id) {
     return NULL;
 }
 
+EXPORTED void*
+handle_for_window_id(id_type os_window_id) {
+    void *ans = NULL;
+    WITH_OS_WINDOW(os_window_id)
+        ans = os_window->handle;
+    END_WITH_OS_WINDOW
+    return ans;
+}
+
+EXPORTED void*
+get_os_window_struct_for_tests(id_type os_window_id) {
+    void *ans = NULL;
+    WITH_OS_WINDOW(os_window_id)
+        ans = os_window;
+    END_WITH_OS_WINDOW
+    return ans;
+}
+
 PYWRAP1(get_os_window_struct_for_tests) {
     id_type os_window_id;
     PA("K", &os_window_id);

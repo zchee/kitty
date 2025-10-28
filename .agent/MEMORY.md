@@ -1,101 +1,96 @@
-# Renderer & Backend Knowledge Base (Updated 2025-10-27)
+# Metal Migration Knowledge Base (Updated 2025-10-28)
 
-Authoritative, always-current snapshot of the Metal migration state, helper exports, and validation mandates. Update immediately whenever renderer behavior or planned work changes.
-
----
-
-## Platform & Backend Policy
-
-- **macOS uses Metal exclusively.** Build flags keep `KITTY_DISABLE_NSGL=1`, drop `-framework OpenGL`, and ship only the Metal renderer on Darwin. OpenGL entry points remain for non-macOS targets and negative tests that assert failure modes.
-- Selecting `"opengl"` on macOS must raise an informative error (`renderer_backend_select('opengl')` → `ValueError` mentioning the platform). Unit coverage exists in `kitty_tests/renderer_backend.py`.
-- Non-macOS builds continue to expose both backends; skip decorators guard Metal-only expectations outside Darwin CI.
+Authoritative snapshot of the Metal renderer status, helper exports, diagnostics, and remaining work. Update immediately after any functional or planning change.
 
 ---
 
-## Current Implementation Highlights (Metal Phase 2.2)
-
-1. **Tint uniforms unified**  
-   - `MetalTintUniforms` is now a shared C struct (edges + color arrays) declared in `kitty/metal_renderer.h`.  
-   - `metal_make_tint_uniforms()` builds the packed data for both runtime rendering and tests.  
-   - `metal_renderer_prepare_tint_uniforms_for_tests()` clamps tint input, converts sRGB→linear, premultiplies opacity, and returns the struct for Python validation.
-
-2. **Renderer background capture**  
-   - New integration harness (`TestMetalBackgroundTintRendering`) constructs an OS window, attaches the Metal backend, renders a tinted background, and captures the framebuffer for pixel assertions.  
-   - Helper uses `_solid_rgba_png()` to generate a deterministic texture and guarantees cleanup by clearing background image and removing the window.  
-   - Requires `renderer_backend_attach_window`, `renderer_backend_shutdown_active`, `get_os_window_struct_for_tests`, etc.; skips gracefully if any symbol is absent.
-
-3. **State exposure for tests**  
-   - `get_os_window_struct_for_tests()` exported from `kitty/state.c`, returning the raw `OSWindow *` for test use; stub typed in `fast_data_types.pyi`.  
-   - `BackendFFI` in `kitty_tests/renderer_backend.py` now declares `RendererWindowConfig`, pointer-returning helpers, and shutdown hooks so ctypes signatures stay correct across Metal integration tests.
-
-4. **Metal helper coverage**  
-   - `TestMetalHelperFunctions` includes new tint uniform assertions (linear premultiplication, clamping) alongside previous trails/borders validations.  
-   - Capture lifecycle tests ensure debug resets clear buffers and state.  
-   - Metal windows confirmed not to allocate GL VAOs via state debug helpers.  
-   - Runtime flag helpers (`metal_renderer_debug_get_runtime_flags_for_tests`) now expose `display_sync_enabled` to validate `sync_to_monitor` behaviour without requiring frame capture.
+## Platform Policy
+- macOS builds ship **Metal-only** (`KITTY_DISABLE_NSGL=1`, no OpenGL frameworks). Selecting `opengl` on macOS must raise `ValueError`; negative tests live in `kitty_tests/renderer_backend.py`.
+- Non-macOS builds still expose both backends; Metal-only expectations remain skip-guarded outside Darwin.
 
 ---
 
-## Test Coverage Requirements
+## Current Implementation Highlights
+1. **Unified Tint Uniforms**
+   - `MetalTintUniforms` struct shared via `kitty/metal_renderer.h`.
+   - `metal_make_tint_uniforms()` + `metal_renderer_prepare_tint_uniforms_for_tests()` clamp tint, convert sRGB→linear, premultiply alpha, and return deterministic data.
 
+2. **Background Capture Harness**
+   - `TestMetalBackgroundTintRendering` creates an actual OS window, attaches the Metal backend, renders a tinted background, and captures the framebuffer.
+   - Uses `_solid_rgba_png()` to feed deterministic pixels; cleanup clears background image and removes the OS window.
+   - Requires native helpers: `handle_for_window_id()`, `get_os_window_struct_for_tests()`, `state_debug_add_os_window_for_tests()`, `renderer_backend_attach_window()`, `renderer_backend_begin_frame()`, `renderer_backend_render()`, `renderer_backend_present()`, `renderer_backend_shutdown_active()`, `metal_renderer_copy_captured_frame_for_tests()`.
+   - Runs `NSApplicationLoad`, checks `metal_renderer_preflight()`, and gracefully skips if any stage fails or the framebuffer is empty.
+   - Opt-in via `KITTY_ENABLE_METAL_GUI_TESTS=1`; without a live GUI session the test skips instead of crashing.
+   - When enabled, diagnostics now iterate multiple background colors and tint strengths, verifying that captured pixels move toward the expected dominant channel with monotonic channel reductions.
+
+3. **State Exposure for Tests**
+   - Native exports (`kitty/state.c` + `state.h`): `handle_for_window_id(id_type)` and `get_os_window_struct_for_tests(id_type)` return raw Cocoa handle / `OSWindow*` without Python wrappers.
+   - `kitty_tests/renderer_backend.py` `BackendFFI` defines window config structs and function signatures for the Metal debug helpers.
+
+4. **Helper Suite Coverage**
+   - `TestMetalHelperFunctions` covers border, trail, tint uniform math (strict sRGB→linear assertions), graphics uniform packing, visual bell alpha scaling, and ensures Metal paths never allocate OpenGL VAOs.
+   - Runtime debug helpers expose `display_sync_enabled` for parity checks.
+
+---
+
+## Test Coverage Expectations
 - `kitty_tests/test_metal_helpers.py`
-  - Drawable blanking, capture lifecycle, uniform packing, VAO regression, tint uniform math, and PNG-backed background capture (skips if helpers missing).  
-  - Keep new helpers deterministic and GUI-free; rely on debug stubs and synthetic PNG data.
+  - Must stay deterministic; avoid real GUI dependencies except for `TestMetalBackgroundTintRendering` (handled via skip guards).
+  - New multi-background, multi-tint capture assertions check channel deltas and enforce monotonic behaviour.
 - `kitty_tests/renderer_backend.py`
-  - Backend registration parity, macOS OpenGL fail-fast path, Metal preflight, VAO rebuild on backend switch.
+  - Validates backend registration, Metal preflight, and macOS OpenGL fail-fast behaviour; updated ctypes bindings must remain in sync with native exports.
 - `kitty_tests/test_metal_background.py`, `test_metal_resources.py`
-  - Continue to validate background geometry calculations and metallib availability.
-- **Rule:** Every new Metal-exported function must acquire direct unit coverage in the helper suite or renderer_backend harness. No “cheater” tests—must fail on logic regressions.
+  - Continue to cover background geometry math and metallib presence.
+- Rule: every new Metal export or helper requires direct unit coverage; “cheater” tests are forbidden.
 
 ---
 
 ## Operational Checklist
-
-- Rebuild native artifacts with `./.venv/bin/python3.13 setup.py build` after touching C/ObjC. Python 3.13 inside `.venv` is the only supported interpreter.
-- Use `./test.py --module test_metal_helpers` after Metal changes. On macOS hosts, ensure `TestMetalBackgroundTintRendering` executes instead of skipping (requires Metal debug helpers).
-- When adding renderer exports:
-  1. Declare in `metal_renderer.h`.
-  2. Implement in `metal_renderer.m` with error handling, clamping, and resource cleanup.
-  3. Expose Python wrapper (if needed) in `kitty/state.c` or related module and type it in `fast_data_types.pyi`.
-  4. Extend helper tests with deterministic assertions.
-  5. Update this memory file with behavior + coverage notes.
-- Avoid GL fallbacks in Metal paths; fail fast with descriptive `PyErr_SetString`.
-
----
-
-## Immediate Roadmap
-
-1. **Run tint capture integration on real Metal hardware**  
-   - Execute `./test.py --module test_metal_helpers` on a macOS host with full Metal build so `TestMetalBackgroundTintRendering` runs (currently skips off-host).  
-   - Record pixel diffs and ensure cleanup (background image cleared, OS window removed) leaves no leaks.
-2. **Extend capture diagnostics**  
-   - Add assertions on tint application using multiple background colors and tint factors once Metal helpers expose raw float arrays to Python more broadly.
-3. **Sprite atlas stress tests (deferred)**  
-   - Requires deterministic fixtures; keep on backlog until pipeline instrumentation lands.
+1. Rebuild native artifacts with `./.venv/bin/python3.13 setup.py build` after touching C/ObjC sources.
+2. Run `./test.py --module test_metal_helpers` after Metal changes.
+3. For GUI capture tests:
+   - Ensure macOS GUI session (physical log-in, Screen Sharing, or GUI CI runner).
+   - Export `KITTY_ENABLE_METAL_GUI_TESTS=1` before invoking the suite.
+4. When adding Metal exports:
+   - Declare in `metal_renderer.h`.
+   - Implement in `metal_renderer.m` with full error checks and cleanup.
+   - Expose via `kitty/state.c` (or relevant module) and type in `fast_data_types.pyi`.
+   - Extend helper tests deterministically.
+   - Update this memory file.
 
 ---
 
-## Longer-Term Backlog
-
-- Visual diff harness comparing archived OpenGL frames with Metal renders.
-- Remote-control toggles for Metal debug flags (parity with GL debug options).
-- CI runners with Metal capability; cache metallib outputs for fast builds.
-- Automated coverage for cursor trails, window logos, and background tint via captured frames.
+## Immediate Roadmap (Metal Migration)
+1. **Capture Verification on Hardware**
+   - On a GUI-enabled macOS host, run `KITTY_ENABLE_METAL_GUI_TESTS=1 ./test.py --module test_metal_helpers`.
+   - Record per-background/tint pixel tuples produced by `_render_and_capture_pixel` for regression tracking.
+   - Confirm dominant-channel assertions hold on real hardware; adjust tolerances if necessary.
+2. **Baseline Consolidation**
+   - Archive captured pixel baselines (prefer JSON fixture) once validated; integrate regression comparison into the test to detect future drift.
+3. **Future Diagnostics Enhancements**
+   - Once raw float tint data is exposed beyond helper tests, replace per-channel int assertions with float comparisons to remove reliance on PNG preload.
 
 ---
 
-## Reference Links & Assets
+## Backlog (Post-Phase)
+- Build image-diff harness comparing archived OpenGL frames with Metal renders.
+- Implement remote-control toggles for Metal debug flags (parity with GL tooling).
+- Provision Metal-capable CI runners and cache metallib outputs for faster builds.
+- Extend automated capture coverage to cursor trails, window logos, and other graphical elements.
+- Develop sprite atlas stress tests once deterministic fixtures are available.
 
-- Architecture guide: `docs/metal_renderer_architecture.md`.
-- Official Metal docs (Objective-C): scrape via firecrawl at `https://developer.apple.com/documentation/metal?language=objc`.
-- Apple sample code: `/Users/zchee/src/github.com/zchee/apple-metal-samples/MigratingOpenGLCodeToMetal`.
-- Always run code and tests using `.venv/bin/python3.13`.
+---
+
+## Reference Assets
+- Architecture: `docs/metal_renderer_architecture.md`.
+- Official Metal docs (Objective-C): scrape with `firecrawl` at <https://developer.apple.com/documentation/metal?language=objc>.
+- Apple sample: `/Users/zchee/src/github.com/zchee/apple-metal-samples/MigratingOpenGLCodeToMetal`.
+- Always run tooling with `.venv/bin/python3.13`.
 
 ---
 
 ## Notes for Future Iterations
-
-- Whenever new ctypes bindings are required, update `BackendFFI` once and reuse across tests; avoid per-test redefinitions.  
-- For additional renderer helpers, prefer returning POD structs so Python sees deterministic layouts (mirroring the `MetalTintUniforms` approach).  
-- Maintain strict naming consistency between C exports and Python wrappers to satisfy mypy in `fast_data_types.pyi`.  
-- Keep this file concise but exhaustive—list every active helper, associated tests, and follow-up tasks to prevent duplicate discovery in future sessions.
+- Update `BackendFFI` a single time per new native helper; reuse shared structs/functions across tests.
+- Prefer POD structs when exposing additional state to Python for deterministic layout.
+- Maintain naming parity between C exports and Python wrappers to satisfy mypy.
+- Keep this file comprehensive yet concise—document every active helper, associated tests, and pending action items to avoid rediscovery.

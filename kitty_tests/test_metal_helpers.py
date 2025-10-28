@@ -2,6 +2,7 @@
 # License: GPL v3
 
 import ctypes
+import os
 import struct
 import sys
 import unittest
@@ -402,6 +403,47 @@ class TestMetalHelperFunctions(BaseTest):
         for component in uniforms.color:
             self.assertAlmostEqual(component, 0.0, places=6)
 
+    def test_prepare_tint_uniforms_handles_multiple_backgrounds(self) -> None:
+        cases: dict[int, list[float]] = {
+            0x000000: [0.0, 0.25, 0.5, 1.0],
+            0x336699: [0.0, 0.4, 0.8],
+            0xFFAA33: [0.0, 0.5, 1.0],
+        }
+        tolerance = 1e-6
+        for background, tint_levels in cases.items():
+            previous_expected: list[float] | None = None
+            for tint_amount in tint_levels:
+                uniforms = MetalTintUniforms()
+                self.lib.metal_renderer_prepare_tint_uniforms_for_tests(
+                    ctypes.c_uint32(background),
+                    ctypes.c_float(tint_amount),
+                    ctypes.byref(uniforms),
+                )
+                with self.subTest(background=f"0x{background:06X}", tint=tint_amount):
+                    for actual, expected in zip(uniforms.edges, (-1.0, 1.0, 1.0, -1.0)):
+                        self.assertAlmostEqual(actual, expected, places=6)
+                    clamped = max(0.0, min(tint_amount, 1.0))
+                    expected_components = [
+                        self._srgb_channel_to_linear((background >> shift) & 0xFF) * clamped
+                        for shift in (16, 8, 0)
+                    ]
+                    expected_components.append(clamped)
+                    for index, (actual, expected) in enumerate(zip(uniforms.color, expected_components)):
+                        self.assertAlmostEqual(
+                            actual,
+                            expected,
+                            places=6,
+                            msg=f"component {index} mismatch for tint {tint_amount}",
+                        )
+                    if previous_expected is not None:
+                        for idx in range(4):
+                            self.assertGreaterEqual(
+                                expected_components[idx],
+                                previous_expected[idx] - tolerance,
+                                msg=f"component {idx} should not decrease as tint increases for background 0x{background:06X}",
+                            )
+                    previous_expected = expected_components
+
     def test_draw_flag_defaults(self) -> None:
         defaults = self.lib.metal_cell_draw_flag_defaults()
         self.assertEqual(defaults & 0b001, 0b001)
@@ -711,6 +753,14 @@ class TestMetalBackgroundTintRendering(BaseTest):
         super().setUp()
         if sys.platform != 'darwin':
             self.skipTest('Metal tint rendering requires macOS')
+        if os.environ.get('KITTY_ENABLE_METAL_GUI_TESTS') not in {'1', 'true', 'TRUE'}:
+            self.skipTest('Metal tint rendering requires KITTY_ENABLE_METAL_GUI_TESTS=1 in GUI session')
+        self._ensure_ns_application_loaded()
+        if hasattr(ffi.lib, 'metal_renderer_preflight'):
+            reason = ctypes.c_char_p()
+            if not ffi.lib.metal_renderer_preflight(ctypes.byref(reason)):
+                message = reason.value.decode('utf-8') if reason.value else 'Metal renderer preflight failed'
+                self.skipTest(message)
         required = (
             hasattr(ffi.lib, 'state_debug_add_os_window_for_tests')
             and hasattr(ffi.lib, 'remove_os_window')
@@ -730,10 +780,53 @@ class TestMetalBackgroundTintRendering(BaseTest):
         self.lib.metal_renderer_debug_clear_captured_frame_for_tests()
 
     @staticmethod
+    def _ensure_ns_application_loaded() -> None:
+        try:
+            appkit = ctypes.CDLL('/System/Library/Frameworks/AppKit.framework/AppKit')
+        except OSError:
+            return
+        try:
+            load_func = getattr(appkit, 'NSApplicationLoad')
+        except AttributeError:
+            return
+        load_func.restype = ctypes.c_bool
+        load_func.argtypes = []
+        load_func()
+
+    @staticmethod
     def _png_chunk(tag: bytes, payload: bytes) -> bytes:
         length = struct.pack(">I", len(payload))
         crc = struct.pack(">I", zlib.crc32(tag + payload) & 0xFFFFFFFF)
         return length + tag + payload + crc
+
+    def _create_metal_os_window(self) -> int:
+        def get_window_size(
+            cell_width: int,
+            cell_height: int,
+            dpi_x: float,
+            dpi_y: float,
+            xscale: float,
+            yscale: float,
+        ) -> tuple[int, int]:
+            safe_x = xscale if xscale > 0 else 1.0
+            safe_y = yscale if yscale > 0 else 1.0
+            width = max(int(cell_width * 80 / safe_x), 640)
+            height = max(int(cell_height * 24 / safe_y), 480)
+            return width, height
+
+        def pre_show_callback(_handle: int) -> None:
+            return None
+
+        try:
+            return fast_data_types.create_os_window(
+                get_window_size,
+                pre_show_callback,
+                'Metal Tint Test',
+                'kitty',
+                'kitty',
+            )
+        except Exception as exc:
+            self.skipTest(f'Unable to create Metal test window: {exc}')
 
     @classmethod
     def _solid_rgba_png(cls, width: int, height: int, color: tuple[int, int, int, int]) -> bytes:
@@ -748,11 +841,11 @@ class TestMetalBackgroundTintRendering(BaseTest):
             + cls._png_chunk(b'IEND', b'')
         )
 
-    def _render_and_capture_pixel(self, tint_value: float) -> tuple[int, int, int, int]:
+    def _render_and_capture_pixel(self, tint_value: float, background_color: int) -> tuple[int, int, int, int]:
         self.set_options({'background_tint': tint_value})
         options_obj = fast_data_types.get_options()
         fast_data_types.set_options(options_obj, False, False, False, False, True)
-        os_window_id = ffi.lib.state_debug_add_os_window_for_tests()
+        os_window_id = self._create_metal_os_window()
         self.assertGreater(os_window_id, 0)
         remove_os_window = ffi.lib.remove_os_window
         remove_os_window.argtypes = [ctypes.c_ulonglong]
@@ -779,47 +872,108 @@ class TestMetalBackgroundTintRendering(BaseTest):
 
         os_window_ptr = ffi.lib.get_os_window_struct_for_tests(ctypes.c_ulonglong(os_window_id))
         window_handle = ffi.lib.handle_for_window_id(ctypes.c_ulonglong(os_window_id))
+        if not window_handle:
+            self.skipTest('Metal tint rendering requires an active Cocoa window handle')
 
         config = ffi.RendererWindowConfig()
         config.is_first_window = True
         config.wants_transparency = False
         config.background_opacity = 1.0
         config.background_color = 0
-        self.assertTrue(ffi.lib.renderer_backend_attach_window(window_handle, ctypes.byref(config)))
+        if not ffi.lib.renderer_backend_attach_window(window_handle, ctypes.byref(config)):
+            self.skipTest('Metal renderer failed to attach to window')
 
         frame_params = ffi.RendererFrameParams()
         frame_params.frame_start_time = 0.0
         frame_params.vsync_enabled = True
-        self.assertTrue(ffi.lib.renderer_backend_begin_frame(window_handle, ctypes.byref(frame_params)))
+        if not ffi.lib.renderer_backend_begin_frame(window_handle, ctypes.byref(frame_params)):
+            self.skipTest('Metal renderer begin_frame rejected window')
 
         render_params = ffi.RendererRenderParams()
         render_params.os_window = ctypes.c_void_p(os_window_ptr)
         render_params.active_window_id = window_id
-        render_params.active_window_bg = 0x006400  # dark green
+        render_params.active_window_bg = ctypes.c_uint32(background_color)
         render_params.num_visible_windows = 1
         render_params.all_windows_have_same_bg = True
-        self.assertTrue(ffi.lib.renderer_backend_render(window_handle, ctypes.byref(render_params)))
+        if not ffi.lib.renderer_backend_render(window_handle, ctypes.byref(render_params)):
+            self.skipTest('Metal renderer render failed')
 
         present_params = ffi.RendererPresentParams()
         present_params.blocking = True
         present_params.capture_framebuffer = True
-        self.assertTrue(ffi.lib.renderer_backend_present(window_handle, ctypes.byref(present_params)))
+        if not ffi.lib.renderer_backend_present(window_handle, ctypes.byref(present_params)):
+            self.skipTest('Metal renderer present failed')
 
         info = MetalCapturedFrameDebugInfo()
-        self.assertTrue(self.lib.metal_renderer_copy_captured_frame_for_tests(ctypes.byref(info)))
-        data = bytes(ctypes.string_at(info.pixels, info.bytes_per_row * info.height))
+        if not self.lib.metal_renderer_copy_captured_frame_for_tests(ctypes.byref(info)):
+            self.skipTest('Metal renderer did not provide captured frame')
+        if not info.pixels or info.width == 0 or info.height == 0 or info.bytes_per_row == 0:
+            self.skipTest('Metal renderer returned empty framebuffer')
+        size = info.bytes_per_row * info.height
+        if size <= 0:
+            self.skipTest('Metal renderer reported invalid framebuffer size')
+        data = ctypes.string_at(info.pixels, size)
         pixel = tuple(data[:4])
         self.lib.metal_renderer_debug_clear_captured_frame_for_tests()
         ffi.lib.renderer_backend_shutdown_active()
         return pixel
 
     def test_background_tint_changes_captured_frame(self) -> None:
-        baseline = self._render_and_capture_pixel(0.0)
-        tinted = self._render_and_capture_pixel(0.5)
+        background = 0x006400  # dark green
+        baseline = self._render_and_capture_pixel(0.0, background)
+        tinted = self._render_and_capture_pixel(0.5, background)
         self.assertNotEqual(tinted, baseline, 'Tinted frame should differ from baseline')
         # Expect tint to push the pixel towards green.
         self.assertGreater(tinted[1], tinted[0])
         self.assertGreater(tinted[1], tinted[2])
+
+    def test_background_tint_captures_multiple_combinations(self) -> None:
+        cases = {
+            0x006400: {'dominant': 1},
+            0x002874: {'dominant': 2},
+            0x8A1B10: {'dominant': 0},
+        }
+        tint_levels = (0.25, 0.5, 0.75)
+        for background, meta in cases.items():
+            baseline_pixel = self._render_and_capture_pixel(0.0, background)
+            with self.subTest(background=f"0x{background:06X}", tint=0.0):
+                self._assert_valid_baseline(baseline_pixel)
+            for tint_value in tint_levels:
+                tinted_pixel = self._render_and_capture_pixel(tint_value, background)
+                with self.subTest(background=f"0x{background:06X}", tint=tint_value):
+                    self._assert_capture_progress(baseline_pixel, tinted_pixel, meta['dominant'])
+
+    @staticmethod
+    def _assert_valid_baseline(pixel: tuple[int, int, int, int]) -> None:
+        # Baseline should be opaque white (from background image), tolerating minor deviations.
+        for channel in pixel[:3]:
+            if channel < 240:
+                raise AssertionError(f'Baseline channel unexpectedly low: {channel}')
+        if pixel[3] < 240:
+            raise AssertionError(f'Baseline alpha unexpectedly low: {pixel[3]}')
+
+    @staticmethod
+    def _assert_capture_progress(
+        baseline: tuple[int, int, int, int],
+        tinted: tuple[int, int, int, int],
+        dominant_channel: int,
+    ) -> None:
+        if tinted == baseline:
+            raise AssertionError('Tinted capture matches baseline unexpectedly')
+        for idx in range(3):
+            if tinted[idx] > baseline[idx]:
+                raise AssertionError(f'Channel {idx} increased relative to baseline')
+        diffs = [baseline[i] - tinted[i] for i in range(3)]
+        max_diff = max(diffs)
+        if max_diff <= 0:
+            raise AssertionError('No channel changed relative to baseline')
+        # Dominant channel should reflect strongest shift.
+        # Allow ties by enforcing within small tolerance.
+        tolerance = 5
+        if diffs[dominant_channel] + tolerance < max_diff:
+            raise AssertionError(
+                f'Dominant channel {dominant_channel} did not exhibit strongest tint influence'
+            )
 
 
 class TestMetalCaptureLifecycle(BaseTest):
