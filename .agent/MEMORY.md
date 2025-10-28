@@ -73,3 +73,14 @@ All Metal tests must run under `.venv/bin/python3.14`.
 3. Expand capture helpers to assert `frameHasContent` transitions after every pass.
 4. Investigate headless Metal CI runners or fallback simulation to unblock automated test execution.
 
+---
+
+### 9. Metal background tint GUI tests (2025-10-28 snapshot)
+* **Current blockers:** running `KITTY_ENABLE_METAL_GUI_TESTS=1 ./.venv/bin/python3.13 ./test.py --module test_metal_helpers` still crashes with `EXC_BAD_ACCESS`/segfault during teardown; direct invocation of `TestMetalBackgroundTintRendering.test_background_tint_captures_multiple_combinations()` inside a single test instance now succeeds.
+* **Root-cause eliminated:** initial crash came from calling `fast_data_types.create_os_window` before GLFW initialization. The test fixture must call `fast_data_types.glfw_init(glfw_path("cocoa"), edge_spacing, ...)` and seed fonts via `set_font_family()` before creating Metal windows. Restoring `supports_window_occlusion()` after the tests prevents leaking global state.
+* **Remaining hypothesis:** the full module segfault happens when Python unloads, likely due to repeated GLFW/Metal shutdown paths (suspect `glfw_terminate` and `free_font_data` interactions). We temporarily avoid `glfw_terminate` in the fixture; need structured shutdown sequencing or a reference-counted init/teardown in fast_data_types.
+* **Regression expectations:** capture diffs now assert that the configured dominant channel remains strongest after tinting (rather than clamping to absolute maximum). Baseline/tint comparison data for 0x006400, 0x002874, 0x8A1B10 collected; see terminal capture from 2025-10-28 if further tuning needed.
+* **Next actions:**
+  - Inspect macOS crash reports (`~/Library/Logs/DiagnosticReports/`) to confirm teardown frame (look for font/GLFW cleanup symbol).
+  - Audit Metal test fixture cleanup to ensure `renderer_backend_shutdown_active()` runs, and track outstanding windows via `state_debug_add_os_window_for_tests` vs `remove_os_window` pairs.
+  - Consider gating Metal GUI tests behind single-process harness to avoid repeated init/terminate until cleanup ordering is fixed.
