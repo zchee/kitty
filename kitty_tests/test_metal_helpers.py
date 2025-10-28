@@ -841,7 +841,13 @@ class TestMetalBackgroundTintRendering(BaseTest):
             + cls._png_chunk(b'IEND', b'')
         )
 
-    def _render_and_capture_pixel(self, tint_value: float, background_color: int) -> tuple[int, int, int, int]:
+    def _render_and_capture_pixel(
+        self,
+        tint_value: float,
+        background_color: int,
+        *,
+        background_image: bool = True,
+    ) -> tuple[int, int, int, int]:
         self.set_options({'background_tint': tint_value})
         options_obj = fast_data_types.get_options()
         fast_data_types.set_options(options_obj, False, False, False, False, True)
@@ -858,17 +864,18 @@ class TestMetalBackgroundTintRendering(BaseTest):
         tab_id = fast_data_types.add_tab(os_window_id)
         window_id = fast_data_types.add_window(os_window_id, tab_id, 'tint-test')
 
-        png = self._solid_rgba_png(2, 2, (255, 255, 255, 255))
-        fast_data_types.set_background_image(
-            "memory.png",
-            (os_window_id,),
-            True,
-            "tiled",
-            png,
-            False,
-            None,
-            None,
-        )
+        if background_image:
+            png = self._solid_rgba_png(2, 2, (255, 255, 255, 255))
+            fast_data_types.set_background_image(
+                "memory.png",
+                (os_window_id,),
+                True,
+                "tiled",
+                png,
+                False,
+                None,
+                None,
+            )
 
         os_window_ptr = ffi.lib.get_os_window_struct_for_tests(ctypes.c_ulonglong(os_window_id))
         window_handle = ffi.lib.handle_for_window_id(ctypes.c_ulonglong(os_window_id))
@@ -879,7 +886,7 @@ class TestMetalBackgroundTintRendering(BaseTest):
         config.is_first_window = True
         config.wants_transparency = False
         config.background_opacity = 1.0
-        config.background_color = 0
+        config.background_color = background_color if not background_image else 0
         if not ffi.lib.renderer_backend_attach_window(window_handle, ctypes.byref(config)):
             self.skipTest('Metal renderer failed to attach to window')
 
@@ -974,6 +981,18 @@ class TestMetalBackgroundTintRendering(BaseTest):
             raise AssertionError(
                 f'Dominant channel {dominant_channel} did not exhibit strongest tint influence'
             )
+
+    def test_initial_blank_frame_uses_active_window_background(self) -> None:
+        background = 0x224466
+        pixel = self._render_and_capture_pixel(0.0, background, background_image=False)
+        expected = (
+            (background >> 16) & 0xFF,
+            (background >> 8) & 0xFF,
+            background & 0xFF,
+            255,
+        )
+        for actual, exp in zip(pixel, expected):
+            self.assertLessEqual(abs(actual - exp), 1, f'channel mismatch: got {pixel} expected {expected}')
 
 
 class TestMetalCaptureLifecycle(BaseTest):

@@ -406,6 +406,51 @@ static MetalGlobalState g_metal = {
     .display_sync_enabled = true,
 };
 
+static bool
+metal_zero_texture(id<MTLTexture> texture, NSUInteger width, NSUInteger height, NSUInteger layers) {
+    if (!texture || width == 0 || height == 0 || layers == 0) {
+        return true;
+    }
+    const NSUInteger bytes_per_row = width * sizeof(pixel);
+    const NSUInteger bytes_per_image = bytes_per_row * height;
+    id<MTLBuffer> zero_buffer = [g_metal.device newBufferWithLength:bytes_per_image options:MTLResourceStorageModeShared];
+    if (!zero_buffer) {
+        metal_log("sprite_texture_clear_failed", "length=%lu", (unsigned long)bytes_per_image);
+        return false;
+    }
+    memset([zero_buffer contents], 0, bytes_per_image);
+    const void *zeros = [zero_buffer contents];
+    for (NSUInteger slice = 0; slice < layers; slice++) {
+        [texture replaceRegion:MTLRegionMake3D(0, 0, 0, width, height, 1)
+                   mipmapLevel:0
+                         slice:slice
+                     withBytes:zeros
+                   bytesPerRow:bytes_per_row
+                 bytesPerImage:bytes_per_image];
+    }
+    return true;
+}
+
+static inline void
+metal_zero_buffer(id<MTLBuffer> buffer, size_t length) {
+    if (!buffer || length == 0) {
+        return;
+    }
+    void *dst = [buffer contents];
+    if (!dst) {
+        return;
+    }
+    memset(dst, 0, length);
+    if ([buffer respondsToSelector:@selector(storageMode)] && [buffer storageMode] == MTLStorageModeManaged) {
+        [buffer didModifyRange:NSMakeRange(0, (NSUInteger)length)];
+    }
+}
+
+enum {
+    MetalSpriteIndexMask = 0x7fffffffu,
+    MetalMissingGlyphIndex = 1u,
+};
+
 static inline bool
 metal_debug_events_enabled(void) {
     return g_metal.debug_events;
@@ -619,6 +664,7 @@ metal_shared_buffer_map(RendererSharedBufferType type, size_t size, void *user) 
                 }
                 state.cellBuffer = buffer;
                 state.cellBufferCapacity = required;
+                metal_zero_buffer(state.cellBuffer, required);
             }
             state.cellBufferLength = size;
             return state.cellBuffer.contents;
@@ -632,6 +678,7 @@ metal_shared_buffer_map(RendererSharedBufferType type, size_t size, void *user) 
                 }
                 state.selectionBuffer = buffer;
                 state.selectionBufferCapacity = required;
+                metal_zero_buffer(state.selectionBuffer, required);
             }
             state.selectionBufferLength = size;
             return state.selectionBuffer.contents;
@@ -759,6 +806,10 @@ ensure_sprite_texture_capacity(MetalSpriteAtlas *atlas, NSUInteger width, NSUInt
         PyErr_SetString(PyExc_RuntimeError, "Metal failed to allocate sprite texture");
         return false;
     }
+    if (!metal_zero_texture(newTexture, width, height, layers)) {
+        PyErr_SetString(PyExc_RuntimeError, "Metal failed to clear sprite texture");
+        return false;
+    }
     if (atlas->spriteTexture) {
         NSUInteger copyWidth = MIN(width, atlas->spriteWidth);
         NSUInteger copyHeight = MIN(height, atlas->spriteHeight);
@@ -807,6 +858,7 @@ ensure_decorations_buffer_capacity(MetalSpriteAtlas *atlas, NSUInteger neededCap
         PyErr_SetString(PyExc_RuntimeError, "Metal failed to allocate decorations buffer");
         return false;
     }
+    metal_zero_buffer(newBuffer, newCapacity * sizeof(uint32_t));
     if (atlas->decorationsBuffer) {
         memcpy([newBuffer contents], [atlas->decorationsBuffer contents], atlas->decorationsCapacity * sizeof(uint32_t));
     }
@@ -1460,6 +1512,7 @@ metal_ensure_uniform_buffer(MetalWindowState *state) {
         }
         state.uniformBuffer = buffer;
         state.uniformBufferCapacity = required;
+        metal_zero_buffer(state.uniformBuffer, required);
     }
     state.uniformBufferLength = required;
     return true;
@@ -1952,6 +2005,35 @@ metal_render_pass_for_render_data(
     if (!instance_count) {
         return true;
     }
+    bool should_clear_missing_cells = false;
+    if (state.cellBuffer) {
+        const GPUCell *cells = (const GPUCell *)state.cellBuffer.contents;
+        if (cells) {
+            size_t sample_count = instance_count < (size_t)64 ? instance_count : (size_t)64;
+            bool all_missing = sample_count > 0;
+            for (size_t i = 0; i < sample_count; i++) {
+                if ((cells[i].sprite_idx & MetalSpriteIndexMask) != MetalMissingGlyphIndex) {
+                    all_missing = false;
+                    break;
+                }
+            }
+            if (all_missing) {
+                should_clear_missing_cells = true;
+            }
+        } else if (!state.frameHasContent) {
+            should_clear_missing_cells = true;
+        }
+    }
+    if (should_clear_missing_cells) {
+        if (state.frameHasContent) {
+            state.frameHasContent = NO;
+        }
+        return encode_clear_pass(window, state, state.clearColor);
+    }
+    if (!frame_result.cell_data_changed && !state.frameHasContent) {
+        return encode_clear_pass(window, state, state.clearColor);
+    }
+
     const WindowGeometry *geometry = &render_data->geometry;
     const unsigned int screen_width_px = geometry->right - geometry->left;
     const unsigned int screen_height_px = geometry->bottom - geometry->top;
