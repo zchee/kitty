@@ -2878,120 +2878,119 @@ metal_encode_background(
     }
     BackgroundImage *bgimage = os_window->bgimage;
     MetalBackgroundTexture *background = metal_background_texture(bgimage);
-    if (!background) {
-        return true;
-    }
-    if (!metal_background_texture_ensure_ready(background)) {
-        if (PyErr_Occurred()) {
-            return false;
-        }
-        return true;
-    }
-    if (!state.commandBuffer || !state.drawable) {
-        if (!ensure_command_primitives(window, state)) {
-            return false;
-        }
-    }
-    if (!metal_ensure_resources()) {
-        return false;
-    }
-    const unsigned int fb_width = (unsigned int)state.drawable.texture.width;
-    const unsigned int fb_height = (unsigned int)state.drawable.texture.height;
-    MetalBackgroundGeometry geometry = {0};
-    if (!metal_compute_background_geometry(
-            fb_width,
-            fb_height,
-            background->width,
-            background->height,
-            background->layout,
-            &geometry)) {
-        return true;
-    }
-    const float left = geometry.positions[0];
-    const float right = geometry.positions[2];
-    const float top = geometry.positions[1];
-    const float bottom = geometry.positions[3];
-    if (left == right || top == bottom) {
-        return true;
-    }
-    @autoreleasepool {
-        MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
-        if (!pass) {
-            PyErr_SetString(PyExc_RuntimeError, "Failed to allocate Metal render pass descriptor for background image");
-            return false;
-        }
-        pass.colorAttachments[0].texture = state.drawable.texture;
-        pass.colorAttachments[0].loadAction = state.frameHasContent ? MTLLoadActionLoad : MTLLoadActionClear;
-        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-        pass.colorAttachments[0].clearColor = state.clearColor;
-        id<MTLRenderCommandEncoder> encoder = [state.commandBuffer renderCommandEncoderWithDescriptor:pass];
-        if (!encoder) {
-            PyErr_SetString(PyExc_RuntimeError, "Failed to create Metal command encoder for background image");
-            return false;
-        }
-        if (g_metal.debug_labels) {
-            encoder.label = @"kitty-background-image";
-        }
-        const double pixel_left = ((double)left + 1.0) * 0.5 * (double)fb_width;
-        const double pixel_right = ((double)right + 1.0) * 0.5 * (double)fb_width;
-        const double pixel_bottom = ((double)bottom + 1.0) * 0.5 * (double)fb_height;
-        const double pixel_top = ((double)top + 1.0) * 0.5 * (double)fb_height;
-        const double origin_x = MIN(pixel_left, pixel_right);
-        const double origin_y = MIN(pixel_bottom, pixel_top);
-        const double viewport_width = fabs(pixel_right - pixel_left);
-        const double viewport_height = fabs(pixel_top - pixel_bottom);
-        if (viewport_width <= 0.0 || viewport_height <= 0.0) {
-            encode_draw_end(encoder);
+    if (background) {
+        if (!metal_background_texture_ensure_ready(background)) {
+            if (PyErr_Occurred()) {
+                return false;
+            }
             return true;
         }
-        MTLViewport viewport = {
-            .originX = origin_x,
-            .originY = origin_y,
-            .width = viewport_width,
-            .height = viewport_height,
-            .znear = 0.0,
-            .zfar = 1.0,
-        };
-        [encoder setViewport:viewport];
-        [encoder setRenderPipelineState:g_metal.overlay_texture_pipeline];
-        const bool is_tiled = geometry.tiled != 0.f;
-        const float scale_x = (is_tiled && geometry.sizes[2] > 0.f)
-            ? geometry.sizes[0] / geometry.sizes[2]
-            : 1.f;
-        const float scale_y = (is_tiled && geometry.sizes[3] > 0.f)
-            ? geometry.sizes[1] / geometry.sizes[3]
-            : 1.f;
-        MetalOverlayTextureUniforms uniforms = {
-            .tex_scale = { scale_x, scale_y },
-        };
-        [encoder setVertexBytes:&uniforms length:sizeof uniforms atIndex:0];
-        [encoder setFragmentTexture:background->texture atIndex:0];
-        MTLSamplerDescriptor *sampler_desc = [[MTLSamplerDescriptor alloc] init];
-        sampler_desc.minFilter = background->linear_filter ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
-        sampler_desc.magFilter = background->linear_filter ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
-        sampler_desc.mipFilter = MTLSamplerMipFilterNotMipmapped;
-        switch (background->layout) {
-            case MIRRORED:
-                sampler_desc.sAddressMode = MTLSamplerAddressModeMirrorRepeat;
-                sampler_desc.tAddressMode = MTLSamplerAddressModeMirrorRepeat;
-                break;
-            case TILING:
-                sampler_desc.sAddressMode = MTLSamplerAddressModeRepeat;
-                sampler_desc.tAddressMode = MTLSamplerAddressModeRepeat;
-                break;
-            default:
-                sampler_desc.sAddressMode = MTLSamplerAddressModeClampToEdge;
-                sampler_desc.tAddressMode = MTLSamplerAddressModeClampToEdge;
-                break;
+        if (!state.commandBuffer || !state.drawable) {
+            if (!ensure_command_primitives(window, state)) {
+                return false;
+            }
         }
-        id<MTLSamplerState> sampler = [g_metal.device newSamplerStateWithDescriptor:sampler_desc];
-        if (sampler) {
-            [encoder setFragmentSamplerState:sampler atIndex:0];
+        if (!metal_ensure_resources()) {
+            return false;
         }
-        [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
-        encode_draw_end(encoder);
+        const unsigned int fb_width = (unsigned int)state.drawable.texture.width;
+        const unsigned int fb_height = (unsigned int)state.drawable.texture.height;
+        MetalBackgroundGeometry geometry = {0};
+        if (!metal_compute_background_geometry(
+                fb_width,
+                fb_height,
+                background->width,
+                background->height,
+                background->layout,
+                &geometry)) {
+            return true;
+        }
+        const float left = geometry.positions[0];
+        const float right = geometry.positions[2];
+        const float top = geometry.positions[1];
+        const float bottom = geometry.positions[3];
+        if (left == right || top == bottom) {
+            return true;
+        }
+        @autoreleasepool {
+            MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+            if (!pass) {
+                PyErr_SetString(PyExc_RuntimeError, "Failed to allocate Metal render pass descriptor for background image");
+                return false;
+            }
+            pass.colorAttachments[0].texture = state.drawable.texture;
+            pass.colorAttachments[0].loadAction = state.frameHasContent ? MTLLoadActionLoad : MTLLoadActionClear;
+            pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+            pass.colorAttachments[0].clearColor = state.clearColor;
+            id<MTLRenderCommandEncoder> encoder = [state.commandBuffer renderCommandEncoderWithDescriptor:pass];
+            if (!encoder) {
+                PyErr_SetString(PyExc_RuntimeError, "Failed to create Metal command encoder for background image");
+                return false;
+            }
+            if (g_metal.debug_labels) {
+                encoder.label = @"kitty-background-image";
+            }
+            const double pixel_left = ((double)left + 1.0) * 0.5 * (double)fb_width;
+            const double pixel_right = ((double)right + 1.0) * 0.5 * (double)fb_width;
+            const double pixel_bottom = ((double)bottom + 1.0) * 0.5 * (double)fb_height;
+            const double pixel_top = ((double)top + 1.0) * 0.5 * (double)fb_height;
+            const double origin_x = MIN(pixel_left, pixel_right);
+            const double origin_y = MIN(pixel_bottom, pixel_top);
+            const double viewport_width = fabs(pixel_right - pixel_left);
+            const double viewport_height = fabs(pixel_top - pixel_bottom);
+            if (viewport_width <= 0.0 || viewport_height <= 0.0) {
+                encode_draw_end(encoder);
+                return true;
+            }
+            MTLViewport viewport = {
+                .originX = origin_x,
+                .originY = origin_y,
+                .width = viewport_width,
+                .height = viewport_height,
+                .znear = 0.0,
+                .zfar = 1.0,
+            };
+            [encoder setViewport:viewport];
+            [encoder setRenderPipelineState:g_metal.overlay_texture_pipeline];
+            const bool is_tiled = geometry.tiled != 0.f;
+            const float scale_x = (is_tiled && geometry.sizes[2] > 0.f)
+                ? geometry.sizes[0] / geometry.sizes[2]
+                : 1.f;
+            const float scale_y = (is_tiled && geometry.sizes[3] > 0.f)
+                ? geometry.sizes[1] / geometry.sizes[3]
+                : 1.f;
+            MetalOverlayTextureUniforms uniforms = {
+                .tex_scale = { scale_x, scale_y },
+            };
+            [encoder setVertexBytes:&uniforms length:sizeof uniforms atIndex:0];
+            [encoder setFragmentTexture:background->texture atIndex:0];
+            MTLSamplerDescriptor *sampler_desc = [[MTLSamplerDescriptor alloc] init];
+            sampler_desc.minFilter = background->linear_filter ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+            sampler_desc.magFilter = background->linear_filter ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+            sampler_desc.mipFilter = MTLSamplerMipFilterNotMipmapped;
+            switch (background->layout) {
+                case MIRRORED:
+                    sampler_desc.sAddressMode = MTLSamplerAddressModeMirrorRepeat;
+                    sampler_desc.tAddressMode = MTLSamplerAddressModeMirrorRepeat;
+                    break;
+                case TILING:
+                    sampler_desc.sAddressMode = MTLSamplerAddressModeRepeat;
+                    sampler_desc.tAddressMode = MTLSamplerAddressModeRepeat;
+                    break;
+                default:
+                    sampler_desc.sAddressMode = MTLSamplerAddressModeClampToEdge;
+                    sampler_desc.tAddressMode = MTLSamplerAddressModeClampToEdge;
+                    break;
+            }
+            id<MTLSamplerState> sampler = [g_metal.device newSamplerStateWithDescriptor:sampler_desc];
+            if (sampler) {
+                [encoder setFragmentSamplerState:sampler atIndex:0];
+            }
+            [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+            encode_draw_end(encoder);
+        }
+        state.frameHasContent = YES;
     }
-    state.frameHasContent = YES;
     if (OPT(background_tint) > 0.f) {
         if (!metal_encode_background_tint(window, state, fallback_bg)) {
             return false;

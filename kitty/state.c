@@ -1367,7 +1367,7 @@ pyset_background_image(PyObject *self UNUSED, PyObject *args, PyObject *kw) {
     static char *kwds[] = {"path", "os_window_ids", "configured", "layout_name", "png_data", "linear", "tint", "tint_gaps", NULL};
     if (!PyArg_ParseTupleAndKeywords(args, kw, "zO!|pOy#OOO", kwds, &path, &PyTuple_Type, &os_window_ids, &configured, &layout_name, &png_data, &png_data_size, &pylinear, &pytint, &pytint_gaps)) return NULL;
     size_t size;
-    BackgroundImageLayout layout = PyUnicode_Check(layout_name) ? bglayout(layout_name) : OPT(background_image_layout);
+    BackgroundImageLayout layout = (layout_name && PyUnicode_Check(layout_name)) ? bglayout(layout_name) : OPT(background_image_layout);
     BackgroundImage *bgimage = NULL;
     if (path) {
         bgimage = calloc(1, sizeof(BackgroundImage));
