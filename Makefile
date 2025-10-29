@@ -19,13 +19,15 @@ IDENTITY ?= -
 # PYTHON3 ?= PYTHON_GIL=0 PYTHON_JIT=1 PYTHONUNBUFFERED=1 PYTHONOPTIMIZE=2 python3.13t -Xgil=0
 PYTHON3 ?= PYTHONOPTIMIZE=2 python3.13
 
-default: devel
+default: all
 
-devel: CC=$(shell brew --prefix)/opt/ccache-head/libexec/clang
-devel: VVAL=--verbose
-devel: rebase
-devel: clean
+all: CC=$(shell brew --prefix)/opt/ccache-head/libexec/clang
+all: VVAL=--verbose
+all: rebase
+all: clean
 	KITTY_USE_WHOLE_ARCHIVE=1 ${PYTHON3} setup.py kitty.app -v --full --update-check-interval=0 --shell-integration=enabled $(VVAL)
+	ln -sf build/compile_commands.json compile_commands.json
+	ln -sf build/link_commands.json link_commands.json
 	# ${MAKE} docs SPHINXBUILD=/usr/local/share/pipx/sphinx-build
 	# rm -rf /usr/local/share/man/man1/kitty.1 /usr/local/share/man/man5/kitty.conf.5 /usr/local/share/doc/kitty
 	# install -m 0644 docs/_build/man/kitty.1 /usr/local/share/man/man1
@@ -47,17 +49,19 @@ codesign:
 	codesign -dvvvvv --options=runtime --entitlements ./entitlements.plist -s "${IDENTITY}" ${APP}
 
 devel/signed: devel
-	codesign -vvvvv --deep -f -s "$(shell security find-identity -v | grep 'Developer ID Application' | awk -F'"' '{print $$2}')" --entitlements ./entitlements.plist $(APPLICATIONS_DIR)/${APP}
+	codesign -vvvvv --deep -f -s "${IDENTITY}" --entitlements ./entitlements.plist $(APPLICATIONS_DIR)/${APP}
 
 devel/signed-noentitlements: devel
-	codesign -vvvvv --deep -f -s "$(shell security find-identity -v | grep 'Developer ID Application' | awk -F'"' '{print $$2}')" $(APPLICATIONS_DIR)/${APP}
+	codesign -vvvvv --deep -f -s "${IDENTITY}" $(APPLICATIONS_DIR)/${APP}
 
 rebase:
 	git fetch --all
 	git rebase --gpg-sign --autostash origin/master
 
-all:
+_all:
 	${PYTHON3} setup.py $(VVAL)
+	ln -sf build/compile_commands.json compile_commands.json
+	ln -sf build/link_commands.json link_commands.json
 
 test:
 	${PYTHON3} setup.py $(VVAL) test
