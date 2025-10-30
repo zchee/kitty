@@ -25,7 +25,7 @@ devel: CC=$(shell brew --prefix)/opt/ccache-head/libexec/clang
 devel: VVAL=--verbose
 devel: rebase
 devel: clean
-	${PYTHON3} setup.py kitty.app -v --full --update-check-interval=0 --shell-integration=enabled $(VVAL)
+	KITTY_USE_WHOLE_ARCHIVE=1 ${PYTHON3} setup.py kitty.app -v --full --update-check-interval=0 --shell-integration=enabled $(VVAL)
 	# ${MAKE} docs SPHINXBUILD=/usr/local/share/pipx/sphinx-build
 	# rm -rf /usr/local/share/man/man1/kitty.1 /usr/local/share/man/man5/kitty.conf.5 /usr/local/share/doc/kitty
 	# install -m 0644 docs/_build/man/kitty.1 /usr/local/share/man/man1
@@ -39,8 +39,8 @@ devel: clean
 	sudo codesign -dvvvvv --options=runtime --entitlements ./entitlements.plist -fs "${IDENTITY}" ${APP}/Contents/MacOS/kitty || true
 	sudo codesign -dvvvvv --options=runtime --entitlements ./entitlements.plist -fs "${IDENTITY}" ${APP}/Contents/MacOS/kitten
 	sudo codesign -dvvvvv --deep --options=runtime --entitlements ./entitlements.plist -fs "${IDENTITY}" ${APP}
-	rm -rf ${APP_TARGET}
-	mv ${APP} $(APPLICATIONS_DIR)
+	# rm -rf ${APP_TARGET}
+	# mv ${APP} $(APPLICATIONS_DIR)
 
 codesign:
 	codesign -dvvvvv --options=runtime --entitlements ./entitlements.plist -s "${IDENTITY}" ${APP}/Contents/MacOS/kitten
