@@ -81,7 +81,7 @@ is_arm = platform.processor() == 'arm' or platform.machine() in ('arm64', 'aarch
 c_std = '' if is_openbsd else '-std=c11'
 Env = glfw.Env
 env = Env()
-PKGCONFIG = os.environ.get('PKGCONFIG_EXE', 'pkg-config')
+PKGCONFIG = os.environ.get('PKG_CONFIG', os.environ.get('PKGCONFIG_EXE', 'pkg-config'))
 link_targets: List[str] = []
 macos_universal_arches = ('arm64', 'x86_64') if is_arm else ('x86_64', 'arm64')
 
@@ -302,7 +302,7 @@ def libcrypto_flags() -> Tuple[List[str], List[str]]:
 
 @lru_cache(maxsize=2)
 def xxhash_flags() -> tuple[list[str], list[str]]:
-    return pkg_config('libxxhash', '--cflags-only-I'), pkg_config('libxxhash', '--libs')
+    return pkg_config('libxxhash', '--cflags-only-I'), ['/opt/homebrew/opt/xxhash/lib/libxxhash.a'] # pkg_config('libxxhash', '--libs')
 
 
 
@@ -661,7 +661,7 @@ def kitty_env(args: Options) -> Env:
 
     xxhash = xxhash_flags()
     at_least_version('harfbuzz', 1, 5)
-    cflags.extend(pkg_config('libpng', '--cflags-only-I'))
+    cflags.extend(pkg_config('libpng', '--cflags-only-I', extra_pc_dir='/opt/homebrew/opt/libpng/lib/pkgconfig'))
     cflags.extend(pkg_config('lcms2', '--cflags-only-I'))
     cflags.extend(xxhash[0])
     # simde doesnt come with pkg-config files but some Linux distros add
@@ -696,7 +696,7 @@ def kitty_env(args: Options) -> Env:
     gl_libs = ['-framework', 'OpenGL'] if is_macos else pkg_config('gl', '--libs')
     libpng = [f'{homebrew_prefix()}/opt/libpng/lib/libpng16.a']
     lcms2 = [f'{homebrew_prefix()}/opt/lcms2/lib/liblcms2.a']
-    ans.ldpaths += pylib + platform_libs + gl_libs + libpng + lcms2 + libcrypto_ldflags + xxhash[1]
+    ans.ldpaths += pylib + platform_libs + gl_libs + libpng + lcms2 + libcrypto_ldflags # + xxhash[1]
     if is_macos:
         ans.ldpaths.extend('-framework Cocoa'.split())
     elif not is_openbsd:
