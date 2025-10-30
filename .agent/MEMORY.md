@@ -36,15 +36,15 @@ Authoritative playbook for diagnosing and fixing Metal rendering issues in kitty
 
 ---
 
-### 5. Regression Tests (Python 3.14)
-All Metal tests must run under `.venv/bin/python3.14`.
+### 5. Regression Tests (Python 3.13)
+All Metal tests must run under `.venv/bin/python3.13`.
 1. Full module:
    ```bash
-   KITTY_ENABLE_METAL_GUI_TESTS=1 ./.venv/bin/python3.14 ./test.py --module test_metal_helpers --verbose --failfast
+   KITTY_ENABLE_METAL_GUI_TESTS=1 ./.venv/bin/python3.13 ./test.py --module test_metal_helpers --verbose --failfast
    ```
 2. Targeted regression:
    ```bash
-   KITTY_ENABLE_METAL_GUI_TESTS=1 ./.venv/bin/python3.14 ./test.py \
+   KITTY_ENABLE_METAL_GUI_TESTS=1 ./.venv/bin/python3.13 ./test.py \
      test_metal_helpers.TestMetalTintRendering.test_background_tint_without_image_uses_clear_load_action --verbose
    ```
 3. If the environment lacks a Metal-capable display (common on CI), document the failure and request rerun on macOS hardware. Never mark the test as skipped locally without analysing the root cause.
@@ -76,10 +76,10 @@ All Metal tests must run under `.venv/bin/python3.14`.
 ---
 
 ### 9. Metal background tint GUI tests (2025-10-29 snapshot)
-* **Current status:** `KITTY_ENABLE_METAL_GUI_TESTS=1 python3.13 ./test.py --module test_metal_helpers` now completes without crashes; tint coverage assertions pass for all backgrounds (0x006400, 0x002874, 0x8A1B10).
+* **Current status:** `KITTY_ENABLE_METAL_GUI_TESTS=1 .venv/bin/python3.13 ./test.py --module test_metal_helpers` now completes without crashes; tint coverage assertions pass for all backgrounds (0x006400, 0x002874, 0x8A1B10).
 * **Root cause resolved:** `pyset_background_image` dereferenced a NULL layout string when no background image was configured, and the Metal path skipped tinting entirely when no texture existed. Guarding the layout check and allowing `metal_encode_background` to execute the tint-only path removed the teardown segfault.
 * **Regression commands run (Oct 29 2025):**
-  - `KITTY_ENABLE_METAL_GUI_TESTS=1 python3.13 ./test.py --module test_metal_helpers`
-  - `KITTY_ENABLE_METAL_GUI_TESTS=1 python3.13 ./test.py --module test_metal_helpers background_tint_without_image_uses_clear_load_action`
-* **Implementation roadmap:** mirror the fixes into any Python 3.14 build and schedule a full `.venv/bin/python3.14 ./test.py --module test_metal_helpers --verbose --failfast` run when Metal hardware is available; consider adding a regression to ensure layout-less calls remain safe.
+  - `KITTY_ENABLE_METAL_GUI_TESTS=1 .venv/bin/python3.13 ./test.py --module test_metal_helpers`
+  - `KITTY_ENABLE_METAL_GUI_TESTS=1 .venv/bin/python3.13 ./test.py --module test_metal_helpers background_tint_without_image_uses_clear_load_action`
+* **Implementation roadmap:** mirror the fixes into any Python 3.13 build and schedule a full `.venv/bin/python3.13 ./test.py --module test_metal_helpers --verbose --failfast` run when Metal hardware is available; consider adding a regression to ensure layout-less calls remain safe.
 * **Known risks:** broader regression suite has not yet been exercised post-fix (only Metal helper module); keep an eye on background image hot reload paths that may still assume layout strings are present.

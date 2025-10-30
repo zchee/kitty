@@ -1366,7 +1366,7 @@ def compile_metal_shaders(args: Options) -> None:
     failures: List[Tuple[str, str, Union[int, None]]] = []
     stale_paths: Dict[str, str] = {}
     expected_packages: List[Tuple[str, str, str]] = []
-    min_macos_version = '13.0'
+    min_macos_version = '26.1'
     for src in metal_sources:
         name = os.path.splitext(os.path.basename(src))[0]
         air = os.path.join(metal_build_dir, f'{name}.air')
@@ -1623,7 +1623,7 @@ def build_launcher(args: Options, launcher_dir: str = '.', bundle_type: str = 's
     cflags.append('-O3')
     cflags.append('-ffast-math')
     cflags.append('-flto')
-    cflags.append('-mmacosx-version-min=15.3')
+    cflags.append('-mmacosx-version-min=26.1')
     cflags.append('-pipe')
     if not is_arm:
         cflags += ['-mavx', '-mavx2', '-mavx512f', '-mavx512cd', '-mavx512dq', '-mavx512bw', '-mavx512vl', '-mavx512vnni']

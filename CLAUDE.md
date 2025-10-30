@@ -1,6 +1,25 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+## Your running environment
+
+- macOS Tahoe 26.1
+- `system_profiler SPHardwareDataType` output:
+
+        Hardware:
+
+            Hardware Overview:
+
+              Model Name: MacBook Pro
+              Model Identifier: Mac15,9
+              Model Number: Z1CM000TQJ/A
+              Chip: Apple M3 Max
+              Total Number of Cores: 16 (12 performance and 4 efficiency)
+              Memory: 128 GB
+              System Firmware Version: 13822.41.1
+              OS Loader Version: 13822.41.1
+              .
+              .
+              Activation Lock Status: Enabled
 
 ## Project Overview
 
