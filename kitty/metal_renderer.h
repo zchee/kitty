@@ -125,6 +125,7 @@ EXPORTED void metal_renderer_debug_clear_captured_frame_for_tests(void);
 
 typedef struct MetalWindowDebugState {
     bool frame_has_content;
+    bool has_encoded_pass;
     bool capture_valid;
     uint32_t capture_width;
     uint32_t capture_height;
@@ -133,6 +134,7 @@ typedef struct MetalWindowDebugState {
     uint32_t drawable_width;
     uint32_t drawable_height;
     bool layer_attached;
+    uint32_t last_tint_load_action;
 } MetalWindowDebugState;
 
 typedef struct MetalRuntimeDebugFlags {

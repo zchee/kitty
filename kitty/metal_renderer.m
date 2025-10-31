@@ -574,6 +574,8 @@ graphics_sampler_for(bool linear_filter, RepeatStrategy repeat) {
 @property (nonatomic, strong) id<CAMetalDrawable> drawable;
 @property (nonatomic, strong) id<MTLCommandBuffer> commandBuffer;
 @property (nonatomic) BOOL frameHasContent;
+@property (nonatomic) BOOL hasEncodedPass;
+@property (nonatomic) MTLLoadAction lastTintLoadAction;
 @property (nonatomic) MTLClearColor clearColor;
 @property (nonatomic) float backgroundOpacity;
 @property (nonatomic) color_type fallbackBackground;
@@ -636,6 +638,9 @@ static bool metal_encode_visual_bell(GLFWwindow *window, MetalWindowState *state
 static bool metal_encode_scrollbar(GLFWwindow *window, MetalWindowState *state, OSWindow *os_window, Window *render_window, Screen *screen, const WindowGeometry *geometry, unsigned int screen_width_px, unsigned int screen_height_px);
 static bool metal_encode_hyperlink_target(GLFWwindow *window, MetalWindowState *state, OSWindow *os_window, Window *render_window, Screen *screen, const WindowGeometry *geometry, unsigned int screen_width_px, unsigned int screen_height_px);
 static bool metal_encode_window_number(GLFWwindow *window, MetalWindowState *state, OSWindow *os_window, Window *render_window, Screen *screen, const WindowGeometry *geometry, unsigned int screen_width_px, unsigned int screen_height_px);
+static inline void mark_frame_has_content(MetalWindowState *state);
+static inline void clear_frame_content(MetalWindowState *state);
+static inline void initialize_frame_state(MetalWindowState *state);
 static bool encode_clear_pass(GLFWwindow *window, MetalWindowState *state, MTLClearColor clear_color);
 static MetalBackgroundTexture* metal_background_texture(BackgroundImage *bgimage);
 static bool metal_background_texture_ensure_ready(MetalBackgroundTexture *background);
@@ -1008,7 +1013,8 @@ metal_reset_capture_state(MetalWindowState *state, bool release_buffer) {
     if (release_buffer && state.captureBuffer) {
         state.captureBuffer = nil;
     }
-    state.frameHasContent = NO;
+    clear_frame_content(state);
+    state.lastTintLoadAction = MTLLoadActionDontCare;
     state.captureValid = NO;
     state.captureWidth = 0;
     state.captureHeight = 0;
@@ -1677,7 +1683,7 @@ metal_encode_borders(
     [encoder setFragmentBytes:&uniforms length:sizeof(MetalBorderUniforms) atIndex:0];
     [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:(NSUInteger)state.borderCount];
     encode_draw_end(encoder);
-    state.frameHasContent = YES;
+    mark_frame_has_content(state);
     return true;
 }
 
@@ -1799,7 +1805,7 @@ metal_encode_graphics_bucket(
     }
 
     encode_draw_end(encoder);
-    state.frameHasContent = YES;
+    mark_frame_has_content(state);
     return true;
 }
 
@@ -1878,7 +1884,7 @@ metal_encode_graphics_alpha_bucket(
     }
 
     encode_draw_end(encoder);
-    state.frameHasContent = YES;
+    mark_frame_has_content(state);
     return true;
 }
 
@@ -1944,7 +1950,7 @@ metal_encode_cursor_trail(
     [encoder setFragmentBytes:&uniforms length:sizeof(MetalTrailUniforms) atIndex:0];
     [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
     encode_draw_end(encoder);
-    state.frameHasContent = YES;
+    mark_frame_has_content(state);
     return true;
 }
 
@@ -2026,7 +2032,7 @@ metal_render_pass_for_render_data(
     }
     if (should_clear_missing_cells) {
         if (state.frameHasContent) {
-            state.frameHasContent = NO;
+            clear_frame_content(state);
         }
         return encode_clear_pass(window, state, state.clearColor);
     }
@@ -2232,7 +2238,7 @@ metal_encode_cell_pass(
 
     [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:(NSUInteger)instance_count];
     encode_draw_end(encoder);
-    state.frameHasContent = YES;
+    mark_frame_has_content(state);
     return true;
 }
 
@@ -2266,6 +2272,7 @@ ensure_state_for_window(GLFWwindow *window) {
     MetalWindowState *state = [table objectForKey:key];
     if (!state) {
         state = [[MetalWindowState alloc] init];
+        initialize_frame_state(state);
         [table setObject:state forKey:key];
     }
     return state;
@@ -2277,11 +2284,31 @@ remove_state_for_window(GLFWwindow *window) {
 }
 
 static inline void
+mark_frame_has_content(MetalWindowState *state) {
+    if (!state) return;
+    state.frameHasContent = YES;
+    state.hasEncodedPass = YES;
+}
+
+static inline void
+clear_frame_content(MetalWindowState *state) {
+    if (!state) return;
+    state.frameHasContent = NO;
+    state.hasEncodedPass = NO;
+}
+
+static inline void
+initialize_frame_state(MetalWindowState *state) {
+    clear_frame_content(state);
+    state.lastTintLoadAction = MTLLoadActionDontCare;
+}
+
+static inline void
 reset_command_primitives(MetalWindowState *state) {
     if (!state) return;
     state.commandBuffer = nil;
     state.drawable = nil;
-    state.frameHasContent = NO;
+    clear_frame_content(state);
 }
 
 static MTLClearColor
@@ -2363,7 +2390,7 @@ encode_clear_pass(GLFWwindow *window, MetalWindowState *state, MTLClearColor cle
         }
         encode_draw_end(encoder);
     }
-    state.frameHasContent = YES;
+    mark_frame_has_content(state);
     return true;
 }
 
@@ -2602,7 +2629,7 @@ metal_backend_attach_window(GLFWwindow *window, const RendererWindowConfig *conf
         content_view.layer = layer;
         state.attachedView = content_view;
         state.layer = layer;
-        state.frameHasContent = NO;
+        initialize_frame_state(state);
 
         RendererResizeParams initial_params = {
             .framebuffer_width = (int)lround(drawable_size.width),
@@ -2785,7 +2812,7 @@ metal_backend_on_resize(GLFWwindow *window, const RendererResizeParams *params) 
     if (!state) return;
     metal_reset_capture_state(state, false);
     reset_command_primitives(state);
-    state.frameHasContent = NO;
+    initialize_frame_state(state);
     if (params) {
         state.lastContentsScale = params->framebuffer_scale > 0.f ? params->framebuffer_scale : 1.f;
         const int width = params->framebuffer_width > 0 ? params->framebuffer_width : 0;
@@ -2826,6 +2853,8 @@ metal_encode_background_tint(GLFWwindow *window, MetalWindowState *state, color_
     if (!metal_ensure_resources()) {
         return false;
     }
+    const bool had_prior_pass = state.hasEncodedPass && state.frameHasContent;
+    const bool should_clear = !had_prior_pass;
     @autoreleasepool {
         MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
         if (!pass) {
@@ -2833,7 +2862,6 @@ metal_encode_background_tint(GLFWwindow *window, MetalWindowState *state, color_
             return false;
         }
         pass.colorAttachments[0].texture = state.drawable.texture;
-        const bool should_clear = !state.frameHasContent;
         pass.colorAttachments[0].loadAction = should_clear ? MTLLoadActionClear : MTLLoadActionLoad;
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
         pass.colorAttachments[0].clearColor = state.clearColor;
@@ -2845,6 +2873,7 @@ metal_encode_background_tint(GLFWwindow *window, MetalWindowState *state, color_
         if (g_metal.debug_labels) {
             encoder.label = @"kitty-background-tint";
         }
+        state.lastTintLoadAction = pass.colorAttachments[0].loadAction;
         [encoder setViewport:(MTLViewport){
             .originX = 0.0,
             .originY = 0.0,
@@ -2862,7 +2891,7 @@ metal_encode_background_tint(GLFWwindow *window, MetalWindowState *state, color_
         [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
         encode_draw_end(encoder);
     }
-    state.frameHasContent = YES;
+    mark_frame_has_content(state);
     return true;
 }
 
@@ -2989,7 +3018,7 @@ metal_encode_background(
             [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
             encode_draw_end(encoder);
         }
-        state.frameHasContent = YES;
+        mark_frame_has_content(state);
     }
     if (OPT(background_tint) > 0.f) {
         if (!metal_encode_background_tint(window, state, fallback_bg)) {
@@ -3066,7 +3095,7 @@ metal_renderer_blank_drawable(GLFWwindow *window, color_type color, float backgr
         state.backgroundOpacity = background_opacity;
         state.fallbackBackground = color;
         state.clearColor = clear_color_from(color, background_opacity);
-        state.frameHasContent = YES;
+        mark_frame_has_content(state);
         state.commandBuffer = nil;
         state.drawable = nil;
         return true;
@@ -3083,7 +3112,7 @@ metal_renderer_blank_drawable(GLFWwindow *window, color_type color, float backgr
     state.backgroundOpacity = background_opacity;
     state.fallbackBackground = color;
     state.clearColor = clear_color_from(color, background_opacity);
-    state.frameHasContent = NO;
+    clear_frame_content(state);
     return encode_clear_pass(window, state, state.clearColor);
 }
 
@@ -3442,7 +3471,7 @@ metal_encode_visual_bell(GLFWwindow *window, MetalWindowState *state, Screen *sc
     [encoder setFragmentBytes:&uniforms length:sizeof uniforms atIndex:0];
     [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
     encode_draw_end(encoder);
-    state.frameHasContent = YES;
+    mark_frame_has_content(state);
     return true;
 }
 
@@ -3525,7 +3554,7 @@ metal_encode_scrollbar(
         [encoder setFragmentBytes:&tint_uniforms length:sizeof tint_uniforms atIndex:0];
         [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
         encode_draw_end(encoder);
-        state.frameHasContent = YES;
+        mark_frame_has_content(state);
     }
 
     if (metrics.handle_opacity <= 0.f) {
@@ -3570,7 +3599,7 @@ metal_encode_scrollbar(
         [encoder setFragmentBytes:&uniforms length:sizeof uniforms atIndex:1];
         [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
         encode_draw_end(encoder);
-        state.frameHasContent = YES;
+        mark_frame_has_content(state);
     } else {
         MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
         if (!pass) {
@@ -3606,7 +3635,7 @@ metal_encode_scrollbar(
         [encoder setFragmentBytes:&tint_uniforms length:sizeof tint_uniforms atIndex:0];
         [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
         encode_draw_end(encoder);
-        state.frameHasContent = YES;
+        mark_frame_has_content(state);
     }
     return true;
 }
@@ -3785,7 +3814,7 @@ metal_encode_hyperlink_target(
         [encoder setFragmentBytes:&tint_uniforms length:sizeof tint_uniforms atIndex:0];
         [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
         encode_draw_end(encoder);
-        state.frameHasContent = YES;
+        mark_frame_has_content(state);
     }
 
     {
@@ -3823,7 +3852,7 @@ metal_encode_hyperlink_target(
         [encoder setFragmentBytes:&tint_uniforms length:sizeof tint_uniforms atIndex:0];
         [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
         encode_draw_end(encoder);
-        state.frameHasContent = YES;
+        mark_frame_has_content(state);
     }
 
     RendererGraphicsImageUpload upload = {
@@ -4092,6 +4121,7 @@ metal_renderer_debug_get_window_state_for_tests(GLFWwindow *window, MetalWindowD
         return false;
     }
     out_state->frame_has_content = state.frameHasContent ? true : false;
+    out_state->has_encoded_pass = state.hasEncodedPass ? true : false;
     out_state->capture_valid = state.captureValid ? true : false;
     out_state->capture_width = (uint32_t)state.captureWidth;
     out_state->capture_height = (uint32_t)state.captureHeight;
@@ -4100,6 +4130,7 @@ metal_renderer_debug_get_window_state_for_tests(GLFWwindow *window, MetalWindowD
     out_state->drawable_width = (uint32_t)lround(state.lastDrawableSize.width);
     out_state->drawable_height = (uint32_t)lround(state.lastDrawableSize.height);
     out_state->layer_attached = (state.layer != nil) && (state.attachedView != nil);
+    out_state->last_tint_load_action = (uint32_t)state.lastTintLoadAction;
     return true;
 }
 
@@ -4111,12 +4142,14 @@ metal_renderer_debug_set_window_state_for_tests(GLFWwindow *window, const MetalW
     }
     MetalWindowState *state = ensure_state_for_window(window);
     state.frameHasContent = state_info->frame_has_content ? YES : NO;
+    state.hasEncodedPass = state_info->has_encoded_pass ? YES : NO;
     state.captureValid = state_info->capture_valid ? YES : NO;
     state.captureWidth = state_info->capture_width;
     state.captureHeight = state_info->capture_height;
     state.captureBytesPerRow = state_info->capture_bytes_per_row;
     state.lastContentsScale = state_info->contents_scale;
     state.lastDrawableSize = CGSizeMake((CGFloat)state_info->drawable_width, (CGFloat)state_info->drawable_height);
+    state.lastTintLoadAction = (MTLLoadAction)state_info->last_tint_load_action;
     if (!state_info->layer_attached) {
         metal_detach_layer_from_view(state);
         state.layer = nil;

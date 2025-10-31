@@ -259,6 +259,7 @@ class BackendFFI:
                     class MetalWindowDebugState(ctypes.Structure):
                         _fields_ = [
                             ("frame_has_content", ctypes.c_bool),
+                            ("has_encoded_pass", ctypes.c_bool),
                             ("capture_valid", ctypes.c_bool),
                             ("capture_width", ctypes.c_uint32),
                             ("capture_height", ctypes.c_uint32),
@@ -267,6 +268,7 @@ class BackendFFI:
                             ("drawable_width", ctypes.c_uint32),
                             ("drawable_height", ctypes.c_uint32),
                             ("layer_attached", ctypes.c_bool),
+                            ("last_tint_load_action", ctypes.c_uint32),
                         ]
 
                     self.MetalWindowDebugState = MetalWindowDebugState

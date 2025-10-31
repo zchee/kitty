@@ -7,7 +7,7 @@ import struct
 import sys
 import unittest
 import zlib
-from typing import Sequence
+from typing import Callable, Optional, Sequence
 
 import kitty.fast_data_types as fast_data_types
 from kitty.constants import glfw_path, supports_window_occlusion
@@ -80,6 +80,7 @@ class MetalCapturedFrameDebugInfo(ctypes.Structure):
 class MetalWindowDebugState(ctypes.Structure):
     _fields_ = [
         ('frame_has_content', ctypes.c_bool),
+        ('has_encoded_pass', ctypes.c_bool),
         ('capture_valid', ctypes.c_bool),
         ('capture_width', ctypes.c_uint32),
         ('capture_height', ctypes.c_uint32),
@@ -88,6 +89,7 @@ class MetalWindowDebugState(ctypes.Structure):
         ('drawable_width', ctypes.c_uint32),
         ('drawable_height', ctypes.c_uint32),
         ('layer_attached', ctypes.c_bool),
+        ('last_tint_load_action', ctypes.c_uint32),
     ]
 
 
@@ -615,6 +617,7 @@ class TestMetalHelperFunctions(BaseTest):
 
         state = MetalWindowDebugState()
         state.frame_has_content = True
+        state.has_encoded_pass = True
         state.capture_valid = True
         state.capture_width = 64
         state.capture_height = 32
@@ -887,6 +890,9 @@ class TestMetalBackgroundTintRendering(BaseTest):
         background_color: int,
         *,
         background_image: bool = True,
+        pre_render: Optional[Callable[[ctypes.c_void_p, ctypes.c_void_p], None]] = None,
+        post_render: Optional[Callable[[ctypes.c_void_p, ctypes.c_void_p], None]] = None,
+        post_present: Optional[Callable[[ctypes.c_void_p, ctypes.c_void_p], None]] = None,
     ) -> tuple[int, int, int, int]:
         self.set_options({'background_tint': tint_value})
         options_obj = fast_data_types.get_options()
@@ -936,6 +942,9 @@ class TestMetalBackgroundTintRendering(BaseTest):
         if not ffi.lib.renderer_backend_begin_frame(window_handle, ctypes.byref(frame_params)):
             self.skipTest('Metal renderer begin_frame rejected window')
 
+        if pre_render is not None:
+            pre_render(window_handle, os_window_ptr)
+
         render_params = ffi.RendererRenderParams()
         render_params.os_window = ctypes.c_void_p(os_window_ptr)
         render_params.active_window_id = window_id
@@ -944,6 +953,9 @@ class TestMetalBackgroundTintRendering(BaseTest):
         render_params.all_windows_have_same_bg = True
         if not ffi.lib.renderer_backend_render(window_handle, ctypes.byref(render_params)):
             self.skipTest('Metal renderer render failed')
+
+        if post_render is not None:
+            post_render(window_handle, os_window_ptr)
 
         present_params = ffi.RendererPresentParams()
         present_params.blocking = True
@@ -960,6 +972,10 @@ class TestMetalBackgroundTintRendering(BaseTest):
         if size <= 0:
             self.skipTest('Metal renderer reported invalid framebuffer size')
         data = ctypes.string_at(info.pixels, size)
+
+        if post_present is not None:
+            post_present(window_handle, os_window_ptr)
+
         pixel = tuple(data[:4])
         self.lib.metal_renderer_debug_clear_captured_frame_for_tests()
         ffi.lib.renderer_backend_shutdown_active()
@@ -1068,6 +1084,58 @@ class TestMetalBackgroundTintRendering(BaseTest):
                 f'channel {idx} mismatch: got {pixel} expected {expected}',
             )
 
+    def test_background_tint_clears_when_debug_state_claims_content(self) -> None:
+        background = 0x224466
+        tint = 0.5
+        captured_action: dict[str, int] = {}
+
+        def pre_render(window_handle: ctypes.c_void_p, _os_window: ctypes.c_void_p) -> None:
+            dbg = ffi.MetalWindowDebugState()
+            handle_val = window_handle.value if hasattr(window_handle, 'value') else int(window_handle)
+            window_ptr = ctypes.c_void_p(handle_val)
+            self.lib.metal_renderer_debug_seed_window_state_for_tests(window_ptr)
+            if not self.lib.metal_renderer_debug_get_window_state_for_tests(
+                window_ptr, ctypes.byref(dbg)
+            ):
+                self.fail('Failed to fetch Metal window state for test setup')
+            dbg.frame_has_content = True
+            dbg.has_encoded_pass = False
+            dbg.last_tint_load_action = 0
+            self.lib.metal_renderer_debug_set_window_state_for_tests(window_ptr, ctypes.byref(dbg))
+
+        def post_render(window_handle: ctypes.c_void_p, _os_window: ctypes.c_void_p) -> None:
+            dbg = ffi.MetalWindowDebugState()
+            handle_val = window_handle.value if hasattr(window_handle, 'value') else int(window_handle)
+            window_ptr = ctypes.c_void_p(handle_val)
+            if self.lib.metal_renderer_debug_get_window_state_for_tests(
+                window_ptr, ctypes.byref(dbg)
+            ):
+                captured_action['value'] = dbg.last_tint_load_action
+
+        pixel = self._render_and_capture_pixel(
+            tint,
+            background,
+            background_image=False,
+            pre_render=pre_render,
+            post_render=post_render,
+        )
+        expected = self._expected_tinted_pixel(background, tint)
+        for idx, (actual, exp) in enumerate(zip(pixel, expected)):
+            tolerance = 2 if idx < 3 else 0
+            self.assertLessEqual(
+                abs(actual - exp),
+                tolerance,
+                f'channel {idx} mismatch: got {pixel} expected {expected}',
+            )
+
+        MTL_LOAD_ACTION_CLEAR = 2
+        recorded = captured_action.get('value')
+        self.assertEqual(
+            recorded,
+            MTL_LOAD_ACTION_CLEAR,
+            f'Background tint pass should clear when no encoded content; got load action {recorded}',
+        )
+
 
 class TestMetalCaptureLifecycle(BaseTest):
     def setUp(self) -> None:
@@ -1093,6 +1161,7 @@ class TestMetalCaptureLifecycle(BaseTest):
     def test_resize_invalidates_capture_state(self) -> None:
         state = ffi.MetalWindowDebugState()
         state.frame_has_content = True
+        state.has_encoded_pass = True
         state.capture_valid = True
         state.capture_width = 120
         state.capture_height = 60
