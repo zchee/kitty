@@ -576,6 +576,7 @@ graphics_sampler_for(bool linear_filter, RepeatStrategy repeat) {
 @property (nonatomic, assign) id<CAMetalDrawable> lastTintDrawable;
 @property (nonatomic) BOOL frameHasContent;
 @property (nonatomic) BOOL hasEncodedPass;
+@property (nonatomic) BOOL pendingDrawableClear;
 @property (nonatomic) MTLLoadAction lastTintLoadAction;
 @property (nonatomic) MTLClearColor clearColor;
 @property (nonatomic) float backgroundOpacity;
@@ -804,7 +805,7 @@ ensure_sprite_texture_capacity(MetalSpriteAtlas *atlas, NSUInteger width, NSUInt
     MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:width height:height mipmapped:NO];
     descriptor.textureType = MTLTextureType2DArray;
     descriptor.arrayLength = layers;
-    descriptor.storageMode = MTLStorageModeManaged;
+    descriptor.storageMode = MTLStorageModeShared;
     descriptor.usage = MTLTextureUsageShaderRead;
     id<MTLTexture> newTexture = [g_metal.device newTextureWithDescriptor:descriptor];
     if (!newTexture) {
@@ -896,6 +897,37 @@ metal_sprite_upload(FONTS_DATA_HANDLE fg, sprite_index idx, const pixel *buf, De
     NSUInteger bytesPerRow = cellWidth * sizeof(pixel);
     NSUInteger bytesPerImage = bytesPerRow * cellHeightPlusOne;
     @autoreleasepool {
+        if (g_metal.debug_events && idx < 8 && buf) {
+            const pixel *pixels = buf;
+            const NSUInteger sample_height = metrics.cell_height;
+            const NSUInteger sample_width = cellWidth;
+            uint64_t alpha_sum = 0;
+            NSUInteger samples = sample_width * sample_height;
+            if (samples) {
+                uint8_t min_alpha = 255u;
+                uint8_t max_alpha = 0u;
+                for (NSUInteger r = 0; r < sample_height; r++) {
+                    for (NSUInteger c = 0; c < sample_width; c++) {
+                        uint8_t alpha = pixels[r * cellWidth + c] & 0xFFu;
+                        alpha_sum += alpha;
+                        if (alpha < min_alpha) min_alpha = alpha;
+                        if (alpha > max_alpha) max_alpha = alpha;
+                    }
+                }
+                double avg_alpha = (double)alpha_sum / (double)(samples * 255.0);
+                metal_debug_event(
+                    "sprite_upload",
+                    "idx=%u layer=%u avg_alpha=%.3f min_alpha=%.3f max_alpha=%.3f width=%lu height=%lu",
+                    idx,
+                    (unsigned)z,
+                    avg_alpha,
+                    (double)min_alpha / 255.0,
+                    (double)max_alpha / 255.0,
+                    (unsigned long)cellWidth,
+                    (unsigned long)metrics.cell_height
+                );
+            }
+        }
         [atlas->spriteTexture replaceRegion:region mipmapLevel:0 slice:z withBytes:buf bytesPerRow:bytesPerRow bytesPerImage:bytesPerImage];
     }
     if (!ensure_decorations_buffer_capacity(atlas, (NSUInteger)idx + 1)) return;
@@ -1008,9 +1040,7 @@ metal_clear_last_capture(void) {
 static void
 metal_reset_capture_state(MetalWindowState *state, bool release_buffer) {
     if (!state) {
-        if (release_buffer) {
-            metal_clear_last_capture();
-        }
+        metal_clear_last_capture();
         return;
     }
     if (release_buffer && state.captureBuffer) {
@@ -1022,9 +1052,7 @@ metal_reset_capture_state(MetalWindowState *state, bool release_buffer) {
     state.captureWidth = 0;
     state.captureHeight = 0;
     state.captureBytesPerRow = 0;
-    if (release_buffer) {
-        metal_clear_last_capture();
-    }
+    metal_clear_last_capture();
 }
 
 static void
@@ -1567,6 +1595,16 @@ metal_populate_uniforms(MetalWindowState *state, Screen *screen, OSWindow *os_wi
     params.draw_foreground = 1u;
     params.extra_alpha = 1.0f;
     state.drawParams = params;
+    if (g_metal.debug_events) {
+        metal_debug_event(
+            "uniforms_sprite_dims",
+            "sprites_x=%u sprites_y=%u cell_height=%u cell_width=%u",
+            uniforms->sprites_xnum,
+            uniforms->sprites_ynum,
+            uniforms->cell_height,
+            uniforms->cell_width
+        );
+    }
     return true;
 }
 
@@ -1971,10 +2009,25 @@ metal_render_pass_for_render_data(
     bool is_single_window
 ) {
     if (!render_data) {
+        if (g_metal.debug_events) {
+            metal_debug_event(
+                "prepare_frame_skip",
+                "window=%p reason=no_render_data",
+                window
+            );
+        }
         return true;
     }
     Screen *screen = render_data->screen;
     if (!screen) {
+        if (g_metal.debug_events) {
+            metal_debug_event(
+                "prepare_frame_skip",
+                "window=%p reason=no_screen render_data=%p",
+                window,
+                render_data
+            );
+        }
         return true;
     }
     if (!state.commandBuffer || !state.drawable) {
@@ -1994,6 +2047,20 @@ metal_render_pass_for_render_data(
     RendererSharedFrameResult frame_result = {0};
     if (!renderer_shared_prepare_frame(&frame_params, &ops, (__bridge void *)state, &frame_result)) {
         return false;
+    }
+    if (g_metal.debug_events) {
+        metal_debug_event(
+            "prepare_frame_result",
+            "window=%p cell_changed=%d selection_changed=%d graphics_changed=%d default_bg=%#010x reload_all=%d is_dirty=%d scroll_changed=%d",
+            window,
+            frame_result.cell_data_changed ? 1 : 0,
+            frame_result.selection_data_changed ? 1 : 0,
+            frame_result.graphics_data_changed ? 1 : 0,
+            frame_result.default_bg,
+            screen->reload_all_gpu_data ? 1 : 0,
+            screen->is_dirty ? 1 : 0,
+            screen->scroll_changed ? 1 : 0
+        );
     }
     if (is_active_window) {
         state.sharedFrame = frame_result;
@@ -2022,6 +2089,21 @@ metal_render_pass_for_render_data(
         if (cells) {
             size_t sample_count = instance_count < (size_t)64 ? instance_count : (size_t)64;
             bool all_missing = sample_count > 0;
+            if (g_metal.debug_events && sample_count > 0) {
+                const uint8_t *selection = state.selectionBuffer ? (const uint8_t *)state.selectionBuffer.contents : NULL;
+                metal_debug_event(
+                    "cell_sample",
+                    "window=%p sample_count=%zu cell0_bg=%#010x cell0_sprite=%#010x cell1_bg=%#010x cell1_sprite=%#010x sel0=%u sel1=%u",
+                    window,
+                    sample_count,
+                    cells[0].bg,
+                    cells[0].sprite_idx,
+                    sample_count > 1 ? cells[1].bg : 0u,
+                    sample_count > 1 ? cells[1].sprite_idx : 0u,
+                    selection ? selection[0] : 0u,
+                    selection ? selection[1] : 0u
+                );
+            }
             for (size_t i = 0; i < sample_count; i++) {
                 if ((cells[i].sprite_idx & MetalSpriteIndexMask) != MetalMissingGlyphIndex) {
                     all_missing = false;
@@ -2096,13 +2178,26 @@ metal_render_pass_for_render_data(
     }
     const bool has_between_content = has_window_logo || graphics_below > 0 || graphics_negative > 0;
 
-    bool allow_clear = !state.frameHasContent;
+    if (g_metal.debug_events) {
+        metal_debug_event(
+            "cell_allow_clear_state",
+            "window=%p frame_has_content=%d has_encoded_pass=%d has_between_content=%d bg_image=%d pending_clear=%d",
+            window,
+            state.frameHasContent ? 1 : 0,
+            state.hasEncodedPass ? 1 : 0,
+            has_between_content ? 1 : 0,
+            has_background_image ? 1 : 0,
+            state.pendingDrawableClear ? 1 : 0
+        );
+    }
+    bool allow_clear = state.pendingDrawableClear || !state.frameHasContent;
 
     if (has_between_content) {
         if (!has_background_image) {
             if (!metal_encode_cell_pass(window, state, atlas, instance_count, METAL_DRAW_BG_DEFAULT, false, allow_clear)) {
                 return false;
             }
+            state.pendingDrawableClear = NO;
             allow_clear = false;
         }
         if (has_window_logo) {
@@ -2121,6 +2216,7 @@ metal_render_pass_for_render_data(
         if (!metal_encode_cell_pass(window, state, atlas, instance_count, METAL_DRAW_BG_NON_DEFAULT, false, allow_clear)) {
             return false;
         }
+        state.pendingDrawableClear = NO;
         allow_clear = false;
         if (!metal_encode_graphics_bucket(window, state, &grd, graphics_below, graphics_negative, inactive_alpha)) {
             return false;
@@ -2128,11 +2224,13 @@ metal_render_pass_for_render_data(
         if (!metal_encode_cell_pass(window, state, atlas, instance_count, 0u, true, false)) {
             return false;
         }
+        state.pendingDrawableClear = NO;
     } else {
         uint32_t draw_mask = has_background_image ? METAL_DRAW_BG_NON_DEFAULT : METAL_DRAW_BG_BOTH;
         if (!metal_encode_cell_pass(window, state, atlas, instance_count, draw_mask, true, allow_clear)) {
             return false;
         }
+        state.pendingDrawableClear = NO;
         if (has_window_logo) {
             GraphicsRenderData logo_data = {
                 .count = 1,
@@ -2179,9 +2277,30 @@ metal_encode_cell_pass(
     bool allow_clear
 ) {
     if (!state || !atlas || !instance_count) {
+        if (g_metal.debug_events) {
+            metal_debug_event(
+                "cell_pass_skip",
+                "window=%p reason=missing_state state=%p atlas=%p instances=%zu",
+                window,
+                state,
+                atlas,
+                instance_count
+            );
+        }
         return encode_clear_pass(window, state, state.clearColor);
     }
     if (!state.cellBuffer || !state.selectionBuffer || !state.uniformBuffer || !atlas->spriteTexture) {
+        if (g_metal.debug_events) {
+            metal_debug_event(
+                "cell_pass_skip",
+                "window=%p reason=incomplete_buffers cell_buf=%p sel_buf=%p uniform_buf=%p sprite_texture=%p",
+                window,
+                state ? state.cellBuffer : nil,
+                state ? state.selectionBuffer : nil,
+                state ? state.uniformBuffer : nil,
+                atlas ? atlas->spriteTexture : nil
+            );
+        }
         return encode_clear_pass(window, state, state.clearColor);
     }
     if (!state.commandBuffer || !state.drawable) {
@@ -2202,6 +2321,20 @@ metal_encode_cell_pass(
     pass.colorAttachments[0].loadAction = should_clear ? MTLLoadActionClear : MTLLoadActionLoad;
     pass.colorAttachments[0].storeAction = MTLStoreActionStore;
     pass.colorAttachments[0].clearColor = state.clearColor;
+
+    if (g_metal.debug_events) {
+        metal_debug_event(
+            "cell_pass_begin",
+            "window=%p instances=%zu allow_clear=%d should_clear=%d frame_has_content=%d atlas=%p sprite_texture=%p",
+            window,
+            instance_count,
+            allow_clear ? 1 : 0,
+            should_clear ? 1 : 0,
+            state.frameHasContent ? 1 : 0,
+            atlas,
+            atlas->spriteTexture
+        );
+    }
 
     id<MTLRenderCommandEncoder> encoder = [state.commandBuffer renderCommandEncoderWithDescriptor:pass];
     if (!encoder) {
@@ -2243,6 +2376,15 @@ metal_encode_cell_pass(
 
     [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:(NSUInteger)instance_count];
     encode_draw_end(encoder);
+    if (g_metal.debug_events) {
+        metal_debug_event(
+            "cell_pass_end",
+            "window=%p load_action=%u frame_has_content=%d",
+            window,
+            pass.colorAttachments[0].loadAction,
+            state.frameHasContent ? 1 : 0
+        );
+    }
     mark_frame_has_content(state);
     return true;
 }
@@ -2300,6 +2442,7 @@ clear_frame_content(MetalWindowState *state) {
     if (!state) return;
     state.frameHasContent = NO;
     state.hasEncodedPass = NO;
+    state.pendingDrawableClear = NO;
     state.lastTintDrawable = nil;
 }
 
@@ -2312,9 +2455,11 @@ initialize_frame_state(MetalWindowState *state) {
 static inline void
 reset_command_primitives(MetalWindowState *state) {
     if (!state) return;
+    BOOL pending_clear = state.pendingDrawableClear;
     state.commandBuffer = nil;
     state.drawable = nil;
     clear_frame_content(state);
+    state.pendingDrawableClear = pending_clear;
 }
 
 static MTLClearColor
@@ -2684,7 +2829,12 @@ metal_backend_attach_window(GLFWwindow *window, const RendererWindowConfig *conf
     }];
     state.closeObserver = observer;
 
-    return encode_clear_pass(window, state, state.clearColor);
+    bool ok = encode_clear_pass(window, state, state.clearColor);
+    if (ok) {
+        clear_frame_content(state);
+        state.pendingDrawableClear = YES;
+    }
+    return ok;
 }
 
 static void
@@ -2768,17 +2918,32 @@ metal_backend_render(GLFWwindow *window, const RendererRenderParams *params) {
     unsigned int visible_windows = params && params->num_visible_windows ? params->num_visible_windows : computed_visible;
     bool is_single_window = visible_windows <= 1u;
 
-    if (os_window->num_tabs >= OPT(tab_bar_min_tabs) && os_window->tab_bar_render_data.screen) {
-        if (!metal_render_pass_for_render_data(window, state, os_window, &os_window->tab_bar_render_data, NULL, false, true, is_single_window)) {
-            return false;
-        }
+    if (g_metal.debug_events) {
+        metal_debug_event(
+            "render_tab_state",
+            "window=%p os_window=%p tab_count=%u active_tab=%u tab_ptr=%p",
+            window,
+            os_window,
+            os_window->num_tabs,
+            os_window->active_tab,
+            tab
+        );
     }
-
     if (tab) {
         Window *active_window_ptr = NULL;
         for (unsigned int i = 0; i < tab->num_windows; i++) {
             Window *w = tab->windows + i;
             if (!w->visible || !w->render_data.screen) {
+                if (g_metal.debug_events) {
+                    metal_debug_event(
+                        "render_window_skip",
+                        "window=%p index=%u visible=%d screen=%p",
+                        window,
+                        i,
+                        w->visible ? 1 : 0,
+                        w->render_data.screen
+                    );
+                }
                 continue;
             }
             bool is_active = i == tab->active_window;
@@ -2794,6 +2959,12 @@ metal_backend_render(GLFWwindow *window, const RendererRenderParams *params) {
         }
     } else {
         if (!metal_encode_cursor_trail(window, state, os_window, NULL, NULL)) {
+            return false;
+        }
+    }
+
+    if (os_window->num_tabs >= OPT(tab_bar_min_tabs) && os_window->tab_bar_render_data.screen) {
+        if (!metal_render_pass_for_render_data(window, state, os_window, &os_window->tab_bar_render_data, NULL, false, true, is_single_window)) {
             return false;
         }
     }
@@ -2819,6 +2990,8 @@ metal_backend_present(GLFWwindow *window, const RendererPresentParams *params) {
         if (!encode_clear_pass(window, state, state.clearColor)) {
             return false;
         }
+        clear_frame_content(state);
+        state.pendingDrawableClear = YES;
     }
     const bool wants_capture = g_metal.capture_frames || (params && params->capture_framebuffer);
     if (wants_capture) {

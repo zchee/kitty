@@ -248,14 +248,47 @@ inline ColorPair resolve_extra_cursor_colors(float3 cell_bg, float3 cell_fg, Col
     return ans;
 }
 
+struct SpriteLayout {
+    uint column;
+    uint row;
+    uint layer;
+    uint xnum;
+    uint ynum;
+};
+
+inline SpriteLayout sprite_layout(uint sprite, constant MetalCellUniformData &u) {
+    SpriteLayout layout;
+    layout.xnum = u.sprites_xnum ? u.sprites_xnum : 1u;
+    layout.ynum = u.sprites_ynum ? u.sprites_ynum : 1u;
+    uint sprites_per_layer = layout.xnum * layout.ynum;
+    if (sprites_per_layer == 0u) {
+        sprites_per_layer = 1u;
+        layout.xnum = 1u;
+        layout.ynum = 1u;
+    }
+    layout.layer = sprite / sprites_per_layer;
+    uint index_in_layer = sprite % sprites_per_layer;
+    uint safe_xnum = layout.xnum ? layout.xnum : 1u;
+    layout.column = index_in_layer % safe_xnum;
+    layout.row = index_in_layer / safe_xnum;
+    return layout;
+}
+
 inline float3 sprite_coord(uint sprite, uint2 pos, constant MetalCellUniformData &u) {
-    uint layer = sprite & SPRITE_INDEX_MASK;
-    uint column = layer % u.sprites_xnum;
-    uint row = layer / u.sprites_xnum;
-    float sx = (float(column) + float(pos.x)) / float(u.sprites_xnum);
-    float sy_full = float(row) * (float(u.cell_height + 1u) / float(u.sprites_ynum));
-    float sy = sy_full + (float(pos.y) * float(u.cell_height) / float(u.cell_height + 1u));
-    return float3(sx, sy, float(layer));
+    SpriteLayout layout = sprite_layout(sprite, u);
+    float inv_x = 1.0f / float(layout.xnum);
+    float sprite_height = float(u.cell_height + 1u);
+    float inv_total_height = sprite_height > 0.f
+        ? (1.0f / (float(layout.ynum) * sprite_height))
+        : 0.f;
+    float sx = (float(layout.column) + float(pos.x)) * inv_x;
+    float sy = (float(layout.row) * sprite_height + float(pos.y) * float(u.cell_height)) * inv_total_height;
+    return float3(sx, sy, float(layout.layer));
+}
+
+inline uint sprite_row(uint sprite, constant MetalCellUniformData &u) {
+    SpriteLayout layout = sprite_layout(sprite, u);
+    return layout.row;
 }
 
 inline uint decorations_index(uint sprite_idx, device const uint *decorations_buffer, uint count) {
@@ -355,19 +388,9 @@ vertex VertexOut cell_vertex(
     float colored_sprite = float((cell.sprite_idx & SPRITE_COLORED_MASK) >> SPRITE_COLORED_SHIFT);
     out.colored_sprite = colored_sprite;
 
-    out.sprite_pos = float3(
-        (float(sprite_index % u.sprites_xnum) + float(pos.x)) / float(u.sprites_xnum),
-        (float(sprite_index / u.sprites_xnum) * float(u.cell_height + 1u) + float(pos.y) * float(u.cell_height)) /
-        (float(u.sprites_ynum) * float(u.cell_height + 1u)),
-        float(sprite_index)
-    );
+    out.sprite_pos = sprite_coord(sprite_index, pos, u);
 
-    out.cursor_pos = float3(
-        (float(final_cursor_sprite % u.sprites_xnum) + float(pos.x)) / float(u.sprites_xnum),
-        (float(final_cursor_sprite / u.sprites_xnum) * float(u.cell_height + 1u) + float(pos.y) * float(u.cell_height)) /
-        (float(u.sprites_ynum) * float(u.cell_height + 1u)),
-        float(final_cursor_sprite)
-    );
+    out.cursor_pos = sprite_coord(final_cursor_sprite, pos, u);
 
     uint underline_style = ((attrs >> DECORATION_SHIFT) & DECORATION_MASK);
     underline_style = uint(in_url) * u.url_style + (1u - uint(in_url)) * underline_style;
@@ -380,7 +403,7 @@ vertex VertexOut cell_vertex(
     out.strike_pos = sprite_coord(strike_idx, pos, u);
     out.underline_pos = sprite_coord(underline_idx, pos, u);
 
-    uint cell_top_px = (sprite_index / u.sprites_xnum) * (u.cell_height + 1u);
+    uint cell_top_px = sprite_row(sprite_index, u) * (u.cell_height + 1u);
     out.underline_exclusion_pos = cell_top_px + u.cell_height;
 
     float bg_alpha = calc_background_opacity(bg_as_uint, u);

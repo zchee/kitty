@@ -1025,6 +1025,36 @@ class TestMetalBackgroundTintRendering(BaseTest):
         self.assertGreater(tinted[1], tinted[0])
         self.assertGreater(tinted[1], tinted[2])
 
+    @unittest.skipUnless(sys.platform == 'darwin', 'Metal backend only available on macOS')
+    def test_cell_pass_marks_frame_has_content(self) -> None:
+        if not ffi.has_metal:
+            self.skipTest('Metal backend not available')
+
+        recorded: dict[str, bool] = {}
+
+        def post_render(window_handle: ctypes.c_void_p, _os_window: ctypes.c_void_p) -> None:
+            dbg = MetalWindowDebugState()
+            handle_val = window_handle.value if hasattr(window_handle, 'value') else int(window_handle)
+            window_ptr = ctypes.c_void_p(handle_val)
+            if not self.lib.metal_renderer_debug_get_window_state_for_tests(
+                window_ptr,
+                ctypes.byref(dbg),
+            ):
+                self.fail('Failed to read Metal window debug state after render')
+            recorded['frame_has_content'] = bool(dbg.frame_has_content)
+            recorded['has_encoded_pass'] = bool(dbg.has_encoded_pass)
+
+        self._render_and_capture_pixel(
+            0.0,
+            0x101010,
+            background_image=False,
+            post_render=post_render,
+        )
+
+        self.assertIn('frame_has_content', recorded, 'Render callback did not capture state')
+        self.assertTrue(recorded['frame_has_content'], 'Metal frame failed to record content during cell pass')
+        self.assertTrue(recorded['has_encoded_pass'], 'Metal renderer did not report encoded pass after rendering cells')
+
     def test_background_tint_captures_multiple_combinations(self) -> None:
         cases = {
             0x006400: {'dominant': 1},
