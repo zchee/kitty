@@ -1008,7 +1008,9 @@ metal_clear_last_capture(void) {
 static void
 metal_reset_capture_state(MetalWindowState *state, bool release_buffer) {
     if (!state) {
-        metal_clear_last_capture();
+        if (release_buffer) {
+            metal_clear_last_capture();
+        }
         return;
     }
     if (release_buffer && state.captureBuffer) {
@@ -1020,7 +1022,9 @@ metal_reset_capture_state(MetalWindowState *state, bool release_buffer) {
     state.captureWidth = 0;
     state.captureHeight = 0;
     state.captureBytesPerRow = 0;
-    metal_clear_last_capture();
+    if (release_buffer) {
+        metal_clear_last_capture();
+    }
 }
 
 static void
