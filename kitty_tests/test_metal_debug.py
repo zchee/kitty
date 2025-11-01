@@ -221,7 +221,26 @@ class TestMetalDebugToggles(BaseTest):
             macos_custom_beam_cursor=False,
         )
 
-        with mock.patch('kitty.main.is_macos', True),              mock.patch('kitty.main.set_cocoa_global_shortcuts', side_effect=lambda *a, **k: calls.append('set_shortcuts') or {}),              mock.patch('kitty.main.set_macos_app_custom_icon'),              mock.patch('kitty.main.cached_values_for', fake_cached_values),              mock.patch('kitty.main.startup_notification_handler', fake_startup_handler),              mock.patch('kitty.main.create_sessions', return_value=[]),              mock.patch('kitty.main.create_os_window', side_effect=lambda *a, **k: calls.append('create_window') or 1),              mock.patch('kitty.main.parse_os_window_state', return_value=None),              mock.patch('kitty.main.get_os_window_sizing_data', return_value=None),              mock.patch('kitty.main.Boss', side_effect=lambda *a, **k: DummyBoss()),              mock.patch('kitty.main._dump_metal_capture', side_effect=fake_dump),              mock.patch('kitty.main.set_custom_ibeam_cursor'),              mock.patch('kitty.main.dump_font_debug'),              mock.patch('kitty.main.set_font_family', side_effect=lambda *a, **k: calls.append('set_font_family')):
+        def fake_set_shortcuts(*_args: object, **_kwargs: object) -> set[str]:
+            calls.append('set_shortcuts')
+            return set()
+
+        with (
+            mock.patch('kitty.main.is_macos', True),
+            mock.patch('kitty.main.set_cocoa_global_shortcuts', side_effect=fake_set_shortcuts),
+            mock.patch('kitty.main.set_macos_app_custom_icon'),
+            mock.patch('kitty.main.cached_values_for', fake_cached_values),
+            mock.patch('kitty.main.startup_notification_handler', fake_startup_handler),
+            mock.patch('kitty.main.create_sessions', return_value=[]),
+            mock.patch('kitty.main.create_os_window', side_effect=lambda *a, **k: calls.append('create_window') or 1),
+            mock.patch('kitty.main.parse_os_window_state', return_value=None),
+            mock.patch('kitty.main.get_os_window_sizing_data', return_value=None),
+            mock.patch('kitty.main.Boss', side_effect=lambda *a, **k: DummyBoss()),
+            mock.patch('kitty.main._dump_metal_capture', side_effect=fake_dump),
+            mock.patch('kitty.main.set_custom_ibeam_cursor'),
+            mock.patch('kitty.main.dump_font_debug'),
+            mock.patch('kitty.main.set_font_family', side_effect=lambda *a, **k: calls.append('set_font_family')),
+        ):
             with mock.patch.object(main.run_app, 'initial_window_size_func', lambda *a, **k: (80, 24)):
                 main._run_app(opts, args)
 
