@@ -215,7 +215,11 @@ class TestMetalDebugToggles(BaseTest):
                             main._dump_metal_capture(out_path)
             self.assertFalse(out_path.exists(), 'PNG unexpectedly written despite missing capture')
             self.assertIn('No Metal capture available', stderr.getvalue())
-            self.assertEqual(sleep_mock.call_count, 4, 'Expected four retry delays before giving up')
+            self.assertEqual(
+                sleep_mock.call_count,
+                main._METAL_CAPTURE_MAX_ATTEMPTS - 1,
+                f'Expected {main._METAL_CAPTURE_MAX_ATTEMPTS - 1} retry delays before giving up',
+            )
 
 
     def test_runtime_flags_follow_option_toggles(self) -> None:

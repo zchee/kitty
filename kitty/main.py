@@ -13,6 +13,9 @@ from collections.abc import Generator, Sequence
 from contextlib import contextmanager, suppress
 from gettext import gettext as _
 
+_METAL_CAPTURE_MAX_ATTEMPTS = 40
+_METAL_CAPTURE_RETRY_DELAY = 0.1
+
 from .borders import load_borders_program
 from .boss import Boss
 from .child import set_default_env, set_LANG_in_default_env
@@ -417,17 +420,15 @@ def _dump_metal_capture(target: str | os.PathLike[str]) -> bool:
             clear_fn.argtypes = []
         if hasattr(clear_fn, 'restype'):
             clear_fn.restype = None
-    attempts = 5
-    delay = 0.05
     info = MetalCapturedFrameDebugInfo()
-    for attempt in range(attempts):
+    for attempt in range(_METAL_CAPTURE_MAX_ATTEMPTS):
         info = MetalCapturedFrameDebugInfo()
         if copy_capture(ctypes.pointer(info)):
             break
-        if attempt == attempts - 1:
+        if attempt == _METAL_CAPTURE_MAX_ATTEMPTS - 1:
             sys.stderr.write(f'No Metal capture available; nothing written to {path}\n')
             return False
-        time.sleep(delay)
+        time.sleep(_METAL_CAPTURE_RETRY_DELAY)
     width = int(info.width)
     height = int(info.height)
     stride = int(info.bytes_per_row)
