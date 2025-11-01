@@ -987,6 +987,7 @@ class Boss:
     def mark_os_window_for_close(self, os_window_id: int, request_type: int = IMPERATIVE_CLOSE_REQUESTED) -> None:
         if self.current_visual_select is not None and self.current_visual_select.os_window_id == os_window_id:
             self.cancel_current_visual_select()
+        self.dump_metal_capture_if_pending()
         mark_os_window_for_close(os_window_id, request_type)
 
     def _cleanup_tab_after_window_removal(self, src_tab: Tab) -> None:
