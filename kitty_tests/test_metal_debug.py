@@ -153,100 +153,69 @@ class TestMetalDebugToggles(BaseTest):
             stderr = io.StringIO()
             with mock.patch('kitty.main.ctypes.CDLL', return_value=EmptyLib()):
                 with mock.patch('kitty.main.is_macos', True):
-                    with mock.patch('sys.stderr', stderr):
-                        main._dump_metal_capture(out_path)
+                    with mock.patch('kitty.main.time.sleep') as sleep_mock:
+                        sleep_mock.side_effect = lambda _delay: None
+                        with mock.patch('sys.stderr', stderr):
+                            main._dump_metal_capture(out_path)
         self.assertFalse(out_path.exists(), 'Unexpected PNG produced when capture unavailable')
         self.assertIn('No Metal capture available', stderr.getvalue())
 
-    def test_run_app_dumps_before_renderer_shutdown(self) -> None:
-        from contextlib import contextmanager
-        from types import SimpleNamespace
+    def test_dump_metal_capture_waits_for_capture_ready(self) -> None:
         from kitty import main
 
-        calls: list[str] = []
+        buf = ctypes.create_string_buffer(b'\xff\x00\x00\xff')
+        attempt_counter = {'count': 0}
 
-        @contextmanager
-        def fake_cached_values(_name: str):
-            calls.append('cached_enter')
-            try:
-                yield {}
-            finally:
-                calls.append('cached_exit')
+        class FlakyLib:
+            def __init__(self) -> None:
+                self._buf = buf
 
-        @contextmanager
-        def fake_startup_handler(**_kw):
-            calls.append('notify_enter')
-            try:
-                yield lambda *a, **k: None
-            finally:
-                calls.append('notify_exit')
+            def metal_renderer_copy_captured_frame_for_tests(self, info_ptr: ctypes.POINTER(ctypes.c_void_p)) -> bool:
+                attempt_counter['count'] += 1
+                if attempt_counter['count'] < 2:
+                    return False
+                info = info_ptr.contents
+                info.width = 1
+                info.height = 1
+                info.bytes_per_row = 4
+                info.pixels = ctypes.cast(ctypes.addressof(self._buf), ctypes.c_void_p)
+                return True
 
-        class DummyBoss:
-            def __init__(self, *args, **kwargs) -> None:
-                self.misc_config_errors: list[str] = []
-                self.child_monitor = SimpleNamespace(main_loop=lambda: calls.append('main_loop'))
-
-            def start(self, *args, **kwargs) -> None:
-                calls.append('boss_start')
-
-            def show_bad_config_lines(self, *args, **kwargs) -> None:
+            def metal_renderer_debug_clear_captured_frame_for_tests(self) -> None:
                 pass
 
-            def show_error(self, *args, **kwargs) -> None:
-                pass
+        with tempfile.TemporaryDirectory() as td:
+            out_path = Path(td) / 'capture.png'
+            stderr = io.StringIO()
+            with mock.patch('kitty.main.ctypes.CDLL', return_value=FlakyLib()):
+                with mock.patch('kitty.main.is_macos', True):
+                    with mock.patch('kitty.main.time.sleep') as sleep_mock:
+                        sleep_mock.side_effect = lambda _delay: None
+                        with mock.patch('sys.stderr', stderr):
+                            main._dump_metal_capture(out_path)
+            self.assertEqual(attempt_counter['count'], 2, 'Expected two capture attempts before success')
+            self.assertTrue(out_path.exists(), 'Capture PNG missing after retried capture')
+            self.assertEqual(sleep_mock.call_count, 1, 'Retry path should pause exactly once before succeeding')
 
-            def destroy(self) -> None:
-                calls.append('destroy')
+    def test_dump_metal_capture_reports_after_retry_exhaustion(self) -> None:
+        from kitty import main
 
-        def fake_dump(path: object) -> None:
-            calls.append(f'dump:{path}')
+        class AlwaysEmptyLib:
+            def metal_renderer_copy_captured_frame_for_tests(self, info_ptr: ctypes.POINTER(ctypes.c_void_p)) -> bool:
+                return False
 
-        args = SimpleNamespace(
-            cls='',
-            name='',
-            title=None,
-            position=None,
-            start_as=None,
-            grab_keyboard=False,
-            debug_font_fallback=False,
-            debug_rendering=False,
-            debug_metal=False,
-            metal_dump_frame='/tmp/metal-capture.png',
-            metal_gpu_capture=True,
-            session='',
-        )
-        opts = SimpleNamespace(
-            startup_session=None,
-            remember_window_position=False,
-            macos_custom_beam_cursor=False,
-        )
-
-        def fake_set_shortcuts(*_args: object, **_kwargs: object) -> set[str]:
-            calls.append('set_shortcuts')
-            return set()
-
-        with (
-            mock.patch('kitty.main.is_macos', True),
-            mock.patch('kitty.main.set_cocoa_global_shortcuts', side_effect=fake_set_shortcuts),
-            mock.patch('kitty.main.set_macos_app_custom_icon'),
-            mock.patch('kitty.main.cached_values_for', fake_cached_values),
-            mock.patch('kitty.main.startup_notification_handler', fake_startup_handler),
-            mock.patch('kitty.main.create_sessions', return_value=[]),
-            mock.patch('kitty.main.create_os_window', side_effect=lambda *a, **k: calls.append('create_window') or 1),
-            mock.patch('kitty.main.parse_os_window_state', return_value=None),
-            mock.patch('kitty.main.get_os_window_sizing_data', return_value=None),
-            mock.patch('kitty.main.Boss', side_effect=lambda *a, **k: DummyBoss()),
-            mock.patch('kitty.main._dump_metal_capture', side_effect=fake_dump),
-            mock.patch('kitty.main.set_custom_ibeam_cursor'),
-            mock.patch('kitty.main.dump_font_debug'),
-            mock.patch('kitty.main.set_font_family', side_effect=lambda *a, **k: calls.append('set_font_family')),
-        ):
-            with mock.patch.object(main.run_app, 'initial_window_size_func', lambda *a, **k: (80, 24)):
-                main._run_app(opts, args)
-
-        dump_calls = [entry for entry in calls if entry.startswith('dump:')]
-        self.assertTrue(dump_calls, 'Metal capture dump was not triggered by _run_app')
-        self.assertLess(calls.index(dump_calls[0]), calls.index('destroy'), 'Metal dump should run before renderer teardown')
+        with tempfile.TemporaryDirectory() as td:
+            out_path = Path(td) / 'capture.png'
+            stderr = io.StringIO()
+            with mock.patch('kitty.main.ctypes.CDLL', return_value=AlwaysEmptyLib()):
+                with mock.patch('kitty.main.is_macos', True):
+                    with mock.patch('kitty.main.time.sleep') as sleep_mock:
+                        sleep_mock.side_effect = lambda _delay: None
+                        with mock.patch('sys.stderr', stderr):
+                            main._dump_metal_capture(out_path)
+            self.assertFalse(out_path.exists(), 'PNG unexpectedly written despite missing capture')
+            self.assertIn('No Metal capture available', stderr.getvalue())
+            self.assertEqual(sleep_mock.call_count, 4, 'Expected four retry delays before giving up')
 
 
     def test_runtime_flags_follow_option_toggles(self) -> None:

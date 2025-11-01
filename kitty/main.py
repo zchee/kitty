@@ -7,6 +7,7 @@ import locale
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager, suppress
@@ -409,10 +410,17 @@ def _dump_metal_capture(target: str | os.PathLike[str]) -> None:
             clear_fn.argtypes = []
         if hasattr(clear_fn, 'restype'):
             clear_fn.restype = None
+    attempts = 5
+    delay = 0.05
     info = MetalCapturedFrameDebugInfo()
-    if not copy_capture(ctypes.pointer(info)):
-        sys.stderr.write(f'No Metal capture available; nothing written to {path}\n')
-        return
+    for attempt in range(attempts):
+        info = MetalCapturedFrameDebugInfo()
+        if copy_capture(ctypes.pointer(info)):
+            break
+        if attempt == attempts - 1:
+            sys.stderr.write(f'No Metal capture available; nothing written to {path}\n')
+            return
+        time.sleep(delay)
     width = int(info.width)
     height = int(info.height)
     stride = int(info.bytes_per_row)
