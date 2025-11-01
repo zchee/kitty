@@ -374,6 +374,8 @@ class Boss:
         cached_values: dict[str, Any],
         global_shortcuts: dict[str, SingleKey],
         talk_fd: int = -1,
+        metal_dump_target: str | os.PathLike[str] | None = None,
+        metal_dump_handler: Callable[[str | os.PathLike[str]], bool] | None = None,
     ):
         self.atexit = Atexit()
         set_layout_options(opts)
@@ -419,11 +421,26 @@ class Boss:
             talk_fd, listen_fd, self.listening_on.startswith('unix:')
         )
         self.args: CLIOptions = args
+        self._metal_dump_target = metal_dump_target
+        self._metal_dump_handler = metal_dump_handler
+        self._metal_dump_completed = False
         self.mouse_handler: Callable[[WindowSystemMouseEvent], None] | None = None
         set_boss(self)
         self.mappings: Mappings = Mappings(global_shortcuts, self.refresh_active_tab_bar)
         self.notification_manager: NotificationManager = NotificationManager(debug=self.args.debug_keyboard or self.args.debug_rendering)
         self.atexit.unlink(store_effective_config())
+
+    def dump_metal_capture_if_pending(self) -> bool:
+        if self._metal_dump_completed or not self._metal_dump_target or self._metal_dump_handler is None:
+            return False
+        try:
+            success = bool(self._metal_dump_handler(self._metal_dump_target))
+        except Exception as exc:
+            log_error(f'Metal capture dump raised an unexpected error: {exc}')
+            success = False
+        if success:
+            self._metal_dump_completed = True
+        return success
 
     def startup_first_child(self, os_window_id: int | None, startup_sessions: Iterable[Session] = ()) -> None:
         si = startup_sessions or create_sessions(get_options(), self.args, default_session=get_options().startup_session)
@@ -1974,6 +1991,7 @@ class Boss:
                 self.cached_values['monitor-workarea'] = glfw_get_monitor_workarea()
             self.cached_values['window-size'] = viewport_width, viewport_height
         if tm is not None:
+            self.dump_metal_capture_if_pending()
             tm.destroy()
         for window_id in tuple(w.id for w in self.window_id_map.values() if getattr(w, 'os_window_id', None) == os_window_id):
             self.window_id_map.pop(window_id, None)
@@ -3382,5 +3400,3 @@ class Boss:
     @ac('misc', 'Ungrab the keyboard if it was previously grabbed')
     def ungrab_keyboard(self) -> None:
         grab_keyboard(False)
-
-
