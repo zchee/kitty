@@ -545,6 +545,13 @@ Capture the Metal swapchain framebuffer every frame for debugging on macOS.
 This introduces overhead and should only be used for investigation.
 
 
+--metal-dump-frame
+completion=type:file
+condition=is_macos
+Provide a path to save a Metal framebuffer capture as a PNG when kitty exits.
+Implies --metal-gpu-capture.
+
+
 --debug-input --debug-keyboard
 dest=debug_keyboard
 type=bool-set

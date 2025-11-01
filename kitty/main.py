@@ -7,6 +7,7 @@ import locale
 import os
 import shutil
 import sys
+from pathlib import Path
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager, suppress
 from gettext import gettext as _
@@ -363,8 +364,98 @@ def _run_app(opts: Options, args: CLIOptions, bad_lines: Sequence[BadLine] = (),
         try:
             boss.child_monitor.main_loop()
         finally:
+            dump_target = getattr(args, 'metal_dump_frame', None)
+            if dump_target:
+                _dump_metal_capture(dump_target)
             boss.destroy()
 
+
+def _dump_metal_capture(target: str | os.PathLike[str]) -> None:
+    if not target or not is_macos:
+        return
+    path = Path(target).expanduser()
+    try:
+        import kitty.fast_data_types as fast_data_types  # local import to avoid cyclic import issues during tests
+    except ImportError as exc:
+        log_error(f'Failed to import Metal capture helpers: {exc}')
+        return
+    lib_path = getattr(fast_data_types, '__file__', None)
+    if not lib_path:
+        log_error('Failed to access Metal capture buffer: fast_data_types has no library path')
+        return
+    try:
+        lib = ctypes.CDLL(str(Path(lib_path)))
+    except OSError as exc:
+        log_error(f'Failed to access Metal capture buffer: {exc}')
+        return
+    class MetalCapturedFrameDebugInfo(ctypes.Structure):
+        _fields_ = [
+            ('width', ctypes.c_uint32),
+            ('height', ctypes.c_uint32),
+            ('bytes_per_row', ctypes.c_uint32),
+            ('pixels', ctypes.c_void_p),
+        ]
+    copy_capture = getattr(lib, 'metal_renderer_copy_captured_frame_for_tests', None)
+    if copy_capture is None:
+        sys.stderr.write(f'Metal capture API unavailable; nothing written to {path}\n')
+        return
+    if hasattr(copy_capture, 'argtypes'):
+        copy_capture.argtypes = [ctypes.POINTER(MetalCapturedFrameDebugInfo)]
+    if hasattr(copy_capture, 'restype'):
+        copy_capture.restype = ctypes.c_bool
+    clear_fn = getattr(lib, 'metal_renderer_debug_clear_captured_frame_for_tests', None)
+    if clear_fn is not None:
+        if hasattr(clear_fn, 'argtypes'):
+            clear_fn.argtypes = []
+        if hasattr(clear_fn, 'restype'):
+            clear_fn.restype = None
+    info = MetalCapturedFrameDebugInfo()
+    if not copy_capture(ctypes.pointer(info)):
+        sys.stderr.write(f'No Metal capture available; nothing written to {path}\n')
+        return
+    width = int(info.width)
+    height = int(info.height)
+    stride = int(info.bytes_per_row)
+    if width <= 0 or height <= 0 or stride <= 0 or stride < width * 4 or not info.pixels:
+        sys.stderr.write(f'Captured Metal frame metadata invalid; nothing written to {path}\n')
+        return
+    size = stride * height
+    try:
+        data = ctypes.string_at(info.pixels, size)
+    except (OSError, ValueError) as exc:
+        log_error(f'Failed to read Metal capture buffer: {exc}')
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    def write_png(outfile: Path, w: int, h: int, row_bytes: int, rgba: bytes) -> None:
+        import struct
+        import zlib
+        with outfile.open('wb') as fh:
+            fh.write(b'\x89PNG\r\n\x1a\n')
+            def chunk(tag: bytes, payload: bytes) -> None:
+                fh.write(struct.pack('>I', len(payload)))
+                fh.write(tag)
+                fh.write(payload)
+                fh.write(struct.pack('>I', zlib.crc32(tag + payload) & 0xffffffff))
+            chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 6, 0, 0, 0))
+            filtered = bytearray()
+            row_span = w * 4
+            for y in range(h):
+                filtered.append(0)
+                start = y * row_bytes
+                filtered.extend(rgba[start:start + row_span])
+            chunk(b'IDAT', zlib.compress(bytes(filtered), 9))
+            chunk(b'IEND', b'')
+    try:
+        write_png(path, width, height, stride, data)
+        sys.stderr.write(f'Metal capture saved to {path}\n')
+    except Exception as exc:  # pragma: no cover - defensive logging
+        log_error(f'Failed to write Metal capture to {path}: {exc}')
+    finally:
+        if clear_fn is not None:
+            try:
+                clear_fn()
+            except Exception as exc:  # pragma: no cover - defensive logging
+                log_error(f'Failed to clear Metal capture buffer: {exc}')
 
 class AppRunner:
 
@@ -377,6 +468,9 @@ class AppRunner:
     def __call__(self, opts: Options, args: CLIOptions, bad_lines: Sequence[BadLine] = (), talk_fd: int = -1) -> None:
         if theme_colors.refresh():
             theme_colors.patch_opts(opts, args.debug_rendering)
+        dump_target = getattr(args, 'metal_dump_frame', None)
+        if dump_target and not getattr(args, 'metal_gpu_capture', False):
+            args.metal_gpu_capture = True
         set_options(
             opts,
             is_wayland(),
