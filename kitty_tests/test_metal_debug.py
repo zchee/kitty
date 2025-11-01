@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ctypes
+import sys
 import unittest
 
 import kitty.fast_data_types as fast_data_types
@@ -83,6 +84,16 @@ class TestMetalDebugToggles(BaseTest):
         frame_params = ffi.RendererFrameParams()
         ffi.lib.renderer_backend_begin_frame(ctypes.c_void_p(), ctypes.byref(frame_params))
         ffi.lib.renderer_backend_swap_buffers(None)
+
+    def test_cli_flags_toggle_metal_debug(self) -> None:
+        if sys.platform != 'darwin':
+            self.skipTest('Metal CLI flags only available on macOS')
+        from kitty import cli
+
+        opts, leftover = cli.parse_args(['--debug-metal', '--metal-gpu-capture'])
+        self.assertEqual(leftover, [], 'cli.parse_args left unexpected positional args')
+        self.assertTrue(getattr(opts, 'debug_metal', False), '--debug-metal flag not reflected in CLI options')
+        self.assertTrue(getattr(opts, 'metal_gpu_capture', False), '--metal-gpu-capture flag not reflected in CLI options')
 
     def test_runtime_flags_follow_option_toggles(self) -> None:
         # Defaults: logging and capture disabled

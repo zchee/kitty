@@ -203,7 +203,7 @@ metal_log(const char *event, const char *fmt, ...) {
     vsnprintf(detail, sizeof(detail), fmt, args);
     va_end(args);
     if (metal_debug_events_enabled()) {
-        timed_debug_print("metal_event=%s %s", event, detail);
+        timed_debug_print("metal_event=%s %s\n", event, detail);
     }
     log_error("metal_event=%s %s", event, detail);
 }
@@ -218,7 +218,7 @@ metal_debug_event(const char *event, const char *fmt, ...) {
     char detail[256];
     vsnprintf(detail, sizeof(detail), fmt, args);
     va_end(args);
-    timed_debug_print("metal_event=%s %s", event, detail);
+    timed_debug_print("metal_event=%s %s\n", event, detail);
 }
 
 bool
@@ -573,6 +573,7 @@ graphics_sampler_for(bool linear_filter, RepeatStrategy repeat) {
 @property (nonatomic, strong) CAMetalLayer *layer;
 @property (nonatomic, strong) id<CAMetalDrawable> drawable;
 @property (nonatomic, strong) id<MTLCommandBuffer> commandBuffer;
+@property (nonatomic, assign) id<CAMetalDrawable> lastTintDrawable;
 @property (nonatomic) BOOL frameHasContent;
 @property (nonatomic) BOOL hasEncodedPass;
 @property (nonatomic) MTLLoadAction lastTintLoadAction;
@@ -2295,6 +2296,7 @@ clear_frame_content(MetalWindowState *state) {
     if (!state) return;
     state.frameHasContent = NO;
     state.hasEncodedPass = NO;
+    state.lastTintDrawable = nil;
 }
 
 static inline void
@@ -2324,6 +2326,12 @@ static bool
 ensure_command_primitives(GLFWwindow *window, MetalWindowState *state) {
     (void)window;
     if (!state || !state.layer) {
+        metal_log(
+            "command_primitives_layer_missing",
+            "state=%p layer=%p",
+            state,
+            state ? state.layer : nil
+        );
         PyErr_SetString(PyExc_RuntimeError, "Metal window state missing layer");
         return false;
     }
@@ -2379,6 +2387,16 @@ encode_clear_pass(GLFWwindow *window, MetalWindowState *state, MTLClearColor cle
         pass.colorAttachments[0].loadAction = state.frameHasContent ? MTLLoadActionLoad : MTLLoadActionClear;
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
         pass.colorAttachments[0].clearColor = clear_color;
+        if (g_metal.debug_events) {
+            metal_debug_event(
+                "clear_pass",
+                "drawable=%p load_action=%u frame_has_content=%d clear_alpha=%.3f",
+                state.drawable,
+                pass.colorAttachments[0].loadAction,
+                state.frameHasContent ? 1 : 0,
+                (double)pass.colorAttachments[0].clearColor.alpha
+            );
+        }
 
         id<MTLRenderCommandEncoder> encoder = [state.commandBuffer renderCommandEncoderWithDescriptor:pass];
         if (!encoder) {
@@ -2521,10 +2539,20 @@ metal_backend_ensure_initialized(const RendererInitConfig *cfg) {
             g_metal.initialized = true;
         }
     }
-    g_metal.prefer_low_latency = cfg ? cfg->prefer_low_latency : false;
-    g_metal.debug_labels = cfg ? cfg->enable_debug_labels : false;
-    g_metal.debug_events = cfg ? cfg->enable_debug_logging : false;
-    g_metal.capture_frames = cfg ? cfg->enable_frame_capture : false;
+    if (cfg) {
+        g_metal.prefer_low_latency = cfg->prefer_low_latency;
+        g_metal.debug_labels = cfg->enable_debug_labels;
+        g_metal.debug_events = cfg->enable_debug_logging;
+        g_metal.capture_frames = cfg->enable_frame_capture;
+    }
+    metal_log(
+        "init_config",
+        "prefer_low_latency=%d debug_labels=%d debug_logging=%d frame_capture=%d",
+        g_metal.prefer_low_latency ? 1 : 0,
+        g_metal.debug_labels ? 1 : 0,
+        g_metal.debug_events ? 1 : 0,
+        g_metal.capture_frames ? 1 : 0
+    );
     g_metal.display_sync_enabled = !g_metal.prefer_low_latency;
     set_display_sync_for_all_layers();
     metal_register_sprite_hooks();
@@ -2684,7 +2712,16 @@ metal_backend_render(GLFWwindow *window, const RendererRenderParams *params) {
         return false;
     }
     OSWindow *os_window = params ? params->os_window : NULL;
+    metal_log(
+        "render_begin",
+        "window=%p os_window=%p command_buffer=%p drawable=%p",
+        window,
+        os_window,
+        state.commandBuffer,
+        state.drawable
+    );
     if (!os_window) {
+        metal_log("render_no_os_window", "window=%p", window);
         return encode_clear_pass(window, state, state.clearColor);
     }
     if (!state.commandBuffer || !state.drawable) {
@@ -2839,10 +2876,21 @@ metal_backend_on_resume(void) {
     // Resources are recreated lazily per-frame.
 }
 
+static inline bool
+metal_should_clear_tint(bool has_encoded_pass, bool frame_has_content, bool drawable_changed) {
+    return drawable_changed || !(has_encoded_pass && frame_has_content);
+}
+
 static bool
 metal_encode_background_tint(GLFWwindow *window, MetalWindowState *state, color_type background_color) {
     (void)window;
     if (!state || OPT(background_tint) <= 0.f) {
+        metal_log(
+            "background_tint_skip",
+            "state=%p tint=%f",
+            state,
+            OPT(background_tint)
+        );
         return true;
     }
     if (!state.commandBuffer || !state.drawable) {
@@ -2853,8 +2901,12 @@ metal_encode_background_tint(GLFWwindow *window, MetalWindowState *state, color_
     if (!metal_ensure_resources()) {
         return false;
     }
-    const bool had_prior_pass = state.hasEncodedPass && state.frameHasContent;
-    const bool should_clear = !had_prior_pass;
+    const bool drawable_changed = state.lastTintDrawable != state.drawable;
+    const bool should_clear = metal_should_clear_tint(
+        state.hasEncodedPass,
+        state.frameHasContent,
+        drawable_changed
+    );
     @autoreleasepool {
         MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
         if (!pass) {
@@ -2865,6 +2917,19 @@ metal_encode_background_tint(GLFWwindow *window, MetalWindowState *state, color_
         pass.colorAttachments[0].loadAction = should_clear ? MTLLoadActionClear : MTLLoadActionLoad;
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
         pass.colorAttachments[0].clearColor = state.clearColor;
+        if (g_metal.debug_events) {
+            metal_debug_event(
+                "background_tint_pass",
+                "drawable=%p last_drawable=%p drawable_changed=%d has_encoded_pass=%d frame_has_content=%d load_action=%u should_clear=%d",
+                state.drawable,
+                state.lastTintDrawable,
+                drawable_changed ? 1 : 0,
+                state.hasEncodedPass ? 1 : 0,
+                state.frameHasContent ? 1 : 0,
+                pass.colorAttachments[0].loadAction,
+                should_clear ? 1 : 0
+            );
+        }
         id<MTLRenderCommandEncoder> encoder = [state.commandBuffer renderCommandEncoderWithDescriptor:pass];
         if (!encoder) {
             PyErr_SetString(PyExc_RuntimeError, "Failed to create Metal command encoder for background tint");
@@ -2874,6 +2939,7 @@ metal_encode_background_tint(GLFWwindow *window, MetalWindowState *state, color_
             encoder.label = @"kitty-background-tint";
         }
         state.lastTintLoadAction = pass.colorAttachments[0].loadAction;
+        state.lastTintDrawable = state.drawable;
         [encoder setViewport:(MTLViewport){
             .originX = 0.0,
             .originY = 0.0,
@@ -2903,6 +2969,12 @@ metal_encode_background(
     color_type fallback_bg
 ) {
     if (!state || !os_window) {
+        metal_log(
+            "background_skip_state",
+            "state=%p os_window=%p",
+            state,
+            os_window
+        );
         return true;
     }
     BackgroundImage *bgimage = os_window->bgimage;
@@ -2951,6 +3023,16 @@ metal_encode_background(
             pass.colorAttachments[0].loadAction = state.frameHasContent ? MTLLoadActionLoad : MTLLoadActionClear;
             pass.colorAttachments[0].storeAction = MTLStoreActionStore;
             pass.colorAttachments[0].clearColor = state.clearColor;
+            if (g_metal.debug_events) {
+                metal_debug_event(
+                    "background_image_pass",
+                    "drawable=%p load_action=%u frame_has_content=%d clear_alpha=%.3f",
+                    state.drawable,
+                    pass.colorAttachments[0].loadAction,
+                    state.frameHasContent ? 1 : 0,
+                    (double)pass.colorAttachments[0].clearColor.alpha
+                );
+            }
             id<MTLRenderCommandEncoder> encoder = [state.commandBuffer renderCommandEncoderWithDescriptor:pass];
             if (!encoder) {
                 PyErr_SetString(PyExc_RuntimeError, "Failed to create Metal command encoder for background image");
@@ -3024,6 +3106,14 @@ metal_encode_background(
         if (!metal_encode_background_tint(window, state, fallback_bg)) {
             return false;
         }
+    }
+    if (!background && OPT(background_tint) <= 0.f && g_metal.debug_events) {
+        metal_debug_event(
+            "background_skip",
+            "drawable=%p frame_has_content=%d",
+            state.drawable,
+            state.frameHasContent ? 1 : 0
+        );
     }
     return true;
 }
@@ -4160,6 +4250,15 @@ EXPORTED void
 metal_renderer_debug_reset_capture_state_for_tests(GLFWwindow *window, bool release_buffer) {
     MetalWindowState *state = state_for_window(window);
     metal_reset_capture_state(state, release_buffer);
+}
+
+EXPORTED bool
+metal_renderer_debug_should_clear_tint_for_tests(
+    bool has_encoded_pass,
+    bool frame_has_content,
+    bool drawable_changed
+) {
+    return metal_should_clear_tint(has_encoded_pass, frame_has_content, drawable_changed);
 }
 
 EXPORTED void

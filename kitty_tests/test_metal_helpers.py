@@ -157,6 +157,7 @@ class TestMetalHelperFunctions(BaseTest):
                 'metal_renderer_debug_get_window_state_for_tests',
                 'metal_renderer_debug_set_window_state_for_tests',
                 'metal_renderer_debug_reset_capture_state_for_tests',
+                'metal_renderer_debug_should_clear_tint_for_tests',
                 'metal_renderer_blank_drawable',
             )
         )
@@ -255,6 +256,12 @@ class TestMetalHelperFunctions(BaseTest):
                 ctypes.c_bool,
             ]
             cls.lib.metal_renderer_debug_reset_capture_state_for_tests.restype = None
+            cls.lib.metal_renderer_debug_should_clear_tint_for_tests.argtypes = [
+                ctypes.c_bool,
+                ctypes.c_bool,
+                ctypes.c_bool,
+            ]
+            cls.lib.metal_renderer_debug_should_clear_tint_for_tests.restype = ctypes.c_bool
             cls.lib.metal_renderer_blank_drawable.argtypes = [
                 ctypes.c_void_p,
                 ctypes.c_uint32,
@@ -740,6 +747,14 @@ class TestMetalHelperFunctions(BaseTest):
             -1,
             'Metal window render data should not allocate an OpenGL VAO',
         )
+
+    def test_should_clear_tint_helper_accounts_for_drawable_changes(self) -> None:
+        helper = self.lib.metal_renderer_debug_should_clear_tint_for_tests
+        self.assertTrue(helper(False, False, False), 'New drawable without prior passes should clear')
+        self.assertTrue(helper(False, True, False), 'Missing encoded pass still requires clear')
+        self.assertTrue(helper(True, False, False), 'No recorded content mandates clear')
+        self.assertTrue(helper(True, True, True), 'Drawable change requires clear even with prior content')
+        self.assertFalse(helper(True, True, False), 'Existing content on same drawable may load safely')
 
 class TestMetalBackgroundTintRendering(BaseTest):
     _glfw_initialized = False
