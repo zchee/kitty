@@ -13,6 +13,9 @@
 #include "glfw-wrapper.h"
 #ifdef __APPLE__
 #include "cocoa_window.h"
+#include "metal_surface.h"
+#include <stdlib.h>
+#include <strings.h>
 #else
 #include "freetype_render_ui_text.h"
 #endif
@@ -24,6 +27,11 @@ typedef struct mouse_cursor {
 } mouse_cursor;
 
 static mouse_cursor cursors[GLFW_INVALID_CURSOR+1] = {0};
+
+#ifdef __APPLE__
+static bool metal_backend_checked = false;
+static bool metal_backend_requested = false;
+#endif
 
 static void
 apply_swap_interval(int val) {
@@ -1350,6 +1358,19 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
     }
     if (PyErr_Occurred()) return NULL;
     if (lsc && window_state != WINDOW_HIDDEN) window_state = WINDOW_NORMAL;
+
+#ifdef __APPLE__
+    if (!metal_backend_checked) {
+        const char *requested_backend = getenv("KITTY_GPU_BACKEND");
+        if (requested_backend && strcasecmp(requested_backend, "metal") == 0) {
+            metal_backend_requested = true;
+            if (!metal_backend_available()) {
+                log_error("Metal backend requested via KITTY_GPU_BACKEND but support is not yet available; falling back to OpenGL.");
+            }
+        }
+        metal_backend_checked = true;
+    }
+#endif
 
     static bool is_first_window = true;
     if (is_first_window) {

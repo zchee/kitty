@@ -3697,6 +3697,15 @@ global menu bar. Values less than one means that there is no maximum limit.
 '''
     )
 
+opt('macos_use_metal', 'no',
+    option_type='to_bool', ctype='bool',
+    long_text='''
+Enable kitty's experimental Metal based renderer on macOS. When disabled, kitty
+uses the legacy OpenGL backend. Requires macOS 11.0 or newer and a GPU that
+supports Metal. Changing this option by reloading the config is not supported.
+'''
+    )
+
 opt('macos_custom_beam_cursor', 'no',
     option_type='to_bool',
     long_text='''

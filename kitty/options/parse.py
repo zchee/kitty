@@ -1091,6 +1091,9 @@ class Parser:
     def macos_menubar_title_max_length(self, val: str, ans: dict[str, typing.Any]) -> None:
         ans['macos_menubar_title_max_length'] = positive_int(val)
 
+    def macos_use_metal(self, val: str, ans: dict[str, typing.Any]) -> None:
+        ans['macos_use_metal'] = to_bool(val)
+
     def macos_option_as_alt(self, val: str, ans: dict[str, typing.Any]) -> None:
         ans['macos_option_as_alt'] = macos_option_as_alt(val)
 
