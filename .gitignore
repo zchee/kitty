@@ -18,6 +18,7 @@
 /glad/out/
 /kitty/launcher/kitt*
 /*.dSYM/
+kitty/metal/*.metallib
 __pycache__/
 /glfw/wayland-*-client-protocol.[ch]
 /docs/_build/

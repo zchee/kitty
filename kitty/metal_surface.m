@@ -12,8 +12,11 @@
 #ifdef __APPLE__
 
 #include "state.h"
+#include "metal_text_shared.h"
 
 #include <math.h>
+#include <limits.h>
+#include <unistd.h>
 
 #import <AppKit/AppKit.h>
 #import <Metal/Metal.h>
@@ -27,7 +30,161 @@ typedef struct {
     MTLClearColor clear_color;
 } MetalSurfaceState;
 
+typedef enum {
+    MetalCellPipelineFull = 0,
+    MetalCellPipelineBackground = 1,
+    MetalCellPipelineForeground = 2,
+    MetalCellPipelineCount = 3
+} MetalCellPipelineKind;
+
+typedef struct {
+    bool attempted;
+    bool ok;
+    id<MTLLibrary> library;
+    id<MTLRenderPipelineState> cell_pipelines[MetalCellPipelineCount];
+    MTLVertexDescriptor *vertex_descriptor;
+} MetalRendererState;
+
 static id<MTLDevice> metal_device = nil;
+static MetalRendererState renderer_state = {0};
+
+static NSString*
+find_cell_metallib_path(void) {
+    NSString *path = [[NSBundle mainBundle] pathForResource:@"cell" ofType:@"metallib" inDirectory:@"kitty/metal"];
+    if (!path) path = [[NSBundle mainBundle] pathForResource:@"cell" ofType:@"metallib"];
+    if (path) return path;
+    const char *env = getenv("KITTY_METAL_LIB");
+    if (env && access(env, R_OK) == 0) return [NSString stringWithUTF8String:env];
+    const char *fallback = "kitty/metal/cell.metallib";
+    if (access(fallback, R_OK) == 0) {
+        char resolved[PATH_MAX];
+        if (realpath(fallback, resolved)) return [NSString stringWithUTF8String:resolved];
+        return [NSString stringWithUTF8String:fallback];
+    }
+    return nil;
+}
+
+static id<MTLFunction>
+new_function(id<MTLLibrary> library, NSString *name) {
+    id<MTLFunction> fn = [library newFunctionWithName:name];
+    if (!fn) log_error("Metal: failed to load function %s from metallib", name.UTF8String);
+    return fn;
+}
+
+static void
+destroy_metal_renderer_state(void) {
+    for (size_t i = 0; i < MetalCellPipelineCount; i++) {
+        if (renderer_state.cell_pipelines[i]) {
+            [renderer_state.cell_pipelines[i] release];
+            renderer_state.cell_pipelines[i] = nil;
+        }
+    }
+    if (renderer_state.vertex_descriptor) {
+        [renderer_state.vertex_descriptor release];
+        renderer_state.vertex_descriptor = nil;
+    }
+    if (renderer_state.library) {
+        [renderer_state.library release];
+        renderer_state.library = nil;
+    }
+    renderer_state.ok = false;
+    renderer_state.attempted = false;
+}
+
+static bool
+ensure_metal_renderer_state(id<MTLDevice> device) {
+    if (renderer_state.ok) return true;
+    if (renderer_state.attempted) return false;
+    renderer_state.attempted = true;
+
+    NSString *metallib_path = find_cell_metallib_path();
+    if (!metallib_path) {
+        log_error("Metal: could not locate cell.metallib");
+        return false;
+    }
+
+    NSError *error = nil;
+    renderer_state.library = [device newLibraryWithFile:metallib_path error:&error];
+    if (!renderer_state.library) {
+        log_error("Metal: failed to load metallib at %s (%s)", metallib_path.UTF8String, error.localizedDescription.UTF8String);
+        destroy_metal_renderer_state();
+        return false;
+    }
+
+    MTLVertexDescriptor *vertex_desc = [MTLVertexDescriptor vertexDescriptor];
+    vertex_desc.attributes[0].format = MTLVertexFormatUInt3;
+    vertex_desc.attributes[0].offset = offsetof(KittyGPUCell, fg);
+    vertex_desc.attributes[0].bufferIndex = 0;
+
+    vertex_desc.attributes[1].format = MTLVertexFormatUInt2;
+    vertex_desc.attributes[1].offset = offsetof(KittyGPUCell, sprite_idx);
+    vertex_desc.attributes[1].bufferIndex = 0;
+
+    vertex_desc.attributes[2].format = MTLVertexFormatUChar;
+    vertex_desc.attributes[2].offset = 0;
+    vertex_desc.attributes[2].bufferIndex = 1;
+
+    vertex_desc.layouts[0].stride = sizeof(KittyGPUCell);
+    vertex_desc.layouts[0].stepRate = 1;
+    vertex_desc.layouts[0].stepFunction = MTLVertexStepFunctionPerInstance;
+
+    vertex_desc.layouts[1].stride = sizeof(uint8_t);
+    vertex_desc.layouts[1].stepRate = 1;
+    vertex_desc.layouts[1].stepFunction = MTLVertexStepFunctionPerInstance;
+
+    renderer_state.vertex_descriptor = [vertex_desc retain];
+
+    struct PipelineSpec {
+        NSString *vertex;
+        NSString *fragment;
+        MetalCellPipelineKind kind;
+    };
+    const struct PipelineSpec specs[] = {
+        { @"cell_vertex_full", @"cell_fragment_full", MetalCellPipelineFull },
+        { @"cell_vertex_background", @"cell_fragment_background", MetalCellPipelineBackground },
+        { @"cell_vertex_foreground", @"cell_fragment_foreground", MetalCellPipelineForeground },
+    };
+
+    for (size_t i = 0; i < arraysz(specs); i++) {
+        id<MTLFunction> vertex_fn = new_function(renderer_state.library, specs[i].vertex);
+        id<MTLFunction> fragment_fn = new_function(renderer_state.library, specs[i].fragment);
+        if (!vertex_fn || !fragment_fn) {
+            if (vertex_fn) [vertex_fn release];
+            if (fragment_fn) [fragment_fn release];
+            destroy_metal_renderer_state();
+            return false;
+        }
+
+        MTLRenderPipelineDescriptor *descriptor = [[MTLRenderPipelineDescriptor alloc] init];
+        descriptor.vertexFunction = vertex_fn;
+        descriptor.fragmentFunction = fragment_fn;
+        descriptor.vertexDescriptor = renderer_state.vertex_descriptor;
+        descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm_sRGB;
+        descriptor.colorAttachments[0].blendingEnabled = YES;
+        descriptor.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+        descriptor.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+        descriptor.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+        descriptor.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+        descriptor.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        descriptor.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        descriptor.label = [NSString stringWithFormat:@"kitty.cell.%@", specs[i].vertex];
+
+        id<MTLRenderPipelineState> pipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+        [descriptor release];
+        [vertex_fn release];
+        [fragment_fn release];
+
+        if (!pipeline) {
+            log_error("Metal: failed to create pipeline %s (%s)", specs[i].vertex.UTF8String, error.localizedDescription.UTF8String);
+            destroy_metal_renderer_state();
+            return false;
+        }
+        renderer_state.cell_pipelines[specs[i].kind] = pipeline;
+    }
+
+    renderer_state.ok = true;
+    return true;
+}
 
 static inline MetalSurfaceState*
 get_surface_state(OSWindow *window) {
@@ -115,6 +272,15 @@ metal_backend_init(OSWindow *window) {
             return false;
         }
 
+        if (!ensure_metal_renderer_state(metal_device)) {
+            [queue release];
+            [layer removeFromSuperlayer];
+            [layer release];
+            free(state);
+            log_error("Metal backend unavailable: failed to initialize render pipelines.");
+            return false;
+        }
+
         state->layer = layer;
         state->command_queue = queue;
         state->clear_color = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
@@ -131,6 +297,7 @@ metal_backend_shutdown(void) {
             [metal_device release];
             metal_device = nil;
         }
+        destroy_metal_renderer_state();
     }
 }
 

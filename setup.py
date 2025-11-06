@@ -1213,6 +1213,26 @@ def build_uniforms_header(skip_generation: bool = False) -> str:
     return dest
 
 
+def build_metal_shaders(args: Options) -> Optional[str]:
+    if not is_macos or args.skip_code_generation:
+        return None
+    src = Path('kitty/metal/shaders/cell.metal')
+    impl = Path('kitty/metal/shaders/cell_variant_impl.metal')
+    shared_header = Path('kitty/metal_text_shared.h')
+    if not src.exists():
+        return None
+    out_dir = Path(build_dir) / 'metal'
+    out_dir.mkdir(parents=True, exist_ok=True)
+    air = out_dir / 'cell.air'
+    metallib = Path('kitty/metal/cell.metallib')
+    inputs = [src, impl, shared_header]
+    if metallib.exists() and all(metallib.stat().st_mtime >= p.stat().st_mtime for p in inputs if p.exists()):
+        return str(metallib)
+    run_tool(['xcrun', 'metal', '-c', str(src), '-o', str(air)], desc='Compiling Metal shaders')
+    run_tool(['xcrun', 'metallib', str(air), '-o', str(metallib)], desc='Linking Metal shaders')
+    return str(metallib)
+
+
 @lru_cache
 def wrapped_kittens() -> str:
     with open('shell-integration/ssh/kitty') as f:
@@ -1230,6 +1250,7 @@ def build(args: Options, native_optimizations: bool = True, call_init: bool = Tr
     headers.append(build_ref_map(args.skip_code_generation))
     headers.append(build_cli_parser_specs(args.skip_code_generation))
     headers.append(build_uniforms_header(args.skip_code_generation))
+    build_metal_shaders(args)
     compile_c_extension(
         kitty_env(args), 'kitty/fast_data_types', args.compilation_database, sources, headers,
         build_dsym=args.build_dsym,

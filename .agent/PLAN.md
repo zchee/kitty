@@ -8,14 +8,14 @@
 - [x] Review existing CPU-side staging buffers (VBO data structures, sprite tracker) to determine reuse potential.
 - [x] Gather Apple Metal documentation for textures (`MTLTextureDescriptor`), samplers, and buffer encoding best practices.
 - [x] Design Metal resource structures for glyph atlas textures, vertex buffers, uniform buffers, and sampler state.
-- [ ] Plan metallib packaging for the cell shaders (translate GLSL to MSL and integrate into build).
+- [x] Plan metallib packaging for the cell shaders (translate GLSL to MSL and integrate into build).
 - [ ] Prototype creation of Metal pipeline state objects mirroring the GLSL programs (blend state, vertex descriptors).
 - [ ] Implement glyph atlas upload path using Metal blit/replaceRegion, wired into existing glyph-cache callbacks.
 - [ ] Implement Metal vertex/index buffer population mirroring the OpenGL path for cell quads.
 - [ ] Encode render pass for main text grid (bind atlas texture, constant buffers, draw calls).
 - [ ] Integrate Metal render flow into `render_prepared_os_window` keeping GL path intact for other backends.
 - [ ] Adjust Python bindings/fast_data_types to expose backend-neutral draw calls usable by both GL and Metal.
-- [ ] Update build system to compile and bundle MSL shaders (`xcrun metal` + `metallib` stages).
+- [x] Update build system to compile and bundle MSL shaders (`xcrun metal` + `metallib` stages).
 - [ ] Add diagnostics/logging for Metal text rendering (device loss, command buffer failures).
 - [ ] Create focused regression tests exercising Metal text rendering (headless snapshot or glyph-upload smoke test).
 - [ ] Run targeted Metal tests plus existing fast checks to validate no regressions.

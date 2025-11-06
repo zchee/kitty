@@ -186,6 +186,8 @@ This inventory is the contract the Metal backend must satisfy when reconstructin
 
 This layout keeps CPU producers untouched while giving Metal explicit ownership of textures, buffers, and pipeline state.
 
+**Current status:** `kitty/metal/shaders/cell.metal` and `cell_variant_impl.metal` provide MSL equivalents for the existing cell vertex/fragment shaders with variant entry points, while `kitty/metal_text_shared.h` shares uniform layouts between C and Metal. `setup.py` now compiles the Metal sources via `xcrun metal`/`metallib` into `kitty/metal/cell.metallib` during the build.
+
 ## 7. Build, Packaging, and Tooling Updates
 
 - Modify `setup.py:680-706` to drop `-framework OpenGL` in favor of `-framework Metal -framework QuartzCore -framework MetalKit (optional)` and include metallib assets in the package data.  

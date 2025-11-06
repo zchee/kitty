@@ -10,12 +10,16 @@
 
 #pragma once
 
+#ifndef __METAL_VERSION__
 #include <stdint.h>
+#endif
 
 #define KITTY_NUM_COLORS              256u
 #define KITTY_MARK_MASK               3u
 #define KITTY_COLOR_TABLE_SIZE        (KITTY_NUM_COLORS + 2u * KITTY_MARK_MASK + 2u)
 #define KITTY_GAMMA_LUT_SIZE          256u
+
+#define KITTY_BYTE_MASK               0xffu
 
 #define KITTY_DECORATION_SHIFT        0u
 #define KITTY_REVERSE_SHIFT           5u
@@ -48,7 +52,7 @@ typedef GPUCell KittyGPUCell;
 
 typedef struct KittyCellUniforms {
     float use_cell_bg_for_selection_fg;
-    float use_cell_fg_for_selection_color;
+    float use_cell_fg_for_selection_fg;
     float use_cell_for_selection_bg;
     float _pad0;
 
@@ -102,7 +106,7 @@ struct KittyGPUCell {
 
 struct KittyCellUniforms {
     float use_cell_bg_for_selection_fg;
-    float use_cell_fg_for_selection_color;
+    float use_cell_fg_for_selection_fg;
     float use_cell_for_selection_bg;
     float _pad0;
 
