@@ -340,6 +340,10 @@ typedef struct OSWindow {
     id_type last_focused_counter;
     CloseRequest close_request;
     bool is_layer_shell, hide_on_focus_loss;
+#ifdef KITTY_ENABLE_METAL
+    void *metal_surface;
+    bool metal_backend_active;
+#endif
 } OSWindow;
 
 static inline float

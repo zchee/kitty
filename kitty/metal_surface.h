@@ -18,8 +18,9 @@ struct OSWindow;
 bool metal_backend_available(void);
 bool metal_backend_init(struct OSWindow *window);
 void metal_backend_shutdown(void);
-bool metal_begin_frame(struct OSWindow *window);
+bool metal_begin_frame(struct OSWindow *window, float background_opacity, unsigned int color_in_srgb);
 void metal_end_frame(struct OSWindow *window);
+void metal_teardown_surface(struct OSWindow *window);
 
 #else
 
@@ -36,13 +37,20 @@ static inline void
 metal_backend_shutdown(void) {}
 
 static inline bool
-metal_begin_frame(struct OSWindow *window) {
+metal_begin_frame(struct OSWindow *window, float background_opacity, unsigned int color_in_srgb) {
     (void)window;
+    (void)background_opacity;
+    (void)color_in_srgb;
     return false;
 }
 
 static inline void
 metal_end_frame(struct OSWindow *window) {
+    (void)window;
+}
+
+static inline void
+metal_teardown_surface(struct OSWindow *window) {
     (void)window;
 }
 

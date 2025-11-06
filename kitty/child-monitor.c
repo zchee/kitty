@@ -8,6 +8,9 @@
 #include "loop-utils.h"
 #include "safe-wrappers.h"
 #include "state.h"
+#ifdef KITTY_ENABLE_METAL
+#include "metal_surface.h"
+#endif
 #include "threading.h"
 #include "screen.h"
 #include "monotonic.h"
@@ -870,6 +873,20 @@ render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images) {
         }
     }
     w->render_calls++;
+#ifdef KITTY_ENABLE_METAL
+    if (w->metal_backend_active) {
+        float alpha = effective_os_window_alpha(w);
+        color_type bg = OPT(background);
+        if (metal_begin_frame(w, alpha, bg)) {
+            if (w->viewport_size_dirty) w->viewport_size_dirty = false;
+            swap_window_buffers(w);
+            if (w->redraw_count) w->redraw_count--;
+            w->focused_at_last_render = w->is_focused;
+            return true;
+        }
+        return false;
+    }
+#endif
     make_os_window_context_current(w);
     bool needs_render = w->redraw_count > 0 || w->live_resize.in_progress;
     if (w->viewport_size_dirty) {

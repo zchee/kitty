@@ -923,6 +923,9 @@ set_os_window_icon(PyObject UNUSED *self, PyObject *args) {
 
 void*
 make_os_window_context_current(OSWindow *w) {
+#ifdef KITTY_ENABLE_METAL
+    if (w && w->metal_backend_active) return NULL;
+#endif
     GLFWwindow *current_context = glfwGetCurrentContext();
     if (w->handle != current_context) {
         glfwMakeContextCurrent(w->handle);
@@ -1365,7 +1368,7 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
         if (requested_backend && strcasecmp(requested_backend, "metal") == 0) {
             metal_backend_requested = true;
             if (!metal_backend_available()) {
-                log_error("Metal backend requested via KITTY_GPU_BACKEND but support is not yet available; falling back to OpenGL.");
+                fatal("Metal backend requested via KITTY_GPU_BACKEND but support is not available on this system.");
             }
         }
         metal_backend_checked = true;
@@ -1374,33 +1377,30 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
 
     static bool is_first_window = true;
     if (is_first_window) {
-        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, OPENGL_REQUIRED_VERSION_MAJOR);
-        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, OPENGL_REQUIRED_VERSION_MINOR);
-        glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, true);
-        // We don't use depth and stencil buffers
-        glfwWindowHint(GLFW_DEPTH_BITS, 0);
-        glfwWindowHint(GLFW_STENCIL_BITS, 0);
-        glfwSetApplicationCloseCallback(application_close_requested_callback);
-        glfwSetCurrentSelectionCallback(get_current_selection);
-        glfwSetHasCurrentSelectionCallback(has_current_selection);
-        glfwSetIMECursorPositionCallback(get_ime_cursor_position);
-        glfwSetSystemColorThemeChangeCallback(on_system_color_scheme_change);
-        glfwSetClipboardLostCallback(on_clipboard_lost);
-        // Request SRGB output buffer
-        // Prevents kitty from starting on Wayland + NVIDIA, sigh: https://github.com/kovidgoyal/kitty/issues/7021
-        // Remove after https://github.com/NVIDIA/egl-wayland/issues/85 is fixed.
-        // Also apparently mesa has introduced a bug with sRGB surfaces and Wayland.
-        // Sigh. Wayland is such a pile of steaming crap.
-        // See https://github.com/kovidgoyal/kitty/issues/7174#issuecomment-2000033873
-        // GL_FRAMEBUFFER_SRGB works anyway without this on Wayland.
-        if (!global_state.is_wayland) glfwWindowHint(GLFW_SRGB_CAPABLE, true);
 #ifdef __APPLE__
-        cocoa_set_activation_policy(OPT(macos_hide_from_tasks) || lsc != NULL);
-        glfwWindowHint(GLFW_COCOA_GRAPHICS_SWITCHING, true);
-        glfwWindowHint(GLFW_COCOA_RETINA_FRAMEBUFFER, true);
-        glfwSetApplicationShouldHandleReopen(on_application_reopen);
-        glfwSetApplicationWillFinishLaunching(cocoa_application_lifecycle_event);
+        if (!metal_backend_requested) {
 #endif
+            glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, OPENGL_REQUIRED_VERSION_MAJOR);
+            glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, OPENGL_REQUIRED_VERSION_MINOR);
+            glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, true);
+            glfwWindowHint(GLFW_DEPTH_BITS, 0);
+            glfwWindowHint(GLFW_STENCIL_BITS, 0);
+            glfwSetApplicationCloseCallback(application_close_requested_callback);
+            glfwSetCurrentSelectionCallback(get_current_selection);
+            glfwSetHasCurrentSelectionCallback(has_current_selection);
+            glfwSetIMECursorPositionCallback(get_ime_cursor_position);
+            glfwSetSystemColorThemeChangeCallback(on_system_color_scheme_change);
+            glfwSetClipboardLostCallback(on_clipboard_lost);
+            if (!global_state.is_wayland) glfwWindowHint(GLFW_SRGB_CAPABLE, true);
+#ifdef __APPLE__
+            cocoa_set_activation_policy(OPT(macos_hide_from_tasks) || lsc != NULL);
+            glfwWindowHint(GLFW_COCOA_GRAPHICS_SWITCHING, true);
+            glfwWindowHint(GLFW_COCOA_RETINA_FRAMEBUFFER, true);
+            glfwSetApplicationShouldHandleReopen(on_application_reopen);
+            glfwSetApplicationWillFinishLaunching(cocoa_application_lifecycle_event);
+        }
+#endif
+        is_first_window = false;
     }
     if (OPT(hide_window_decorations) & 1) glfwWindowHint(GLFW_DECORATED, false);
 
@@ -1418,6 +1418,10 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
         PyErr_SetString(PyExc_ValueError, "Too many windows");
         return NULL;
     }
+#ifdef __APPLE__
+    if (metal_backend_requested) glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+    else glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_API);
+#endif
     bool want_semi_transparent = (1.0 - OPT(background_opacity) >= 0.01) || OPT(dynamic_background_opacity);
     glfwWindowHint(GLFW_TRANSPARENT_FRAMEBUFFER, want_semi_transparent);
     uint32_t bgcolor = OPT(background);
@@ -1464,15 +1468,18 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
     if (temp_window) { glfwDestroyWindow(temp_window); temp_window = NULL; }
     if (glfw_window == NULL) glfw_failure;
 #undef glfw_failure
-    glfwMakeContextCurrent(glfw_window);
-    if (is_first_window) gl_init();
     bool is_semi_transparent = glfwGetWindowAttrib(glfw_window, GLFW_TRANSPARENT_FRAMEBUFFER);
-    // blank the window once so that there is no initial flash of color
-    // changing, in case the background color is not black
-    blank_canvas(is_semi_transparent ? OPT(background_opacity) : 1.0f, OPT(background), true);
-    apply_swap_interval(-1);
-    // On Wayland the initial swap is allowed only after the first XDG configure event
-    if (glfwAreSwapsAllowed(glfw_window)) glfwSwapBuffers(glfw_window);
+#ifdef __APPLE__
+    if (!metal_backend_requested) {
+#endif
+        glfwMakeContextCurrent(glfw_window);
+        if (is_first_window) gl_init();
+        blank_canvas(is_semi_transparent ? OPT(background_opacity) : 1.0f, OPT(background), true);
+        apply_swap_interval(-1);
+        if (glfwAreSwapsAllowed(glfw_window)) glfwSwapBuffers(glfw_window);
+#ifdef __APPLE__
+    }
+#endif
     glfwSetInputMode(glfw_window, GLFW_LOCK_KEY_MODS, true);
     PyObject *pret = PyObject_CallFunction(pre_show_callback, "N", native_window_handle(glfw_window));
     if (pret == NULL) return NULL;
@@ -1502,6 +1509,10 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
         is_first_window = false;
     }
     OSWindow *w = add_os_window();
+#ifdef KITTY_ENABLE_METAL
+    w->metal_surface = NULL;
+    w->metal_backend_active = false;
+#endif
     w->handle = glfw_window;
     w->disallow_title_changes = disallow_override_title;
     if (lsc != NULL) {
@@ -1519,13 +1530,23 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
     w->fonts_data = fonts_data;
     w->shown_once = true;
     w->last_focused_counter = ++focus_counter;
+#ifdef KITTY_ENABLE_METAL
+    if (metal_backend_requested) {
+        if (!metal_backend_init(w)) {
+            fatal("Failed to initialize Metal backend for the new window.");
+        }
+    }
+#endif
     os_window_update_size_increments(w);
 #ifdef __APPLE__
     if (OPT(macos_option_as_alt)) glfwSetCocoaTextInputFilter(glfw_window, filter_option);
     glfwSetCocoaToggleFullscreenIntercept(glfw_window, intercept_cocoa_fullscreen);
     glfwCocoaSetWindowResizeCallback(glfw_window, cocoa_os_window_resized);
 #endif
-    send_prerendered_sprites_for_window(w);
+#ifdef KITTY_ENABLE_METAL
+    if (!metal_backend_requested)
+#endif
+        send_prerendered_sprites_for_window(w);
     if (logo.pixels && logo.width && logo.height) glfwSetWindowIcon(glfw_window, 1, &logo);
     set_glfw_mouse_pointer_shape_in_window(glfw_window, OPT(default_pointer_shape));
     update_os_window_viewport(w, false);
@@ -1626,6 +1647,9 @@ destroy_os_window(OSWindow *w) {
 #ifdef __APPLE__
     static size_t source_workspaces[64];
     size_t source_workspace_count = 0;
+#endif
+#ifdef KITTY_ENABLE_METAL
+    if (w->metal_backend_active) metal_teardown_surface(w);
 #endif
     if (w->handle) {
 #ifdef __APPLE__
@@ -2110,6 +2134,13 @@ is_mouse_hidden(OSWindow *w) {
 
 void
 swap_window_buffers(OSWindow *os_window) {
+#ifdef KITTY_ENABLE_METAL
+    if (os_window->metal_backend_active) {
+        metal_end_frame(os_window);
+        os_window->keep_rendering_till_swap = 0;
+        return;
+    }
+#endif
     if (glfwAreSwapsAllowed(os_window->handle)) {
         glfwSwapBuffers(os_window->handle);
         os_window->keep_rendering_till_swap = 0;

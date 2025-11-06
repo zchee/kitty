@@ -682,9 +682,7 @@ def kitty_env(args: Options) -> Env:
             platform_libs.extend(shlex.split(user_notifications_framework))
         else:
             raise SystemExit('UserNotifications framework missing')
-        # Apple deprecated OpenGL in Mojave (10.14) silence the endless
-        # warnings about it
-        cppflags.append('-DGL_SILENCE_DEPRECATION')
+        cppflags.append('-DKITTY_ENABLE_METAL')
     else:
         cflags.extend(pkg_config('cairo-fc', '--cflags-only-I'))
         platform_libs = []
@@ -692,7 +690,7 @@ def kitty_env(args: Options) -> Env:
     cflags.extend(pkg_config('harfbuzz', '--cflags-only-I'))
     platform_libs.extend([f'-L{homebrew_prefix()}/opt/harfbuzz/lib', '-lharfbuzz', f'-L{homebrew_prefix()}/opt/graphite2/lib', '-lgraphite2'])
     pylib = get_python_flags(args, cflags)
-    gl_libs = ['-framework', 'OpenGL'] if is_macos else pkg_config('gl', '--libs')
+    gl_libs = ['-framework', 'Metal', '-framework', 'QuartzCore'] if is_macos else pkg_config('gl', '--libs')
     libpng = [f'{homebrew_prefix()}/opt/libpng/lib/libpng16.a']
     lcms2 = [f'{homebrew_prefix()}/opt/lcms2/lib/liblcms2.a']
     ans.ldpaths += pylib + platform_libs + gl_libs + libpng + lcms2 + libcrypto_ldflags + xxhash[1]
@@ -814,6 +812,11 @@ def get_source_specific_defines(env: Env, src: str) -> Tuple[str, List[str], Opt
 def get_source_specific_cflags(env: Env, src: str) -> List[str]:
     ans = list(env.cflags)
     # ans.append("-I/usr/local/opt/simde/include")
+    # Objective-C++ sources require C++ standard flag instead of C
+    if src.endswith('.mm'):
+        ans = [flag for flag in ans if not flag.startswith('-std=')]
+        ans.append('-std=c++17')
+        ans.append('-fobjc-arc')
     # SIMD specific flags
     if src in ('kitty/simd-string-128.c', 'kitty/simd-string-256.c'):
         # simde recommends these are used for best performance
@@ -1038,7 +1041,7 @@ def find_c_files() -> Tuple[List[str], List[str]]:
     }
     for x in sorted(os.listdir(d)):
         ext = os.path.splitext(x)[1]
-        if ext in ('.c', '.m') and os.path.basename(x) not in exclude:
+        if ext in ('.c', '.m', '.mm') and os.path.basename(x) not in exclude:
             ans.append(os.path.join('kitty', x))
         elif ext == '.h':
             headers.append(os.path.join('kitty', x))
