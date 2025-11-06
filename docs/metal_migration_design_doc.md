@@ -134,6 +134,58 @@ Prior repository work already catalogued affected components (`docs/metal_migrat
 - Extend `kitty/debug_config.py` to report Metal device name, driver version, and active backend.  
 - Capture per-frame telemetry (frame time, command buffer duration) for logging.
 
+### 6.8 OpenGL Text Pipeline Inventory (Parity Baseline)
+
+Metal has to reproduce the OpenGL data path before we can iterate. The current renderer organizes the text grid as follows:
+
+- **Shader programs & variants**
+  - `CELL_PROGRAM` draws background + foreground in a single instanced pass.
+  - `CELL_BG_PROGRAM` recompiles the same sources with `ONLY_BACKGROUND` for layered UI.
+  - `CELL_FG_PROGRAM` recompiles with `ONLY_FOREGROUND`, adding cursor and decoration sprites.
+  - All three bind the shared `CellRenderData` UBO, `gamma_lut[256]`, `sprites` (glyph atlas, unit `SPRITE_MAP_UNIT`), and `sprite_decorations_map` (unit `SPRITE_DECORATIONS_MAP_UNIT`).
+- **Vertex inputs**
+  - Instanced attribute 0 (`uvec3 colors`) reads `GPUCell.fg`, `GPUCell.bg`, `GPUCell.decoration_fg`.
+  - Attribute 1 (`uvec2 sprite_idx`) draws from `GPUCell.sprite_idx` plus decoration page index.
+  - Attribute 2 (`uint is_selected`) is sourced from the selection buffer and drives highlight logic.
+- **Buffers**
+  - Cell instance buffer = tightly packed `GPUCell` array (`sizeof(GPUCell) == 20`) mapped via `cell_prepare_to_render()`.
+  - Selection buffer = one byte per cell populated by `screen_apply_selection()`.
+  - Uniform buffer = streamed `GPUCellRenderData` structure containing cursor bounds, atlas metrics (`sprites_xnum`, `sprites_ynum`, `cell_width`, `cell_height`), inactive text alpha, dim/blink opacity, and expanded color tables.
+- **Textures & samplers**
+  - Glyph atlas is a `GL_TEXTURE_2D_ARRAY` sized `sprites_xnum * cell_width` × `sprites_ynum * (cell_height + 1)` × `z` with `GL_SRGB8_ALPHA8` storage and `GL_NEAREST` filtering.
+  - Decorations map is a `GL_TEXTURE_2D` (`GL_R32UI`) storing underline/strike sprite indices per glyph; also `GL_NEAREST`.
+  - `send_sprite_to_gpu()` handles uploads via `glTexSubImage3D/2D` after `sprite_tracker` picks coordinates.
+- **CPU staging**
+  - `screen_update_cell_data()` renders dirty lines into `Line::gpu_cells` and copies the results into the mapped instance buffer.
+  - `screen_apply_selection()` writes highlight masks; `grman_update_layers()` prepares image layers consumed by `draw_cells_with_layers()`.
+- `draw_cells()` chooses layered vs non-layered path and issues instanced draws over `lines * columns`.
+
+This inventory is the contract the Metal backend must satisfy when reconstructing buffers, textures, and shader logic.
+
+### 6.9 Metal Text Resource Layout (Proposed)
+
+- **Per-font atlas state** — extend `SpriteMap` with a `MetalSpriteMap` payload containing:
+  - `id<MTLTexture> glyph_array;` (`MTLTextureType2DArray`, `MTLPixelFormatBGRA8Unorm_sRGB`, `MTLStorageModePrivate`).
+  - `id<MTLTexture> decorations;` (`MTLPixelFormatR32Uint`, `MTLTextureType2D`, `MTLStorageModePrivate`).
+  - `id<MTLBlitCommandEncoder>` usage hooks so uploads happen via `replaceRegion:` when data is CPU-side or `copyFromBuffer` when we stage into a shared upload buffer.
+  - Cached dimensions (`sprites_xnum`, `sprites_ynum`, `layers`, `cell_width`, `cell_height_plus1`) for quick validation against CPU layout.
+- **Sampler state** — global `id<MTLSamplerState> glyph_sampler;` configured via `MTLSamplerDescriptor` with `minFilter = magFilter = nearest`, `addressMode = clampToEdge`, and `normalizedCoordinates = YES`.
+- **Pipeline objects** — create three `id<MTLRenderPipelineState>` items mirroring GL programs (full, background-only, foreground-only). Vertex descriptor maps:
+  - Buffer 0: `MTLVertexFormatUInt4` for `gpu_cell_colors_idx` (we pack fg/bg/decoration into `uint4` with final slot reserved for future flags).
+  - Buffer 1: `MTLVertexFormatUInt2` for `sprite_idx`.
+  - Buffer 2: `MTLVertexFormatUChar` for selection mask (promoted to `uint` in shader).
+- **Uniform buffers** — introduce `struct MetalCellUniforms` aligned to 16 bytes and shared between Objective-C++ and MSL. Allocate a per-surface ring of 3 `MTLBuffer` objects (`storageModeShared`) sized to hold `GPUCellRenderData`. Each frame cycles the ring to avoid CPU/GPU contention, with `didModifyRange:` for managed macOS targets.
+- **Instance + selection buffers** — allocate resizable `MTLBuffer` objects per `Screen`:
+  - `cell_instances` sized `sizeof(GPUCell) * columns * lines`, `storageModeShared`.
+  - `selection_mask` sized `columns * lines`, `MTLResourceCPUCacheModeWriteCombined`.
+  - Both buffers reuse the existing CPU staging produced by `screen_update_cell_data()` and `screen_apply_selection()` by memcpy-ing into `buffer.contents`.
+- **Command encoding** — build a `MetalTextEncoder` helper that:
+  1. Ensures atlas textures match sprite tracker layout, reallocating with `newTextureWithDescriptor:` when `sprites_xnum`/`ynum` change.
+  2. Uploads dirty glyph slices via `replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:` (or blit from staging buffer for contiguous regions).
+  3. Writes uniform data into the current ring buffer, binds textures/samplers, sets vertex buffers (quad positions remain implicit via `vertex_id` logic), then issues `drawPrimitives:vertexStart:vertexCount:instanceCount:` with `vertexCount == 4`.
+
+This layout keeps CPU producers untouched while giving Metal explicit ownership of textures, buffers, and pipeline state.
+
 ## 7. Build, Packaging, and Tooling Updates
 
 - Modify `setup.py:680-706` to drop `-framework OpenGL` in favor of `-framework Metal -framework QuartzCore -framework MetalKit (optional)` and include metallib assets in the package data.  

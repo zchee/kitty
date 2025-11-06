@@ -1,13 +1,13 @@
 # 2025‑11‑06 Metal Text Pipeline Plan
 
-- [ ] Restate constraints for Metal parity work (macOS focus, catastrophic risk acceptance, Python 3.13 tooling, plan/citation requirements).
-- [ ] Catalogue OpenGL text-rendering flow across `kitty/shaders.c`, `kitty/graphics.c`, `kitty/screen.c`, and `kitty/glyph-cache.c`.
-- [ ] Extract data-flow for glyph atlas uploads (current GL texture creation and update pipeline).
-- [ ] Inventory shader programs used for text/cell rendering (`cell_vertex.glsl`, `cell_fragment.glsl`, etc.) and the associated uniforms.
-- [ ] Document vertex/index buffer usage for cell quads (VAO setup, attribute layouts, instancing strategy).
-- [ ] Review existing CPU-side staging buffers (VBO data structures, sprite tracker) to determine reuse potential.
-- [ ] Gather Apple Metal documentation for textures (`MTLTextureDescriptor`), samplers, and buffer encoding best practices.
-- [ ] Design Metal resource structures for glyph atlas textures, vertex buffers, uniform buffers, and sampler state.
+- [x] Restate constraints for Metal parity work (macOS focus, catastrophic risk acceptance, Python 3.13 tooling, plan/citation requirements).
+- [x] Catalogue OpenGL text-rendering flow across `kitty/shaders.c`, `kitty/graphics.c`, `kitty/screen.c`, and `kitty/glyph-cache.c`.
+- [x] Extract data-flow for glyph atlas uploads (current GL texture creation and update pipeline).
+- [x] Inventory shader programs used for text/cell rendering (`cell_vertex.glsl`, `cell_fragment.glsl`, etc.) and the associated uniforms.
+- [x] Document vertex/index buffer usage for cell quads (VAO setup, attribute layouts, instancing strategy).
+- [x] Review existing CPU-side staging buffers (VBO data structures, sprite tracker) to determine reuse potential.
+- [x] Gather Apple Metal documentation for textures (`MTLTextureDescriptor`), samplers, and buffer encoding best practices.
+- [x] Design Metal resource structures for glyph atlas textures, vertex buffers, uniform buffers, and sampler state.
 - [ ] Plan metallib packaging for the cell shaders (translate GLSL to MSL and integrate into build).
 - [ ] Prototype creation of Metal pipeline state objects mirroring the GLSL programs (blend state, vertex descriptors).
 - [ ] Implement glyph atlas upload path using Metal blit/replaceRegion, wired into existing glyph-cache callbacks.
