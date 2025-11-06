@@ -421,6 +421,20 @@ void os_window_regions(OSWindow*, Region *main, Region *tab_bar);
 bool drag_scroll(Window *, OSWindow*);
 void draw_borders(ssize_t vao_idx, unsigned int num_border_rects, BorderRect *rect_buf, bool rect_data_is_dirty, color_type, unsigned int, bool, OSWindow *w);
 ssize_t create_cell_vao(void);
+typedef struct CellBufferWriters {
+    void* (*acquire_cell_buffer)(size_t size, void *user_data);
+    void (*commit_cell_buffer)(void *user_data, void *ptr, size_t size);
+    void* (*acquire_selection_buffer)(size_t size, void *user_data);
+    void (*commit_selection_buffer)(void *user_data, void *ptr, size_t size);
+} CellBufferWriters;
+
+bool cell_prepare_buffers_with_writers(Screen *screen, FONTS_DATA_HANDLE fonts_data, const CellBufferWriters *writers, void *user_data);
+
+#ifdef KITTY_ENABLE_METAL
+typedef struct KittyCellUniforms KittyCellUniforms;
+color_type populate_cell_uniforms(Screen *screen, const CursorRenderInfo *cursor, OSWindow *os_window, float inactive_text_alpha, float bg_alpha, KittyCellUniforms *dst, ColorProfile **out_profile);
+#endif
+
 ssize_t create_graphics_vao(void);
 ssize_t create_border_vao(void);
 bool send_cell_data_to_gpu(ssize_t, Screen *, OSWindow *);

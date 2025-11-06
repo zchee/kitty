@@ -13,6 +13,10 @@
 #include <string.h>
 #include "text-cache.h"
 #include "window_logo.h"
+#ifdef KITTY_ENABLE_METAL
+#include "metal_surface.h"
+#endif
+#include "metal_text_shared.h"
 #include "srgb_gamma.h"
 #include "uniforms_generated.h"
 #include "state.h"
@@ -29,6 +33,7 @@ enum {
     NUM_PROGRAMS
 };
 enum { SPRITE_MAP_UNIT, GRAPHICS_UNIT, SPRITE_DECORATIONS_MAP_UNIT };
+enum { cell_data_buffer, selection_buffer, uniform_buffer };
 
 typedef struct UIRenderData {
     unsigned screen_width, screen_height, cell_width, cell_height, screen_left, screen_top, full_framebuffer_width, full_framebuffer_height;
@@ -50,9 +55,19 @@ typedef struct {
         unsigned width, height;
         size_t count;
     } decorations_map;
+#ifdef KITTY_ENABLE_METAL
+    void *metal_state;
+#endif
 } SpriteMap;
 
-static const SpriteMap NEW_SPRITE_MAP = { .xnum = 1, .ynum = 1, .last_num_of_layers = 1, .last_ynum = -1 };
+static const SpriteMap NEW_SPRITE_MAP = {
+    .xnum = 1, .ynum = 1, .last_num_of_layers = 1, .last_ynum = -1,
+    .texture_id = 0, .max_texture_size = 0, .max_array_texture_layers = 0,
+    .decorations_map = { 0, 0, 0, 0 }
+#ifdef KITTY_ENABLE_METAL
+    , .metal_state = NULL
+#endif
+};
 static GLint max_texture_size = 0, max_array_texture_layers = 0;
 
 static GLfloat
@@ -105,8 +120,11 @@ void
 free_sprite_data(FONTS_DATA_HANDLE fg) {
     SpriteMap *sprite_map = (SpriteMap*)fg->sprite_map;
     if (sprite_map) {
+#ifdef KITTY_ENABLE_METAL
+        metal_sprite_free(fg);
+#endif
         if (sprite_map->texture_id) free_texture(&sprite_map->texture_id);
-        if (sprite_map->decorations_map.texture_id) free_texture(&sprite_map->texture_id);
+        if (sprite_map->decorations_map.texture_id) free_texture(&sprite_map->decorations_map.texture_id);
         free(sprite_map);
         fg->sprite_map = NULL;
     }
@@ -192,6 +210,9 @@ realloc_sprite_decorations_texture_if_needed(FONTS_DATA_HANDLE fg) {
     }
     glBindTexture(texture_type, 0);
     dm.texture_id = tex; dm.width = width; dm.height = height;
+#ifdef KITTY_ENABLE_METAL
+    metal_sprite_decorations_resize(fg, (unsigned)width, (unsigned)height);
+#endif
 #undef dm
 }
 
@@ -213,6 +234,9 @@ realloc_sprite_texture(FONTS_DATA_HANDLE fg) {
     sprite_map->last_num_of_layers = znum;
     sprite_map->last_ynum = ynum;
     sprite_map->texture_id = tex;
+#ifdef KITTY_ENABLE_METAL
+    metal_sprite_map_resize(fg, fg->fcm.cell_width, fg->fcm.cell_height + 1, xnum, ynum, znum);
+#endif
 }
 
 static void
@@ -253,6 +277,9 @@ send_sprite_to_gpu(FONTS_DATA_HANDLE fg, sprite_index idx, pixel *buf, sprite_in
     sprite_index_to_pos(idx, xnum, ynum, &x, &y, &z);
     x *= fg->fcm.cell_width; y *= (fg->fcm.cell_height + 1);
     glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, x, y, z, fg->fcm.cell_width, fg->fcm.cell_height + 1, 1, GL_RGBA, GL_UNSIGNED_INT_8_8_8_8, buf);
+#ifdef KITTY_ENABLE_METAL
+    metal_sprite_upload(fg, idx, buf, decoration_idx);
+#endif
 }
 
 void
@@ -381,8 +408,6 @@ init_cell_program(void) {
     get_uniform_locations_rounded_rect(ROUNDED_RECT_PROGRAM, &rounded_rect_program_layout.uniforms);
 }
 
-#define CELL_BUFFERS enum { cell_data_buffer, selection_buffer, uniform_buffer };
-
 ssize_t
 create_cell_vao(void) {
     ssize_t vao_idx = create_vao();
@@ -435,65 +460,70 @@ has_bgimage(OSWindow *w) {
     return w->bgimage && w->bgimage->texture_id > 0;
 }
 
-static color_type
-cell_update_uniform_block(ssize_t vao_idx, Screen *screen, int uniform_buffer, const CursorRenderInfo *cursor, OSWindow *os_window, float inactive_text_alpha, float bg_alpha) {
-    struct GPUCellRenderData {
-        GLfloat use_cell_bg_for_selection_fg, use_cell_fg_for_selection_color, use_cell_for_selection_bg;
-
-        GLuint default_fg, highlight_fg, highlight_bg, main_cursor_fg, main_cursor_bg, url_color, url_style, inverted, extra_cursor_fg, extra_cursor_bg;
-
-        GLuint columns, lines, sprites_xnum, sprites_ynum, cursor_shape, cell_width, cell_height;
-        GLuint cursor_x1, cursor_x2, cursor_y1, cursor_y2;
-        GLfloat cursor_opacity, inactive_text_alpha, dim_opacity, blink_opacity;
-
-        GLuint bg_colors0, bg_colors1, bg_colors2, bg_colors3, bg_colors4, bg_colors5, bg_colors6, bg_colors7;
-        GLfloat bg_opacities0, bg_opacities1, bg_opacities2, bg_opacities3, bg_opacities4, bg_opacities5, bg_opacities6, bg_opacities7;
-    };
-    // Send the uniform data
-    struct GPUCellRenderData *rd = (struct GPUCellRenderData*)map_vao_buffer(vao_idx, uniform_buffer, GL_WRITE_ONLY);
+color_type
+populate_cell_uniforms(Screen *screen, const CursorRenderInfo *cursor, OSWindow *os_window, float inactive_text_alpha, float bg_alpha, KittyCellUniforms *dst, ColorProfile **out_profile) {
     ColorProfile *cp = screen->paused_rendering.expires_at ? &screen->paused_rendering.color_profile : screen->color_profile;
-    if (UNLIKELY(cp->dirty || screen->reload_all_gpu_data)) {
-        copy_color_table_to_buffer(cp, (GLuint*)rd, cell_program_layouts[CELL_PROGRAM].color_table.offset / sizeof(GLuint), cell_program_layouts[CELL_PROGRAM].color_table.stride / sizeof(GLuint));
-    }
+    if (out_profile) *out_profile = cp;
 #define COLOR(name) colorprofile_to_color(cp, cp->overridden.name, cp->configured.name).rgb
-    rd->default_fg = COLOR(default_fg);
-    rd->highlight_fg = COLOR(highlight_fg); rd->highlight_bg = COLOR(highlight_bg);
-    rd->extra_cursor_fg = screen->extra_cursors.color.text.val;
-    rd->extra_cursor_bg = screen->extra_cursors.color.cursor.val;
-    rd->bg_colors0 = COLOR(default_bg);
-    rd->bg_opacities0 = bg_alpha;
-#define SETBG(which) { \
-    colorprofile_to_transparent_color(cp, which - 1, &rd->bg_colors##which, &rd->bg_opacities##which); }
-    SETBG(1); SETBG(2); SETBG(3); SETBG(4); SETBG(5); SETBG(6); SETBG(7);
-#undef SETBG
-    // selection
+    dst->default_fg = COLOR(default_fg);
+    dst->highlight_fg = COLOR(highlight_fg);
+    dst->highlight_bg = COLOR(highlight_bg);
+    dst->extra_cursor_fg = screen->extra_cursors.color.text.val;
+    dst->extra_cursor_bg = screen->extra_cursors.color.cursor.val;
+    dst->bg_colors[0] = COLOR(default_bg);
+#undef COLOR
+    dst->bg_opacities[0] = bg_alpha;
+    for (size_t i = 1; i < KITTY_NUM_BG_SLOTS; i++) {
+        colorprofile_to_transparent_color(cp, (int)(i - 1), &dst->bg_colors[i], &dst->bg_opacities[i]);
+    }
     if (IS_SPECIAL_COLOR(highlight_fg)) {
         if (IS_SPECIAL_COLOR(highlight_bg)) {
-            rd->use_cell_bg_for_selection_fg = 1.f; rd->use_cell_fg_for_selection_color = 0.f;
+            dst->use_cell_bg_for_selection_fg = 1.f;
+            dst->use_cell_fg_for_selection_fg = 0.f;
         } else {
-            rd->use_cell_bg_for_selection_fg = 0.f; rd->use_cell_fg_for_selection_color = 1.f;
+            dst->use_cell_bg_for_selection_fg = 0.f;
+            dst->use_cell_fg_for_selection_fg = 1.f;
         }
     } else {
-        rd->use_cell_bg_for_selection_fg = 0.f; rd->use_cell_fg_for_selection_color = 0.f;
+        dst->use_cell_bg_for_selection_fg = 0.f;
+        dst->use_cell_fg_for_selection_fg = 0.f;
     }
-    rd->use_cell_for_selection_bg = IS_SPECIAL_COLOR(highlight_bg) ? 1. : 0.;
-    // Cursor position
-    Line *line_for_cursor = NULL;
-    rd->cursor_opacity = MAX(0, MIN(cursor->cursor_opacity, 1));
-    rd->blink_opacity = MAX(0, MIN(cursor->text_blink_opacity, 1));
-    if (rd->cursor_opacity != 0 && cursor->is_visible) {
-        rd->cursor_x1 = cursor->x, rd->cursor_y1 = cursor->y;
-        rd->cursor_x2 = cursor->x, rd->cursor_y2 = cursor->y;
+    dst->use_cell_for_selection_bg = IS_SPECIAL_COLOR(highlight_bg) ? 1.f : 0.f;
+    dst->cursor_opacity = MAX(0, MIN(cursor->cursor_opacity, 1));
+    dst->blink_opacity = MAX(0, MIN(cursor->text_blink_opacity, 1));
+    dst->inactive_text_alpha = inactive_text_alpha;
+    dst->dim_opacity = OPT(dim_opacity);
+    dst->draw_bg_bitfield = 0;
+    dst->columns = screen->columns;
+    dst->lines = screen->lines;
+    unsigned int x = 0, y = 0, z = 0;
+    sprite_tracker_current_layout(os_window->fonts_data, &x, &y, &z);
+    dst->sprites_xnum = x;
+    dst->sprites_ynum = y;
+    dst->inverted = screen_invert_colors(screen) ? 1 : 0;
+    dst->cell_width = os_window->fonts_data->fcm.cell_width;
+    dst->cell_height = os_window->fonts_data->fcm.cell_height;
+    dst->url_color = OPT(url_color);
+    dst->url_style = OPT(url_style);
+    if (dst->cursor_opacity != 0 && cursor->is_visible) {
+        dst->cursor_x1 = cursor->x;
+        dst->cursor_y1 = cursor->y;
+        dst->cursor_x2 = cursor->x;
+        dst->cursor_y2 = cursor->y;
         CursorShape cs = (cursor->is_focused || OPT(cursor_shape_unfocused) == NO_CURSOR_SHAPE) ? cursor->shape : OPT(cursor_shape_unfocused);
-        rd->cursor_shape = cs;
-        color_type cell_fg = rd->default_fg, cell_bg = rd->bg_colors0;
+        dst->cursor_shape = cs;
+        color_type cell_fg = dst->default_fg;
+        color_type cell_bg = dst->bg_colors[0];
         index_type cell_color_x = cursor->x;
         bool reversed = false;
+        Line *line_for_cursor = NULL;
         if (cursor->x < screen->columns && cursor->y < screen->lines) {
             if (screen->paused_rendering.expires_at) {
-                linebuf_init_line(screen->paused_rendering.linebuf, cursor->y); line_for_cursor = screen->paused_rendering.linebuf->line;
+                linebuf_init_line(screen->paused_rendering.linebuf, cursor->y);
+                line_for_cursor = screen->paused_rendering.linebuf->line;
             } else {
-                linebuf_init_line(screen->linebuf, cursor->y); line_for_cursor = screen->linebuf->line;
+                linebuf_init_line(screen->linebuf, cursor->y);
+                line_for_cursor = screen->linebuf->line;
             }
         }
         if (line_for_cursor) {
@@ -501,66 +531,94 @@ cell_update_uniform_block(ssize_t vao_idx, Screen *screen, int uniform_buffer, c
             const CPUCell *cursor_cell;
             const bool large_cursor = ((cursor_cell = &line_for_cursor->cpu_cells[cursor->x])->is_multicell) && cursor_cell->x == 0 && cursor_cell->y == 0;
             if (large_cursor) {
-                switch(cs) {
+                switch (cs) {
                     case CURSOR_BEAM:
-                        rd->cursor_y2 += cursor_cell->scale - 1; break;
+                        dst->cursor_y2 += cursor_cell->scale - 1;
+                        break;
                     case CURSOR_UNDERLINE:
-                        rd->cursor_y1 += cursor_cell->scale - 1;
-                        rd->cursor_y2 = rd->cursor_y1;
-                        rd->cursor_x2 += mcd_x_limit(cursor_cell) - 1;
+                        dst->cursor_y1 += cursor_cell->scale - 1;
+                        dst->cursor_y2 = dst->cursor_y1;
+                        dst->cursor_x2 += mcd_x_limit(cursor_cell) - 1;
                         break;
                     case CURSOR_BLOCK:
-                        rd->cursor_y2 += cursor_cell->scale - 1;
-                        rd->cursor_x2 += mcd_x_limit(cursor_cell) - 1;
+                        dst->cursor_y2 += cursor_cell->scale - 1;
+                        dst->cursor_x2 += mcd_x_limit(cursor_cell) - 1;
                         break;
-                    case CURSOR_HOLLOW: case NUM_OF_CURSOR_SHAPES: case NO_CURSOR_SHAPE: break;
-                };
+                    case CURSOR_HOLLOW:
+                    case NUM_OF_CURSOR_SHAPES:
+                    case NO_CURSOR_SHAPE:
+                        break;
+                }
             }
         }
-        // If you change the following algorithm remember to change it in the cell shader for extra cursors too
         if (IS_SPECIAL_COLOR(cursor_color)) {
-            if (line_for_cursor) pick_cursor_color(cell_fg, cell_bg, &rd->main_cursor_fg, &rd->main_cursor_bg, rd->default_fg, rd->bg_colors0);
-            else { rd->main_cursor_fg = rd->bg_colors0; rd->main_cursor_bg = rd->default_fg; }
+            if (line_for_cursor) pick_cursor_color(cell_fg, cell_bg, &dst->main_cursor_fg, &dst->main_cursor_bg, dst->default_fg, dst->bg_colors[0]);
+            else {
+                dst->main_cursor_fg = dst->bg_colors[0];
+                dst->main_cursor_bg = dst->default_fg;
+            }
             if (cell_bg == cell_fg) {
-                rd->main_cursor_fg = rd->bg_colors0; rd->main_cursor_bg = rd->default_fg;
-            } else { rd->main_cursor_fg = cell_bg; rd->main_cursor_bg = cell_fg; }
+                dst->main_cursor_fg = dst->bg_colors[0];
+                dst->main_cursor_bg = dst->default_fg;
+            } else {
+                dst->main_cursor_fg = cell_bg;
+                dst->main_cursor_bg = cell_fg;
+            }
         } else {
-            rd->main_cursor_bg = COLOR(cursor_color);
-            if (IS_SPECIAL_COLOR(cursor_text_color)) rd->main_cursor_fg = cell_bg;
-            else rd->main_cursor_fg = COLOR(cursor_text_color);
+            dst->main_cursor_bg = colorprofile_to_color(cp, cp->overridden.cursor_color, cp->configured.cursor_color).rgb;
+            if (IS_SPECIAL_COLOR(cursor_text_color)) dst->main_cursor_fg = cell_bg;
+            else dst->main_cursor_fg = colorprofile_to_color(cp, cp->overridden.cursor_text_color, cp->configured.cursor_text_color).rgb;
         }
-        // store last rendered cursor color for trail rendering
-        screen->last_rendered.cursor_bg = rd->main_cursor_bg;
+        screen->last_rendered.cursor_bg = dst->main_cursor_bg;
     } else {
-        rd->cursor_shape = 0;
-        rd->cursor_x1 = screen->columns + 1; rd->cursor_x2 = screen->columns;
-        rd->cursor_y1 = screen->lines + 1; rd->cursor_y2 = screen->lines;
+        dst->cursor_shape = 0;
+        dst->cursor_x1 = screen->columns + 1;
+        dst->cursor_x2 = screen->columns;
+        dst->cursor_y1 = screen->lines + 1;
+        dst->cursor_y2 = screen->lines;
     }
+    return dst->bg_colors[0];
+}
 
-    rd->columns = screen->columns; rd->lines = screen->lines;
-
-    unsigned int x, y, z;
-    sprite_tracker_current_layout(os_window->fonts_data, &x, &y, &z);
-    rd->sprites_xnum = x; rd->sprites_ynum = y;
-    rd->inverted = screen_invert_colors(screen) ? 1 : 0;
-    rd->cell_width = os_window->fonts_data->fcm.cell_width;
-    rd->cell_height = os_window->fonts_data->fcm.cell_height;
-    rd->inactive_text_alpha = inactive_text_alpha;
-    rd->dim_opacity = OPT(dim_opacity);
-
-#undef COLOR
-    rd->url_color = OPT(url_color); rd->url_style = OPT(url_style);
-    color_type default_bg = rd->bg_colors0;
-    unmap_vao_buffer(vao_idx, uniform_buffer); rd = NULL;
+static color_type
+cell_update_uniform_block(ssize_t vao_idx, Screen *screen, int uniform_buffer, const CursorRenderInfo *cursor, OSWindow *os_window, float inactive_text_alpha, float bg_alpha) {
+    KittyCellUniforms *rd = (KittyCellUniforms*)map_vao_buffer(vao_idx, uniform_buffer, GL_WRITE_ONLY);
+    ColorProfile *cp = NULL;
+    color_type default_bg = populate_cell_uniforms(screen, cursor, os_window, inactive_text_alpha, bg_alpha, rd, &cp);
+    if (UNLIKELY(cp && (cp->dirty || screen->reload_all_gpu_data))) {
+        copy_color_table_to_buffer(cp, (color_type*)rd, cell_program_layouts[CELL_PROGRAM].color_table.offset / sizeof(GLuint), cell_program_layouts[CELL_PROGRAM].color_table.stride / sizeof(GLuint));
+    }
+    unmap_vao_buffer(vao_idx, uniform_buffer);
     return default_bg;
 }
 
 static bool
-cell_prepare_to_render(ssize_t vao_idx, Screen *screen, FONTS_DATA_HANDLE fonts_data) {
-    size_t sz;
-    CELL_BUFFERS;
-    void *address;
-    bool changed = false;
+write_cell_buffer(const CellBufferWriters *writers, void *user_data, Screen *screen, FONTS_DATA_HANDLE fonts_data, bool disable_ligatures, bool cursor_pos_changed) {
+    if (!writers || !writers->acquire_cell_buffer) return false;
+    size_t sz = sizeof(GPUCell) * (size_t)screen->lines * screen->columns;
+    if (sz == 0) return false;
+    void *address = writers->acquire_cell_buffer(sz, user_data);
+    if (!address) return false;
+    screen_update_cell_data(screen, address, fonts_data, disable_ligatures && cursor_pos_changed);
+    if (writers->commit_cell_buffer) writers->commit_cell_buffer(user_data, address, sz);
+    return true;
+}
+
+static bool
+write_selection_buffer(const CellBufferWriters *writers, void *user_data, Screen *screen) {
+    if (!writers || !writers->acquire_selection_buffer) return false;
+    size_t sz = (size_t)screen->lines * screen->columns;
+    if (sz == 0) return false;
+    void *address = writers->acquire_selection_buffer(sz, user_data);
+    if (!address) return false;
+    screen_apply_selection(screen, address, sz);
+    if (writers->commit_selection_buffer) writers->commit_selection_buffer(user_data, address, sz);
+    return true;
+}
+
+bool
+cell_prepare_buffers_with_writers(Screen *screen, FONTS_DATA_HANDLE fonts_data, const CellBufferWriters *writers, void *user_data) {
+    if (!screen || !writers || !fonts_data) return false;
 
     ensure_sprite_map(fonts_data);
     const Cursor *cursor = screen->paused_rendering.expires_at ? &screen->paused_rendering.cursor : screen->cursor;
@@ -570,47 +628,81 @@ cell_prepare_to_render(ssize_t vao_idx, Screen *screen, FONTS_DATA_HANDLE fonts_
     bool disable_ligatures = screen->disable_ligatures == DISABLE_LIGATURES_CURSOR;
     bool screen_resized = screen->last_rendered.columns != screen->columns || screen->last_rendered.lines != screen->lines;
 
-#define update_cell_data { \
-        sz = sizeof(GPUCell) * screen->lines * screen->columns; \
-        address = alloc_and_map_vao_buffer(vao_idx, sz, cell_data_buffer, GL_STREAM_DRAW, GL_WRITE_ONLY); \
-        screen_update_cell_data(screen, address, fonts_data, disable_ligatures && cursor_pos_changed); \
-        unmap_vao_buffer(vao_idx, cell_data_buffer); address = NULL; \
-        changed = true; \
-}
-
-    if (screen->paused_rendering.expires_at) {
-        if (!screen->paused_rendering.cell_data_updated) update_cell_data;
-    } else if (screen->reload_all_gpu_data || screen->scroll_changed || screen->is_dirty || screen_resized || (disable_ligatures && cursor_pos_changed)) update_cell_data;
-
-#define update_selection_data { \
-    sz = (size_t)screen->lines * screen->columns; \
-    address = alloc_and_map_vao_buffer(vao_idx, sz, selection_buffer, GL_STREAM_DRAW, GL_WRITE_ONLY); \
-    screen_apply_selection(screen, address, sz); \
-    unmap_vao_buffer(vao_idx, selection_buffer); address = NULL; \
-    changed = true; \
-}
-
-#define update_graphics_data(grman) \
-    grman_update_layers(grman, screen->scrolled_by, -1.f, 1.f, 2.f/screen->columns, 2.f/screen->lines, screen->columns, screen->lines, screen->cell_size)
+    bool changed = false;
 
     if (screen->paused_rendering.expires_at) {
         if (!screen->paused_rendering.cell_data_updated) {
-            update_selection_data; update_graphics_data(screen->paused_rendering.grman);
+            if (write_cell_buffer(writers, user_data, screen, fonts_data, disable_ligatures, cursor_pos_changed)) changed = true;
+            if (write_selection_buffer(writers, user_data, screen)) changed = true;
+            if (screen->paused_rendering.grman && grman_update_layers(
+                    screen->paused_rendering.grman, screen->scrolled_by,
+                    -1.f, 1.f, 2.f/screen->columns, 2.f/screen->lines,
+                    screen->columns, screen->lines, screen->cell_size)) changed = true;
         }
         screen->paused_rendering.cell_data_updated = true;
         screen->last_rendered.scrolled_by = screen->paused_rendering.scrolled_by;
     } else {
-        if (screen->reload_all_gpu_data || screen_resized || screen_is_selection_dirty(screen)) update_selection_data;
-        if (update_graphics_data(screen->grman)) changed = true;
+        if (screen->reload_all_gpu_data || screen->scroll_changed || screen->is_dirty || screen_resized || (disable_ligatures && cursor_pos_changed)) {
+            if (write_cell_buffer(writers, user_data, screen, fonts_data, disable_ligatures, cursor_pos_changed)) changed = true;
+        }
+        if (screen->reload_all_gpu_data || screen_resized || screen_is_selection_dirty(screen)) {
+            if (write_selection_buffer(writers, user_data, screen)) changed = true;
+        }
+        if (grman_update_layers(screen->grman, screen->scrolled_by, -1.f, 1.f, 2.f/screen->columns, 2.f/screen->lines, screen->columns, screen->lines, screen->cell_size)) changed = true;
         screen->last_rendered.scrolled_by = screen->scrolled_by;
     }
-#undef update_selection_data
-#undef update_cell_data
+
     screen->last_rendered.columns = screen->columns;
     screen->last_rendered.lines = screen->lines;
     screen->last_rendered.cursor = screen->cursor_render_info;
 
     return changed;
+}
+
+typedef struct {
+    ssize_t vao_idx;
+} GLCellBufferContext;
+
+static void*
+gl_acquire_cell_buffer(size_t size, void *user_data) {
+    if (size == 0) return NULL;
+    GLCellBufferContext *ctx = user_data;
+    return alloc_and_map_vao_buffer(ctx->vao_idx, (GLsizeiptr)size, cell_data_buffer, GL_STREAM_DRAW, GL_WRITE_ONLY);
+}
+
+static void
+gl_commit_cell_buffer(void *user_data, void *ptr, size_t size) {
+    (void)size;
+    if (!ptr) return;
+    GLCellBufferContext *ctx = user_data;
+    unmap_vao_buffer(ctx->vao_idx, cell_data_buffer);
+}
+
+static void*
+gl_acquire_selection_buffer(size_t size, void *user_data) {
+    if (size == 0) return NULL;
+    GLCellBufferContext *ctx = user_data;
+    return alloc_and_map_vao_buffer(ctx->vao_idx, (GLsizeiptr)size, selection_buffer, GL_STREAM_DRAW, GL_WRITE_ONLY);
+}
+
+static void
+gl_commit_selection_buffer(void *user_data, void *ptr, size_t size) {
+    (void)size;
+    if (!ptr) return;
+    GLCellBufferContext *ctx = user_data;
+    unmap_vao_buffer(ctx->vao_idx, selection_buffer);
+}
+
+static bool
+cell_prepare_to_render(ssize_t vao_idx, Screen *screen, FONTS_DATA_HANDLE fonts_data) {
+    GLCellBufferContext ctx = { .vao_idx = vao_idx };
+    const CellBufferWriters writers = {
+        .acquire_cell_buffer = gl_acquire_cell_buffer,
+        .commit_cell_buffer = gl_commit_cell_buffer,
+        .acquire_selection_buffer = gl_acquire_selection_buffer,
+        .commit_selection_buffer = gl_commit_selection_buffer,
+    };
+    return cell_prepare_buffers_with_writers(screen, fonts_data, &writers, &ctx);
 }
 
 static void
@@ -1064,7 +1156,6 @@ enum { DRAW_NEITHER_BG = 0, DRAW_DEFAULT_BG = 1, DRAW_NON_DEFAULT_BG = 2, DRAW_B
 static void
 call_cell_program(int program, const UIRenderData *ui, ssize_t vao_idx, bool for_final_output, unsigned draw_bg_bitfield) {
     bind_program(program);
-    CELL_BUFFERS;
     bind_vao_uniform_buffer(vao_idx, uniform_buffer, cell_program_layouts[program].render_data.index);
     glUniform1ui(cell_program_layouts[program].uniforms.draw_bg_bitfield, draw_bg_bitfield);
     if (for_final_output) glEnable(GL_FRAMEBUFFER_SRGB);
@@ -1129,6 +1220,12 @@ blank_canvas(float background_opacity, color_type color_in_srgb, bool for_final_
 
 bool
 send_cell_data_to_gpu(ssize_t vao_idx, Screen *screen, OSWindow *os_window) {
+#ifdef KITTY_ENABLE_METAL
+    if (os_window->metal_backend_active) {
+        if (!os_window->fonts_data) return false;
+        return metal_prepare_cell_buffers(screen, os_window);
+    }
+#endif
     bool changed = false;
     if (os_window->fonts_data) {
         if (cell_prepare_to_render(vao_idx, screen, os_window->fonts_data)) changed = true;
@@ -1138,8 +1235,13 @@ send_cell_data_to_gpu(ssize_t vao_idx, Screen *screen, OSWindow *os_window) {
 
 void
 draw_cells(const WindowRenderData *srd, OSWindow *os_window, bool is_active_window, bool is_tab_bar, bool is_single_window, Window *window) {
+#ifdef KITTY_ENABLE_METAL
+    if (os_window->metal_backend_active) {
+        metal_draw_cells(srd, os_window, is_active_window, is_tab_bar, is_single_window, window);
+        return;
+    }
+#endif
     Screen *screen = srd->screen;
-    CELL_BUFFERS;
     bind_vertex_array(srd->vao_idx);
     // We draw with inactive text alpha if:
     // - We're not drawing the tab bar

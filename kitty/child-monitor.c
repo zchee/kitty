@@ -713,6 +713,38 @@ change_menubar_title(PyObject *title UNUSED) {
 #endif
 }
 
+#ifdef KITTY_ENABLE_METAL
+static void
+render_prepared_os_window_metal(OSWindow *os_window, unsigned int active_window_id, color_type active_window_bg, unsigned int num_visible_windows, bool all_windows_have_same_bg) {
+    (void)active_window_bg;
+    (void)num_visible_windows;
+    (void)all_windows_have_same_bg;
+#define TD os_window->tab_bar_render_data
+#define WD w->render_data
+    Tab *tab = os_window->tabs + os_window->active_tab;
+    if (TD.screen && os_window->num_tabs >= OPT(tab_bar_min_tabs)) metal_draw_cells(&TD, os_window, true, true, false, NULL);
+    unsigned int num_of_visible_windows = 0;
+    for (unsigned int i = 0; i < tab->num_windows; i++) { if (tab->windows[i].visible) num_of_visible_windows++; }
+    for (unsigned int i = 0; i < tab->num_windows; i++) {
+        Window *w = tab->windows + i;
+        if (w->visible && WD.screen) {
+            bool is_active_window = i == tab->active_window;
+            metal_draw_cells(&WD, os_window, is_active_window, false, num_of_visible_windows == 1, w);
+            if (WD.screen->start_visual_bell_at != 0) set_maximum_wait(ANIMATION_SAMPLE_WAIT);
+        }
+    }
+    swap_window_buffers(os_window);
+    os_window->last_active_tab = os_window->active_tab;
+    os_window->last_num_tabs = os_window->num_tabs;
+    os_window->last_active_window_id = active_window_id;
+    os_window->focused_at_last_render = os_window->is_focused;
+    if (os_window->redraw_count) os_window->redraw_count--;
+    if (USE_RENDER_FRAMES) request_frame_render(os_window);
+#undef TD
+#undef WD
+}
+#endif
+
 static bool
 prepare_to_render_os_window(OSWindow *os_window, monotonic_t now, unsigned int *active_window_id, color_type *active_window_bg, unsigned int *num_visible_windows, bool *all_windows_have_same_bg, bool scan_for_animated_images) {
 #define TD os_window->tab_bar_render_data
@@ -875,16 +907,31 @@ render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images) {
     w->render_calls++;
 #ifdef KITTY_ENABLE_METAL
     if (w->metal_backend_active) {
+        bool needs_render = w->redraw_count > 0 || w->live_resize.in_progress;
+        if (w->viewport_size_dirty) {
+            w->viewport_size_dirty = false;
+            needs_render = true;
+        }
+        unsigned int active_window_id = 0, num_visible_windows = 0;
+        bool all_windows_have_same_bg;
+        color_type active_window_bg = 0;
+        if (!w->fonts_data) {
+            log_error("No fonts data found for window id: %llu", w->id);
+            return false;
+        }
+        if (prepare_to_render_os_window(w, now, &active_window_id, &active_window_bg, &num_visible_windows, &all_windows_have_same_bg, scan_for_animated_images)) needs_render = true;
+        if (w->last_active_window_id != active_window_id || w->last_active_tab != w->active_tab || w->focused_at_last_render != w->is_focused) needs_render = true;
+        if (w->render_calls < 3 && w->bgimage && w->bgimage->texture_id) needs_render = true;
+        if (!needs_render) {
+            if (w->is_focused) change_menubar_title(w->window_title);
+            return false;
+        }
         float alpha = effective_os_window_alpha(w);
         color_type bg = OPT(background);
-        if (metal_begin_frame(w, alpha, bg)) {
-            if (w->viewport_size_dirty) w->viewport_size_dirty = false;
-            swap_window_buffers(w);
-            if (w->redraw_count) w->redraw_count--;
-            w->focused_at_last_render = w->is_focused;
-            return true;
-        }
-        return false;
+        if (!metal_begin_frame(w, alpha, bg)) return false;
+        render_prepared_os_window_metal(w, active_window_id, active_window_bg, num_visible_windows, all_windows_have_same_bg);
+        if (w->is_focused) change_menubar_title(w->window_title);
+        return true;
     }
 #endif
     make_os_window_context_current(w);
