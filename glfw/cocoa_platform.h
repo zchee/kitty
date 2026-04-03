@@ -95,7 +95,11 @@ typedef VkResult (APIENTRY *PFN_vkCreateMetalSurfaceEXT)(VkInstance,const VkMeta
 
 #include "posix_thread.h"
 #include "cocoa_joystick.h"
+#ifdef KITTY_USE_METAL
+#include "metal_context.h"
+#else
 #include "nsgl_context.h"
+#endif
 
 #define _glfw_dlopen(name) dlopen(name, RTLD_LAZY | RTLD_LOCAL)
 #define _glfw_dlclose(handle) dlclose(handle)

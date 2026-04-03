@@ -452,6 +452,9 @@ load_glfw(const char* path) {
     *(void **) (&glfwGetCocoaWindow_impl) = dlsym(handle, "glfwGetCocoaWindow");
     if (glfwGetCocoaWindow_impl == NULL) dlerror(); // clear error indicator
 
+    *(void **) (&glfwGetCocoaMetalLayer_impl) = dlsym(handle, "glfwGetCocoaMetalLayer");
+    if (glfwGetCocoaMetalLayer_impl == NULL) dlerror(); // clear error indicator
+
     *(void **) (&glfwGetNSGLContext_impl) = dlsym(handle, "glfwGetNSGLContext");
     if (glfwGetNSGLContext_impl == NULL) dlerror(); // clear error indicator
 

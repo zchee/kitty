@@ -670,6 +670,7 @@ def kitty_env(args: Options) -> Env:
         cflags.extend(pkg_config('simde', '--cflags-only-I', fatal=False))
     libcrypto_cflags, libcrypto_ldflags = libcrypto_flags()
     cflags.extend(libcrypto_cflags)
+    use_metal = is_macos and os.environ.get('KITTY_USE_METAL', '') == '1'
     if is_macos:
         platform_libs = [
             '-framework', 'Carbon', '-framework', 'CoreText', '-framework', 'CoreGraphics',
@@ -683,9 +684,12 @@ def kitty_env(args: Options) -> Env:
             platform_libs.extend(shlex.split(user_notifications_framework))
         else:
             raise SystemExit('UserNotifications framework missing')
-        # Apple deprecated OpenGL in Mojave (10.14) silence the endless
-        # warnings about it
-        cppflags.append('-DGL_SILENCE_DEPRECATION')
+        if use_metal:
+            cppflags.append('-DKITTY_USE_METAL')
+        else:
+            # Apple deprecated OpenGL in Mojave (10.14) silence the endless
+            # warnings about it
+            cppflags.append('-DGL_SILENCE_DEPRECATION')
     else:
         cflags.extend(pkg_config('cairo-fc', '--cflags-only-I'))
         platform_libs = []
@@ -693,7 +697,12 @@ def kitty_env(args: Options) -> Env:
     cflags.extend(pkg_config('harfbuzz', '--cflags-only-I'))
     platform_libs.extend([f'-L{homebrew_prefix()}/opt/harfbuzz/lib', '-lharfbuzz', f'-L{homebrew_prefix()}/opt/graphite2/lib', '-lgraphite2'])
     pylib = get_python_flags(args, cflags)
-    gl_libs = ['-framework', 'OpenGL'] if is_macos else pkg_config('gl', '--libs')
+    if use_metal:
+        gl_libs = ['-framework', 'Metal', '-framework', 'QuartzCore']
+    elif is_macos:
+        gl_libs = ['-framework', 'OpenGL']
+    else:
+        gl_libs = pkg_config('gl', '--libs')
     libpng = [f'{homebrew_prefix()}/opt/libpng/lib/libpng16.a']
     lcms2 = [f'{homebrew_prefix()}/opt/lcms2/lib/liblcms2.a']
     ans.ldpaths += pylib + platform_libs + gl_libs + libpng + lcms2 + libcrypto_ldflags # + xxhash[1]
@@ -1042,11 +1051,18 @@ def compile_c_extension(
 def find_c_files() -> Tuple[List[str], List[str]]:
     ans, headers = [], []
     d = 'kitty'
+    use_metal = is_macos and os.environ.get('KITTY_USE_METAL', '') == '1'
     exclude = {
         'fontconfig.c', 'freetype.c', 'desktop.c', 'freetype_render_ui_text.c'
     } if is_macos else {
         'core_text.m', 'cocoa_window.m', 'macos_process_info.c'
     }
+    if use_metal:
+        # When building with Metal, exclude the OpenGL backend files
+        exclude.update({'gl.c', 'gl-wrapper.c'})
+    else:
+        # When building with OpenGL, exclude the Metal backend file
+        exclude.add('metal.m')
     for x in sorted(os.listdir(d)):
         ext = os.path.splitext(x)[1]
         if ext in ('.c', '.m') and os.path.basename(x) not in exclude:
@@ -1231,6 +1247,50 @@ def wrapped_kittens() -> str:
     raise Exception('Failed to read wrapped kittens from kitty wrapper script')
 
 
+def compile_metal_shaders() -> Optional[str]:
+    """Compile .metal files into a .metallib for the Metal rendering backend."""
+    if not (is_macos and os.environ.get('KITTY_USE_METAL', '') == '1'):
+        return None
+    metal_files = sorted(glob.glob('kitty/*.metal'))
+    if not metal_files:
+        return None
+    metallib_path = 'kitty/default.metallib'
+    def install_metallib_to_bundle(src: str) -> None:
+        for bundle_resources in [
+            os.path.join('kitty.app', 'Contents', 'Resources'),
+            os.path.join('kitty', 'launcher', 'kitty.app', 'Contents', 'Resources'),
+        ]:
+            if os.path.isdir(bundle_resources):
+                dest = os.path.join(bundle_resources, 'default.metallib')
+                if not os.path.exists(dest) or os.path.getmtime(src) > os.path.getmtime(dest):
+                    shutil.copy2(src, dest)
+                    print(f'Installed Metal shader library to {dest}')
+                break
+
+    # Check if recompilation is needed
+    if os.path.exists(metallib_path):
+        metallib_mtime = os.path.getmtime(metallib_path)
+        if all(os.path.getmtime(f) < metallib_mtime for f in metal_files):
+            install_metallib_to_bundle(metallib_path)
+            return metallib_path
+    # Compile each .metal → .air
+    air_files = []
+    safe_makedirs('build')
+    for metal_file in metal_files:
+        air_file = os.path.join('build', os.path.basename(metal_file).replace('.metal', '.air'))
+        cmd = ['xcrun', '-sdk', 'macosx', 'metal', '-c', metal_file, '-o', air_file,
+               '-std=metal3.1', '-O2', '-Wno-unused-function']
+        print(f'Compiling Metal shader {os.path.basename(metal_file)} ...')
+        subprocess.check_call(cmd)
+        air_files.append(air_file)
+    # Link .air files → .metallib
+    cmd = ['xcrun', '-sdk', 'macosx', 'metallib'] + air_files + ['-o', metallib_path]
+    print(f'Linking Metal shader library ({len(air_files)} shaders) ...')
+    subprocess.check_call(cmd)
+    install_metallib_to_bundle(metallib_path)
+    return metallib_path
+
+
 def build(args: Options, native_optimizations: bool = True, call_init: bool = True) -> None:
     if call_init:
         init_env_from_args(args, native_optimizations)
@@ -1239,6 +1299,7 @@ def build(args: Options, native_optimizations: bool = True, call_init: bool = Tr
     headers.append(build_ref_map(args.skip_code_generation))
     headers.append(build_cli_parser_specs(args.skip_code_generation))
     headers.append(build_uniforms_header(args.skip_code_generation))
+    compile_metal_shaders()
     compile_c_extension(
         kitty_env(args), 'kitty/fast_data_types', args.compilation_database, sources, headers,
         build_dsym=args.build_dsym,
@@ -1246,6 +1307,16 @@ def build(args: Options, native_optimizations: bool = True, call_init: bool = Tr
     compile_glfw(args.compilation_database, args.build_dsym)
     compile_kittens(args)
     add_builtin_fonts(args)
+    # Copy .so files to app bundle so clicking kitty.app uses the latest build
+    if is_macos:
+        bundle_kitty = os.path.join('kitty.app', 'Contents', 'Resources', 'kitty', 'kitty')
+        if os.path.isdir(bundle_kitty):
+            for so_name in ('fast_data_types.so', 'glfw-cocoa.so'):
+                src = os.path.join('kitty', so_name)
+                dst = os.path.join(bundle_kitty, so_name)
+                if os.path.exists(src) and (not os.path.exists(dst) or os.path.getmtime(src) > os.path.getmtime(dst)):
+                    shutil.copy2(src, dst)
+                    print(f'Updated {dst}')
 
 
 def safe_makedirs(path: str) -> None:

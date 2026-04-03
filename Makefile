@@ -15,7 +15,7 @@ APP_TARGET ?= $(join $(addsuffix /,${APPLICATIONS_DIR}), $(APP))
 
 IDENTITY ?= $(shell security find-identity -v | grep 'Apple Development' | awk -F'"' '{print $$2}')
 
-PYTHON3 ?= PYTHONUNBUFFERED=1 PYTHONOPTIMIZE=2 python3.14
+PYTHON3 ?= KITTY_USE_METAL=1 PYTHONUNBUFFERED=1 PYTHONOPTIMIZE=2 python3.14
 
 default: devel
 
@@ -23,7 +23,7 @@ devel: CC=$(shell brew --prefix)/opt/ccache-head/libexec/clang
 devel: VVAL=--verbose
 devel: rebase
 devel: clean
-	@PKG_CONFIG_PATH=/opt/homebrew/opt/libpng/lib/pkgconfig:/opt/homebrew/opt/freetype2/lib/pkgconfig:${PKG_CONFIG_PATH} ${PYTHON3} setup.py kitty.app -v --full --update-check-interval=0 --shell-integration=enabled $(VVAL)
+	@PKG_CONFIG_PATH=/opt/homebrew/opt/libpng/lib/pkgconfig:/opt/homebrew/opt/freetype2/lib/pkgconfig:${PKG_CONFIG_PATH} KITTY_USE_METAL=1 ${PYTHON3} setup.py kitty.app -v --full --update-check-interval=0 --shell-integration=enabled $(VVAL)
 	# ${MAKE} docs SPHINXBUILD=/usr/local/share/pipx/sphinx-build
 	# rm -rf /usr/local/share/man/man1/kitty.1 /usr/local/share/man/man5/kitty.conf.5 /usr/local/share/doc/kitty
 	# install -m 0644 docs/_build/man/kitty.1 /usr/local/share/man/man1
@@ -37,8 +37,8 @@ devel: clean
 	sudo codesign -dvvvvv --options=runtime --entitlements ./entitlements.plist -fs "${IDENTITY}" ${APP}/Contents/MacOS/kitty || true
 	sudo codesign -dvvvvv --options=runtime --entitlements ./entitlements.plist -fs "${IDENTITY}" ${APP}/Contents/MacOS/kitten
 	sudo codesign -dvvvvv --deep --options=runtime --entitlements ./entitlements.plist -fs "${IDENTITY}" ${APP}
-	rm -rf ${APP_TARGET}
-	mv ${APP} $(APPLICATIONS_DIR)
+	# rm -rf ${APP_TARGET}
+	# mv ${APP} $(APPLICATIONS_DIR)
 
 codesign:
 	codesign -dvvvvv --options=runtime --entitlements ./entitlements.plist -s "${IDENTITY}" ${APP}/Contents/MacOS/kitten

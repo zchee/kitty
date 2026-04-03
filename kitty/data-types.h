@@ -21,14 +21,30 @@
 #include <locale.h>
 #include "glfw-wrapper.h"
 #include "banned.h"
+
+// GPU backend selection
+#if defined(__APPLE__) && defined(KITTY_USE_METAL)
+// Metal backend for macOS
+#define KITTY_BACKEND_METAL 1
+// Keep OpenGL version constants for GLFW window hints (still needed for context creation)
+#define OPENGL_REQUIRED_VERSION_MAJOR 3
+#define OPENGL_REQUIRED_VERSION_MINOR 3
+#else
+// OpenGL backend (Linux, or macOS without KITTY_USE_METAL)
+#define KITTY_BACKEND_OPENGL 1
 // Required minimum OpenGL version
 #define OPENGL_REQUIRED_VERSION_MAJOR 3
 #ifdef __APPLE__
-#include <xlocale.h>
 #define OPENGL_REQUIRED_VERSION_MINOR 3
 #else
 #define OPENGL_REQUIRED_VERSION_MINOR 1
 #endif
+#endif
+
+#ifdef __APPLE__
+#include <xlocale.h>
+#endif
+
 #define GLSL_VERSION 140
 #define GLFW_MOD_KITTY (GLFW_MOD_LAST * 2)
 #define UNUSED __attribute__ ((unused))

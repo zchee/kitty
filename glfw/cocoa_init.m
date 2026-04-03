@@ -357,8 +357,14 @@ static GLFWapplicationshouldhandlereopenfun handle_reopen_callback = NULL;
 
     for (window = _glfw.windowListHead;  window;  window = window->next)
     {
-        if (window->context.client != GLFW_NO_API)
+        if (window->context.client != GLFW_NO_API) {
+#ifdef KITTY_USE_METAL
+            // Metal layer is automatically updated by the system
+            (void)window;
+#else
             [window->context.nsgl.object update];
+#endif
+        }
     }
 
     _glfwPollMonitorsNS();
@@ -1141,7 +1147,11 @@ void _glfwPlatformTerminate(void)
         _glfw.ns.appleSettings = nil;
     }
 
+#ifdef KITTY_USE_METAL
+    _glfwTerminateMetal();
+#else
     _glfwTerminateNSGL();
+#endif
     if (global_shortcuts != nil) { [global_shortcuts release]; global_shortcuts = nil; }
 
     } // autoreleasepool

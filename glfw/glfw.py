@@ -190,9 +190,19 @@ def init_env(
     elif module == 'cocoa':
         ans.cppflags.append('-I/opt/local/include')
         ans.ldflags.append(f'-F{homebrew_prefix()}/Frameworks')
-        ans.cppflags.append('-DGL_SILENCE_DEPRECATION')
-        for f_ in 'Cocoa IOKit CoreFoundation CoreVideo UniformTypeIdentifiers'.split():
-            ans.ldpaths.extend(('-framework', f_))
+        use_metal = os.environ.get('KITTY_USE_METAL', '') == '1'
+        if use_metal:
+            ans.cppflags.append('-DKITTY_USE_METAL')
+            # Replace nsgl_context.m with metal_context.m in sources
+            if 'nsgl_context.m' in ans.sources:
+                ans.sources.remove('nsgl_context.m')
+            ans.sources.append('metal_context.m')
+            for f_ in 'Cocoa IOKit CoreFoundation CoreVideo UniformTypeIdentifiers Metal QuartzCore'.split():
+                ans.ldpaths.extend(('-framework', f_))
+        else:
+            ans.cppflags.append('-DGL_SILENCE_DEPRECATION')
+            for f_ in 'Cocoa IOKit CoreFoundation CoreVideo UniformTypeIdentifiers'.split():
+                ans.ldpaths.extend(('-framework', f_))
 
     elif module == 'wayland':
         at_least_version('wayland-protocols', *sinfo['wayland_protocols'])
@@ -316,6 +326,7 @@ def generate_wrappers(glfw_header: str) -> None:
         functions.append(Function(decl))
     for line in '''\
     void* glfwGetCocoaWindow(GLFWwindow* window)
+    void* glfwGetCocoaMetalLayer(GLFWwindow* window)
     void* glfwGetNSGLContext(GLFWwindow *window)
     uint32_t glfwGetCocoaMonitor(GLFWmonitor* monitor)
     GLFWcocoatextinputfilterfun glfwSetCocoaTextInputFilter(GLFWwindow* window, GLFWcocoatextinputfilterfun callback)

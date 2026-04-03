@@ -26,6 +26,7 @@ typedef struct mouse_cursor {
 
 static mouse_cursor cursors[GLFW_INVALID_CURSOR+1] = {0};
 
+#ifndef KITTY_BACKEND_METAL
 static void
 apply_swap_interval(int val) {
     (void)val;
@@ -34,6 +35,7 @@ apply_swap_interval(int val) {
     glfwSwapInterval(val);
 #endif
 }
+#endif
 
 void
 get_platform_dependent_config_values(void *glfw_window) {
@@ -349,6 +351,12 @@ cocoa_out_of_sequence_render(OSWindow *window) {
     make_os_window_context_current(window);
     window->needs_render = true;
 
+#ifdef KITTY_BACKEND_METAL
+    // Metal: just mark window as needing render and request a tick.
+    // Actual rendering happens in the main render loop to avoid
+    // consuming drawable pool during initialization.
+    request_tick_callback();
+#else
     // On macOS Tahoe, the default framebuffer can become undefined during
     // screen change events. Try to recover by recreating the drawable.
     // See https://github.com/kovidgoyal/kitty/issues/9463
@@ -373,6 +381,7 @@ cocoa_out_of_sequence_render(OSWindow *window) {
         swap_window_buffers(window);
     }
     window->needs_render = true;
+#endif
 }
 
 static void
@@ -1352,8 +1361,14 @@ make_os_window_context_current(OSWindow *w) {
     GLFWwindow *current_context = glfwGetCurrentContext();
     if (w->handle != current_context) {
         glfwMakeContextCurrent(w->handle);
+#ifdef KITTY_BACKEND_METAL
+        metal_set_current_layer(glfwGetCocoaMetalLayer(w->handle));
+#endif
         return current_context;
     }
+#ifdef KITTY_BACKEND_METAL
+    metal_set_current_layer(glfwGetCocoaMetalLayer(w->handle));
+#endif
     return NULL;
 }
 
@@ -1802,9 +1817,14 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
 #ifndef __APPLE__
         glfwConfigureMomentumScroller(OPT(momentum_scroll), -1, -1, 0);
 #endif
+#ifdef KITTY_BACKEND_METAL
+        // Metal: no OpenGL context needed — tell GLFW to skip GL context creation
+        glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+#else
         glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, OPENGL_REQUIRED_VERSION_MAJOR);
         glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, OPENGL_REQUIRED_VERSION_MINOR);
         glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, true);
+#endif
         // We don't use depth and stencil buffers
         glfwWindowHint(GLFW_DEPTH_BITS, 0);
         glfwWindowHint(GLFW_STENCIL_BITS, 0);
@@ -1814,7 +1834,8 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
         glfwSetIMECursorPositionCallback(get_ime_cursor_position);
         glfwSetSystemColorThemeChangeCallback(on_system_color_scheme_change);
         glfwSetClipboardLostCallback(on_clipboard_lost);
-        // Request SRGB output buffer
+#ifndef KITTY_BACKEND_METAL
+        // Request SRGB output buffer (OpenGL-specific)
         // Prevents kitty from starting on Wayland + NVIDIA, sigh: https://github.com/kovidgoyal/kitty/issues/7021
         // Remove after https://github.com/NVIDIA/egl-wayland/issues/85 is fixed.
         // Also apparently mesa has introduced a bug with sRGB surfaces and Wayland.
@@ -1822,9 +1843,12 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
         // See https://github.com/kovidgoyal/kitty/issues/7174#issuecomment-2000033873
         // GL_FRAMEBUFFER_SRGB works anyway without this on Wayland.
         if (!global_state.is_wayland) glfwWindowHint(GLFW_SRGB_CAPABLE, true);
+#endif
 #ifdef __APPLE__
         cocoa_set_activation_policy(OPT(macos_hide_from_tasks) || lsc != NULL);
+#ifndef KITTY_BACKEND_METAL
         glfwWindowHint(GLFW_COCOA_GRAPHICS_SWITCHING, true);
+#endif
         glfwWindowHint(GLFW_COCOA_RETINA_FRAMEBUFFER, true);
         glfwSetApplicationShouldHandleReopen(on_application_reopen);
         glfwSetApplicationWillFinishLaunching(cocoa_application_lifecycle_event);
@@ -1855,7 +1879,9 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
     // creation, which causes a resize event and all the associated processing.
     // The temp window is used to get the DPI. On Wayland no temp window can be
     // used, so start with window visible unless hidden window requested.
+#ifndef KITTY_BACKEND_METAL
     GLFWwindow *common_context = global_state.num_os_windows ? global_state.os_windows[0].handle : NULL;
+#endif
     GLFWwindow *temp_window = NULL;
     glfwWindowHint(GLFW_VISIBLE, window_state != WINDOW_HIDDEN && global_state.is_wayland);
     float xscale, yscale;
@@ -1871,11 +1897,22 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
             }
         }
     } else {
+#ifdef KITTY_BACKEND_METAL
+#define glfw_failure { \
+        PyErr_Format(PyExc_OSError, "Failed to create GLFWwindow for Metal rendering."); \
+        return NULL; }
+#else
 #define glfw_failure { \
         PyErr_Format(PyExc_OSError, "Failed to create GLFWwindow. This usually happens because of old/broken OpenGL drivers. kitty requires working OpenGL %d.%d drivers.", OPENGL_REQUIRED_VERSION_MAJOR, OPENGL_REQUIRED_VERSION_MINOR); \
         return NULL; }
+#endif
 
+#ifdef KITTY_BACKEND_METAL
+        // Metal: no shared GL context needed
+        temp_window = glfwCreateWindow(640, 480, "temp", NULL, NULL, NULL);
+#else
         temp_window = glfwCreateWindow(640, 480, "temp", NULL, common_context, NULL);
+#endif
         if (temp_window == NULL) glfw_failure;
         get_window_content_scale(temp_window, &xscale, &yscale, &xdpi, &ydpi);
     }
@@ -1888,7 +1925,11 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
         if (!layer_shell_config_from_python(layer_shell_config, lsc)) return NULL;
         lsc->expected.xscale = xscale; lsc->expected.yscale = yscale;
     }
+#ifdef KITTY_BACKEND_METAL
+    GLFWwindow *glfw_window = glfwCreateWindow(width, height, title, NULL, NULL, lsc);
+#else
     GLFWwindow *glfw_window = glfwCreateWindow(width, height, title, NULL, temp_window ? temp_window : common_context, lsc);
+#endif
     if (temp_window) { glfwDestroyWindow(temp_window); temp_window = NULL; }
     if (glfw_window == NULL) glfw_failure;
 #undef glfw_failure
@@ -1897,14 +1938,24 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
         glfwWaylandSetTitlebarHidden(glfw_window, true);
     }
     glfwMakeContextCurrent(glfw_window);
+#ifdef KITTY_BACKEND_METAL
+    metal_set_current_layer(glfwGetCocoaMetalLayer(glfw_window));
+#endif
     if (is_first_window) gl_init();
     bool is_semi_transparent = glfwGetWindowAttrib(glfw_window, GLFW_TRANSPARENT_FRAMEBUFFER);
+#ifdef KITTY_BACKEND_METAL
+    // Metal: skip initial blank canvas — rendering happens in main loop
+    // Acquiring a drawable here would consume from the pool and potentially
+    // cause nextDrawable to block in the first render call
+    (void)is_semi_transparent;
+#else
     // blank the window once so that there is no initial flash of color
     // changing, in case the background color is not black
     blank_canvas(is_semi_transparent ? OPT(background_opacity) : 1.0f, OPT(background), true);
     apply_swap_interval(-1);
     // On Wayland the initial swap is allowed only after the first XDG configure event
     if (glfwAreSwapsAllowed(glfw_window)) glfwSwapBuffers(glfw_window);
+#endif
     glfwSetInputMode(glfw_window, GLFW_LOCK_KEY_MODS, true);
     PyObject *pret = PyObject_CallFunction(pre_show_callback, "N", native_window_handle(glfw_window));
     if (pret == NULL) return NULL;
@@ -2557,10 +2608,16 @@ is_mouse_hidden(OSWindow *w) {
 
 void
 swap_window_buffers(OSWindow *os_window) {
+#ifdef KITTY_BACKEND_METAL
+    // Metal: end the frame (present drawable, commit command buffer)
+    metal_end_frame();
+    os_window->keep_rendering_till_swap = 0;
+#else
     if (glfwAreSwapsAllowed(os_window->handle)) {
         glfwSwapBuffers(os_window->handle);
         os_window->keep_rendering_till_swap = 0;
     }
+#endif
 }
 
 void
