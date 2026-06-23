@@ -913,10 +913,19 @@ _glfwPlatformInit(bool *supports_window_occlusion) {
             @"ApplePressAndHoldEnabled" : @NO,
             // Dont generate openFile events from command line arguments
             @"NSTreatUnknownArgumentsAsOpen" : @"NO",
-            // This Tahoe nonsense causes slowdowns in some situations, see for example:
-            // https://issues.chromium.org/issues/452372350 it doesnt affect
-            // autofill via Edit->Autofill
+            // The AutoFill heuristic controller installs a per-event hook that
+            // accumulates overhead over time, degrading keyboard latency until the
+            // app is restarted. It does not affect autofill via Edit->Autofill. See
+            // https://issues.chromium.org/issues/452372350
+            // macOS 26 (Tahoe) gated this on NSAutoFillHeuristicControllerEnabled,
+            // but macOS 27 renamed the key to NSAutoFillHeuristicsEnabled (the
+            // AppKit binary has _NSAutoFillHeuristicsEnabledDefaultValueFunction
+            // while the old key has no reader). Register both so the controller
+            // stays disabled on every macOS version; the AppKit that does not use a
+            // given key simply ignores it.
             @"NSAutoFillHeuristicControllerEnabled" : @NO,
+            @"NSAutoFillHeuristicsEnabled" : @NO,
+            @"NSAutoFillPanelEnabled" : @NO,
         }];
 
         NSUserDefaults *apple_settings = [[NSUserDefaults alloc] initWithSuiteName:@"com.apple.symbolichotkeys"];
