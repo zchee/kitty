@@ -366,7 +366,7 @@ parse_and_check_kitty_cli(CLISpec *cli_spec, int argc, char **argv) {
     if (cli_spec->errmsg) {
         fprintf(stderr, "%s\n", cli_spec->errmsg);
 #ifdef __APPLE__
-        os_log_error(OS_LOG_DEFAULT, "%{public}s", cli_spec->errmsg);
+        OS_LOG_ERROR(OS_LOG_DEFAULT, "%{public}s", cli_spec->errmsg);
 #endif
         return false;
     }
@@ -379,7 +379,7 @@ parse_and_check_panel_kitten_cli(CLISpec *cli_spec, int argc, char **argv) {
     if (cli_spec->errmsg) {
         fprintf(stderr, "%s\n", cli_spec->errmsg);
 #ifdef __APPLE__
-        os_log_error(OS_LOG_DEFAULT, "%{public}s", cli_spec->errmsg);
+        OS_LOG_ERROR(OS_LOG_DEFAULT, "%{public}s", cli_spec->errmsg);
 #endif
         return false;
     }
