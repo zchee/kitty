@@ -789,7 +789,14 @@ static void _glfwUpdateNotchCover(_GLFWwindow*);
 - (void)windowDidEnterFullScreen:(NSNotification *)notification
 {
     (void)notification;
-    if (window) window->ns.in_fullscreen_transition = false;
+    if (window) {
+        window->ns.in_fullscreen_transition = false;
+        // The fullscreen transition (native or the Split View fallback path in
+        // _glfwPlatformToggleFullscreen) can clear the first responder, which
+        // deactivates the content view's inputContext and breaks IME (pre-edit)
+        // input. Restore it so input methods keep working in fullscreen.
+        [window->ns.object makeFirstResponder:window->ns.view];
+    }
     [self performSelector:@selector(request_delayed_cursor_update:) withObject:nil afterDelay:0.3];
 }
 
@@ -842,6 +849,12 @@ static void _glfwUpdateNotchCover(_GLFWwindow*);
                     if (w2) w2->ns.suppress_frame_constraints = false;
                 });
             });
+        } else {
+            // Native (non-traditional) fullscreen exit also clears the first
+            // responder, deactivating the inputContext and breaking IME. The
+            // traditional branch above restores it inside its deferred block;
+            // do the same for the native path here.
+            [window->ns.object makeFirstResponder:window->ns.view];
         }
     }
     [self performSelector:@selector(request_delayed_cursor_update:) withObject:nil afterDelay:0.3];
