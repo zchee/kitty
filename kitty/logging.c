@@ -61,7 +61,11 @@ log_error(const char *fmt, ...) {
     // To see os_log messages from kitty, use:
     // log show --predicate 'processImagePath contains "kitty" and messageType == error'
 #ifdef __APPLE__
+    // os_log_error() expands to __attribute__((stack_protector_ignore)) in the
+    // macOS SDK, an attribute some clang builds reject under -Werror.
+    START_IGNORE_DIAGNOSTIC("-Wunknown-attributes")
     if (use_os_log) os_log_error(OS_LOG_DEFAULT, "%{public}s", sanbuf);
+    END_IGNORE_DIAGNOSTIC
 #endif
     if (!use_os_log) fprintf(stderr, "%s\n", sanbuf);
 #undef bufprint
