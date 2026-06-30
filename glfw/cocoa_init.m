@@ -1032,6 +1032,7 @@ int _glfwPlatformInit(bool *supports_window_occlusion)
         @"NSAutoFillHeuristicControllerEnabled" : @NO,
         @"NSAutoFillHeuristicsEnabled" : @NO,
         @"NSAutoFillPanelEnabled" : @NO,
+        @"NSAutomaticInlinePredictionEnabled" : @NO,
     }];
 
     NSUserDefaults *apple_settings = [[NSUserDefaults alloc] initWithSuiteName:@"com.apple.symbolichotkeys"];
