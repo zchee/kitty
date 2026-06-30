@@ -333,7 +333,18 @@ static void
 window_occlusion_callback(GLFWwindow *window, bool occluded) {
     if (!set_callback_window(window)) return;
     debug("OSWindow %llu occlusion state changed, occluded: %d\n", global_state.callback_os_window->id, occluded);
-    if (!occluded) global_state.check_for_active_animated_images = true;
+    if (!occluded) {
+        global_state.check_for_active_animated_images = true;
+        // A fullscreen-space transition (for example dragging the window onto the
+        // top of Mission Control) occludes the window while it slides to the new
+        // Space. render_os_window() blanks the buffer during that time because
+        // should_os_window_be_rendered() is false while occluded, and nothing
+        // forces a repaint once the window becomes visible again, leaving a blank
+        // screen. Force a single repaint on un-occlusion so the blanked buffer is
+        // overwritten. The kitty-initiated toggle_fullscreen path does not hit
+        // this because it manages the transition (and the settling repaint) itself.
+        if (!global_state.callback_os_window->redraw_count) global_state.callback_os_window->redraw_count++;
+    }
     update_os_window_visibility_reports(global_state.callback_os_window);
     request_tick_callback();
     global_state.callback_os_window = NULL;
