@@ -783,6 +783,7 @@ def kitty_env(args: Options) -> Env:
         cflags.extend(pkg_config('simde', '--cflags-only-I', fatal=False))
     libcrypto_cflags, libcrypto_ldflags = libcrypto_flags()
     cflags.extend(libcrypto_cflags)
+    use_metal = is_macos and os.environ.get('KITTY_USE_METAL', '') == '1'
     if is_macos:
         platform_libs = [
             '-framework', 'Carbon', '-framework', 'CoreText', '-framework', 'CoreGraphics',
@@ -796,9 +797,12 @@ def kitty_env(args: Options) -> Env:
             platform_libs.extend(shlex.split(user_notifications_framework))
         else:
             raise SystemExit('UserNotifications framework missing')
-        # Apple deprecated OpenGL in Mojave (10.14) silence the endless
-        # warnings about it
-        cppflags.append('-DGL_SILENCE_DEPRECATION')
+        if use_metal:
+            cppflags.append('-DKITTY_USE_METAL')
+        else:
+            # Apple deprecated OpenGL in Mojave (10.14) silence the endless
+            # warnings about it
+            cppflags.append('-DGL_SILENCE_DEPRECATION')
     else:
         cflags.extend(pkg_config('cairo-fc', '--cflags-only-I'))
         platform_libs = []
@@ -806,7 +810,12 @@ def kitty_env(args: Options) -> Env:
     cflags.extend(pkg_config('harfbuzz', '--cflags-only-I'))
     platform_libs.extend([f'-L{homebrew_prefix()}/opt/harfbuzz/lib', '-lharfbuzz', f'-L{homebrew_prefix()}/opt/graphite2/lib', '-lgraphite2'])
     pylib = get_python_flags(args, cflags)
-    gl_libs = ['-framework', 'OpenGL'] if is_macos else pkg_config('gl', '--libs')
+    if use_metal:
+        gl_libs = ['-framework', 'Metal', '-framework', 'QuartzCore']
+    elif is_macos:
+        gl_libs = ['-framework', 'OpenGL']
+    else:
+        gl_libs = pkg_config('gl', '--libs')
     libpng = [f'{homebrew_prefix()}/opt/libpng/lib/libpng16.a']
     lcms2 = [f'{homebrew_prefix()}/opt/lcms2/lib/liblcms2.a']
     ans.ldpaths += pylib + platform_libs + gl_libs + libpng + lcms2 + libcrypto_ldflags + xxhash[1]
@@ -1160,6 +1169,11 @@ def find_c_files() -> Tuple[List[str], List[str]]:
     } if is_macos else {
         'core_text.m', 'cocoa_window.m', 'macos_process_info.c'
     }
+    if is_macos and os.environ.get('KITTY_USE_METAL', '') == '1':
+        # The Metal backend replaces the OpenGL loader and wrapper
+        exclude.update({'gl.c', 'gl-wrapper.c'})
+    else:
+        exclude.add('metal.m')
     for x in sorted(os.listdir(d)):
         ext = os.path.splitext(x)[1]
         if ext in ('.c', '.m') and os.path.basename(x) not in exclude:
@@ -1232,7 +1246,15 @@ def glfw_init_env(
         ans.cppflags.append('-I/opt/local/include')
         ans.ldflags.append(f'-F{homebrew_prefix()}/Frameworks')
         ans.cppflags.append('-DGL_SILENCE_DEPRECATION')
-        for f_ in 'Cocoa IOKit CoreFoundation CoreVideo QuartzCore UniformTypeIdentifiers'.split():
+        frameworks = 'Cocoa IOKit CoreFoundation CoreVideo QuartzCore UniformTypeIdentifiers'
+        if os.environ.get('KITTY_USE_METAL', '') == '1':
+            ans.cppflags.append('-DKITTY_USE_METAL')
+            # The Metal backend replaces the NSGL context implementation
+            if 'nsgl_context.m' in ans.sources:
+                ans.sources.remove('nsgl_context.m')
+            ans.sources.append('metal_context.m')
+            frameworks += ' Metal'
+        for f_ in frameworks.split():
             ans.ldpaths.extend(('-framework', f_))
 
     elif module == 'wayland':
@@ -1474,6 +1496,48 @@ def build_shaders(args: Options, kitty_exe: str, for_freeze: bool) -> None:
         shutil.copytree('shaders', os.path.join(libdir, 'shaders'), dirs_exist_ok=True)
 
 
+def compile_metal_shaders() -> Optional[str]:
+    '''Compile kitty/*.metal into the metallib used by the Metal rendering backend.'''
+    if not (is_macos and os.environ.get('KITTY_USE_METAL', '') == '1'):
+        return None
+    metal_files = sorted(glob.glob('kitty/*.metal'))
+    if not metal_files:
+        return None
+    metallib_path = 'kitty/default.metallib'
+
+    def install_metallib_to_bundle(src: str) -> None:
+        for bundle_resources in (
+            os.path.join('kitty.app', 'Contents', 'Resources'),
+            os.path.join('kitty', 'launcher', 'kitty.app', 'Contents', 'Resources'),
+        ):
+            if os.path.isdir(bundle_resources):
+                dest = os.path.join(bundle_resources, 'default.metallib')
+                if not os.path.exists(dest) or os.path.getmtime(src) > os.path.getmtime(dest):
+                    shutil.copy2(src, dest)
+                    print(f'Installed Metal shader library to {dest}')
+                break
+
+    if os.path.exists(metallib_path):
+        metallib_mtime = os.path.getmtime(metallib_path)
+        if all(os.path.getmtime(f) < metallib_mtime for f in metal_files):
+            install_metallib_to_bundle(metallib_path)
+            return metallib_path
+    air_files = []
+    safe_makedirs('build')
+    for metal_file in metal_files:
+        air_file = os.path.join('build', os.path.basename(metal_file).replace('.metal', '.air'))
+        cmd = ['xcrun', '-sdk', 'macosx', 'metal', '-c', metal_file, '-o', air_file,
+               '-std=metal3.1', '-O2', '-Wno-unused-function']
+        print(f'Compiling Metal shader {os.path.basename(metal_file)} ...')
+        subprocess.check_call(cmd)
+        air_files.append(air_file)
+    cmd = ['xcrun', '-sdk', 'macosx', 'metallib'] + air_files + ['-o', metallib_path]
+    print(f'Linking Metal shader library ({len(air_files)} shaders) ...')
+    subprocess.check_call(cmd)
+    install_metallib_to_bundle(metallib_path)
+    return metallib_path
+
+
 def build(args: Options, native_optimizations: bool = True, call_init: bool = True) -> None:
     if call_init:
         init_env_from_args(args, native_optimizations)
@@ -1482,6 +1546,7 @@ def build(args: Options, native_optimizations: bool = True, call_init: bool = Tr
     headers.append(build_ref_map(args.skip_code_generation))
     headers.append(build_cli_parser_specs(args.skip_code_generation))
     headers.append(build_uniforms_header(args.skip_code_generation))
+    compile_metal_shaders()
     compile_c_extension(
         kitty_env(args), 'kitty/fast_data_types', args.compilation_database, sources, headers,
         build_dsym=args.build_dsym,

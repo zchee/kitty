@@ -7,6 +7,12 @@
 #pragma once
 
 #include "data-types.h"
+
+#ifdef KITTY_BACKEND_METAL
+// Metal backend — metal.h provides all type definitions and function declarations
+#include "metal.h"
+#else
+// OpenGL backend
 #include "gl-wrapper.h"
 
 typedef struct {
@@ -73,3 +79,5 @@ void bind_framebuffer_for_output(unsigned fbid);
 void set_framebuffer_to_use_for_output(unsigned fbid);
 void enable_scissor_using_top_left_origin(Viewport, unsigned);
 void disable_scissor(void);
+
+#endif // KITTY_BACKEND_METAL

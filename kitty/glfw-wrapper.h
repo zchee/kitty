@@ -2420,6 +2420,10 @@ typedef void* (*glfwGetCocoaWindow_func)(GLFWwindow*);
 GFW_EXTERN glfwGetCocoaWindow_func glfwGetCocoaWindow_impl;
 #define glfwGetCocoaWindow glfwGetCocoaWindow_impl
 
+typedef void* (*glfwGetCocoaMetalLayer_func)(GLFWwindow*);
+GFW_EXTERN glfwGetCocoaMetalLayer_func glfwGetCocoaMetalLayer_impl;
+#define glfwGetCocoaMetalLayer glfwGetCocoaMetalLayer_impl
+
 typedef void* (*glfwGetNSGLContext_func)(GLFWwindow*);
 GFW_EXTERN glfwGetNSGLContext_func glfwGetNSGLContext_impl;
 #define glfwGetNSGLContext glfwGetNSGLContext_impl
