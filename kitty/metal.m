@@ -738,6 +738,7 @@ restore_viewport(void) {
 // ----- Drawing -----
 
 static int dq_log_count = 0;
+static int metal_frame_counter = 0;
 void
 draw_quad(bool blend, unsigned instance_count) {
     blend_enabled = blend;
@@ -1311,10 +1312,31 @@ dump_frame_and_present(id<MTLCommandBuffer> cb, id<CAMetalDrawable> drawable, co
     free(data);
 }
 
+// Dump one layer of a texture as straight RGBA PNG (dev harness).
+static void
+dump_texture_layer(GLuint tex_id, unsigned layer, const char *path) {
+    MetalTexture *t = get_texture(tex_id);
+    if (!t || !t->texture) return;
+    size_t w = t->texture.width, h = t->texture.height;
+    uint32_t *data = malloc(w * h * 4);
+    if (!data) return;
+    [t->texture getBytes:data bytesPerRow:w * 4 bytesPerImage:0 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 slice:layer];
+    size_t sz = 0;
+    const char *png = png_from_32bit_rgba((const char*)data, w, h, &sz, false);
+    if (sz) { FILE *f = fopen(path, "wb"); if (f) { fwrite(png, 1, sz, f); fclose(f); } }
+    free(data);
+    METAL_TRACE("dumped texture %u layer %u (%zux%zu) to %s\n", tex_id, layer, w, h, path);
+}
+
 void
 metal_end_frame(void) {
     end_current_encoder();
-    METAL_TRACE("end_frame: cb=%d drawable=%d\n", mtl_current_command_buffer != nil, mtl_current_drawable != nil);
+    METAL_TRACE("end_frame[%d]: cb=%d drawable=%d\n", metal_frame_counter++, mtl_current_command_buffer != nil, mtl_current_drawable != nil);
+    {
+        static bool atlas_dumped = false;
+        const char *ap = getenv("KITTY_METAL_DUMP_ATLAS");
+        if (ap && !atlas_dumped && metal_frame_counter > 5) { atlas_dumped = true; dump_texture_layer(2, 0, ap); }
+    }
     if (mtl_current_command_buffer) {
         static bool dump_env_checked = false;
         static const char *dump_path = NULL;
