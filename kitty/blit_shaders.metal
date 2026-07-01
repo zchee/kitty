@@ -67,6 +67,18 @@ constant int2 blit_pos_map[4] = {
     int2(2, 1),  // right, top    → src_rect[right], src_rect[top]
 };
 
+// The C callers bake GL's bottom-up texture orientation into src_rect
+// (e.g. stop_os_window_rendering passes top=sy, bottom=0). Metal render
+// passes write the layers FBO and the drawable top-down, so the texcoord
+// y endpoints must be swapped to cancel that flip. dest_rect (NDC) is
+// orientation-independent and keeps the original mapping.
+constant int2 blit_tex_map[4] = {
+    int2(0, 1),  // left, bottom  → v from src_rect[top]
+    int2(2, 1),  // right, bottom → v from src_rect[top]
+    int2(0, 3),  // left, top     → v from src_rect[bottom]
+    int2(2, 3),  // right, top    → v from src_rect[bottom]
+};
+
 // ---- Blit Vertex Shader ----
 
 vertex BlitVertexOut blit_vertex(
@@ -75,7 +87,8 @@ vertex BlitVertexOut blit_vertex(
 ) {
     BlitVertexOut out;
     int2 pos = blit_pos_map[vid];
-    out.texcoord = float2(uniforms.src_rect[pos.x], uniforms.src_rect[pos.y]);
+    int2 tex = blit_tex_map[vid];
+    out.texcoord = float2(uniforms.src_rect[tex.x], uniforms.src_rect[tex.y]);
     out.position = float4(uniforms.dest_rect[pos.x], uniforms.dest_rect[pos.y], 0, 1);
     return out;
 }
@@ -111,7 +124,8 @@ vertex BlitVertexOut screenshot_vertex(
 ) {
     BlitVertexOut out;
     int2 pos = blit_pos_map[vid];
-    out.texcoord = float2(uniforms.src_rect[pos.x], uniforms.src_rect[pos.y]);
+    int2 tex = blit_tex_map[vid];
+    out.texcoord = float2(uniforms.src_rect[tex.x], uniforms.src_rect[tex.y]);
     out.position = float4(uniforms.dest_rect[pos.x], uniforms.dest_rect[pos.y], 0, 1);
     return out;
 }

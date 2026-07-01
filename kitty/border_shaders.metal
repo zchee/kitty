@@ -21,16 +21,13 @@ struct BorderUniforms {
     float gamma_lut[256];
 };
 
-// Must match C struct BorderRect layout exactly (56 bytes)
-struct BorderRect {
-    float4 rect;           // left, top, right, bottom (offset 0, 16 bytes)
-    uint4 px;              // px.left, px.top, px.right, px.bottom (offset 16, 16 bytes)
-    uint color;            // offset 32, 4 bytes
-    uint _pad0;            // offset 36, 4 bytes (alignment padding)
-    uint2 border_type;     // long long = 8 bytes (offset 40)
-    uint horizontal;       // bool = 1 byte but aligned to 4 (offset 48)
-    uint _pad1;            // padding to 56 bytes
-};
+// The C-side BorderRect (kitty/state.h) is 56 bytes with natural C
+// alignment; an MSL struct containing float4 is padded to a 64-byte stride
+// and 56 is not 16-aligned, so neither struct indexing nor float4 loads may
+// be used on the instance array. Instances are addressed with an explicit
+// byte stride and read as 4-byte scalars (offset 0: rect floats, offset 32:
+// color).
+#define BORDER_RECT_C_STRIDE 56u
 
 struct BorderVertexOut {
     float4 position [[position]];
@@ -62,17 +59,19 @@ inline float is_integer_value(uint c, int x) {
 vertex BorderVertexOut border_vertex(
     uint vid [[vertex_id]],
     uint iid [[instance_id]],
-    constant BorderRect *rects [[buffer(0)]],
+    constant uchar *rects_raw [[buffer(0)]],
     constant BorderUniforms& uniforms [[buffer(1)]]
 ) {
     BorderVertexOut out;
-    constant BorderRect& r = rects[iid];
+    constant float *rf = (constant float*)(rects_raw + iid * BORDER_RECT_C_STRIDE);
+    float4 rect = float4(rf[0], rf[1], rf[2], rf[3]);
+    uint rect_color = ((constant uint*)rf)[8]; // offsetof(BorderRect, color) == 32
 
     uint2 pos = border_pos_map[vid];
-    out.position = float4(r.rect[pos.x], r.rect[pos.y], 0, 1);
+    out.position = float4(rect[pos.x], rect[pos.y], 0, 1);
 
-    float3 window_bg = as_color_vector(r.color, 24, uniforms.gamma_lut);
-    uint rc = r.color & 0xFFu;
+    float3 window_bg = as_color_vector(rect_color, 24, uniforms.gamma_lut);
+    uint rc = rect_color & 0xFFu;
     float3 color3 = as_color_vector(uniforms.colors[rc], 16, uniforms.gamma_lut);
 
     float is_window_bg = is_integer_value(rc, 3); // WINDOW_BACKGROUND_PLACEHOLDER
