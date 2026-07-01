@@ -413,6 +413,7 @@ typedef struct {
     GLsizeiptr size;
     GLenum usage;
     void *mapped_ptr;
+    bool in_use;
 } MetalBuffer;
 
 #define MAX_CHILDREN 512
@@ -421,12 +422,17 @@ static size_t buffer_count = 0;
 
 static ssize_t
 create_buffer(GLenum usage) {
+    // A slot is free only when explicitly released: a created-but-not-yet
+    // allocated buffer has no MTLBuffer, and treating it as free hands the
+    // same slot to two VAO buffers (the UBO then overwrites the selection
+    // map — the G4-D1/G4-D2 corruption).
     for (size_t i = 0; i < sizeof(buffers)/sizeof(buffers[0]); i++) {
-        if (!buffers[i].mtl_buffer && !buffers[i].mapped_ptr) {
+        if (!buffers[i].in_use) {
             buffers[i].size = 0;
             buffers[i].usage = usage;
             buffers[i].mtl_buffer = nil;
             buffers[i].mapped_ptr = NULL;
+            buffers[i].in_use = true;
             if (i >= buffer_count) buffer_count = i + 1;
             return i;
         }
@@ -443,6 +449,7 @@ delete_buffer(ssize_t buf_idx) {
     // mapped_ptr points into MTLBuffer's memory — do NOT free() it
     buffers[buf_idx].mapped_ptr = NULL;
     buffers[buf_idx].size = 0;
+    buffers[buf_idx].in_use = false;
 }
 
 static void
@@ -857,11 +864,23 @@ draw_quad(bool blend, unsigned instance_count) {
                 (MetalCellRenderData*)buffers[vaos[current_bound_vao].buffers[2]].mapped_ptr : NULL;
             METAL_TRACE("  cell: vao=%zd nbuf=%zu rdp=%p\n", current_bound_vao,
                 current_bound_vao >= 0 ? vaos[current_bound_vao].num_buffers : 0, (void*)rdp);
-            if (rdp) METAL_TRACE("  rd: cols=%u lines=%u sx=%u sy=%u cw=%u ch=%u ita=%.2f fg=%06x bg0=%06x | du: tc=%.2f tga=%.2f dbb=%u ro=%.2f gl=%d\n",
+            if (rdp) METAL_TRACE("  rd: cols=%u lines=%u sx=%u sy=%u cw=%u ch=%u ita=%.2f fg=%06x bg0=%06x | cur=(%u..%u,%u..%u) shape=%u op=%.2f xfg=%08x xbg=%08x | url_style=%u inv=%u | du: tc=%.2f tga=%.2f dbb=%u ro=%.2f\n",
                 rdp->columns, rdp->lines, rdp->sprites_xnum, rdp->sprites_ynum, rdp->cell_width, rdp->cell_height,
                 rdp->inactive_text_alpha, rdp->default_fg, rdp->bg_colors0,
-                cell_draw.text_contrast, cell_draw.text_gamma_adjustment, cell_draw.draw_bg_bitfield, cell_draw.row_offset,
-                cached_gamma_lut != NULL);
+                rdp->cursor_x1, rdp->cursor_x2, rdp->cursor_y1, rdp->cursor_y2, rdp->cursor_shape, rdp->cursor_opacity,
+                rdp->extra_cursor_fg, rdp->extra_cursor_bg, rdp->url_style, rdp->inverted,
+                cell_draw.text_contrast, cell_draw.text_gamma_adjustment, cell_draw.draw_bg_bitfield, cell_draw.row_offset);
+            if (vaos[current_bound_vao].num_buffers > 1) {
+                const uint8_t *sel = buffers[vaos[current_bound_vao].buffers[0] + 0].mapped_ptr ? buffers[vaos[current_bound_vao].buffers[1]].mapped_ptr : NULL;
+                typedef struct { uint32_t fg, bg, dfg, sprite, attrs; } DbgCell;
+                const DbgCell *cells = (const DbgCell*)buffers[vaos[current_bound_vao].buffers[0]].mapped_ptr;
+                if (sel && cells) {
+                    char selhex[64], attrshex[128]; size_t sp = 0, ap = 0;
+                    for (int i = 12; i < 24 && sp < 60; i++) sp += snprintf(selhex + sp, sizeof(selhex) - sp, "%02x", sel[i]);
+                    for (int i = 12; i < 24 && ap < 120; i++) ap += snprintf(attrshex + ap, sizeof(attrshex) - ap, "%x,", cells[i].attrs);
+                    METAL_TRACE("  row0 cols12-23: sel=%s attrs=%s spr12=%x\n", selhex, attrshex, cells[12].sprite);
+                }
+            }
         }
 
         // Bind textures: unit 0 = sprite atlas (2D array), unit 2 = decorations map
