@@ -79,8 +79,11 @@ static unsigned active_texture_unit = 0;
 static GLuint bound_textures[MAX_TEXTURE_UNITS] = {0};  // texture ID bound per unit
 static GLenum bound_texture_targets[MAX_TEXTURE_UNITS] = {0}; // GL_TEXTURE_2D or GL_TEXTURE_2D_ARRAY
 
-// Output framebuffer tracking
-static unsigned output_framebuffer = 0;
+// Framebuffer tracking, mirroring gl.c semantics: set_framebuffer_to_use_
+// for_output REGISTERS an indirection target, and binding fb 0 resolves to
+// that registered target (not to the real default framebuffer).
+static unsigned output_framebuffer = 0;  // registered indirection target
+static unsigned bound_framebuffer = 0;   // actually bound render target
 
 // Per-program uniform data store
 // Each uniform location maps to a slot in this buffer.
@@ -754,8 +757,9 @@ draw_quad(bool blend, unsigned instance_count) {
         FILE *f = fopen("/tmp/kitty_metal_debug.log", "a");
         if (f) {
             CGSize ds = mtl_current_layer.drawableSize;
-            fprintf(f, "draw_quad[%d]: prog=%d blend=%d inst=%u vao=%zd vp=(%.0f,%.0f,%.0f,%.0f) ds=%.0fx%.0f pso=%p\n",
+            fprintf(f, "draw_quad[%d]: prog=%d blend=%d inst=%u vao=%zd fb=%u enc_fmt=%lu vp=(%.0f,%.0f,%.0f,%.0f) ds=%.0fx%.0f pso=%p\n",
                 dq_log_count, current_program, blend, instance_count, current_bound_vao,
+                bound_framebuffer, (unsigned long)mtl_current_enc_fmt,
                 mtl_viewport.originX, mtl_viewport.originY, mtl_viewport.width, mtl_viewport.height,
                 ds.width, ds.height,
                 current_program >= 0 && current_program < NUM_PROGRAMS ?
@@ -1003,15 +1007,15 @@ check_framebuffer_status(void) {
 
 void
 bind_framebuffer_for_output(unsigned fbid) {
-    // Switch rendering between the main drawable and an offscreen framebuffer
-    if (fbid != output_framebuffer) {
-        // End current render pass before switching targets
+    // fbid == 0 resolves to the registered output framebuffer (gl.c parity);
+    // a nonzero fbid binds that framebuffer directly.
+    unsigned target = fbid ? fbid : output_framebuffer;
+    if (target != bound_framebuffer) {
+        // End current render pass before switching targets; the next draw
+        // opens an encoder on the new target.
         end_current_encoder();
-        output_framebuffer = fbid;
+        bound_framebuffer = target;
     }
-    // If we switch to an offscreen framebuffer, the next draw call will
-    // create a new render pass targeting that framebuffer's texture.
-    // If fbid == 0, we render to the default drawable.
 }
 
 void
@@ -1251,9 +1255,9 @@ current_drawable_srgb_view(void) {
 // conversion to linear attachments, so the flag is ignored for the FBO path.
 static MTLPixelFormat
 wanted_attachment_format(bool for_clear) {
-    if (output_framebuffer && output_framebuffer < MAX_FRAMEBUFFERS &&
-        framebuffers[output_framebuffer].in_use && framebuffers[output_framebuffer].render_target) {
-        return framebuffers[output_framebuffer].render_target.pixelFormat;
+    if (bound_framebuffer && bound_framebuffer < MAX_FRAMEBUFFERS &&
+        framebuffers[bound_framebuffer].in_use && framebuffers[bound_framebuffer].render_target) {
+        return framebuffers[bound_framebuffer].render_target.pixelFormat;
     }
     bool want_srgb = for_clear ? clear_srgb_flag : framebuffer_srgb_enabled;
     return want_srgb ? MTLPixelFormatBGRA8Unorm_sRGB : MTLPixelFormatBGRA8Unorm;
@@ -1268,9 +1272,9 @@ begin_render_pass_to_drawable(bool clear) {
     bool is_fbo = false;
 
     // Determine render target: offscreen framebuffer or main drawable
-    if (output_framebuffer && output_framebuffer < MAX_FRAMEBUFFERS &&
-        framebuffers[output_framebuffer].in_use && framebuffers[output_framebuffer].render_target) {
-        target_texture = framebuffers[output_framebuffer].render_target;
+    if (bound_framebuffer && bound_framebuffer < MAX_FRAMEBUFFERS &&
+        framebuffers[bound_framebuffer].in_use && framebuffers[bound_framebuffer].render_target) {
+        target_texture = framebuffers[bound_framebuffer].render_target;
         is_fbo = true;
     } else {
         if (!ensure_drawable()) return nil;
@@ -1355,6 +1359,27 @@ metal_end_frame(void) {
         static bool atlas_dumped = false;
         const char *ap = getenv("KITTY_METAL_DUMP_ATLAS");
         if (ap && !atlas_dumped && metal_frame_counter > 5) { atlas_dumped = true; dump_texture_layer(2, 0, ap); }
+        static bool fbo_dumped = false;
+        const char *fp = getenv("KITTY_METAL_DUMP_FBO");
+        if (fp && !fbo_dumped && metal_frame_counter > 5 && framebuffers[1].render_target) {
+            fbo_dumped = true;
+            id<MTLTexture> t = framebuffers[1].render_target;
+            size_t w = t.width, h = t.height;
+            uint16_t *raw = malloc(w * h * 8);
+            uint32_t *rgba = malloc(w * h * 4);
+            if (raw && rgba) {
+                [t getBytes:raw bytesPerRow:w * 8 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+                for (size_t i = 0; i < w * h; i++) {
+                    uint32_t r = raw[i*4] / 257, g = raw[i*4+1] / 257, b = raw[i*4+2] / 257, a = raw[i*4+3] / 257;
+                    rgba[i] = r | (g << 8) | (b << 16) | (a << 24);
+                }
+                size_t sz = 0;
+                const char *png = png_from_32bit_rgba((const char*)rgba, w, h, &sz, false);
+                if (sz) { FILE *f = fopen(fp, "wb"); if (f) { fwrite(png, 1, sz, f); fclose(f); } }
+                METAL_TRACE("dumped FBO texture (%zux%zu fmt=%lu) to %s\n", w, h, (unsigned long)t.pixelFormat, fp);
+            }
+            free(raw); free(rgba);
+        }
     }
     if (mtl_current_command_buffer) {
         static bool dump_env_checked = false;
@@ -1444,7 +1469,7 @@ void metal_gl_get_integerv(GLenum pname, GLint *params) {
             params[0] = 0;
             break;
         case GL_DRAW_FRAMEBUFFER_BINDING:
-            params[0] = (GLint)output_framebuffer;
+            params[0] = (GLint)bound_framebuffer;
             break;
         default:
             params[0] = 0;
@@ -1671,8 +1696,8 @@ void metal_gl_copy_tex_image_2d(GLenum target, int level, GLenum internalformat,
 
     // Copy from current drawable/render target to the new texture
     id<MTLTexture> source = nil;
-    if (output_framebuffer && output_framebuffer < MAX_FRAMEBUFFERS && framebuffers[output_framebuffer].render_target) {
-        source = framebuffers[output_framebuffer].render_target;
+    if (bound_framebuffer && bound_framebuffer < MAX_FRAMEBUFFERS && framebuffers[bound_framebuffer].render_target) {
+        source = framebuffers[bound_framebuffer].render_target;
     } else if (mtl_current_drawable) {
         source = mtl_current_drawable.texture;
     }
@@ -1743,16 +1768,20 @@ void metal_gl_delete_framebuffers(int n, const GLuint *ids) {
 }
 
 void metal_gl_bind_framebuffer(GLenum target, GLuint id) {
+    // Direct glBindFramebuffer: binds literally (no output indirection).
     (void)target;
-    output_framebuffer = id;
+    if (id != bound_framebuffer) {
+        end_current_encoder();
+        bound_framebuffer = id;
+    }
 }
 
 void metal_gl_framebuffer_texture_2d(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, int level) {
     (void)target; (void)attachment; (void)textarget; (void)level;
-    if (output_framebuffer && output_framebuffer < MAX_FRAMEBUFFERS) {
-        framebuffers[output_framebuffer].attached_texture_id = texture;
+    if (bound_framebuffer && bound_framebuffer < MAX_FRAMEBUFFERS) {
+        framebuffers[bound_framebuffer].attached_texture_id = texture;
         MetalTexture *t = get_texture(texture);
-        if (t) framebuffers[output_framebuffer].render_target = t->texture;
+        if (t) framebuffers[bound_framebuffer].render_target = t->texture;
     }
 }
 
@@ -1767,8 +1796,8 @@ void metal_gl_read_pixels(int x, int y, int width, int height, GLenum format, GL
     end_current_encoder();
 
     id<MTLTexture> source = nil;
-    if (output_framebuffer && output_framebuffer < MAX_FRAMEBUFFERS && framebuffers[output_framebuffer].render_target) {
-        source = framebuffers[output_framebuffer].render_target;
+    if (bound_framebuffer && bound_framebuffer < MAX_FRAMEBUFFERS && framebuffers[bound_framebuffer].render_target) {
+        source = framebuffers[bound_framebuffer].render_target;
     } else if (mtl_current_drawable) {
         source = mtl_current_drawable.texture;
     }
