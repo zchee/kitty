@@ -650,8 +650,10 @@ static void _glfwUpdateNotchCover(_GLFWwindow*);
     }
     [currentScreenStates release];
 
+#ifndef KITTY_USE_METAL
     if (window->context.client != GLFW_NO_API)
         [window->context.nsgl.object update];
+#endif
 
     if (_glfw.ns.disabledCursorWindow == window)
         _glfwCenterCursorInContentArea(window);
@@ -691,8 +693,10 @@ static void _glfwUpdateNotchCover(_GLFWwindow*);
 - (void)windowDidMove:(NSNotification *)notification
 {
     (void)notification;
+#ifndef KITTY_USE_METAL
     if (window->context.client != GLFW_NO_API)
         [window->context.nsgl.object update];
+#endif
 
     if (_glfw.ns.disabledCursorWindow == window)
         _glfwCenterCursorInContentArea(window);
@@ -929,6 +933,18 @@ static void _glfwUpdateNotchCover(_GLFWwindow*);
 
 @implementation GLFWContentView
 
+#ifdef KITTY_USE_METAL
+// AppKit may re-create the backing layer at any time (backing-property
+// changes, full-screen transitions, screen moves). Always hand back the
+// window's CAMetalLayer so the render target is never silently replaced
+// by a plain CALayer.
+- (CALayer *)makeBackingLayer {
+    if (window && window->ns.layer) return (CALayer*)window->ns.layer;
+    return [super makeBackingLayer];
+}
+
+#endif
+
 - (instancetype)initWithGlfwWindow:(_GLFWwindow *)initWindow
 {
     self = [super init];
@@ -1007,6 +1023,7 @@ static void _glfwUpdateNotchCover(_GLFWwindow*);
 - (void)updateLayer
 {
     if (!window) return;
+#ifndef KITTY_USE_METAL
     if (window->context.client != GLFW_NO_API) {
         @try {
             [window->context.nsgl.object update];
@@ -1016,6 +1033,7 @@ static void _glfwUpdateNotchCover(_GLFWwindow*);
                             [[e name] UTF8String], [[e reason] UTF8String]);
         }
     }
+#endif
 
     _glfwInputWindowDamage(window);
 }
@@ -2493,6 +2511,9 @@ static bool createNativeWindow(_GLFWwindow* window,
 //////////////////////////////////////////////////////////////////////////
 
 int _glfwPlatformCreateWindow(_GLFWwindow* window, const _GLFWwndconfig* wndconfig, const _GLFWctxconfig* ctxconfig, const _GLFWfbconfig* fbconfig, const GLFWLayerShellConfig *lsc) {
+#ifdef KITTY_USE_METAL
+    (void)ctxconfig; (void)fbconfig;
+#endif
     window->ns.deadKeyState = 0;
     if (lsc) {
         window->ns.layer_shell.is_active = true;
@@ -2512,6 +2533,15 @@ int _glfwPlatformCreateWindow(_GLFWwindow* window, const _GLFWwndconfig* wndconf
         case DEFAULT_COLORSPACE: break;
     }
 
+#ifdef KITTY_USE_METAL
+    // Metal: always create Metal context, regardless of GLFW_CLIENT_API setting
+    {
+        if (!_glfwInitMetal())
+            return false;
+        if (!_glfwCreateContextMetal(window))
+            return false;
+    }
+#else
     if (ctxconfig->client != GLFW_NO_API)
     {
         if (ctxconfig->source == GLFW_NATIVE_CONTEXT_API)
@@ -2541,6 +2571,7 @@ int _glfwPlatformCreateWindow(_GLFWwindow* window, const _GLFWwndconfig* wndconf
                 return false;
         }
     }
+#endif // KITTY_USE_METAL
 
     if (window->monitor)
     {
@@ -3997,6 +4028,15 @@ GLFWAPI id glfwGetCocoaWindow(GLFWwindow* handle)
 
     _GLFW_REQUIRE_INIT_OR_RETURN(nil);
     return window->ns.object;
+}
+
+GLFWAPI void* glfwGetCocoaMetalLayer(GLFWwindow* handle)
+{
+    _GLFWwindow* window = (_GLFWwindow*) handle;
+    if (!window) return NULL;
+
+    _GLFW_REQUIRE_INIT_OR_RETURN(NULL);
+    return (__bridge void*)window->ns.layer;
 }
 
 GLFWAPI GLFWcocoatextinputfilterfun glfwSetCocoaTextInputFilter(GLFWwindow *handle, GLFWcocoatextinputfilterfun callback) {

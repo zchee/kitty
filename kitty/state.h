@@ -554,6 +554,11 @@ sprite_index_to_pos(unsigned idx, unsigned xnum, unsigned ynum, unsigned *x, uns
 
 
 void gl_init(void);
+#ifdef KITTY_BACKEND_METAL
+void metal_end_frame(void);
+void metal_set_current_layer(void *layer);
+void* metal_get_device(void);
+#endif
 void remove_vao(ssize_t vao_idx);
 bool remove_os_window(id_type os_window_id);
 void* make_os_window_context_current(OSWindow *w);

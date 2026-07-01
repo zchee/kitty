@@ -193,7 +193,15 @@ def init_env(
         ans.cppflags.append('-I/opt/local/include')
         ans.ldflags.append(f'-F{homebrew_prefix()}/Frameworks')
         ans.cppflags.append('-DGL_SILENCE_DEPRECATION')
-        for f_ in 'Cocoa IOKit CoreFoundation CoreVideo QuartzCore UniformTypeIdentifiers'.split():
+        frameworks = 'Cocoa IOKit CoreFoundation CoreVideo QuartzCore UniformTypeIdentifiers'
+        if os.environ.get('KITTY_USE_METAL', '') == '1':
+            ans.cppflags.append('-DKITTY_USE_METAL')
+            # The Metal backend replaces the NSGL context implementation
+            if 'nsgl_context.m' in ans.sources:
+                ans.sources.remove('nsgl_context.m')
+            ans.sources.append('metal_context.m')
+            frameworks += ' Metal'
+        for f_ in frameworks.split():
             ans.ldpaths.extend(('-framework', f_))
 
     elif module == 'wayland':
@@ -318,6 +326,7 @@ def generate_wrappers(glfw_header: str) -> None:
         functions.append(Function(decl))
     for line in '''\
     void* glfwGetCocoaWindow(GLFWwindow* window)
+    void* glfwGetCocoaMetalLayer(GLFWwindow* window)
     void* glfwGetNSGLContext(GLFWwindow *window)
     uint32_t glfwGetCocoaMonitor(GLFWmonitor* monitor)
     GLFWcocoatextinputfilterfun glfwSetCocoaTextInputFilter(GLFWwindow* window, GLFWcocoatextinputfilterfun callback)

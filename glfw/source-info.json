@@ -5,6 +5,7 @@
       "cocoa_joystick.h",
       "posix_thread.h",
       "nsgl_context.h",
+      "metal_context.h",
       "egl_context.h",
       "osmesa_context.h"
     ],

@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # License: GPL v3 Copyright: 2016, Kovid Goyal <kovid at kovidgoyal.net>
 
+import ctypes
 import json
 import locale
 import os
@@ -73,6 +74,10 @@ from .utils import (
 )
 
 
+_logged_display_link_backend = False
+_display_link_backend_lib = None
+
+
 def set_custom_ibeam_cursor() -> None:
     with open(beam_cursor_data_file, 'rb') as f:
         data = f.read()
@@ -101,6 +106,45 @@ def init_glfw_module(glfw_module: str = 'wayland', debug_keyboard: bool = False,
     if not ok:
         raise SystemExit('GLFW initialization failed')
     supports_window_occlusion(swo)
+    log_display_link_backend(glfw_module)
+
+
+def query_display_link_backend(glfw_module: str) -> None | int:
+    if not is_macos:
+        return None
+    global _display_link_backend_lib
+    if _display_link_backend_lib is None:
+        lib_path = glfw_path(glfw_module)
+        if not os.path.exists(lib_path):
+            return None
+        try:
+            _display_link_backend_lib = ctypes.CDLL(lib_path)
+        except OSError:
+            return None
+    try:
+        func = _display_link_backend_lib.glfwCocoaPreferredDisplayLinkBackend  # type: ignore[attr-defined]
+    except AttributeError:
+        return None
+    func.restype = ctypes.c_int
+    try:
+        backend = int(func())
+    except Exception:
+        return None
+    if backend not in (0, 1):
+        return None
+    return backend
+
+
+def log_display_link_backend(glfw_module: str) -> None:
+    global _logged_display_link_backend
+    if _logged_display_link_backend:
+        return
+    backend = query_display_link_backend(glfw_module)
+    if backend is None:
+        return
+    backend_name = 'CADisplayLink (macOS 14+)' if backend == 1 else 'CVDisplayLink (legacy)'
+    log_error(f'GLFW preferred display link backend: {backend_name}')
+    _logged_display_link_backend = True
 
 
 def init_glfw(opts: Options, debug_keyboard: bool = False, debug_rendering: bool = False) -> str:

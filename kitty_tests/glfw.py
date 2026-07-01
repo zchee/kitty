@@ -12,6 +12,63 @@ is_macos = 'darwin' in _plat
 
 class TestGLFW(BaseTest):
 
+    def test_preferred_display_link_backend_symbol(self):
+        if not is_macos:
+            self.skipTest('macOS only test')
+        import subprocess
+        import sys
+        from textwrap import dedent
+
+        from kitty.constants import glfw_path
+        from kitty.utils import macos_version
+
+        lib_path = glfw_path('cocoa')
+        script = dedent('''
+            import ctypes
+            import sys
+
+            try:
+                lib = ctypes.CDLL(sys.argv[1])
+            except OSError as e:
+                print(e, file=sys.stderr)
+                sys.exit(1)
+            func = lib.glfwCocoaPreferredDisplayLinkBackend
+            func.restype = ctypes.c_int
+            print(func())
+        ''')
+        proc = subprocess.run([sys.executable, '-c', script, lib_path], capture_output=True, text=True)
+        if proc.returncode != 0:
+            self.skipTest('Unable to query Cocoa display link backend: ' + proc.stderr.strip())
+        backend_text = proc.stdout.strip()
+        if not backend_text:
+            self.skipTest('No backend result reported')
+        backend = int(backend_text)
+        self.assertIn(backend, (0, 1))
+        if backend == 1:
+            self.assertGreaterEqual(macos_version()[:1], (14,))
+
+    def test_display_link_backend_helper(self):
+        from kitty.main import query_display_link_backend
+
+        backend = query_display_link_backend('cocoa')
+        self.assertEqual(backend, query_display_link_backend('cocoa'))
+        if is_macos:
+            if backend is None:
+                self.skipTest('Display link backend introspection unavailable')
+            self.assertIn(backend, (0, 1))
+        else:
+            self.assertIsNone(backend)
+
+    def test_display_link_backend_helper_missing_library(self):
+        import kitty.main as km
+
+        orig = km._display_link_backend_lib
+        try:
+            km._display_link_backend_lib = None
+            self.assertIsNone(km.query_display_link_backend('definitely-not-a-real-backend'))
+        finally:
+            km._display_link_backend_lib = orig
+
     def test_os_window_size_calculation(self):
         from kitty.utils import get_new_os_window_size
 

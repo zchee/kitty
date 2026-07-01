@@ -387,12 +387,14 @@ init_cell_program(void) {
         glUniform1fv(cell_program_layouts[i].uniforms.gamma_lut, arraysz(srgb_lut), srgb_lut);
     }
 
-    // Sanity check to ensure the attribute location binding worked
+#ifndef KITTY_BACKEND_METAL
+    // Sanity check to ensure the attribute location binding worked (OpenGL only)
 #define C(p, name, expected) { int aloc = attrib_location(p, #name); if (aloc != expected && aloc != -1) fatal("The attribute location for %s is %d != %d in program: %d", #name, aloc, expected, p); }
     for (int p = CELL_PROGRAM; p < CELL_PROGRAM_SENTINEL; p++) {
         C(p, colors, 0); C(p, sprite_idx, 1); C(p, is_selected, 2); C(p, decorations_sprite_map, 3);
     }
 #undef C
+#endif
     for (int i = GRAPHICS_PROGRAM; i <= GRAPHICS_ALPHA_MASK_PROGRAM; i++) {
         get_uniform_locations_graphics(i, &graphics_program_layouts[i].uniforms);
     }
