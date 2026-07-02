@@ -73,11 +73,15 @@ static bool mtl_current_enc_is_fbo = false;
 // Blend state
 static bool blend_enabled = false;
 
-// Active texture unit tracking
+// Active texture unit tracking. GL keeps an independent binding per
+// (unit, target) pair — upload paths freely bind GL_TEXTURE_2D on whatever
+// unit is active without disturbing that unit's 2D-array binding, so the
+// shim must model both targets separately or an upload clobbers the sprite
+// atlas binding the cell fragment shader samples.
 static unsigned active_texture_unit = 0;
 #define MAX_TEXTURE_UNITS 8
-static GLuint bound_textures[MAX_TEXTURE_UNITS] = {0};  // texture ID bound per unit
-static GLenum bound_texture_targets[MAX_TEXTURE_UNITS] = {0}; // GL_TEXTURE_2D or GL_TEXTURE_2D_ARRAY
+static GLuint bound_tex_2d[MAX_TEXTURE_UNITS] = {0};
+static GLuint bound_tex_2d_array[MAX_TEXTURE_UNITS] = {0};
 
 // Framebuffer tracking, mirroring gl.c semantics: set_framebuffer_to_use_
 // for_output REGISTERS an indirection target, and binding fb 0 resolves to
@@ -888,12 +892,12 @@ draw_quad(bool blend, unsigned instance_count) {
         }
 
         // Bind textures: unit 0 = sprite atlas (2D array), unit 2 = decorations map
-        if (bound_textures[0] && bound_textures[0] < MAX_TEXTURES && textures[bound_textures[0]].texture) {
-            [mtl_current_encoder setFragmentTexture:textures[bound_textures[0]].texture atIndex:0];
-            [mtl_current_encoder setVertexTexture:textures[bound_textures[0]].texture atIndex:0];
+        if (bound_tex_2d_array[0] && bound_tex_2d_array[0] < MAX_TEXTURES && textures[bound_tex_2d_array[0]].texture) {
+            [mtl_current_encoder setFragmentTexture:textures[bound_tex_2d_array[0]].texture atIndex:0];
+            [mtl_current_encoder setVertexTexture:textures[bound_tex_2d_array[0]].texture atIndex:0];
         }
-        if (bound_textures[2] && bound_textures[2] < MAX_TEXTURES && textures[bound_textures[2]].texture) {
-            [mtl_current_encoder setVertexTexture:textures[bound_textures[2]].texture atIndex:2];
+        if (bound_tex_2d[2] && bound_tex_2d[2] < MAX_TEXTURES && textures[bound_tex_2d[2]].texture) {
+            [mtl_current_encoder setVertexTexture:textures[bound_tex_2d[2]].texture atIndex:2];
         }
     } else if (current_program == 4) {
         // Borders — bind rect buffer from VAO, uniforms as buffer
@@ -908,7 +912,7 @@ draw_quad(bool blend, unsigned instance_count) {
         }
         // Multi-element uniform arrays (colors[9]) live at ARRAY_UNIFORM_BASE +
         // slot*16 (see metal_gl_uniform1uiv), keeping scalar slots intact.
-        struct { uint32_t colors[9]; float background_opacity; float pad[2]; float gamma_lut[256]; } border_u = {0};
+        struct { uint32_t colors[9]; float background_opacity; float gamma_lut[256]; } border_u = {0}; // mirrors BorderUniforms: scalar arrays pack, no padding
         GLint colors_slot = find_uniform_slot(current_program, "colors");
         if (colors_slot >= 0) {
             int base = ARRAY_UNIFORM_BASE + colors_slot * 16;
@@ -920,7 +924,10 @@ draw_quad(bool blend, unsigned instance_count) {
         if (cached_gamma_lut) memcpy(border_u.gamma_lut, cached_gamma_lut, sizeof(border_u.gamma_lut));
         [mtl_current_encoder setVertexBytes:&border_u length:sizeof(border_u) atIndex:1];
     } else if (current_program >= 5 && current_program <= 7) {
-        struct { float src_rect[4]; float dest_rect[4]; float extra_alpha; float amask_fg[3]; float amask_bg_premult[4]; } gfx_u = {0};
+        // Mirrors GraphicsUniforms in graphics_shaders.metal: the float3
+        // amask_fg is 16-byte aligned in MSL, so the CPU twin needs explicit
+        // padding (MSL sizeof == 80, not the packed 64).
+        struct { float src_rect[4]; float dest_rect[4]; float extra_alpha; float _pad0[3]; float amask_fg[3]; float _pad1; float amask_bg_premult[4]; } gfx_u = {0};
         uval_fv("src_rect", gfx_u.src_rect, 4);
         uval_fv("dest_rect", gfx_u.dest_rect, 4);
         gfx_u.extra_alpha = uval_f("extra_alpha", 0);
@@ -929,8 +936,8 @@ draw_quad(bool blend, unsigned instance_count) {
         [mtl_current_encoder setVertexBytes:&gfx_u length:sizeof(gfx_u) atIndex:0];
         [mtl_current_encoder setFragmentBytes:&gfx_u length:sizeof(gfx_u) atIndex:0];
         // Bind image texture from unit 1 (GRAPHICS_UNIT)
-        if (bound_textures[1] && bound_textures[1] < MAX_TEXTURES && textures[bound_textures[1]].texture) {
-            [mtl_current_encoder setFragmentTexture:textures[bound_textures[1]].texture atIndex:0];
+        if (bound_tex_2d[1] && bound_tex_2d[1] < MAX_TEXTURES && textures[bound_tex_2d[1]].texture) {
+            [mtl_current_encoder setFragmentTexture:textures[bound_tex_2d[1]].texture atIndex:0];
         }
     } else if (current_program == 8) {
         struct { float sizes[4]; float positions[4]; float background[4]; float tiled; float pad[3]; } bg_u = {0};
@@ -940,8 +947,8 @@ draw_quad(bool blend, unsigned instance_count) {
         bg_u.tiled = uval_f("tiled", 0);
         [mtl_current_encoder setVertexBytes:&bg_u length:sizeof(bg_u) atIndex:0];
         [mtl_current_encoder setFragmentBytes:&bg_u length:sizeof(bg_u) atIndex:0];
-        if (bound_textures[1] && bound_textures[1] < MAX_TEXTURES && textures[bound_textures[1]].texture) {
-            [mtl_current_encoder setFragmentTexture:textures[bound_textures[1]].texture atIndex:0];
+        if (bound_tex_2d[1] && bound_tex_2d[1] < MAX_TEXTURES && textures[bound_tex_2d[1]].texture) {
+            [mtl_current_encoder setFragmentTexture:textures[bound_tex_2d[1]].texture atIndex:0];
         }
     } else if (current_program == 9) {
         struct { float tint_color[4]; float edges[4]; } tint_u = {0};
@@ -966,8 +973,8 @@ draw_quad(bool blend, unsigned instance_count) {
         uval_fv("dest_rect", blit_u.dest_rect, 4);
         [mtl_current_encoder setVertexBytes:&blit_u length:sizeof(blit_u) atIndex:0];
         [mtl_current_encoder setFragmentBytes:&blit_u length:sizeof(blit_u) atIndex:0];
-        if (bound_textures[1] && bound_textures[1] < MAX_TEXTURES && textures[bound_textures[1]].texture) {
-            [mtl_current_encoder setFragmentTexture:textures[bound_textures[1]].texture atIndex:0];
+        if (bound_tex_2d[1] && bound_tex_2d[1] < MAX_TEXTURES && textures[bound_tex_2d[1]].texture) {
+            [mtl_current_encoder setFragmentTexture:textures[bound_tex_2d[1]].texture atIndex:0];
         }
     } else if (current_program == 12) {
         struct { float src_rect[4]; float dest_rect[4]; float src_size[2]; float pad[2]; } ss_u = {0};
@@ -976,8 +983,8 @@ draw_quad(bool blend, unsigned instance_count) {
         uval_fv("src_size", ss_u.src_size, 2);
         [mtl_current_encoder setVertexBytes:&ss_u length:sizeof(ss_u) atIndex:0];
         [mtl_current_encoder setFragmentBytes:&ss_u length:sizeof(ss_u) atIndex:0];
-        if (bound_textures[1] && bound_textures[1] < MAX_TEXTURES && textures[bound_textures[1]].texture) {
-            [mtl_current_encoder setFragmentTexture:textures[bound_textures[1]].texture atIndex:0];
+        if (bound_tex_2d[1] && bound_tex_2d[1] < MAX_TEXTURES && textures[bound_tex_2d[1]].texture) {
+            [mtl_current_encoder setFragmentTexture:textures[bound_tex_2d[1]].texture atIndex:0];
         }
     } else if (current_program == 13) {
         struct { float color[4]; float background_color[4]; float rect[4]; float params[2]; float pad[2]; } rr_u = {0};
@@ -1180,6 +1187,7 @@ metal_set_current_layer(void *layer) {
             memset(slot, 0, sizeof(*slot));
             slot->in_use = true;
             slot->layer_ptr = layer;
+            METAL_TRACE("new window layer=%p contentsScale=%.2f\n", layer, [(__bridge CAMetalLayer*)layer contentsScale]);
         }
     }
     current_window_slot = slot;
@@ -1387,6 +1395,13 @@ metal_end_frame(void) {
         if (!dump_env_checked) { dump_path = getenv("KITTY_METAL_DUMP_FRAME"); dump_env_checked = true; }
         if (dump_path && mtl_current_drawable) {
             dump_frame_and_present(mtl_current_command_buffer, mtl_current_drawable, dump_path);
+        } else if (mtl_current_drawable && mtl_current_layer && mtl_current_layer.presentsWithTransaction) {
+            // Live resize: present inside the current CA transaction so the
+            // frame stays in lockstep with the window chrome. Documented
+            // sequence: commit, wait until scheduled, then present.
+            [mtl_current_command_buffer commit];
+            [mtl_current_command_buffer waitUntilScheduled];
+            [mtl_current_drawable present];
         } else {
             if (mtl_current_drawable) {
                 [mtl_current_command_buffer presentDrawable:mtl_current_drawable];
@@ -1488,8 +1503,8 @@ static GLuint currently_bound_texture_2d_array = 0;
 
 void metal_gl_bind_texture(GLenum target, GLuint id) {
     if (active_texture_unit < MAX_TEXTURE_UNITS) {
-        bound_textures[active_texture_unit] = id;
-        bound_texture_targets[active_texture_unit] = target;
+        if (target == GL_TEXTURE_2D) bound_tex_2d[active_texture_unit] = id;
+        else if (target == GL_TEXTURE_2D_ARRAY) bound_tex_2d_array[active_texture_unit] = id;
     }
     // Also track per-target for tex_image/tex_sub calls
     if (target == GL_TEXTURE_2D) currently_bound_texture_2d = id;

@@ -1005,6 +1005,13 @@ static void _glfwUpdateNotchCover(_GLFWwindow*);
 {
     if (!window) return;
     window->ns.live_resize_in_progress = true;
+#ifdef KITTY_USE_METAL
+    // Keep Metal presentation inside the Core Animation transaction while
+    // the user drags, so the drawable resizes in lockstep with the window
+    // chrome (prevents flicker/stretching). metal_end_frame() switches to
+    // the commit -> waitUntilScheduled -> present sequence while this is on.
+    if (window->ns.layer) ((CAMetalLayer*)window->ns.layer).presentsWithTransaction = YES;
+#endif
     _glfwInputLiveResize(window, true);
 }
 
@@ -1012,6 +1019,9 @@ static void _glfwUpdateNotchCover(_GLFWwindow*);
 {
     if (!window) return;
     window->ns.live_resize_in_progress = false;
+#ifdef KITTY_USE_METAL
+    if (window->ns.layer) ((CAMetalLayer*)window->ns.layer).presentsWithTransaction = NO;
+#endif
     _glfwInputLiveResize(window, false);
 }
 

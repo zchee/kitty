@@ -101,9 +101,11 @@ bool _glfwCreateContextMetal(_GLFWwindow* window)
         layer.allowsNextDrawableTimeout = YES;
     }
 
-    // Handle Retina displays
-    if (window->ns.retina)
-        layer.contentsScale = [window->ns.object backingScaleFactor];
+    // Match the layer's scale to the backing store. The drawable size is
+    // driven explicitly from kitty's viewport (set_gpu_viewport), which uses
+    // the backing-pixel framebuffer size, so contentsScale mainly keeps Core
+    // Animation's point<->pixel mapping consistent across display moves.
+    layer.contentsScale = window->ns.retina ? [window->ns.object backingScaleFactor] : 1.0;
 
 
     // Install as the view's backing layer. window->ns.layer must be set
