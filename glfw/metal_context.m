@@ -93,6 +93,21 @@ bool _glfwCreateContextMetal(_GLFWwindow* window)
     layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
     layer.framebufferOnly = NO;  // Allow read-back for screenshots
     layer.presentsWithTransaction = NO;
+    // CAMetalLayer.maximumDrawableCount accepts only 2 or 3 (any other value
+    // raises an exception, Apple docs); default is 3. Two trades one frame of
+    // drawable-acquisition queue depth for up to one frame less presentation
+    // latency: once both drawables are in flight, nextDrawable blocks
+    // (bounded below by allowsNextDrawableTimeout) instead of the CPU
+    // racing three frames ahead of what's on screen.
+    layer.maximumDrawableCount = 2;
+    // layer.colorspace is intentionally left at its default, nil. Per Apple
+    // docs a nil colorspace means the drawable's content "isn't
+    // color-matched" -- Core Animation performs no colorspace transform at
+    // composite time, which is the fast, GL-parity path. kitty already does
+    // its own sRGB handling in the render pipeline (texture views selected
+    // per pass in metal.m), so a CA-side conversion would be redundant work
+    // at best and a double-conversion bug at worst. Never set a colorspace
+    // here.
     // Allow nextDrawable to return nil instead of blocking indefinitely
     // when all drawables are in-flight. This prevents deadlock when
     // the main thread blocks in nextDrawable while the GPU needs the
@@ -107,6 +122,15 @@ bool _glfwCreateContextMetal(_GLFWwindow* window)
     // Animation's point<->pixel mapping consistent across display moves.
     layer.contentsScale = window->ns.retina ? [window->ns.object backingScaleFactor] : 1.0;
 
+    // Opaque lets Core Animation drop the alpha channel from the drawable's
+    // backing store and skip compositing this layer against whatever sits
+    // behind it (CALayer.isOpaque, default NO -- Apple docs). Seed it from
+    // the NSWindow's own opacity, which createNativeWindow (cocoa_window.m)
+    // already resolved from the GLFW_TRANSPARENT_FRAMEBUFFER hint before this
+    // function runs. glfwCocoaSetWindowChrome (cocoa_window.m) keeps this in
+    // sync with the live background_opacity for the rest of the window's
+    // life -- it must stay NO whenever background_opacity < 1.
+    layer.opaque = [window->ns.object isOpaque];
 
     // Install as the view's backing layer. window->ns.layer must be set
     // BEFORE wantsLayer: GLFWContentView's makeBackingLayer override returns

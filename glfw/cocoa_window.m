@@ -4196,6 +4196,14 @@ GLFWAPI void glfwCocoaSetWindowChrome(GLFWwindow *w, unsigned int color, bool us
     GLFWWindow *nsw = window->ns.object;
     const bool is_transparent = _glfwPlatformFramebufferTransparent(window);
     if (!is_transparent) { background_opacity = 1.0; background_blur = 0; }
+#ifdef KITTY_USE_METAL
+    // Keep the CAMetalLayer's opaque hint in sync with the resolved opacity
+    // (initial value + full rationale in metal_context.m). set_os_window_chrome
+    // (kitty/glfw.c) only calls into here when the chrome state actually
+    // changed, so this never lags a live background_opacity change (OSC 111,
+    // remote control, config reload).
+    if (window->ns.layer) ((CAMetalLayer*)window->ns.layer).opaque = (background_opacity >= 1.0f);
+#endif
     NSColor *window_background = [NSColor windowBackgroundColor];
     if (background_opacity < 1.0) {
         // use a clear color (fully transparent) so that the final color is just the color from the surface.
