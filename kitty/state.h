@@ -442,6 +442,9 @@ typedef struct OSWindow {
     } tab_bar_edge_color;
     bool tab_bar_data_updated;
     bool is_focused;
+    // cached from window_iconify/occlusion callbacks; seeded from a live query at
+    // window creation. Not authoritative for visibility -- query GLFW for that.
+    bool is_iconified, is_occluded;
     monotonic_t cursor_blink_zero_time, last_mouse_activity_at, mouse_activate_deadline;
     int mouse_show_threshold;
     bool has_received_cursor_pos_event;
