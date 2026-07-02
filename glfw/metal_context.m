@@ -9,6 +9,7 @@
 
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
+#import <QuartzCore/CAMetalDisplayLink.h>
 #import <Cocoa/Cocoa.h>
 
 // Undefine system MAX/MIN before internal.h redefines them
@@ -16,6 +17,173 @@
 #undef MIN
 
 #include "internal.h"
+#include <stdio.h>
+#include <string.h>
+
+// --- Wave-4 task #4 link-stall diagnostic (KITTY_METAL_LINKTRACE_FILE) -------
+// Appends CAMetalDisplayLink lifecycle events tagged with the window's
+// activation/visibility state, so a BROKEN run's trace can be diffed against a
+// HEALTHY one to decide whether a frozen window is non-key/occluded (activation)
+// or key-but-not-ticking (a deeper stall). No-op unless the env var is set;
+// temporary diagnostic, removed once the fix lands.
+static FILE *link_trace_fp = NULL;
+static bool link_trace_checked = false;
+static FILE *
+link_trace_file(void) {
+    if (!link_trace_checked) {
+        link_trace_checked = true;
+        const char *p = getenv("KITTY_METAL_LINKTRACE_FILE");
+        if (p && p[0]) link_trace_fp = fopen(p, "a");
+    }
+    return link_trace_fp;
+}
+void
+link_trace(const char *event, _GLFWwindow *w, double extra) {
+    FILE *fp = link_trace_file();
+    if (!fp || !w) return;
+    NSWindow *nw = (NSWindow*)w->ns.object;
+    int is_key = nw ? (int)[nw isKeyWindow] : -1;
+    int is_main = nw ? (int)[nw isMainWindow] : -1;
+    int is_visible = nw ? (int)[nw isVisible] : -1;
+    int occluded = nw ? ((([nw occlusionState] & NSWindowOcclusionStateVisible) == 0) ? 1 : 0) : -1;
+    int app_active = (int)[NSApp isActive];
+    fprintf(fp, "%.6f %s win=%p key=%d main=%d vis=%d occl=%d app=%d x=%.2f\n",
+            CACurrentMediaTime(), event, (void*)w, is_key, is_main, is_visible,
+            occluded, app_active, extra);
+    fflush(fp);
+}
+
+// Phase 4 (L1): CAMetalDisplayLink delegate. One instance per window, holding a
+// back-pointer (unretained — the window owns the delegate, not vice versa) to
+// the _GLFWwindow whose layer drives it. The link delivers a vsync-timed
+// drawable on the main runloop; we hand it to kitty's render callback for this
+// one frame and let kitty render + present it synchronously inside the callback.
+@interface KittyMetalDisplayLinkDelegate : NSObject <CAMetalDisplayLinkDelegate>
+{
+    @public
+    _GLFWwindow *window;
+    uint64_t tick_count;
+}
+@end
+
+@implementation KittyMetalDisplayLinkDelegate
+- (void)metalDisplayLink:(CAMetalDisplayLink *)link needsUpdate:(CAMetalDisplayLinkUpdate *)update {
+    (void)link;
+    _GLFWwindow *w = window;
+    if (!w || !w->ns.renderFrameCallback) return;
+    tick_count++;
+    if (tick_count == 1) link_trace("FIRST_TICK", w, 0);
+    else if (tick_count % 60 == 0) link_trace("TICK", w, (double)tick_count);
+    // Wave-4 task #4 DETERMINISTIC repro (KITTY_METAL_FORCE_STUCK_RESIZE). Mirror
+    // EXACTLY what macOS does when it emits a spurious viewWillStartLiveResize with
+    // no viewDidEndLiveResize: presentsWithTransaction=YES, live_resize latched, link
+    // DESTROYED. dispatch_async onto the main queue so it runs on a LATER turn,
+    // serialized after this delegate call — like the real AppKit event — instead of
+    // destroying the link from inside its own tick. The kill switch / linktrace /
+    // this hook are the only levers for a quirk we cannot otherwise trigger; kept.
+    {
+        static bool forced_stuck_resize = false;
+        if (!forced_stuck_resize && tick_count == 3) {
+            const char *v = getenv("KITTY_METAL_FORCE_STUCK_RESIZE");
+            if (v && v[0] && strcmp(v, "0") != 0) {
+                forced_stuck_resize = true;
+                _GLFWwindow *fw = w;
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    fw->ns.live_resize_in_progress = true;
+                    if (fw->ns.layer) ((CAMetalLayer*)fw->ns.layer).presentsWithTransaction = YES;
+                    _glfwCocoaSetMetalLinkEnabled(fw, false);  // DESTROY, exactly as viewWillStartLiveResize
+                    link_trace("FORCE_STUCK_RESIZE", fw, 0);
+                    _glfwInputLiveResize(fw, true);
+                });
+            }
+        }
+    }
+    // NOTE: do NOT guard on w->ns.live_resize_in_progress here. During a real resize
+    // the link is DESTROYED (viewWillStartLiveResize / change_live_resize_state ENTER),
+    // so this delegate does not run at all; the ONLY resize guard that matters is the
+    // kitty-side w->live_resize.in_progress check in cocoa_metal_frame_callback, which
+    // every resize-exit path (viewDidEndLiveResize, the debounce in
+    // process_pending_resizes, and the render()-loop backstop) clears. The GLFW-side
+    // ns.live_resize_in_progress is only reliably cleared by viewDidEndLiveResize and
+    // the backstop's glfwCocoaResetLiveResizeGuards — the debounce path leaves it
+    // latched, and guarding on it here froze a freshly-recreated link (it ticked but
+    // never invoked the callback). Publishing an unused drawable on a resize tick is
+    // harmless; the callback's kitty-flag guard drops it.
+    // Publish the drawable for glfwGetCocoaPendingMetalDrawable(); valid ONLY for
+    // this synchronous callback (kitty presents with a plain present — a timed
+    // present asserts under CAMetalDisplayLink, per Apple docs).
+    w->context.metal.pending_drawable = update.drawable;
+    w->context.metal.pending_present_time = update.targetPresentationTimestamp;
+    w->ns.renderFrameRequested = false;
+    w->ns.renderFrameCallback((GLFWwindow*)w);
+    w->context.metal.pending_drawable = nil;
+    w->context.metal.pending_present_time = 0;
+}
+@end
+
+// Phase 4 (L1/L3): create/destroy this window's CAMetalDisplayLink. Factored so
+// sync_to_monitor can toggle it AND so live-resize can DESTROY it (an attached link
+// — even removed from the runloop — owns the layer's drawable pool and makes
+// nextDrawable return nil, so both sync_to_monitor=no and the resize's inline
+// nextDrawable path need the link fully gone). The link is created UNPAUSED and
+// added to the runloop; the idle pause/resume toggles runloop membership.
+static void create_metal_display_link(_GLFWwindow *window)
+{
+    if (window->context.metal.display_link || !window->context.metal.layer) return;
+    CAMetalLayer *layer = (CAMetalLayer*)window->context.metal.layer;
+    // A link means normal (non-resize) rendering, so clear a stale
+    // presentsWithTransaction=YES left by the debounce path (process_pending_resizes),
+    // which — unlike the backstop's glfwCocoaResetLiveResizeGuards — does not reset it,
+    // else the fresh link's frames would present through the synchronous transaction
+    // path (pace=resize). BUT only when NO drag is in progress: process_pending_resizes
+    // recreates the link mid-drag on a >100ms pause, and dropping presentsWithTransaction
+    // then would detach the content from the window chrome for the rest of the drag
+    // (the DEFECT-1 flicker). [NSEvent pressedMouseButtons] is AppKit ground truth;
+    // a genuine drag keeps the transaction, a stuck/programmatic resize clears it.
+    if (!([NSEvent pressedMouseButtons] & 1)) layer.presentsWithTransaction = NO;
+    KittyMetalDisplayLinkDelegate *dlDelegate = [[KittyMetalDisplayLinkDelegate alloc] init];
+    dlDelegate->window = window;
+    CAMetalDisplayLink *dl = [[CAMetalDisplayLink alloc] initWithMetalLayer:layer];
+    dl.delegate = dlDelegate;  // link.delegate is weak; the strong ref is in the context
+    // Only 1.0/2.0 valid (1.0 = documented floor). Measured no-op for our cold
+    // latency (1.0==2.0 within noise; frames complete in <1ms so completion slack
+    // is irrelevant) — see metal-pipeline-design.md. 1.0 = least requested latency.
+    dl.preferredFrameLatency = 1.0f;
+    dl.preferredFrameRateRange = CAFrameRateRangeDefault;  // ProMotion; a 0-minimum range throws
+    // Add to the runloop UNPAUSED at creation. The link delivers reliably once in
+    // the runloop, and the idle pause/resume (removeFromRunLoop on a no-damage tick,
+    // addToRunLoop on fresh damage via request_frame_render) is reliable too — a
+    // healthy session performs hundreds of these. The once-then-freeze defect was
+    // NOT the idle resume but the resize->normal handoff: a live resize removed the
+    // link from the runloop and it was never recreated, so render_state stuck at
+    // READY and the main loop spun on inline nextDrawable (nil while the link owns
+    // the pool). That is fixed in change_live_resize_state (kitty/glfw.c), which
+    // recreates the link when a resize ends. The link is removed for live-resize and
+    // destroyed/recreated for sync_to_monitor toggles; paused stays NO throughout.
+    dl.paused = NO;
+    [dl addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+    window->context.metal.display_link = dl;
+    window->context.metal.display_link_delegate = dlDelegate;
+    window->context.metal.link_in_runloop = true;
+    link_trace("CREATE", window, 0);
+}
+
+static void destroy_metal_display_link(_GLFWwindow *window)
+{
+    if (window->context.metal.display_link) link_trace("DESTROY", window, 0);
+    if (window->context.metal.display_link) {
+        CAMetalDisplayLink *dl = (CAMetalDisplayLink*)window->context.metal.display_link;
+        dl.delegate = nil;
+        [dl invalidate];
+        [dl release];
+        window->context.metal.display_link = nil;
+    }
+    if (window->context.metal.display_link_delegate) {
+        [(KittyMetalDisplayLinkDelegate*)window->context.metal.display_link_delegate release];
+        window->context.metal.display_link_delegate = nil;
+    }
+    window->context.metal.link_in_runloop = false;
+}
 
 bool _glfwInitMetal(void)
 {
@@ -55,10 +223,17 @@ static void swapBuffersMetal(_GLFWwindow* window)
     (void)window;
 }
 
-static void swapIntervalMetal(int interval UNUSED)
+static void swapIntervalMetal(int interval)
 {
-    // Metal's CAMetalLayer handles vsync via displaySyncEnabled property.
-    // This is set during layer creation, not per-frame.
+    // Phase 4 (L3): map kitty's swap interval (driven by sync_to_monitor via
+    // apply_swap_interval) onto the layer's displaySyncEnabled. interval 0
+    // (sync_to_monitor=no) => NO: present immediately, tearing accepted — the
+    // documented swap-interval-0 GL semantic. Otherwise YES: vsync-clean (default).
+    // Runs on the CURRENT context's window (glfwMakeContextCurrent set the TLS).
+    _GLFWwindow *window = _glfwPlatformGetTls(&_glfw.contextSlot);
+    if (window && window->context.metal.layer) {
+        ((CAMetalLayer*)window->context.metal.layer).displaySyncEnabled = interval != 0 ? YES : NO;
+    }
 }
 
 static int extensionSupportedMetal(const char* extension UNUSED)
@@ -103,11 +278,15 @@ bool _glfwCreateContextMetal(_GLFWwindow* window)
     layer.framebufferOnly = YES;
     layer.presentsWithTransaction = NO;
     // CAMetalLayer.maximumDrawableCount accepts only 2 or 3 (any other value
-    // raises an exception, Apple docs); default is 3. Two trades one frame of
-    // drawable-acquisition queue depth for up to one frame less presentation
-    // latency: once both drawables are in flight, nextDrawable blocks
-    // (bounded below by allowsNextDrawableTimeout) instead of the CPU
-    // racing three frames ahead of what's on screen.
+    // raises an exception, Apple docs); default is 3. Wave-4 measured 2 vs 3
+    // under the CAMetalDisplayLink driver (flood + typing): the link delivers a
+    // vsync-timed drawable to each delegate callback, so there is no CPU-side
+    // nextDrawable race and a 2-deep pool already yields a perfectly steady
+    // present cadence (16.667 ms p50==p99==max at 60 Hz) with drawable_wait_ms
+    // structurally 0. Count 3 gave BYTE-IDENTICAL cadence and zero tail stalls
+    // (no smoothness gain) while adding ~2 ms of PTY-write->present latency (one
+    // more frame of queue depth). The old 2-pass-era "60 ms tail stall at 2" is
+    // gone. So 2 is optimal: shallowest presentation queue == lowest latency.
     layer.maximumDrawableCount = 2;
     // layer.colorspace is intentionally left at its default, nil. Per Apple
     // docs a nil colorspace means the drawable's content "isn't
@@ -155,6 +334,15 @@ bool _glfwCreateContextMetal(_GLFWwindow* window)
     window->context.metal.layer = layer;
     window->context.metal.device = _glfw.metal.device;
 
+    // Phase 4 (L1): create this window's CAMetalDisplayLink render driver (created
+    // paused; requestRenderFrame() resumes it). kitty destroys it after creation
+    // when sync_to_monitor=no (glfwCocoaSetRenderLinkEnabled) so that mode can
+    // render inline via nextDrawable. Build floor is macOS 15.3 so CAMetalDisplayLink
+    // (14.0+) is unconditional.
+    window->context.metal.pending_drawable = nil;
+    window->context.metal.pending_present_time = 0;
+    create_metal_display_link(window);
+
     // Register GLFW context callbacks
     window->context.makeCurrent = makeContextCurrentMetal;
     window->context.swapBuffers = swapBuffersMetal;
@@ -173,8 +361,48 @@ bool _glfwCreateContextMetal(_GLFWwindow* window)
 
 void _glfwDestroyContextMetal(_GLFWwindow* window)
 {
+    // Phase 4 (L1): tear down the CAMetalDisplayLink (invalidate + release, MRC).
+    destroy_metal_display_link(window);
+    window->context.metal.pending_drawable = nil;
+    window->context.metal.pending_present_time = 0;
     window->context.metal.layer = nil;
     window->context.metal.device = nil;
+}
+
+void _glfwCocoaSetMetalLinkPaused(_GLFWwindow* window, bool paused)
+{
+    // IDLE pause/resume ONLY (live-resize destroys the link instead — see
+    // _glfwCocoaSetMetalLinkEnabled / viewWillStartLiveResize). Toggle runloop
+    // membership: a healthy session performs hundreds of these idle cycles
+    // reliably. The once-then-freeze defect was never here — it was the resize
+    // handoff. Idempotent via link_in_runloop; safe to toggle from the delegate.
+    if (!window || !window->context.metal.display_link) return;
+    CAMetalDisplayLink *dl = (CAMetalDisplayLink*)window->context.metal.display_link;
+    if (paused) {
+        if (window->context.metal.link_in_runloop) {
+            [dl removeFromRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+            window->context.metal.link_in_runloop = false;
+            link_trace("PAUSE", window, 0);
+        }
+    } else {
+        if (!window->context.metal.link_in_runloop) {
+            [dl addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+            window->context.metal.link_in_runloop = true;
+            link_trace("RESUME", window, 0);
+        }
+    }
+}
+
+void _glfwCocoaSetMetalLinkEnabled(_GLFWwindow* window, bool enabled)
+{
+    // Phase 4 (L3): fully create or DESTROY the link. Removing it from the runloop
+    // is not enough — the link object, init'd with the layer, owns the drawable
+    // pool and makes nextDrawable return nil even when paused/removed. So
+    // sync_to_monitor=no destroys it (freeing nextDrawable for inline rendering);
+    // sync_to_monitor=yes (re)creates it. Idempotent.
+    if (!window) return;
+    if (enabled) create_metal_display_link(window);
+    else destroy_metal_display_link(window);
 }
 
 #endif // KITTY_USE_METAL

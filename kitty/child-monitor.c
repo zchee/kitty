@@ -972,7 +972,7 @@ no_render_frame_received_recently(OSWindow *w, monotonic_t now, monotonic_t max_
 }
 
 bool
-render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images) {
+render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images, bool input_driven) {
     if (!w->num_tabs) return false;
     if (!should_os_window_be_rendered(w) && global_state.thumbnail_callback.os_window != w->id) {
         update_os_window_title(w);
@@ -984,7 +984,31 @@ render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images) {
     os_log_t slog = sp ? child_monitor_signpost_log() : NULL;
     os_signpost_id_t render_gate_sid = sp ? os_signpost_id_make_with_pointer(slog, w) : OS_SIGNPOST_ID_INVALID;
 #endif
-    if (!w->keep_rendering_till_swap && USE_RENDER_FRAMES && w->render_state != RENDER_FRAME_READY) {
+    // Phase 4 (L2): immediate-encode-on-input. When damage is input-driven and the
+    // CAMetalDisplayLink is paused (render_state NOT_REQUESTED) and >= ~1 refresh
+    // (8 ms) has passed since the last present, render THIS frame now instead of
+    // deferring to the next link tick — which costs ~1 frame of windowed-mode
+    // frame latency (the link drawable is timed for a future vsync). This uses the
+    // nextDrawable path (pace=immediate). render_prepared_os_window's
+    // request_frame_render resyncs the link afterward, so continuous input (flood)
+    // transitions to link pacing on its next frame (keeping drawable_wait_ms 0);
+    // only sparse input (typing) takes this fast path. The 8 ms floor caps a
+    // key-repeat storm and dedupes within a refresh (present coalesces at vsync).
+    bool immediate_encode = false;
+#ifdef KITTY_BACKEND_METAL
+    if (metal_immediate_encode_enabled()
+        && input_driven && !w->keep_rendering_till_swap && USE_RENDER_FRAMES
+        && w->render_state == RENDER_FRAME_NOT_REQUESTED && !w->live_resize.in_progress
+        && global_state.thumbnail_callback.os_window != w->id
+        && metal_ms_since_last_present() >= 8.0) immediate_encode = true;
+#else
+    (void)input_driven;
+#endif
+    if (immediate_encode) {
+#ifdef __APPLE__
+        if (sp) os_signpost_event_emit(slog, render_gate_sid, "render_gate", "window=%llu state=%{public}s", w->id, "immediate");
+#endif
+    } else if (!w->keep_rendering_till_swap && USE_RENDER_FRAMES && w->render_state != RENDER_FRAME_READY) {
         if (w->render_state == RENDER_FRAME_NOT_REQUESTED || no_render_frame_received_recently(w, now, ms_to_monotonic_t(250ll))) request_frame_render(w);
         if (w->id != global_state.thumbnail_callback.os_window) {
             // dont respect render frames soon after a resize on Wayland as they cause flicker because
@@ -1049,9 +1073,38 @@ render(monotonic_t now, bool input_read) {
         OSWindow *w = global_state.os_windows + i;
 #ifdef __APPLE__
         // rendering is done in cocoa_os_window_resized()
-        if (w->live_resize.in_progress) continue;
+        if (w->live_resize.in_progress) {
+#ifdef KITTY_BACKEND_METAL
+            // Backstop for a stuck live-resize. macOS can latch viewWillStartLiveResize
+            // (e.g. spuriously when a window becomes key) without ever sending
+            // viewDidEndLiveResize, and the resize debounce (process_pending_resizes)
+            // does not run while the window is idle — so live_resize.in_progress stays
+            // true, this loop skips the window forever, and its paused
+            // CAMetalDisplayLink never resumes: the Wave-4 once-then-freeze. If no real
+            // resize event has arrived recently, end the resize now —
+            // change_live_resize_state() recreates the link and marks the window
+            // REQUESTED so rendering resumes. A genuine drag keeps last_resize_event_at
+            // fresh and is still skipped (rendered via cocoa_os_window_resized).
+            static int recovery_disabled = -1;
+            if (recovery_disabled < 0) { const char *v = getenv("KITTY_METAL_NO_RESIZE_RECOVERY"); recovery_disabled = (v && v[0] && v[0] != '0') ? 1 : 0; }
+            // Recover only when the resize is stale (no real event for 150ms) AND
+            // glfwCocoaResetLiveResizeGuards accepts — it DECLINES (returns false,
+            // leaving the guards intact) while the left mouse button is down, i.e. a
+            // genuine drag the user is holding still. On decline we skip and re-check
+            // next pass. On accept it has unlatched the GLFW-side live-resize flag and
+            // presentsWithTransaction, so change_live_resize_state(false) creates a
+            // fresh link (viewWillStartLiveResize DESTROYED the old one) and marks
+            // REQUESTED, and the window renders again.
+            if (!recovery_disabled && now - w->live_resize.last_resize_event_at > ms_to_monotonic_t(150ll)
+                && glfwCocoaResetLiveResizeGuards(w->handle)) {
+                change_live_resize_state(w, false);
+            } else continue;
+#else
+            continue;
 #endif
-        if (!render_os_window(w, now, scan_for_animated_images)) {
+        }
+#endif
+        if (!render_os_window(w, now, scan_for_animated_images, input_read)) {
             // since we didn't scan the window for animations, force a rescan on next wakeup/render frame
             if (scan_for_animated_images) global_state.check_for_active_animated_images = true;
         }

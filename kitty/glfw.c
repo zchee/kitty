@@ -379,7 +379,7 @@ cocoa_out_of_sequence_render(OSWindow *window) {
     if (window->fonts_data->sprite_map) {
         window->needs_render = true;
         window->render_state = RENDER_FRAME_READY;
-        metal_rendered = render_os_window(window, monotonic(), true);
+        metal_rendered = render_os_window(window, monotonic(), true, false);
     }
     if (!metal_rendered) {
         debug_rendering("Cocoa Metal out of sequence render did not happen\n");
@@ -405,7 +405,7 @@ cocoa_out_of_sequence_render(OSWindow *window) {
     if (window->fonts_data->sprite_map) {
         window->needs_render = true;
         window->render_state = RENDER_FRAME_READY;
-        rendered = render_os_window(window, monotonic(), true);
+        rendered = render_os_window(window, monotonic(), true, false);
     }
     if (!rendered) {
         debug_rendering("Cocoa out of sequence render did not happen\n");
@@ -433,7 +433,36 @@ change_live_resize_state(OSWindow *w, bool in_progress) {
         w->live_resize.in_progress = in_progress;
         w->live_resize.num_of_resize_events = 0;
 #ifdef __APPLE__
+#ifdef KITTY_BACKEND_METAL
+        if (!in_progress && OPT(sync_to_monitor)) {
+            // Resize END on a CAMetalDisplayLink-driven (sync_to_monitor=yes) window:
+            // CREATE a fresh link — viewWillStartLiveResize DESTROYED it for the drag
+            // — and mark the window REQUESTED so render() DEFERS presents to it. A
+            // brand-new link has a clean drawable pool; re-adding or resuming the old
+            // (resize-corrupted) link instead delivered a dangling drawable (SIGSEGV)
+            // or stalled. glfwCocoaSetRenderLinkEnabled(true) no-ops if a link already
+            // exists. This is the Wave-4 once-then-freeze fix; the stuck-resize case
+            // (macOS emits viewWillStartLiveResize with no viewDidEndLiveResize)
+            // reaches this via the render()-loop backstop in child-monitor.c.
+            glfwCocoaSetRenderLinkEnabled(w->handle, true);
+            request_frame_render(w);
+        } else {
+            // Resize ENTER (in_progress=true), or a sync_to_monitor=no exit: render
+            // inline via nextDrawable. First ensure the layer is LINK-FREE — a
+            // PROGRAMMATIC resize (kitty @ resize-os-window, any setFrame) enters here
+            // with NO AppKit viewWillStartLiveResize to have destroyed the link, so it
+            // may still be attached and nextDrawable would return nil while the link
+            // owns the drawable pool (nil-spin until the debounce ends the resize).
+            // Destroying pins the invariant "the layer is link-free wherever inline
+            // nextDrawable runs" at the render site; it is idempotent (a no-op in the
+            // normal drag flow where viewWillStartLiveResize already destroyed it).
+            // The matching exit branch above recreates the link.
+            if (in_progress && OPT(sync_to_monitor)) glfwCocoaSetRenderLinkEnabled(w->handle, false);
+            cocoa_out_of_sequence_render(w);
+        }
+#else
         cocoa_out_of_sequence_render(w);
+#endif
 #else
         GLFWwindow *orig_ctx = make_os_window_context_current(w);
         apply_swap_interval(in_progress ? 0 : -1);
@@ -1970,6 +1999,18 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
     // Acquiring a drawable here would consume from the pool and potentially
     // cause nextDrawable to block in the first render call
     (void)is_semi_transparent;
+    // Phase 4 (L3): apply sync_to_monitor -> layer.displaySyncEnabled once here.
+    // glfwSwapInterval routes to swapIntervalMetal on the current context. Default
+    // sync_to_monitor=yes keeps vsync-clean; =no maps to displaySyncEnabled=NO
+    // (immediate present) + the render gate is bypassed (USE_RENDER_FRAMES false),
+    // so frames present as fast as they encode. (apply_swap_interval is compiled
+    // out on Metal and is a no-op on Apple, so it can't be used here.)
+    glfwSwapInterval(OPT(sync_to_monitor) ? 1 : 0);
+    // Phase 4 (L3): with sync_to_monitor=no we render inline via nextDrawable +
+    // immediate present, so REMOVE the CAMetalDisplayLink from the runloop — a
+    // still-attached link (even paused) owns the drawable pool and starves
+    // nextDrawable (returns nil => nothing renders). sync_to_monitor=yes keeps it.
+    glfwCocoaSetRenderLinkEnabled(glfw_window, OPT(sync_to_monitor));
 #else
     // blank the window once so that there is no initial flash of color
     // changing, in case the background color is not black
@@ -2900,6 +2941,52 @@ get_cocoa_key_equivalent(uint32_t key, int mods, char *cocoa_key, size_t key_sz,
     if (ans) encode_utf8(ans, cocoa_key);
 }
 
+#ifdef KITTY_BACKEND_METAL
+static void
+cocoa_metal_frame_callback(GLFWwindow *window) {
+    // Phase 4 (L1): invoked on the main runloop by the CAMetalDisplayLink delegate
+    // (glfw/metal_context.m) once per vsync-timed frame, with the frame's drawable
+    // already published via glfwGetCocoaPendingMetalDrawable(). Unlike the GL
+    // path's cocoa_frame_request_callback (flip READY + wake the loop, render one
+    // hop later via nextDrawable), here we render + present THIS window
+    // synchronously inside the callback using the link-delivered drawable — no
+    // dispatch_async/postEmptyEvent hop, no nextDrawable block, no watchdog. The
+    // main thread holds the GIL throughout [NSApp run], so render_os_window()'s
+    // Python calls are safe (same as cocoa_out_of_sequence_render).
+    for (size_t i = 0; i < global_state.num_os_windows; i++) {
+        OSWindow *w = &global_state.os_windows[i];
+        if (w->handle != window) continue;
+        w->last_render_frame_received_at = monotonic();
+        // Live resize drives synchronous presents via cocoa_out_of_sequence_render
+        // (presentsWithTransaction); the delegate already guards this, but a tick
+        // could have been in flight when the drag started.
+        if (w->live_resize.in_progress) return;
+        const bool scan = global_state.check_for_active_animated_images;
+        global_state.check_for_active_animated_images = false;
+        w->render_state = RENDER_FRAME_READY;
+        metal_set_link_drawable(glfwGetCocoaPendingMetalDrawable(window));
+        bool rendered = render_os_window(w, monotonic(), scan, false);
+        metal_set_link_drawable(NULL);
+        if (!rendered) {
+            // Nothing to draw this tick: pause the link (remove it from the runloop)
+            // until fresh damage re-requests it, which keeps an idle window at ~0
+            // presents (criterion 7). The idle->active resume
+            // (removeFromRunLoop/addToRunLoop via request_frame_render) is reliable
+            // — a healthy session performs hundreds of these per run. The
+            // "renders once then freezes" defect was NOT this idle pause but the
+            // resize->normal handoff: an (often spurious, activation-time) live
+            // resize removed the link and left render_state stuck at READY so the
+            // main loop spun on inline nextDrawable (nil while the link owns the
+            // pool) and never resumed. That is fixed in change_live_resize_state()
+            // below, which recreates the link when a resize ends.
+            if (scan) global_state.check_for_active_animated_images = true;
+            w->render_state = RENDER_FRAME_NOT_REQUESTED;
+            glfwCocoaSetRenderLinkPaused(window, true);
+        }
+        return;
+    }
+}
+#else
 static void
 cocoa_frame_request_callback(GLFWwindow *window) {
     for (size_t i = 0; i < global_state.num_os_windows; i++) {
@@ -2911,10 +2998,18 @@ cocoa_frame_request_callback(GLFWwindow *window) {
         }
     }
 }
+#endif
 
 void
 request_frame_render(OSWindow *w) {
+#ifdef KITTY_BACKEND_METAL
+    // Metal: register the inline-render callback and (via requestRenderFrame in
+    // cocoa_window.m) resume this window's CAMetalDisplayLink. The GL path below
+    // instead arms the CVDisplayLink.
+    glfwCocoaRequestRenderFrame(w->handle, cocoa_metal_frame_callback);
+#else
     glfwCocoaRequestRenderFrame(w->handle, cocoa_frame_request_callback);
+#endif
     w->render_state = RENDER_FRAME_REQUESTED;
 }
 

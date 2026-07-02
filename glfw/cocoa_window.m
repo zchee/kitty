@@ -382,7 +382,20 @@ requestRenderFrame(_GLFWwindow *w, GLFWcocoarenderframefun callback) {
     }
     w->ns.renderFrameCallback = callback;
     w->ns.renderFrameRequested = true;
+#ifdef KITTY_USE_METAL
+    // Phase 4 (L1): on the Metal backend the per-window CAMetalDisplayLink drives
+    // frames — resume it if present (its delegate invokes the callback on the main
+    // runloop). If it is transiently absent — destroyed for a live resize, or
+    // sync_to_monitor=no (which renders inline via nextDrawable) — do NOT fall back
+    // to the CVDisplayLink. That path drives cocoa_metal_frame_callback into
+    // nextDrawable, and once the link is (re)created -[CAMetalLayer nextDrawable]
+    // RAISES an NSException (a layer with an attached CAMetalDisplayLink cannot vend
+    // drawables) -> abort. The Metal backend never uses the CVDisplayLink.
+    if (w->context.metal.display_link) _glfwCocoaSetMetalLinkPaused(w, false);
+    return;
+#else
     _glfwRequestRenderFrame(w);
+#endif
 }
 
 void
@@ -1006,11 +1019,23 @@ static void _glfwUpdateNotchCover(_GLFWwindow*);
     if (!window) return;
     window->ns.live_resize_in_progress = true;
 #ifdef KITTY_USE_METAL
+    extern void link_trace(const char *event, _GLFWwindow *w, double extra);
+    link_trace("RESIZE_START", window, 0);
     // Keep Metal presentation inside the Core Animation transaction while
     // the user drags, so the drawable resizes in lockstep with the window
     // chrome (prevents flicker/stretching). metal_end_frame() switches to
     // the commit -> waitUntilScheduled -> present sequence while this is on.
     if (window->ns.layer) ((CAMetalLayer*)window->ns.layer).presentsWithTransaction = YES;
+    // Phase 4: DESTROY the CAMetalDisplayLink for the drag (not merely pause it).
+    // cocoa_out_of_sequence_render drives the drag via nextDrawable, and an attached
+    // link — even paused or removed from the runloop — owns the layer's drawable pool
+    // and corrupts it under nextDrawable (dangling drawable -> SIGSEGV on resume, or
+    // a link that then stalls). Destroying detaches the link so nextDrawable is
+    // clean (the proven sync_to_monitor=no path); change_live_resize_state() creates
+    // a fresh link when the resize ends. This must happen BEFORE _glfwInputLiveResize
+    // triggers the first out-of-sequence render. Recovery for a spurious resize with
+    // no viewDidEndLiveResize is the render()-loop backstop in child-monitor.c.
+    _glfwCocoaSetMetalLinkEnabled(window, false);
 #endif
     _glfwInputLiveResize(window, true);
 }
@@ -1020,6 +1045,8 @@ static void _glfwUpdateNotchCover(_GLFWwindow*);
     if (!window) return;
     window->ns.live_resize_in_progress = false;
 #ifdef KITTY_USE_METAL
+    extern void link_trace(const char *event, _GLFWwindow *w, double extra);
+    link_trace("RESIZE_END", window, 0);
     if (window->ns.layer) ((CAMetalLayer*)window->ns.layer).presentsWithTransaction = NO;
 #endif
     _glfwInputLiveResize(window, false);
@@ -4074,6 +4101,76 @@ GLFWAPI GLFWcocoatogglefullscreenfun glfwSetCocoaToggleFullscreenIntercept(GLFWw
 
 GLFWAPI void glfwCocoaRequestRenderFrame(GLFWwindow *w, GLFWcocoarenderframefun callback) {
     requestRenderFrame((_GLFWwindow*)w, callback);
+}
+
+// Phase 4 (L1): the CAMetalDisplayLink-delivered drawable for the frame being
+// rendered inside the current metalDisplayLink:needsUpdate: callback. kitty's
+// render callback pulls it here and hands it to metal.m (metal_set_link_drawable)
+// so ensure_drawable() uses it instead of blocking in nextDrawable. Returns NULL
+// outside a link callback (and on non-Metal builds).
+GLFWAPI void* glfwGetCocoaPendingMetalDrawable(GLFWwindow *handle) {
+#ifdef KITTY_USE_METAL
+    _GLFWwindow* window = (_GLFWwindow*)handle;
+    if (!window) return NULL;
+    return (__bridge void*)window->context.metal.pending_drawable;
+#else
+    (void)handle; return NULL;
+#endif
+}
+
+// Phase 4 (L1): pause/resume this window's CAMetalDisplayLink. kitty pauses it
+// when a link-driven frame finds nothing to render (idle), and the normal
+// requestRenderFrame path resumes it on the next damage. No-op on non-Metal.
+GLFWAPI void glfwCocoaSetRenderLinkPaused(GLFWwindow *handle, bool paused) {
+#ifdef KITTY_USE_METAL
+    _glfwCocoaSetMetalLinkPaused((_GLFWwindow*)handle, paused);
+#else
+    (void)handle; (void)paused;
+#endif
+}
+
+// Phase 4 (L3): enable (add to runloop) or disable (remove) the render link. kitty
+// disables it when sync_to_monitor=no so nextDrawable-based inline rendering works.
+GLFWAPI void glfwCocoaSetRenderLinkEnabled(GLFWwindow *handle, bool enabled) {
+#ifdef KITTY_USE_METAL
+    _glfwCocoaSetMetalLinkEnabled((_GLFWwindow*)handle, enabled);
+#else
+    (void)handle; (void)enabled;
+#endif
+}
+
+// Wave-4 stuck-live-resize recovery: clear the GLFW/Metal state that
+// viewWillStartLiveResize latched — the GLFW-side ns.live_resize_in_progress and the
+// layer's presentsWithTransaction — so a subsequent change_live_resize_state(false)
+// (kitty side) recreates the link on a clean layer. macOS can emit
+// viewWillStartLiveResize (e.g. spuriously when a window becomes key) without a
+// matching viewDidEndLiveResize, leaving presentsWithTransaction YES; the render()-loop
+// backstop calls this to unlatch it (the debounce path clears the kitty-side flag but
+// not these). Returns false and touches nothing while a genuine drag is in progress
+// (see the mouse-button decline). No-op on non-Metal.
+GLFWAPI bool glfwCocoaResetLiveResizeGuards(GLFWwindow *handle) {
+#ifdef KITTY_USE_METAL
+    _GLFWwindow *w = (_GLFWwindow*)handle;
+    if (!w) return false;
+    // DECLINE while the left mouse button is down. A genuine live-resize drag that
+    // the user is holding STILL produces no framebuffer events, so the render-loop
+    // backstop's 150ms staleness timer would otherwise false-fire mid-drag: dropping
+    // presentsWithTransaction and recreating the link mid-transaction (nil-spin +
+    // detached/stretching content for the rest of the drag). [NSEvent
+    // pressedMouseButtons] is AppKit ground truth; keep the check here in Cocoa land.
+    // It is system-global, so a stale latch while the user drags in ANOTHER app just
+    // defers recovery to button-up — the backstop re-checks every render pass, so no
+    // freeze. Recovery is only for a resize with NO drag in progress (the stuck case).
+    extern void link_trace(const char *event, _GLFWwindow *w, double extra);
+    if ([NSEvent pressedMouseButtons] & 1) { link_trace("RESETGUARDS_DECLINE", w, 0); return false; }
+    w->ns.live_resize_in_progress = false;
+    if (w->ns.layer) ((CAMetalLayer*)w->ns.layer).presentsWithTransaction = NO;
+    link_trace("RESETGUARDS_ACCEPT", w, 0);
+    return true;
+#else
+    (void)handle;
+    return false;
+#endif
 }
 
 GLFWAPI GLFWcocoarenderframefun glfwCocoaSetWindowResizeCallback(GLFWwindow *w, GLFWcocoarenderframefun cb) {

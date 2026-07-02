@@ -205,6 +205,19 @@ void metal_end_frame(void);
 void metal_set_current_layer(void *layer);
 void* metal_get_device(void);
 
+// Phase 4 (L1): hand the CAMetalDisplayLink-delivered drawable (id<CAMetalDrawable>
+// as void*) to the renderer for the current frame. When set, ensure_drawable()
+// uses it instead of blocking in nextDrawable, so drawable_wait_ms is structurally
+// 0 (the wait is absorbed by the link scheduling its callback). Pass NULL to clear
+// after the frame; non-link paths (golden dump, live resize) leave it NULL and
+// keep the nextDrawable path.
+void metal_set_link_drawable(void *drawable);
+
+// Phase 4 (L2): milliseconds since the last on-screen present (huge if none yet).
+// Used to gate immediate-encode-on-input so an input burst can't outrun refresh.
+double metal_ms_since_last_present(void);
+bool metal_immediate_encode_enabled(void);  // Phase 4 (L2) runtime kill-switch
+
 // M1: single-pass layered rendering. metal_begin_layered_frame opens ONE render
 // pass whose color attachment 0 is a memoryless RGBA16Unorm working surface
 // (tile-only, never DRAM) and attachment 1 is the drawable; all subsequent

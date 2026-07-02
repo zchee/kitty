@@ -482,6 +482,18 @@ load_glfw(const char* path) {
     *(void **) (&glfwCocoaRequestRenderFrame_impl) = dlsym(handle, "glfwCocoaRequestRenderFrame");
     if (glfwCocoaRequestRenderFrame_impl == NULL) dlerror(); // clear error indicator
 
+    *(void **) (&glfwGetCocoaPendingMetalDrawable_impl) = dlsym(handle, "glfwGetCocoaPendingMetalDrawable");
+    if (glfwGetCocoaPendingMetalDrawable_impl == NULL) dlerror(); // clear error indicator
+
+    *(void **) (&glfwCocoaSetRenderLinkPaused_impl) = dlsym(handle, "glfwCocoaSetRenderLinkPaused");
+    if (glfwCocoaSetRenderLinkPaused_impl == NULL) dlerror(); // clear error indicator
+
+    *(void **) (&glfwCocoaSetRenderLinkEnabled_impl) = dlsym(handle, "glfwCocoaSetRenderLinkEnabled");
+    if (glfwCocoaSetRenderLinkEnabled_impl == NULL) dlerror(); // clear error indicator
+
+    *(void **) (&glfwCocoaResetLiveResizeGuards_impl) = dlsym(handle, "glfwCocoaResetLiveResizeGuards");
+    if (glfwCocoaResetLiveResizeGuards_impl == NULL) dlerror(); // clear error indicator
+
     *(void **) (&glfwCocoaRecreateGLDrawable_impl) = dlsym(handle, "glfwCocoaRecreateGLDrawable");
     if (glfwCocoaRecreateGLDrawable_impl == NULL) dlerror(); // clear error indicator
 
