@@ -117,3 +117,15 @@ cross-compile:
 .PHONY: env/%
 env/%: ## Print the value of MAKEFILE_VARIABLE. Use `make env/GO_FLAGS` or etc.
 	@echo $($*)
+
+# Phase-0 baseline benchmark suite for the Metal-backend optimization project
+# (scripts/metal-baseline.py): throughput (kitten __benchmark__ --render),
+# devlog-006 Japanese `cat` replication, vtebench (if present), RSS, optional
+# powermetrics, and KITTY_METAL_STATS frame timing. Requires kitty/launcher/kitty
+# to already be built (this target does not build it). JSON lands in
+# .omc/baselines/; see docs/metal-performance.md for the GL-backend companion
+# run and full methodology. KITTY_USE_METAL=1 here documents intent to match
+# the build invocation -- the script itself auto-detects the actual backend
+# from the built .app bundle rather than trusting this env var.
+metal-baseline:
+	KITTY_USE_METAL=1 ${PYTHON3} scripts/metal-baseline.py
