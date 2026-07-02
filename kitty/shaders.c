@@ -463,20 +463,46 @@ has_bgimage(OSWindow *w) {
     return background_image_for_os_window(w) != NULL;
 }
 
+struct GPUCellRenderData {
+    GLfloat use_cell_bg_for_selection_fg, use_cell_fg_for_selection_color, use_cell_for_selection_bg;
+
+    GLuint default_fg, highlight_fg, highlight_bg, main_cursor_fg, main_cursor_bg, url_color, url_style, inverted, extra_cursor_fg, extra_cursor_bg;
+
+    GLuint columns, lines, sprites_xnum, sprites_ynum, cursor_shape, cell_width, cell_height;
+    GLuint cursor_x1, cursor_x2, cursor_y1, cursor_y2;
+    GLfloat cursor_opacity, inactive_text_alpha, dim_opacity, blink_opacity;
+
+    GLuint bg_colors0, bg_colors1, bg_colors2, bg_colors3, bg_colors4, bg_colors5, bg_colors6, bg_colors7;
+    GLfloat bg_opacities0, bg_opacities1, bg_opacities2, bg_opacities3, bg_opacities4, bg_opacities5, bg_opacities6, bg_opacities7;
+};
+
+// D4: per-VAO shadow of the last GPUCellRenderData actually written to the GPU
+// buffer. Lets cell_update_uniform_block() elide the map+write (which on the
+// Metal backend orphans the MTLBuffer -- fresh allocation plus a full-buffer
+// memcpy, see orphan_buffer_preserving_contents() in metal.m -- and on GL remaps
+// the buffer range) whenever this render produces byte-identical uniform data to
+// what is already resident: idle cursor blink between opacity steps, or any
+// render triggered by another window's damage. Indexed 1:1 with the vao_idx
+// space both backends use (kitty/gl.c, kitty/metal.m: `vaos[4*MAX_CHILDREN+10]`),
+// so every valid vao_idx has a slot; statically zero-initialized, so a slot
+// recycled by remove_vao()+create_vao() for an unrelated window starts
+// "invalid" and is forced to write on its first use below. That first write is
+// guaranteed: every (re)association of a Screen with GPU resources sets
+// screen->reload_all_gpu_data = true (new_screen_object() in screen.c;
+// attach_window() in state.c), which this function also treats as "any doubt,
+// write" and never skips on.
+#define MAX_CELL_UNIFORM_VAOS (4 * MAX_CHILDREN + 10)
+typedef struct UniformBlockShadow { bool valid; struct GPUCellRenderData data; } UniformBlockShadow;
+static UniformBlockShadow cell_uniform_shadows[MAX_CELL_UNIFORM_VAOS] = {{0}};
+
+static UniformBlockShadow*
+uniform_block_shadow_for_vao(ssize_t vao_idx) {
+    if (vao_idx < 0 || (size_t)vao_idx >= arraysz(cell_uniform_shadows)) return NULL;
+    return &cell_uniform_shadows[vao_idx];
+}
+
 static color_type
 cell_update_uniform_block(ssize_t vao_idx, Screen *screen, int uniform_buffer, int color_table_buf, const CursorRenderInfo *cursor, OSWindow *os_window, float inactive_text_alpha, float bg_alpha) {
-    struct GPUCellRenderData {
-        GLfloat use_cell_bg_for_selection_fg, use_cell_fg_for_selection_color, use_cell_for_selection_bg;
-
-        GLuint default_fg, highlight_fg, highlight_bg, main_cursor_fg, main_cursor_bg, url_color, url_style, inverted, extra_cursor_fg, extra_cursor_bg;
-
-        GLuint columns, lines, sprites_xnum, sprites_ynum, cursor_shape, cell_width, cell_height;
-        GLuint cursor_x1, cursor_x2, cursor_y1, cursor_y2;
-        GLfloat cursor_opacity, inactive_text_alpha, dim_opacity, blink_opacity;
-
-        GLuint bg_colors0, bg_colors1, bg_colors2, bg_colors3, bg_colors4, bg_colors5, bg_colors6, bg_colors7;
-        GLfloat bg_opacities0, bg_opacities1, bg_opacities2, bg_opacities3, bg_opacities4, bg_opacities5, bg_opacities6, bg_opacities7;
-    };
     // Send the uniform data
     ColorProfile *cp = screen->paused_rendering.expires_at ? &screen->paused_rendering.color_profile : screen->color_profile;
     if (cp->dirty || screen->reload_all_gpu_data) {
@@ -484,7 +510,15 @@ cell_update_uniform_block(ssize_t vao_idx, Screen *screen, int uniform_buffer, i
         copy_color_table_to_buffer(cp, ct_buf, 0, cell_program_layouts[CELL_PROGRAM].color_table_stride / sizeof(GLuint));
         unmap_vao_buffer(vao_idx, color_table_buf);
     }
-    struct GPUCellRenderData *rd = (struct GPUCellRenderData*)map_vao_buffer_for_write_only(vao_idx, uniform_buffer, 0, cell_program_layouts[CELL_PROGRAM].render_data.size);
+    UniformBlockShadow *shadow = uniform_block_shadow_for_vao(vao_idx);
+    struct GPUCellRenderData computed;
+    // Seed from the shadow (last value actually written to the GPU buffer) so
+    // fields not assigned on every path below -- main_cursor_fg/main_cursor_bg
+    // when the cursor is not visible -- carry forward their previous value
+    // exactly as the mapped GPU buffer used to preserve them across an orphan
+    // (Metal) or invalidate-range remap (GL). A never-written slot starts zeroed.
+    if (shadow && shadow->valid) computed = shadow->data; else memset(&computed, 0, sizeof(computed));
+    struct GPUCellRenderData *rd = &computed;
 #define COLOR(name) colorprofile_to_color(cp, cp->overridden.name, cp->configured.name).rgb
     rd->default_fg = COLOR(default_fg);
     rd->highlight_fg = COLOR(highlight_fg); rd->highlight_bg = COLOR(highlight_bg);
@@ -585,7 +619,19 @@ cell_update_uniform_block(ssize_t vao_idx, Screen *screen, int uniform_buffer, i
 #undef COLOR
     rd->url_color = OPT(url_color); rd->url_style = OPT(url_style);
     color_type default_bg = rd->bg_colors0;
-    unmap_vao_buffer(vao_idx, uniform_buffer); rd = NULL;
+    // D4: only publish to the GPU buffer when the computed data actually
+    // differs from what is already resident there. Any doubt writes: a missing
+    // shadow slot, a never-yet-written slot, or reload_all_gpu_data (the same
+    // "force everything" signal already used for the color table above) all
+    // force the write, matching cp->dirty's precedent.
+    if (!shadow || !shadow->valid || screen->reload_all_gpu_data || memcmp(&shadow->data, &computed, sizeof(computed)) != 0) {
+        struct GPUCellRenderData *gpu = (struct GPUCellRenderData*)map_vao_buffer_for_write_only(vao_idx, uniform_buffer, 0, cell_program_layouts[CELL_PROGRAM].render_data.size);
+        if (gpu) {
+            *gpu = computed;
+            unmap_vao_buffer(vao_idx, uniform_buffer);
+        }
+        if (shadow) { shadow->data = computed; shadow->valid = true; }
+    }
     return default_bg;
 }
 

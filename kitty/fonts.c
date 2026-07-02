@@ -290,6 +290,18 @@ font_group_for(double font_sz_in_pts, double logical_dpi_x, double logical_dpi_y
 
 // Sprites {{{
 
+// F3: atlas growth policy. Left ungated, the sprite tracker grew ynum (rows) by
+// exactly one per do_increment() call, and every such growth forces a full
+// sprite-texture copy in realloc_sprite_texture() (shaders.c) -- O(n^2) over a
+// session. SPRITE_ATLAS_GROWTH_MIN_ROWS chunks growth so reallocs are rare; the
+// initial atlas is preallocated to roughly INITIAL_SPRITE_ATLAS_CAPACITY glyph
+// slots (~2 screenfuls of unique glyphs for typical terminal sizes) so ordinary
+// sessions rarely grow at all. Target-capacity based (not a fixed row count) so
+// it self-scales with cell size/DPI: xnum (columns/row) already varies with
+// cell_width, so dividing by it keeps total preallocated slots roughly constant.
+#define SPRITE_ATLAS_GROWTH_MIN_ROWS 8u
+#define INITIAL_SPRITE_ATLAS_CAPACITY 4096u
+
 void
 sprite_tracker_set_limits(size_t max_texture_size_, size_t max_array_len_) {
     max_texture_size = max_texture_size_;
@@ -301,7 +313,13 @@ do_increment(FontGroup *fg) {
     fg->sprite_tracker.x++;
     if (fg->sprite_tracker.x >= fg->sprite_tracker.xnum) {
         fg->sprite_tracker.x = 0; fg->sprite_tracker.y++;
-        fg->sprite_tracker.ynum = MIN(MAX(fg->sprite_tracker.ynum, fg->sprite_tracker.y + 1), fg->sprite_tracker.max_y);
+        if (fg->sprite_tracker.y + 1 > fg->sprite_tracker.ynum) {
+            // Grow by a chunk instead of exactly the one row just entered, but
+            // never past max_y; this still always covers y+1, matching the floor
+            // of the un-chunked formula it replaces: MIN(MAX(ynum, y+1), max_y).
+            unsigned int chunk = MAX(SPRITE_ATLAS_GROWTH_MIN_ROWS, fg->sprite_tracker.ynum / 2);
+            fg->sprite_tracker.ynum = MIN(MAX(fg->sprite_tracker.y + 1, fg->sprite_tracker.ynum + chunk), fg->sprite_tracker.max_y);
+        }
         if (fg->sprite_tracker.y >= fg->sprite_tracker.max_y) {
             fg->sprite_tracker.y = 0; fg->sprite_tracker.z++;
             if (fg->sprite_tracker.z >= MIN((size_t)UINT16_MAX, max_array_len)) { PyErr_SetString(PyExc_RuntimeError, "Out of texture space for sprites"); return false; }
@@ -338,7 +356,11 @@ static void
 sprite_tracker_set_layout(GPUSpriteTracker *sprite_tracker, unsigned int cell_width, unsigned int cell_height) {
     sprite_tracker->xnum = MIN(MAX(1u, max_texture_size / cell_width), (size_t)UINT16_MAX);
     sprite_tracker->max_y = MIN(MAX(1u, max_texture_size / cell_height), (size_t)UINT16_MAX);
-    sprite_tracker->ynum = 1;
+    // F3: preallocate several rows up front (see INITIAL_SPRITE_ATLAS_CAPACITY
+    // above) instead of starting at a single row, so ordinary sessions rarely
+    // trigger realloc_sprite_texture() (shaders.c) at all.
+    unsigned int initial_ynum = (INITIAL_SPRITE_ATLAS_CAPACITY + sprite_tracker->xnum - 1) / sprite_tracker->xnum;
+    sprite_tracker->ynum = MIN(MAX(1u, initial_ynum), sprite_tracker->max_y);
     sprite_tracker->x = 0; sprite_tracker->y = 0; sprite_tracker->z = 0;
 }
 
