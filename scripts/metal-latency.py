@@ -293,6 +293,10 @@ def main(argv: list[str] | None = None) -> int:
     stats_dir = Path(tempfile.mkdtemp(prefix="kitty-latency-"))
     stats_file_path = stats_dir / "kitty_metal_stats.txt"
     proc = spawn_kitty(
+        # CGEvent keystrokes are delivered to the KEY window; the harness
+        # default is no-activate, under which the injected keys would land in
+        # whatever the user has focused instead of the test window.
+        take_focus=True,
         extra_env={
             "KITTY_METAL_STATS": "1", "KITTY_METAL_SIGNPOST": "1", "KITTY_METAL_STATS_FILE": str(stats_file_path),
         },
