@@ -31,6 +31,31 @@ extern PyTypeObject Screen_Type;
 #define EVDBG(...)
 #endif
 
+#ifdef __APPLE__
+#include <os/signpost.h>
+
+// Phase 0 instrumentation: env-gated os_signpost spans for the main loop's
+// parse/render/render-gate stages. Uses the same log subsystem/category as
+// the Metal backend's instrumentation (kitty/metal.m) so every span lands in
+// one Instruments track. Zero-cost when KITTY_METAL_SIGNPOST is unset: each
+// call site collapses to a single cached-bool check.
+static bool
+child_monitor_signpost_enabled(void) {
+    static int state = -1;
+    if (state < 0) { const char *v = getenv("KITTY_METAL_SIGNPOST"); state = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0; }
+    return state == 1;
+}
+
+// os_log handle backing the signposts. Created lazily on first use; only
+// ever reached when signposts are enabled.
+static os_log_t
+child_monitor_signpost_log(void) {
+    static os_log_t handle = NULL;
+    if (!handle) handle = os_log_create("net.kovidgoyal.kitty", "metal");
+    return handle;
+}
+#endif
+
 #define EXTRA_FDS 2
 #ifndef MSG_NOSIGNAL
 // Apple does not implement MSG_NOSIGNAL
@@ -954,16 +979,30 @@ render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images) {
         if (w->is_focused) change_menubar_title(w->window_title);
         return false;
     }
+#ifdef __APPLE__
+    const bool sp = child_monitor_signpost_enabled();
+    os_log_t slog = sp ? child_monitor_signpost_log() : NULL;
+    os_signpost_id_t render_gate_sid = sp ? os_signpost_id_make_with_pointer(slog, w) : OS_SIGNPOST_ID_INVALID;
+#endif
     if (!w->keep_rendering_till_swap && USE_RENDER_FRAMES && w->render_state != RENDER_FRAME_READY) {
         if (w->render_state == RENDER_FRAME_NOT_REQUESTED || no_render_frame_received_recently(w, now, ms_to_monotonic_t(250ll))) request_frame_render(w);
         if (w->id != global_state.thumbnail_callback.os_window) {
             // dont respect render frames soon after a resize on Wayland as they cause flicker because
             // we want to fill the newly resized buffer ASAP, not at compositors convenience
             if (!global_state.is_wayland || (monotonic() - w->viewport_resized_at) > s_double_to_monotonic_t(1)) {
+#ifdef __APPLE__
+                if (sp) os_signpost_event_emit(slog, render_gate_sid, "render_gate", "window=%llu state=%{public}s", w->id, "deferred");
+#endif
                 return false;
             }
         }
+#ifdef __APPLE__
+        if (sp) os_signpost_event_emit(slog, render_gate_sid, "render_gate", "window=%llu state=%{public}s", w->id, "REQUESTED");
+#endif
     }
+#ifdef __APPLE__
+    else if (sp) os_signpost_event_emit(slog, render_gate_sid, "render_gate", "window=%llu state=%{public}s", w->id, "READY");
+#endif
     w->render_calls++;
     make_os_window_context_current(w);
     bool needs_render = w->redraw_count > 0 || w->live_resize.in_progress || global_state.thumbnail_callback.os_window == w->id;
@@ -987,10 +1026,18 @@ render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images) {
 static void
 render(monotonic_t now, bool input_read) {
     EVDBG("input_read: %d, check_for_active_animated_images: %d\n", input_read, global_state.check_for_active_animated_images);
+#ifdef __APPLE__
+    const bool sp = child_monitor_signpost_enabled();
+    os_log_t slog = sp ? child_monitor_signpost_log() : NULL;
+    if (sp) os_signpost_interval_begin(slog, OS_SIGNPOST_ID_EXCLUSIVE, "render", "");
+#endif
     static monotonic_t last_render_at = MONOTONIC_T_MIN;
     monotonic_t time_since_last_render = last_render_at == MONOTONIC_T_MIN ? OPT(repaint_delay) : now - last_render_at;
     if (!input_read && time_since_last_render < OPT(repaint_delay) && !global_state.thumbnail_callback.os_window) {
         set_maximum_wait(OPT(repaint_delay) - time_since_last_render);
+#ifdef __APPLE__
+        if (sp) os_signpost_interval_end(slog, OS_SIGNPOST_ID_EXCLUSIVE, "render", "");
+#endif
         return;
     }
 
@@ -1018,6 +1065,9 @@ render(monotonic_t now, bool input_read) {
     }
     last_render_at = now;
     call_boss(cache_process_data, "O", Py_False);
+#ifdef __APPLE__
+    if (sp) os_signpost_interval_end(slog, OS_SIGNPOST_ID_EXCLUSIVE, "render", "");
+#endif
 #undef TD
 }
 
@@ -1403,7 +1453,15 @@ process_global_state(void *data) {
         process_pending_resizes(now);
         input_read = true;
     }
+#ifdef __APPLE__
+    const bool sp = child_monitor_signpost_enabled();
+    os_log_t slog = sp ? child_monitor_signpost_log() : NULL;
+    if (sp) os_signpost_interval_begin(slog, OS_SIGNPOST_ID_EXCLUSIVE, "parse", "");
+#endif
     if (parse_input(self)) input_read = true;
+#ifdef __APPLE__
+    if (sp) os_signpost_interval_end(slog, OS_SIGNPOST_ID_EXCLUSIVE, "parse", "");
+#endif
     render(now, input_read);
 #ifdef __APPLE__
     if (has_cocoa_pending_actions) {

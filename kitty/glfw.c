@@ -335,6 +335,7 @@ static void
 window_occlusion_callback(GLFWwindow *window, bool occluded) {
     if (!set_callback_window(window)) return;
     debug("OSWindow %llu occlusion state changed, occluded: %d\n", global_state.callback_os_window->id, occluded);
+    global_state.callback_os_window->is_occluded = occluded;
     if (!occluded) {
         global_state.check_for_active_animated_images = true;
         // A fullscreen-space transition (for example dragging the window onto the
@@ -354,6 +355,7 @@ window_occlusion_callback(GLFWwindow *window, bool occluded) {
 static void
 window_iconify_callback(GLFWwindow *window, int iconified) {
     if (!set_callback_window(window)) return;
+    global_state.callback_os_window->is_iconified = iconified != 0;
     if (!iconified) global_state.check_for_active_animated_images = true;
     request_tick_callback();
     global_state.callback_os_window = NULL;
@@ -2049,6 +2051,11 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
     glfwSetDropEventCallback(glfw_window, drop_dest_callback);
     monotonic_t now = monotonic();
     w->is_focused = true;
+    // Seed the iconified/occluded cache with a live query; window_iconify_callback
+    // and window_occlusion_callback (above) keep it in sync from here on -- see
+    // should_os_window_be_rendered().
+    w->is_iconified = glfwGetWindowAttrib(glfw_window, GLFW_ICONIFIED);
+    w->is_occluded = glfwGetWindowAttrib(glfw_window, GLFW_OCCLUDED);
     w->cursor_blink_zero_time = now;
     w->last_mouse_activity_at = now;
     w->mouse_activate_deadline = -1;
@@ -2649,10 +2656,18 @@ wakeup_main_loop(void) {
 
 bool
 should_os_window_be_rendered(OSWindow* w) {
+    // ICONIFIED and OCCLUDED are cached on the OSWindow (window_iconify_callback/
+    // window_occlusion_callback in this file keep them in sync, seeded from a
+    // live query at window creation) instead of live AppKit queries here, since
+    // this runs on the per-window render-gate hot path (render_os_window(),
+    // kitty/child-monitor.c). VISIBLE has no single GLFW callback covering
+    // every way it can change (multiple glfwShowWindow/glfwHideWindow call
+    // sites, no dedicated visibility-changed callback), so it stays a live
+    // query -- conservative: fall back to querying when unsure.
     return (
-            glfwGetWindowAttrib(w->handle, GLFW_ICONIFIED)
+            w->is_iconified
             || !glfwGetWindowAttrib(w->handle, GLFW_VISIBLE)
-            || glfwGetWindowAttrib(w->handle, GLFW_OCCLUDED)
+            || w->is_occluded
             || !glfwAreSwapsAllowed(w->handle)
        ) ? false : true;
 }
