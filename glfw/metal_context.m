@@ -129,6 +129,16 @@ link_trace(const char *event, _GLFWwindow *w, double extra) {
 // added to the runloop; the idle pause/resume toggles runloop membership.
 static void create_metal_display_link(_GLFWwindow *window)
 {
+    // Phase-4 step 7 spike (KITTY_METAL_IOSURFACE=1): the IOSurface presentation
+    // model owns presentation — kitty renders into IOSurface-backed textures and
+    // swaps them into layer.contents itself, so no link is created (the layer's
+    // drawable pool goes unused; kitty-side, USE_RENDER_FRAMES turns the render
+    // gate off so damage renders inline, as sync_to_monitor=no does).
+    {
+        static int iosurface_mode = -1;
+        if (iosurface_mode < 0) { const char *v = getenv("KITTY_METAL_IOSURFACE"); iosurface_mode = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0; }
+        if (iosurface_mode) return;
+    }
     if (window->context.metal.display_link || !window->context.metal.layer) return;
     CAMetalLayer *layer = (CAMetalLayer*)window->context.metal.layer;
     // A link means normal (non-resize) rendering, so clear a stale

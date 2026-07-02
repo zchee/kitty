@@ -217,6 +217,7 @@ void metal_set_link_drawable(void *drawable);
 // Used to gate immediate-encode-on-input so an input burst can't outrun refresh.
 double metal_ms_since_last_present(void);
 bool metal_immediate_encode_enabled(void);  // Phase 4 (L2) runtime kill-switch
+bool metal_iosurface_enabled(void);         // Phase 4 step 7 spike (KITTY_METAL_IOSURFACE=1): IOSurface presentation model
 
 // M1: single-pass layered rendering. metal_begin_layered_frame opens ONE render
 // pass whose color attachment 0 is a memoryless RGBA16Unorm working surface
