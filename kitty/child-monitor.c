@@ -19,7 +19,19 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <signal.h>
+#include <stdatomic.h>
 extern PyTypeObject Screen_Type;
+
+// Phase 4 (L5): host time of the last local key input, stamped on the main thread
+// in on_key_input() and read by the I/O thread (io_loop) to fast-path a
+// keystroke's echo past the input_delay coalescing. Relaxed atomic — a stale read
+// only misses one fast-path, which is harmless.
+static _Atomic(monotonic_t) last_local_key_input_at = 0;
+void note_local_key_input(void) { atomic_store_explicit(&last_local_key_input_at, monotonic(), memory_order_relaxed); }
+// A keystroke echo is a SMALL read arriving shortly after the key; bulk output
+// (large reads) keeps batching to avoid full-redraw flicker.
+#define L5_SMALL_READ_MAX ((size_t)128)
+#define L5_KEY_RECENCY_WINDOW (ms_to_monotonic_t(50ll))
 
 #if defined(__APPLE__) || defined(__OpenBSD__)
 #define NO_SIGQUEUE 1
@@ -1609,10 +1621,11 @@ remove_children(ChildMonitor *self) {
 
 
 static bool
-read_bytes(int fd, Screen *screen) {
+read_bytes(int fd, Screen *screen, size_t *nread) {
     ssize_t len;
     size_t available_buffer_space;
 
+    *nread = 0;  // L5: bytes read this call (for the keystroke-echo fast-path)
     uint8_t *buf = vt_parser_create_write_buffer(screen->vt_parser, &available_buffer_space);
     if (!available_buffer_space) return true;
 
@@ -1627,6 +1640,7 @@ read_bytes(int fd, Screen *screen) {
         break;
     }
     vt_parser_commit_write(screen->vt_parser, len);
+    if (len > 0) *nread = (size_t)len;
     return len != 0;
 }
 
@@ -1760,6 +1774,7 @@ io_loop(void *data) {
     size_t i;
     int ret;
     bool has_more, data_received, has_pending_wakeups = false;
+    size_t total_read_bytes;  // L5: bytes read this poll iteration (echo fast-path)
     monotonic_t last_main_loop_wakeup_at = -1, now = -1;
     Screen *screen;
     ChildMonitor *self = (ChildMonitor*)data;
@@ -1771,6 +1786,7 @@ io_loop(void *data) {
         add_children(self);
         children_mutex(unlock);
         data_received = false;
+        total_read_bytes = 0;
         for (i = 0; i < self->count + EXTRA_FDS; i++) children_fds[i].revents = 0;
         for (i = 0; i < self->count; i++) {
             screen = children[i].screen;
@@ -1805,7 +1821,9 @@ io_loop(void *data) {
             for (i = 0; i < self->count; i++) {
                 if (children_fds[EXTRA_FDS + i].revents & (POLLIN | POLLHUP)) {
                     data_received = true;
-                    has_more = read_bytes(children_fds[EXTRA_FDS + i].fd, children[i].screen);
+                    size_t nread = 0;
+                    has_more = read_bytes(children_fds[EXTRA_FDS + i].fd, children[i].screen, &nread);
+                    total_read_bytes += nread;
                     if (!has_more) {
                         // child is dead
                         children_mutex(lock);
@@ -1840,7 +1858,15 @@ io_loop(void *data) {
         // we only wakeup the main loop after input_delay as wakeup is an expensive operation
         // on some platforms, such as cocoa
         if (data_received) {
-            if ((now = monotonic()) - last_main_loop_wakeup_at > OPT(input_delay)) WAKEUP
+            now = monotonic();
+            // Phase 4 (L5): a SMALL read arriving within L5_KEY_RECENCY_WINDOW of a
+            // local key press is the echo of that keystroke — wake the main loop
+            // immediately (skip the input_delay coalescing) so the first echo
+            // renders ~input_delay sooner. Bulk output (large reads) still batches,
+            // avoiding full-redraw flicker.
+            const bool key_echo = total_read_bytes > 0 && total_read_bytes <= L5_SMALL_READ_MAX
+                && (now - atomic_load_explicit(&last_local_key_input_at, memory_order_relaxed)) <= L5_KEY_RECENCY_WINDOW;
+            if (key_echo || now - last_main_loop_wakeup_at > OPT(input_delay)) WAKEUP
             else has_pending_wakeups = true;
         } else {
             if (has_pending_wakeups && (now = monotonic()) - last_main_loop_wakeup_at > OPT(input_delay)) WAKEUP

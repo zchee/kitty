@@ -222,6 +222,9 @@ on_key_input(const GLFWkeyevent *ev) {
     const int action = ev->action, mods = ev->mods;
     const uint32_t key = ev->key, native_key = ev->native_key;
     const char *text = ev->text ? ev->text : "";
+    // Phase 4 (L5): note press/repeat (not release) so the I/O thread can
+    // fast-path the small echo read that follows, skipping the input_delay batch.
+    if (action != GLFW_RELEASE) note_local_key_input();
 
     if (OPT(debug_keyboard)) {
         if (!key && !native_key && text[0]) {
