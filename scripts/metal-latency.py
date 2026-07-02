@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.14
+#!/usr/bin/env -S uv run --quiet --no-project --python 3.14 --with pyobjc-framework-Quartz
 """Keypress-to-presented latency harness for kitty's Metal-backend
 optimization project. See
 .omc/plans/2026-07-02-metal-worlds-fastest-optimization.md SS6 Phase 0 step 2
@@ -15,10 +15,12 @@ WWDC18-405 Points of Interest). This one does:
      shell prompt without Enter -- never actually executes anything) via
      CGEventPost (pyobjc's Quartz) at randomized 80-200ms intervals --
      randomization avoids vsync aliasing (Dan Luu's terminal-latency
-     methodology, danluu.com/term-latency). Falls back to an AppleScript
-     `System Events keystroke` if Quartz/pyobjc is unavailable, flagged
-     with injection_timing="coarse-osascript" since that path has much
-     higher and less predictable dispatch jitter.
+     methodology, danluu.com/term-latency). Executing this script directly
+     (./scripts/metal-latency.py) resolves pyobjc-framework-Quartz via the
+     uv shebang; under a bare python3.14 invocation without pyobjc it falls
+     back to an AppleScript `System Events keystroke`, flagged with
+     injection_timing="coarse-osascript" since that path has much higher
+     and less predictable dispatch jitter.
   3. Times each injection with a CACurrentMediaTime()-equivalent timestamp
      (same timebase as MTLDrawable.presentedTime -- see current_media_time()
      below) and pairs it with the NEXT metal_present line emitted after it.

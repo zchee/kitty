@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.14
+#!/usr/bin/env -S uv run --quiet --no-project --python 3.14 --with Pillow
 """Golden-image capture + compare tool for kitty's Metal-backend
 optimization project. See
 .omc/plans/2026-07-02-metal-worlds-fastest-optimization.md SS6 Phase 0
@@ -160,7 +160,7 @@ def compare_images(path_a: Path, path_b: Path, threshold: int) -> dict[str, Any]
     try:
         from PIL import Image, ImageChops
     except ImportError:
-        return {"pass": None, "error": "Pillow (PIL) not installed -- pip install --user Pillow to enable pixel comparison"}
+        return {"pass": None, "error": "Pillow (PIL) not installed -- execute this script directly (./scripts/metal-golden.py, the uv shebang resolves it) or pip install --user Pillow"}
 
     img_a = Image.open(path_a).convert("RGBA")
     img_b = Image.open(path_b).convert("RGBA")
