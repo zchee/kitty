@@ -430,9 +430,22 @@ link create or real resize end.
 **Timing verification status:** pacing structure (idle-pause, typing-pace,
 keystroke-bytes, `MTL_DEBUG_LAYER`) is byte-identical across 5/5 trials even under
 sustained load, and PTY-write→present p50 (62–66 ms) matches the pre-regression
-baseline. p99 percentiles were captured under loadavg 6–9 and are marked
-LOAD-DEGRADED — they, and the gpu_ms/encode_ms percentile comparison against the
-Wave-3 closeout, await a quiet-machine re-run (user checklist).
+baseline. The Wave-4 p99 captures (loadavg 6–9, LOAD-DEGRADED) were re-run in
+Wave 5 at loadavg 3.2–6.2 with launchservicesd quiet (`pace_probe.py
+--take-focus`, now required: no-activate test windows can spawn fully occluded —
+as they did this session — and the occlusion gate then renders 0 frames): 3/5
+trials valid (trials 4–5 hit an unrelated loadavg 10–20 spike and are
+discarded), PTY-write→present p50 62.1–63.2 ms confirms the baseline, flood
+cadence byte-identical (16.6667 ms p50=p99), idle presents 0 over 60 s. The
+gpu_ms/encode_ms comparison against the Wave-3 closeout
+(`stats-percentiles-wave3-result.json`: gpu 0.251/1.229 ms p50/p99, encode
+0.078/0.185 ms) is CLOSED: gpu_ms 0.19–0.31 / 1.06–1.73 ms (within run-to-run
+variance, no regression) and encode_ms ~0.024 / 0.049–0.059 ms (~3× better).
+One honest surprise: the PTY-write→present p99 tail (179–271 ms, ~1/40 bursts)
+persists at moderate load, so it was never load-caused — the Wave-5 IOSurface
+spike (below) shows it is a link-resume artifact (it has no counterpart with
+the link removed). A pristine sub-3-loadavg run remains open only as a
+formality; the numbers above are the working reference.
 
 ### `maximumDrawableCount` = 2 — measured decision
 
@@ -560,6 +573,90 @@ touch. Conclusion: default-mode cold latency is **not pFL-reducible**; 1.0 stays
 smoothness + `drawable_wait_ms=0` at ~+1 frame cold-keypress cost vs the old
 CVDisplayLink baseline; `sync_to_monitor=no` (L3, ~42 ms) is the low-latency path;
 closing the default-mode gap is the **IOSurface follow-up** (priority-next).
+
+### Wave-5 spike: the IOSurface presentation model (KITTY_METAL_IOSURFACE=1) — ADOPT
+
+`KITTY_METAL_IOSURFACE=1` (spike, default off) replaces drawable presentation
+wholesale, following the Ghostty model the L2 deferral pointed at (plan Phase-4
+step 7): frames render into IOSurface-backed BGRA8Unorm textures from a 3-deep
+per-window ring (slots skipped while `IOSurfaceIsInUse`, i.e. held by the
+window server) and present by assigning the surface to `layer.contents` inside
+an explicit `CATransaction` (+`flush`, so an enclosing implicit AppKit
+transaction cannot defer the swap) after `waitUntilCompleted` — no implicit
+GPU→CA fence exists for manually assigned contents, and terminal frames encode
+<1 ms of GPU work, so the inline wait is cheaper than a completed-handler
+round trip (Ghostty's synchronous path makes the same call). No
+CAMetalDisplayLink is created (`glfw/metal_context.m` no-ops link creation)
+and `USE_RENDER_FRAMES` is off (`kitty/child-monitor.c`), so damage renders
+inline on the next main-loop tick exactly as `sync_to_monitor=no` does — but
+the composite stays vsync-clean because Core Animation picks the new contents
+up at the next display refresh. The drawable pool does not exist on this path,
+which dissolves the L2 blocker by construction: every input-driven frame IS an
+immediate render+present.
+
+Measurement semantics: `presentedTime` does not exist for a contents
+assignment, so `metal_present … pace=iosurface` lines are stamped by a
+CADisplayLink (macOS 14+, `NSScreen.mainScreen`, paused whenever no present is
+pending) with the first display-refresh timestamp at/after the CA commit;
+`commit_time=` is tail-appended for offline bounding. The stamp is a lower
+bound within one refresh (16.7 ms at 60 Hz) of true glass time — optimistic
+when the render server misses that refresh's deadline. Every conclusion below
+survives the worst-case correction.
+
+A/B: 60 Hz session, M3 Max, loadavg ~3.3–3.9, interleaved 3 runs per arm
+(`pace_probe.py --take-focus --sync yes`, 40 bursts each;
+`.omc/verify/wave5/ab_*.json`):
+
+| PTY-write→present | link (default today) | iosurface |
+|---|---|---|
+| p50 | 78.5–79.3 ms | **13.6–15.5 ms** |
+| p90 | 84.6–86.4 ms | 19.7–21.7 ms |
+| p99 / max | 202–209 ms | **21.8–26.3 ms** |
+
+Even with the full one-refresh pessimistic correction (+16.7 ms), iosurface
+p50 ≤ 32 ms vs link ~79 ms. The link arm's 200 ms-class p99 tail (present in
+every Wave-4/5 link capture, including the quiet re-runs above) has no
+iosurface counterpart — so the tail is the link's idle→resume path
+(removeFromRunLoop/addToRunLoop + first vsync-timed callback), not machine
+load. Also verified in iosurface mode: `MTL_DEBUG_LAYER=1` clean, passes=1
+(single-pass pipeline intact), steady-state allocs=0 and dirty-upload bytes
+unchanged (D1/D2 intact), idle presents 0 (no link needed for idle-quiet: no
+damage, no render).
+
+The measured cost, exactly as the plan's pre-mortem predicted: flood renders
+unpaced — ~185–186 fps encoded vs the link's vsync-locked 58 fps. CA coalesces
+to the refresh rate on glass, so the extra ~128 fps is pure invisible work
+(CPU/GPU/energy), and present-interval stats read differently under coalescing
+(multiple frames share one refresh stamp).
+
+**Verdict: ADOPT** — this is the architecture that closes the default-mode
+cold-latency gap (§ "`preferredFrameLatency` is a no-op") and it also removes
+the link's own resume tail. Productization prerequisites before it can replace
+the link as the default:
+
+1. **Flood pacing governor** — cap encode at the refresh cadence during
+   sustained damage (the pre-mortem's content-driven collapse), settling the
+   186→58 fps waste and the energy criterion (§7 #9).
+2. **Colorspace decision** — the spike attaches no colorspace to the surfaces;
+   composite parity with the CAMetalLayer nil-colorspace policy is plausible
+   but UNVERIFIED (the golden harness reads the pre-composite offscreen, and
+   `screencapture` needs a Screen Recording grant — user checklist: eyeball a
+   KITTY_METAL_IOSURFACE=1 window against a normal one).
+3. **Resize / multi-display / occlusion soak** — live resize takes the same
+   contents-swap path inside the resize transaction (structurally sound, only
+   smoke-tested); the measurement stamper is `NSScreen.mainScreen`-bound.
+4. **Ring lifecycle** — surfaces (3 × ~1–31 MB per window by size) are never
+   freed on window close in the spike (bounded by the same table pattern as
+   the per-window state slots).
+5. **L2/L5 groundwork subsumed** — under this model the gate bypass makes
+   every damaged tick an immediate render, so `pace=immediate` and
+   `KITTY_METAL_IMMEDIATE` (still neutered) can be deleted together with the
+   link path when this model graduates.
+
+Keypress→presented (CGEvent) A/B remains blocked on the Accessibility grant
+(`CGPreflightPostEventAccess()` returns false — the same user-checklist item
+as the DEFECT-1 empirical drive); PTY-write→present is the decisive proxy
+meanwhile.
 
 ## Known deviations (tracked, intentional)
 
