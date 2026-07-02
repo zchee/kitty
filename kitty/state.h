@@ -569,6 +569,7 @@ void* metal_get_device(void);
 void metal_set_link_drawable(void *drawable);  // Phase 4 (L1): link-delivered drawable for this frame
 double metal_ms_since_last_present(void);       // Phase 4 (L2): ms since last present (immediate-encode gate)
 bool metal_immediate_encode_enabled(void);      // Phase 4 (L2): runtime kill-switch
+bool metal_iosurface_enabled(void);             // Phase 4 step 7 spike: IOSurface presentation model (KITTY_METAL_IOSURFACE=1)
 #endif
 void remove_vao(ssize_t vao_idx);
 bool remove_os_window(id_type os_window_id);

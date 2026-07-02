@@ -250,6 +250,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=None, help="seed for the randomized intervals (default: unseeded/nondeterministic)")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="directory to write the JSON into")
     parser.add_argument("--label", default=None, help="extra label appended to the output filename")
+    parser.add_argument("--env", action="append", default=[], metavar="KEY=VAL", help="extra env vars for the kitty under test (e.g. KITTY_METAL_IOSURFACE=1)")
     return parser
 
 
@@ -299,6 +300,7 @@ def main(argv: list[str] | None = None) -> int:
         take_focus=True,
         extra_env={
             "KITTY_METAL_STATS": "1", "KITTY_METAL_SIGNPOST": "1", "KITTY_METAL_STATS_FILE": str(stats_file_path),
+            **{k: v for k, _, v in (kv.partition("=") for kv in args.env) if k},
         },
         # Disable cursor blink: it is the only source of idle (non-input-
         # driven) frame production at a bare shell prompt, and left enabled

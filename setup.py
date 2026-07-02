@@ -813,7 +813,7 @@ def kitty_env(args: Options) -> Env:
     platform_libs.extend([f'-L{homebrew_prefix()}/opt/harfbuzz/lib', '-lharfbuzz', f'-L{homebrew_prefix()}/opt/graphite2/lib', '-lgraphite2'])
     pylib = get_python_flags(args, cflags)
     if use_metal:
-        gl_libs = ['-framework', 'Metal', '-framework', 'QuartzCore']
+        gl_libs = ['-framework', 'Metal', '-framework', 'QuartzCore', '-framework', 'IOSurface']
     elif is_macos:
         gl_libs = ['-framework', 'OpenGL']
     else:

@@ -73,7 +73,14 @@ child_monitor_signpost_log(void) {
 // Apple does not implement MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
 #endif
+#ifdef KITTY_BACKEND_METAL
+// Phase-4 step 7 spike: under the IOSurface presentation model there is no
+// CAMetalDisplayLink delivering render frames, so the gate must not defer to
+// them; damage renders inline on the next tick, as sync_to_monitor=no does.
+#define USE_RENDER_FRAMES (global_state.has_render_frames && OPT(sync_to_monitor) && !metal_iosurface_enabled())
+#else
 #define USE_RENDER_FRAMES (global_state.has_render_frames && OPT(sync_to_monitor))
+#endif
 
 typedef struct {
     char *data;
