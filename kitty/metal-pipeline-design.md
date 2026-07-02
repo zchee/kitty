@@ -275,10 +275,299 @@ pass) is unchanged.
   under `MTL_DEBUG_LAYER=1` + `MTL_SHADER_VALIDATION=1` in both drawable and
   offscreen-dump modes.
 
+## Pacing: the CAMetalDisplayLink render driver (Phase 4 / L1)
+
+On the Metal backend, per-window rendering is driven by a **`CAMetalDisplayLink`**
+(macOS 14.0+, unconditional at the 15.3 build floor) instead of the legacy
+CVDisplayLink render-frame gate. The CVDisplayLink machinery
+(`glfw/cocoa_displaylink.m`) stays verbatim for the **GL/NSGL backend** — the two
+paths branch on `window->context.metal.display_link` / `KITTY_BACKEND_METAL`.
+
+### Topology — one link per window (per `CAMetalLayer`)
+
+The link is created in `_glfwCreateContextMetal` via
+`[[CAMetalDisplayLink alloc] initWithMetalLayer:layer]`, so it is bound to the
+window's layer and **follows that layer's display automatically** across monitor
+moves. This is strictly simpler than CVDisplayLink's per-`CGDirectDisplayID`
+registry (no `displayLinks` table, no `displayIDForWindow` re-keying on screen
+change) and handles multi-window / multi-display correctly by construction: each
+window owns exactly one link. (Verified against apple-docs: `init(metalLayer:)`.)
+
+### Callback → inline render → present
+
+The link is added to the **main run loop** in `NSRunLoopCommonModes`, so its
+delegate `metalDisplayLink:needsUpdate:` (`glfw/metal_context.m`,
+`KittyMetalDisplayLinkDelegate`) fires **on the main thread**, interleaved with
+kitty's `[NSApp run]` event loop — no CVDisplayLink-thread → `dispatch_async` →
+`postEmptyEvent` double hop, and no stuck-link watchdog (both retired on the
+Metal path). The delegate:
+
+1. publishes `update.drawable` (a vsync-timed `CAMetalDrawable`) +
+   `targetPresentationTimestamp` on the window context, then
+2. invokes the kitty render callback `cocoa_metal_frame_callback` (`kitty/glfw.c`),
+   which sets `render_state = RENDER_FRAME_READY`, hands the drawable to
+   `metal_set_link_drawable()`, and calls **`render_os_window()` synchronously**
+   — rendering + presenting THIS frame inside the callback (the precedent is
+   `cocoa_out_of_sequence_render`).
+
+This is safe because the **main thread holds the Python GIL for the entire
+lifetime of `[NSApp run]`** (the I/O thread `io_loop` only fills the VT-parser
+buffer under mutexes — it never touches Python — so there is no
+`Py_BEGIN_ALLOW_THREADS` around the loop). The delegate therefore holds the GIL
+and `render_os_window`'s `call_boss(...)` calls are legal.
+
+`metal_end_frame` presents with a **plain** `[commandBuffer presentDrawable:]` —
+timed present variants (`presentDrawable:atTime:` / `afterMinimumDuration:`)
+assert under CAMetalDisplayLink (apple-docs). `preferredFrameLatency = 1.0`
+(only 1.0/2.0 are valid; macOS windowed mode may raise the effective latency);
+`preferredFrameRateRange = CAFrameRateRangeDefault` (== display max, ProMotion;
+a `CAFrameRateRangeMake` with a 0 minimum throws `NSInvalidArgumentException` —
+learned at runtime).
+
+### Drawable hand-off — `drawable_wait_ms` redefined to 0
+
+`ensure_drawable()` now uses the link-delivered drawable when
+`metal_set_link_drawable()` set one, **short-circuiting `nextDrawable`
+entirely**. The nextDrawable backpressure that Wave-2/3 measured
+(`drawable_wait_ms`) is **structurally absorbed by the link scheduling its
+callback**, so on the link path `drawable_wait_ms` is always **`0.000`**. The
+field is KEPT in the `metal_stats` line (tolerant-parser stability) but its
+meaning is redefined: it is 0 whenever a link drawable drove the frame, and
+retains its old "time inside `nextDrawable`" meaning only on the non-link paths
+(golden dump, live resize). The wire format is otherwise unchanged
+(tail-appended keys only).
+
+### Idle pause / resume — the render-frame state machine
+
+The 3-state `render_state` machine is reused: **NOT_REQUESTED** ⇒ link paused
+(removed from the runloop); **REQUESTED** ⇒ link running (set by
+`request_frame_render`, which resumes the link in `requestRenderFrame`); **READY**
+⇒ transient, set by the delegate before the inline render. Damage reaches
+`render_os_window`'s gate with the link paused → `request_frame_render` resumes it →
+the next tick renders. A link tick that finds nothing to draw pauses the link and
+resets to NOT_REQUESTED, keeping a 60 s idle window at **presents == cursor-blink
+frames only** (criterion 7). The `removeFromRunLoop`/`addToRunLoop` idle pause/resume
+is **reliable** — a healthy session performs hundreds per run (~25 PAUSE/RESUME pairs
+per run in the linktrace). It was NOT the source of any freeze.
+
+### Live resize — and the Wave-4 once-then-freeze defect
+
+The "renders once then freezes" defect was **NOT** the idle pause/resume and **NOT**
+activation/occlusion throttling — both earlier hypotheses were falsified by the
+linktrace. **ROOT CAUSE:** macOS emits a **spurious `viewWillStartLiveResize` when a
+window becomes key at startup, with no matching `viewDidEndLiveResize`.** Trace-proven:
+broken runs show `FIRST_TICK → RESIZE_START → link removed → (nothing)`; healthy runs
+have zero resize events. Rate ~5–10%, clustered by activation timing.
+
+Design (destroy/recreate, not pause):
+
+- **`viewWillStartLiveResize` DESTROYS the link** (not pause). The drag renders via
+  `cocoa_out_of_sequence_render`'s `nextDrawable`, and an attached link — even removed
+  from the runloop — owns the drawable pool: `nextDrawable` returns nil, and a link
+  resumed after the resize delivers a **dangling drawable** (SIGSEGV in
+  `begin_render_pass_to_drawable`). Destroying detaches it (the proven
+  `sync_to_monitor=no` path). `change_live_resize_state()` **EXIT recreates a fresh
+  link** (a brand-new link has a clean pool; resuming/re-adding the resize-corrupted
+  link crashed or stalled) and marks REQUESTED.
+- **DEFECT 2:** `change_live_resize_state()` **ENTER destroys the link** (idempotent)
+  before the inline render — a programmatic resize (`kitty @ resize-os-window`, any
+  `setFrame`) enters with no AppKit `viewWillStartLiveResize`, so this pins the
+  invariant "the layer is link-free wherever inline `nextDrawable` runs".
+- **Recovery** for a spurious resize with no `viewDidEndLiveResize` is driven by
+  `process_pending_resizes`'s debounce (it calls `change_live_resize_state(false)`),
+  which runs before `render()` each loop; the **render()-loop backstop** in
+  `child-monitor.c` is a defensive fallback for when the debounce cannot run.
+- **The delegate MUST NOT guard on `w->ns.live_resize_in_progress`.** The debounce
+  clears the kitty-side `w->live_resize.in_progress` but not the GLFW-side flag, and
+  guarding on it froze a freshly-recreated link (it ticked but never called the
+  callback). The **sole** resize guard is the kitty-side flag checked in
+  `cocoa_metal_frame_callback`.
+- **`requestRenderFrame` (Metal) never falls back to the CVDisplayLink** when the link
+  is transiently absent: that path drives `cocoa_metal_frame_callback` into
+  `nextDrawable`, and once the link is recreated `-[CAMetalLayer nextDrawable]` **RAISES
+  an NSException** (attached-link conflict) → abort.
+- **DEFECT 1:** `glfwCocoaResetLiveResizeGuards` (backstop) and the link-create
+  `presentsWithTransaction` reset both **decline while the left mouse button is down**
+  (`[NSEvent pressedMouseButtons] & 1`, a genuine paused drag) — dropping
+  presentsWithTransaction or recreating the link mid-transaction would detach the
+  content from the window chrome for the rest of the drag.
+
+Verified: forced stuck-resize repro **10/10 sync=yes** (worker-pace, independently
+re-verified 10/10 by the verify pass); **sync=no is structurally N/A** — with no
+link there is no delegate, so the force hook cannot fire, and the linkless inline
+path is the already-proven mode. Kill-switch runs (`KITTY_METAL_NO_RESIZE_RECOVERY=1`)
+passed **7/7**: recovery came from the debounce path alone every time, so the
+backstop is **implemented, code-reviewed, and unexercised** defense-in-depth.
+Natural soak **34 runs** (0 triggers), programmatic resize **×20** (0 nil-spin, 0
+crash, link delivering after), **0 crashes** across ~100 runs, both backends
+`-Werror` clean, and
+the **visible-but-inactive** experiment PASS (a visible, uncovered, app-inactive
+window still renders — 37.9→27.7 presents/s, macOS's allowed background throttle, not
+a stall; so no linkless fallback is needed). Repro/regression levers kept:
+`KITTY_METAL_FORCE_STUCK_RESIZE` (dispatch_async, mirrors the AppKit event),
+`KITTY_METAL_LINKTRACE_FILE`, `KITTY_METAL_NO_RESIZE_RECOVERY` (kill switch).
+
+**Caveat (honest):** the natural trigger fired 0/34 times post-fix — acceptance rests
+on FORCED fidelity, substantiated by the two extra defects the faithful dispatch_async
+force exposed (the delegate ns-guard freeze and the CVDisplayLink-fallback NSException
+crash) that a same-pass force masked. The DEFECT-1 mouse-button decline is implemented,
+reviewed, and linktrace'd (`RESETGUARDS_DECLINE`/`ACCEPT`) but not empirically driven —
+`CGEventPost` needs an Accessibility grant that is not present in CI; it is on the user
+checklist (`.omc/verify/wave4/defect1_manual_checklist.md`). NOTE for #5: the spurious
+`viewWillStartLiveResize` is ACTIVATION-clustered, so no-activate test launches may make
+the natural trigger even rarer — test silence is NOT evidence the quirk is gone; the
+forced repro (`KITTY_METAL_FORCE_STUCK_RESIZE`) remains the regression lever.
+
+**Recovery residues (known, accepted):** a debounce-path recovery clears only the
+kitty-side flag, so GLFW's `ns.live_resize_in_progress` stays latched until the next
+real `viewDidEndLiveResize` — `windowDidResize` then routes subsequent resizes
+through the live-resize render path (cosmetic; self-corrects on the next genuine
+resize end). And because the link-create `presentsWithTransaction` reset declines
+while a mouse button is down (DEFECT 1), a recovery that lands during an unrelated
+drag leaves `presentsWithTransaction=YES` (synchronous present path) until the next
+link create or real resize end.
+
+**Timing verification status:** pacing structure (idle-pause, typing-pace,
+keystroke-bytes, `MTL_DEBUG_LAYER`) is byte-identical across 5/5 trials even under
+sustained load, and PTY-write→present p50 (62–66 ms) matches the pre-regression
+baseline. p99 percentiles were captured under loadavg 6–9 and are marked
+LOAD-DEGRADED — they, and the gpu_ms/encode_ms percentile comparison against the
+Wave-3 closeout, await a quiet-machine re-run (user checklist).
+
+### `maximumDrawableCount` = 2 — measured decision
+
+With the link delivering a vsync-timed drawable to every callback there is no
+CPU-side `nextDrawable` race, so a 2-deep pool is optimal. Measured under
+flood + typing (M3 Max, 60 Hz session, `.omc/verify/wave4/pace_probe.py`):
+
+| | count 2 | count 3 |
+|---|---|---|
+| flood present interval p50 / p99 / max | 16.6667 / 16.6668 / 16.6668 ms | 16.6667 / 16.6668 / 16.6668 ms |
+| flood `drawable_wait_ms` (all pctiles) | 0.000 | 0.000 |
+| flood fps | 58.0 | 57.7 |
+| PTY-write→present p50 | **62.3 ms** | 64.3 ms |
+
+Count 3 gives **byte-identical cadence and zero tail stalls** (no smoothness
+gain) while adding ~2 ms of PTY-write→present latency (one more frame of queue
+depth). The pre-Wave-4 "60 ms tail stall at count 2" was an artifact of the
+old 2-pass pipeline; it is gone. **Verdict: keep 2** — shallowest presentation
+queue == lowest latency, and pacing is already perfect at 2.
+
+### Latency vs. smoothness (before/after) and the L2 follow-up
+
+vs. the CVDisplayLink baseline (`.omc/verify/wave4/pace_baseline.json`):
+
+| | baseline (CVDisplayLink) | CAMetalDisplayLink |
+|---|---|---|
+| flood fps | 33.7 | **58** |
+| flood `drawable_wait_ms` p99 / max | 0.049 / 6.411 ms | **0.000 / 0.000** |
+| PTY-write→present p50 | 31.1 ms | 62.3 ms |
+
+The link **doubles sustained-scroll smoothness** (the baseline render-gate +
+`displaySyncEnabled` collapsed flood to every-other-vsync ≈ 30 fps) and zeroes
+drawable backpressure, but the **cold keypress path is ~1 frame slower**: the
+link-delivered drawable is presented for a *future* vsync (windowed-mode frame
+latency), so a keystroke that arrives while the link is paused pays a
+resume + present-buffering beat. This is the CAMetalDisplayLink
+latency-vs-smoothness tradeoff. The low-latency path is **`sync_to_monitor=no`**
+(L3 below); the default-mode fix (**L2 immediate-encode**) is deferred — see below.
+
+### `pace=` observability (Phase 4 step 6)
+
+Both `metal_stats` and `metal_present` lines gain a **tail-appended `pace=`**
+field attributing each frame's scheduling source, so verification can tell them
+apart. Values (priority order, computed in `metal_end_frame`):
+
+- `resize` — the `presentsWithTransaction` live-resize present.
+- `unsynced` — `sync_to_monitor=no` (`displaySyncEnabled=NO`), immediate present.
+- `link` — a CAMetalDisplayLink-delivered drawable drove the frame.
+- `immediate` — an L2 input-driven `nextDrawable` render (see the deferral note).
+
+Harness note: parsers must tolerate `pace=<string>` (it is NOT numeric). Existing
+tolerant parsers already ignore unknown keys; the value is a bare token, never
+`$`-anchored. `metal_ms_since_last_present()` is also exported (used by L2's gate).
+
+### L3 — `sync_to_monitor=no` maps to `displaySyncEnabled=NO`
+
+`sync_to_monitor=no` is kitty's documented low-latency (tearing) config. On the
+GL backend it means swap-interval 0; on Metal it maps to `displaySyncEnabled=NO`
++ immediate present. But there is a hard constraint: **an attached
+CAMetalDisplayLink — even paused, even removed from the runloop — owns the
+layer's drawable pool and makes `nextDrawable` return `nil`**. `sync_to_monitor=no`
+sets `USE_RENDER_FRAMES=false`, which bypasses the link gate and renders inline
+via `nextDrawable`; with the link present that path rendered **0 frames** (a blank
+window — a latent Metal-backend gap since L1 always used the link).
+
+Fix: `sync_to_monitor=no` **destroys** the window's CAMetalDisplayLink
+(`glfwCocoaSetRenderLinkEnabled(false)` → `destroy_metal_display_link`, factored
+alongside `create_metal_display_link`); `=yes` keeps/recreates it. `swapIntervalMetal`
+maps the swap interval onto `displaySyncEnabled` (0 → NO). Measured (M3 Max,
+`pace_probe.py --sync no`): `sync_to_monitor=no` renders (105 frames, `pace=unsynced`),
+PTY-write→present p50 **42.8 ms vs 62.5 ms** for `=yes` (link) — the intended
+lower-latency mode. `=yes` (default) is unchanged (task L1 link, `pace=link`,
+`drawable_wait_ms=0`); MTL_DEBUG_LAYER clean in both modes.
+
+### L5 — adaptive `input_delay` (echo fast-path)
+
+The I/O thread coalesces main-loop wakeups until `input_delay` (3 ms default)
+elapses. L5 fast-paths the **echo of a keystroke**: `on_key_input` stamps
+`last_local_key_input_at` (relaxed atomic, main thread); `io_loop` wakes the main
+loop **immediately** when a SMALL read (`≤128 B`, via `read_bytes`'s new byte
+count) arrives within 50 ms of a key press — skipping the batch so the first echo
+renders ~`input_delay` sooner. Bulk output (large reads) keeps batching, avoiding
+full-redraw flicker. Backend-agnostic (I/O path); `kitty_tests` green (data
+integrity), no drawable interaction.
+
+### L2 — immediate-encode-on-input: DEFERRED (documented)
+
+L2 would render an input frame immediately via `nextDrawable` instead of waiting
+for the next link tick, in the DEFAULT (`sync_to_monitor=yes`) mode. But that
+requires `nextDrawable` while the link is active, which **corrupts the drawable
+pool → SIGSEGV** (the link's `update.drawable` goes dangling in
+`begin_render_pass_to_drawable`; confirmed via `KITTY_METAL_IMMEDIATE=1` A/B —
+1-frame crash on, 100+ frames clean off). Same root cause as L3: the link and
+`nextDrawable` cannot share a layer. Destroying/recreating the link per keystroke
+(as L3 does per-window) is too costly on the input hot path. The correct fix is
+the Ghostty-style **IOSurface-backed render target + `CALayer.contents`**
+presentation model (plan Phase-4 step 7), which owns presentation without a
+drawable pool — a separate spike (now priority-next, see the pFL result below).
+The `pace=immediate` tag + `metal_ms_since_last_present` plumbing stay as
+groundwork, but `KITTY_METAL_IMMEDIATE` is **neutered** — it logs one line
+(`immediate-encode requires the IOSurface presentation model … ignored`) and does
+nothing (never activates the crashing path), so there is no shippable landmine.
+Until then the default mode's low-latency answer is `sync_to_monitor=no` (L3).
+
+### `preferredFrameLatency` is a no-op for cold latency (measured)
+
+Before deferring, we swept the one remaining default-mode knob. apple-docs:
+`preferredFrameLatency` is "the amount of time, in frames, your app requests to
+render a frame … The only acceptable values are **1.0 and 2.0**" — so 1.0 is the
+documented floor (nothing below to try). It governs GPU-completion slack, not the
+present target. Measured default-mode cold PTY-write→present (M3 Max, 3 runs each,
+`pace_probe.py --sync yes`):
+
+| preferredFrameLatency | best-min | median-p50 |
+|---|---|---|
+| 1.0 (shipped) | 54.0 ms | 63.4 ms |
+| 2.0 | 54.0 ms | 62.7 ms |
+
+**Statistically identical** (0.7 ms p50 delta = run-to-run noise). Our frames
+complete in <1 ms GPU, so 1-vs-2 frames of completion slack is irrelevant; the
+~54–63 ms cold latency is the link **cadence** (paused-link resume + wait for the
+next vsync-timed callback + the windowed-mode present pipeline), which pFL does not
+touch. Conclusion: default-mode cold latency is **not pFL-reducible**; 1.0 stays
+(least requested latency). The honest tradeoff: default mode buys 2× flood
+smoothness + `drawable_wait_ms=0` at ~+1 frame cold-keypress cost vs the old
+CVDisplayLink baseline; `sync_to_monitor=no` (L3, ~42 ms) is the low-latency path;
+closing the default-mode gap is the **IOSurface follow-up** (priority-next).
+
 ## Known deviations (tracked, intentional)
 
 - Cell/graphics MSL shader *logic* is still the opus-era port; semantic drift
   against current GLSL (attr bit shifts, fg_override fix, bgimage preload) is
   Phase 3 (gates G2–G7 golden diffs).
-- `presentsWithTransaction` live-resize sequencing and CADisplayLink pacing are
-  Phase 4.
+- `presentsWithTransaction` live-resize sequencing landed in Phase 4/L1 (above);
+  CVDisplayLink pacing is replaced by CAMetalDisplayLink on the Metal path (the
+  CVDisplayLink code remains for the GL backend). L2/L3/L5 (immediate-encode,
+  `sync_to_monitor`→`displaySyncEnabled`, adaptive `input_delay`, `pace=` tag)
+  are the following Phase-4 task.
