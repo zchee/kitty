@@ -3520,16 +3520,39 @@ get_line_edge_colors(Screen *self, color_type *left, color_type *right) {
 }
 
 
-static void
+static size_t
 update_line_data(Line *line, unsigned int dest_y, uint8_t *data) {
-    size_t base = sizeof(GPUCell) * dest_y * line->xnum;
-    memcpy(data + base, line->gpu_cells, line->xnum * sizeof(GPUCell));
+    const size_t sz = line->xnum * sizeof(GPUCell);
+    memcpy(data + sz * dest_y, line->gpu_cells, sz);
+    return sz;
 }
 
-static void
+// D2: with the persistent Metal ring (D1), `data` already holds this slot's last
+// contents. Upload the row only when it actually differs, so a localized edit
+// touches ~one row instead of the whole grid. Returns bytes written (0 or sz).
+static size_t
+update_line_data_diff(Line *line, unsigned int dest_y, uint8_t *data) {
+    const size_t sz = line->xnum * sizeof(GPUCell);
+    uint8_t *dst = data + sz * dest_y;
+    if (memcmp(dst, line->gpu_cells, sz) == 0) return 0;
+    memcpy(dst, line->gpu_cells, sz);
+    return sz;
+}
+
+static size_t
 update_line_data_blank(unsigned xnum, unsigned int dest_y, uint8_t *data) {
     const size_t sz = xnum * sizeof(GPUCell);
     memset(data + sz * dest_y, 0, sz);
+    return sz;
+}
+
+// D2: blank the row only if it is not already blank in the slot.
+static size_t
+update_line_data_blank_diff(unsigned xnum, unsigned int dest_y, uint8_t *data) {
+    const size_t sz = xnum * sizeof(GPUCell);
+    uint8_t *dst = data + sz * dest_y;
+    for (size_t i = 0; i < sz; i++) { if (dst[i]) { memset(dst, 0, sz); return sz; } }
+    return 0;
 }
 
 
@@ -3697,8 +3720,9 @@ screen_update_only_line_graphics_data(Screen *self) {
     }
 }
 
-void
-screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_data, bool cursor_has_moved) {
+uint64_t
+screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_data, bool cursor_has_moved, bool force_full) {
+    uint64_t bytes = 0;
     if (self->paused_rendering.expires_at) {
         if (!self->paused_rendering.cell_data_updated) {
             LineBuf *linebuf = self->paused_rendering.linebuf;
@@ -3711,12 +3735,20 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
                             self->marker, linebuf->line, &self->as_ansi_buf);
                     linebuf_mark_line_clean(linebuf, y);
                 }
-                update_line_data(linebuf->line, y, address);
+                bytes += update_line_data(linebuf->line, y, address); // frozen frame: full write once
             }
         }
-        return;
+        return bytes;
     }
     const bool is_overlay_active = screen_is_overlay_active(self);
+    // D2: with the persistent ring, non-dirty rows are diffed against the slot
+    // (which still holds their last-uploaded bytes) rather than blindly recopied.
+    // A full write is forced when the slot is fresh/GL (force_full) or the overlay
+    // is active (its row is written directly below, so keep the whole frame full).
+    // Row->line mapping shifts (scroll, scrollback, resize) need no special-casing:
+    // the memcmp in update_line_data_diff catches a moved-but-unmarked line because
+    // its bytes no longer match what sits at that render position in the slot.
+    const bool effective_full = force_full || is_overlay_active;
     unsigned int history_line_added_count = self->history_line_added_count;
     screen_reset_dirty(self);
     update_overlay_position(self);
@@ -3732,9 +3764,11 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
         index_type lnum = 0;
         Line *linep = render_line_for_virtual_y(self, virtual_y, &line, &lnum, &is_history);
         if (linep == NULL) {
-            update_line_data_blank(self->columns, render_row, address);
+            bytes += effective_full ? update_line_data_blank(self->columns, render_row, address)
+                                    : update_line_data_blank_diff(self->columns, render_row, address);
             continue;
         }
+        bool rerendered = false;
         if (is_history) {
             // we render line graphics even if the line is not dirty as graphics commands received after
             // the unicode placeholder was first scanned can alter it.
@@ -3743,6 +3777,7 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
                 render_line(fonts_data, linep, lnum, self->cursor, self->disable_ligatures, self->lc);
                 if (screen_has_marker(self)) mark_text_in_line(self->marker, linep, &self->as_ansi_buf);
                 historybuf_mark_line_clean(self->historybuf, lnum);
+                rerendered = true;
             }
         } else {
             if (linep->attrs.has_dirty_text ||
@@ -3753,9 +3788,13 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
                         self->marker, linep, &self->as_ansi_buf);
                 if (is_overlay_active && lnum == self->overlay_line.ynum) render_overlay_line(self, linep, fonts_data);
                 linebuf_mark_line_clean(self->linebuf, lnum);
+                rerendered = true;
             }
         }
-        update_line_data(linep, render_row, address);
+        // Rows re-rendered this frame are known-changed -> copy directly (skip the
+        // memcmp); everything else diffs against the slot.
+        bytes += (effective_full || rerendered) ? update_line_data(linep, render_row, address)
+                                                : update_line_data_diff(linep, render_row, address);
     }
     if (is_overlay_active && self->overlay_line.ynum + self->scrolled_by < self->lines) {
         if (self->overlay_line.is_dirty) {
@@ -3763,7 +3802,9 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
             render_overlay_line(self, self->linebuf->line, fonts_data);
         }
         update_overlay_line_data(self, address);
+        bytes += (uint64_t)self->columns * sizeof(GPUCell);
     }
+    return bytes;
 }
 
 static bool
