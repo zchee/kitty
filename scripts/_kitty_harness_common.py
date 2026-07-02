@@ -252,6 +252,7 @@ def spawn_kitty(
     extra_kitty_opts: list[str] | None = None,
     stdout: Any = subprocess.DEVNULL,
     stderr: Any = subprocess.DEVNULL,
+    take_focus: bool = False,
 ) -> subprocess.Popen:
     """Launch a throwaway kitty OS window (--config NONE, quit-on-last-close)
     and return its Popen handle immediately (does not wait for exit). Caller
@@ -259,8 +260,17 @@ def spawn_kitty(
 
     argv_command, if given, runs as the foreground child (kitty's default
     shell otherwise). extra_kitty_opts are additional `-o key=value`
-    overrides (e.g. for the golden-image config matrix), appended after the
-    two mandatory ones.
+    overrides, appended after the mandatory ones (so they win on conflict).
+
+    By default the window does NOT steal focus / become the active window
+    (KITTY_NO_INITIAL_ACTIVATE=1): rapidly spawned/killed test windows staying
+    backgrounded avoids the activation-clustered spurious-live-resize quirk, and a
+    visible-but-inactive Metal window still renders on damage (verified — the
+    CAMetalDisplayLink is not activation-throttled). Pass take_focus=True for gates
+    that genuinely need active/key-window semantics (e.g. synthesized keyboard input).
+    Window size is pinned (initial_window_width/height + remember_window_size=no) for a
+    deterministic drawable across captures (kills the 701-vs-841px golden instability);
+    callers may override via extra_kitty_opts.
     """
     require_kitty_binary()
     argv = [
@@ -268,12 +278,17 @@ def spawn_kitty(
         "-c", "NONE",
         "-o", "macos_quit_when_last_window_closed=yes",
         "-o", "update_check_interval=0",
+        "-o", "remember_window_size=no",
+        "-o", "initial_window_width=100c",
+        "-o", "initial_window_height=30c",
     ]
     for opt in (extra_kitty_opts or []):
         argv += ["-o", opt]
     if argv_command:
         argv += ["--", *argv_command]
     run_env = _sanitized_env()
+    if not take_focus:
+        run_env["KITTY_NO_INITIAL_ACTIVATE"] = "1"
     if extra_env:
         run_env.update(extra_env)
     return subprocess.Popen(argv, env=run_env, stdout=stdout, stderr=stderr)

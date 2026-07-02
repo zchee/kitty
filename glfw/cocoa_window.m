@@ -3159,6 +3159,22 @@ void _glfwPlatformFocusWindow(_GLFWwindow* window)
         // unminiaturize first
         [window->ns.object deminiaturize:nil];
     }
+    // KITTY_NO_INITIAL_ACTIVATE (default OFF; env checked once): order the window
+    // WITHOUT activating the app or making it key, so a launched kitty does not steal
+    // focus / become the active window. Wave-4 test-harness knob (spawn_kitty) so
+    // rapidly spawned test windows stay backgrounded — a visible-but-inactive window
+    // still renders on damage (verified: the CAMetalDisplayLink is not
+    // activation-throttled). When UNSET this is a strict no-op: behavior is byte-for-byte
+    // the activateIgnoringOtherApps + makeKeyAndOrderFront path below, unchanged.
+    static int no_activate = -1;
+    if (no_activate < 0) {
+        const char *v = getenv("KITTY_NO_INITIAL_ACTIVATE");
+        no_activate = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    if (no_activate) {
+        [window->ns.object orderFront:nil];
+        return;
+    }
     if ([window->ns.object canBecomeKeyWindow]) {
         // Make us the active application
         [NSApp activateIgnoringOtherApps:YES];
