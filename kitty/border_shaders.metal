@@ -10,6 +10,17 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// C1: set on the opaque path so the fragment encodes linear->sRGB itself (the
+// drawable is a plain BGRA8Unorm with no sRGB view). Unset on the layered path
+// (output stays linear in the working surface; the resolve draw encodes).
+constant bool SRGB_ENCODE_OUTPUT [[function_constant(0)]];
+
+inline float linear2srgb(float x) {
+    float lower = 12.92f * x;
+    float upper = 1.055f * pow(x, 1.0f / 2.4f) - 0.055f;
+    return mix(lower, upper, step(0.0031308f, x));
+}
+
 inline float zero_or_one(float x) { return step(1.0f, x); }
 inline float if_one_then(float cond, float t, float e) { return mix(e, t, cond); }
 inline float3 if_one_then(float cond, float3 t, float3 e) { return mix(e, t, cond); }
@@ -88,5 +99,12 @@ vertex BorderVertexOut border_vertex(
 }
 
 fragment float4 border_fragment(BorderVertexOut in [[stage_in]]) {
-    return in.color_premul;
+    float4 c = in.color_premul;
+    if (SRGB_ENCODE_OUTPUT) {
+        // Opaque borders draw with blend disabled, so encode the premultiplied
+        // channels 1:1 (matching a BGRA8Unorm_sRGB attachment write).
+        float3 lin = clamp(c.rgb, 0.0f, 1.0f);
+        c.rgb = float3(linear2srgb(lin.r), linear2srgb(lin.g), linear2srgb(lin.b));
+    }
+    return c;
 }

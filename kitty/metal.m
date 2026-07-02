@@ -84,6 +84,18 @@ metal_dump_frame_path(void) {
     return path;
 }
 
+// C4a: a frame must render to the readable offscreen (never the framebufferOnly
+// drawable, which cannot be read back) whenever it will be read this frame — the
+// KITTY_METAL_DUMP_FRAME golden harness, or a pending thumbnail screenshot
+// (take_screenshot_of_rectangular_region reads the "drawable" via
+// glCopyTexImage2D before present). In that mode no drawable is acquired and
+// nothing is presented; the reader gets the offscreen instead. Cleared once the
+// thumbnail is captured (kitty/child-monitor.c), so normal frames present as usual.
+static bool
+metal_capture_to_offscreen(void) {
+    return metal_dump_frame_path() != NULL || global_state.thumbnail_callback.os_window != 0;
+}
+
 // Metal global state
 static id<MTLDevice> mtl_device = nil;
 static id<MTLCommandQueue> mtl_command_queue = nil;
@@ -124,8 +136,21 @@ static bool framebuffer_srgb_enabled = false;
 // when FRAMEBUFFER_SRGB is enabled at clear time)
 static bool clear_srgb_flag = false;
 // Attachment state of the currently open encoder (kitty/metal-pipeline-design.md)
-static id<MTLTexture> mtl_current_srgb_view = nil;
 static MTLPixelFormat mtl_current_enc_fmt = MTLPixelFormatInvalid;
+
+// M1: single-pass layered rendering. Layered windows (transparency, bg image,
+// graphics, overlays, cursor trail) render into a MEMORYLESS RGBA16Unorm working
+// surface (color attachment 0, tile-memory only — never DRAM) using the existing
+// linear-premultiplied compositing draws, then a resolve draw reads that surface
+// via framebuffer fetch and writes the sRGB drawable (attachment 1), all in ONE
+// pass — replacing the old RGBA16 DRAM FBO + separate BLIT pass. RGBA16Unorm
+// matches the old FBO exactly so blending precision (issue #8953) is preserved.
+#define LAYERED_WORK_FMT MTLPixelFormatRGBA16Unorm      // att0: memoryless working surface
+#define LAYERED_DRAWABLE_FMT MTLPixelFormatBGRA8Unorm   // att1: drawable / dump target
+static bool layered_pass_active = false;                // inside a layered pass? (per window: saved with the slot)
+static id<MTLTexture> layered_work_surface = nil;       // memoryless att0, grown to the drawable size
+static NSUInteger layered_work_w = 0, layered_work_h = 0;
+static id<MTLRenderPipelineState> layers_resolve_pso = nil;  // built once
 
 // Active texture unit tracking. GL keeps an independent binding per
 // (unit, target) pair — upload paths freely bind GL_TEXTURE_2D on whatever
@@ -220,10 +245,11 @@ static int current_program = -1;
 typedef struct {
     id<MTLRenderPipelineState> pso;
     MTLPixelFormat fmt;
-    bool blend, in_use;
+    bool blend, layered, in_use;  // layered: M1 two-attachment (att0 work + att1 drawable) variant
 } PSOCacheEntry;
 static PSOCacheEntry pso_cache[NUM_PROGRAMS * PSO_VARIANTS_PER_PROGRAM];
-static id<MTLRenderPipelineState> build_pso(int program, bool blend, MTLPixelFormat fmt);
+static id<MTLRenderPipelineState> build_pso(int program, bool blend, MTLPixelFormat fmt, bool layered);
+static id<MTLRenderPipelineState> ensure_layers_resolve_pso(void);  // M1: att0->att1 resolve PSO
 
 // Drop the cell-program variants so the next pso_get rebuilds them with the
 // current cell_shader_opts (config change / live reload).
@@ -241,22 +267,22 @@ invalidate_cell_pipeline_states(void) {
 }
 
 static id<MTLRenderPipelineState>
-pso_get(int program, bool blend, MTLPixelFormat fmt) {
+pso_get(int program, bool blend, MTLPixelFormat fmt, bool layered) {
     if (program < 0 || program >= NUM_PROGRAMS) return nil;
     size_t base = (size_t)program * PSO_VARIANTS_PER_PROGRAM;
     size_t free_slot = SIZE_MAX;
     for (size_t i = base; i < base + PSO_VARIANTS_PER_PROGRAM; i++) {
         if (pso_cache[i].in_use) {
-            if (pso_cache[i].blend == blend && pso_cache[i].fmt == fmt) return pso_cache[i].pso;
+            if (pso_cache[i].blend == blend && pso_cache[i].fmt == fmt && pso_cache[i].layered == layered) return pso_cache[i].pso;
         } else if (free_slot == SIZE_MAX) free_slot = i;
     }
     if (free_slot == SIZE_MAX) {
         log_error("Metal: pipeline state cache overflow for program %d", program);
         return nil;
     }
-    id<MTLRenderPipelineState> pso = build_pso(program, blend, fmt);
+    id<MTLRenderPipelineState> pso = build_pso(program, blend, fmt, layered);
     if (!pso) return nil;
-    pso_cache[free_slot] = (PSOCacheEntry){.pso = pso, .fmt = fmt, .blend = blend, .in_use = true};
+    pso_cache[free_slot] = (PSOCacheEntry){.pso = pso, .fmt = fmt, .blend = blend, .layered = layered, .in_use = true};
     return pso;
 }
 
@@ -264,7 +290,7 @@ pso_get(int program, bool blend, MTLPixelFormat fmt) {
 static id<MTLRenderPipelineState>
 create_pipeline_state(NSString *vertex_fn, NSString *fragment_fn, bool enable_blend,
                       MTLVertexDescriptor *vertex_desc, MTLPixelFormat pixel_format,
-                      MTLFunctionConstantValues *constants) {
+                      bool layered, MTLFunctionConstantValues *constants) {
     if (!mtl_default_library) return nil;
     NSError *error = nil;
 
@@ -290,6 +316,13 @@ create_pipeline_state(NSString *vertex_fn, NSString *fragment_fn, bool enable_bl
     desc.vertexFunction = vert;
     desc.fragmentFunction = frag;
     desc.colorAttachments[0].pixelFormat = pixel_format;
+    if (layered) {
+        // M1: two-attachment layered pass. att1 is the drawable, written only by
+        // the resolve draw (its own PSO), so every compositing PSO masks it out
+        // (it still writes att0 = the RGBA16Unorm working surface).
+        desc.colorAttachments[1].pixelFormat = LAYERED_DRAWABLE_FMT;
+        desc.colorAttachments[1].writeMask = MTLColorWriteMaskNone;
+    }
     if (vertex_desc) desc.vertexDescriptor = vertex_desc;
 
     if (enable_blend) {
@@ -344,7 +377,7 @@ cell_vertex_descriptor(void) {
 // GRAPHICS_ALPHA_MASK=7, BGIMAGE=8, TINT=9, TRAIL=10, BLIT=11,
 // SCREENSHOT=12, ROUNDED_RECT=13.
 static id<MTLRenderPipelineState>
-build_pso(int program, bool blend, MTLPixelFormat fmt) {
+build_pso(int program, bool blend, MTLPixelFormat fmt, bool layered) {
     if (!mtl_default_library) return nil;
     switch (program) {
         case 0: case 1: case 2: {
@@ -357,23 +390,30 @@ build_pso(int program, bool blend, MTLPixelFormat fmt) {
             [fc setConstantValue:&cell_shader_opts.fg_override_algo type:MTLDataTypeInt atIndex:3]; // FG_OVERRIDE_ALGO
             [fc setConstantValue:&cell_shader_opts.fg_override_threshold type:MTLDataTypeFloat atIndex:4]; // FG_OVERRIDE_THRESHOLD
             [fc setConstantValue:&cell_shader_opts.text_new_gamma type:MTLDataTypeBool atIndex:5]; // TEXT_NEW_GAMMA
-            return create_pipeline_state(@"cell_vertex", @"cell_fragment", blend, cell_vertex_descriptor(), fmt, fc);
+            bool cell_srgb_encode = !layered; // C1: opaque path (drawable) encodes sRGB in-shader
+            [fc setConstantValue:&cell_srgb_encode type:MTLDataTypeBool atIndex:6]; // SRGB_ENCODE_OUTPUT
+            return create_pipeline_state(@"cell_vertex", @"cell_fragment", blend, cell_vertex_descriptor(), fmt, layered, fc);
         }
-        case 4: return create_pipeline_state(@"border_vertex", @"border_fragment", blend, nil, fmt, nil);
+        case 4: {
+            MTLFunctionConstantValues *fc = [[MTLFunctionConstantValues alloc] init];
+            bool border_srgb_encode = !layered; // C1: opaque borders encode sRGB in-shader
+            [fc setConstantValue:&border_srgb_encode type:MTLDataTypeBool atIndex:0]; // SRGB_ENCODE_OUTPUT
+            return create_pipeline_state(@"border_vertex", @"border_fragment", blend, nil, fmt, layered, fc);
+        }
         case 5: case 6: case 7: {
             MTLFunctionConstantValues *fc = [[MTLFunctionConstantValues alloc] init];
             bool is_alpha_mask = (program == 7);
             bool is_premult = (program == 6);
             [fc setConstantValue:&is_alpha_mask type:MTLDataTypeBool atIndex:0];
             [fc setConstantValue:&is_premult type:MTLDataTypeBool atIndex:1];
-            return create_pipeline_state(@"graphics_vertex", @"graphics_fragment", blend, nil, fmt, fc);
+            return create_pipeline_state(@"graphics_vertex", @"graphics_fragment", blend, nil, fmt, layered, fc);
         }
-        case 8: return create_pipeline_state(@"bgimage_vertex", @"bgimage_fragment", blend, nil, fmt, nil);
-        case 9: return create_pipeline_state(@"tint_vertex", @"tint_fragment", blend, nil, fmt, nil);
-        case 10: return create_pipeline_state(@"trail_vertex", @"trail_fragment", blend, nil, fmt, nil);
-        case 11: return create_pipeline_state(@"blit_vertex", @"blit_fragment", blend, nil, fmt, nil);
-        case 12: return create_pipeline_state(@"screenshot_vertex", @"screenshot_fragment", blend, nil, fmt, nil);
-        case 13: return create_pipeline_state(@"rounded_rect_vertex", @"rounded_rect_fragment", blend, nil, fmt, nil);
+        case 8: return create_pipeline_state(@"bgimage_vertex", @"bgimage_fragment", blend, nil, fmt, layered, nil);
+        case 9: return create_pipeline_state(@"tint_vertex", @"tint_fragment", blend, nil, fmt, layered, nil);
+        case 10: return create_pipeline_state(@"trail_vertex", @"trail_fragment", blend, nil, fmt, layered, nil);
+        case 11: return create_pipeline_state(@"blit_vertex", @"blit_fragment", blend, nil, fmt, layered, nil);
+        case 12: return create_pipeline_state(@"screenshot_vertex", @"screenshot_fragment", blend, nil, fmt, layered, nil);
+        case 13: return create_pipeline_state(@"rounded_rect_vertex", @"rounded_rect_fragment", blend, nil, fmt, layered, nil);
         default: return nil; // 3 == CELL_PROGRAM_SENTINEL, never drawn
     }
 }
@@ -383,15 +423,25 @@ build_pso(int program, bool blend, MTLPixelFormat fmt) {
 static void
 create_all_pipeline_states(void) {
     if (!mtl_default_library) return;
-    const MTLPixelFormat fmts[2] = { MTLPixelFormatBGRA8Unorm, MTLPixelFormatBGRA8Unorm_sRGB };
     int count = 0;
+    // C1: the drawable is now a single format — plain BGRA8Unorm. sRGB is encoded
+    // in-shader (opaque cells/borders) or in the resolve (layered), so the
+    // BGRA8Unorm_sRGB drawable-view variant is gone.
     for (int p = 0; p < NUM_PROGRAMS; p++) {
         if (p == 3) continue; // CELL_PROGRAM_SENTINEL
-        for (int f = 0; f < 2; f++) {
-            if (pso_get(p, false, fmts[f])) count++;
-            if (pso_get(p, true, fmts[f])) count++;
-        }
+        if (pso_get(p, false, MTLPixelFormatBGRA8Unorm, false)) count++;
+        if (pso_get(p, true, MTLPixelFormatBGRA8Unorm, false)) count++;
     }
+    // M1: pre-warm the layered two-attachment variants (att0 = RGBA16Unorm working
+    // surface + att1 = drawable) for the programs that draw in the layered pass, so
+    // MSL/PSO errors surface at startup and the first layered frame does not hitch.
+    // BLIT (11, replaced by the native resolve) and SCREENSHOT (12) are never layered.
+    for (int p = 0; p < NUM_PROGRAMS; p++) {
+        if (p == 3 || p == 11 || p == 12) continue;
+        if (pso_get(p, false, LAYERED_WORK_FMT, true)) count++;
+        if (pso_get(p, true, LAYERED_WORK_FMT, true)) count++;
+    }
+    if (ensure_layers_resolve_pso()) count++;
     if (global_state.debug_rendering) {
         NSLog(@"[Metal] Pre-warmed %d pipeline states", count);
     }
@@ -969,7 +1019,7 @@ gl_init(void) {
         log_error("[Metal] Initialized device: %s, library: %s, pipelines: %d",
             mtl_device ? [mtl_device.name UTF8String] : "nil",
             mtl_default_library ? "loaded" : "MISSING",
-            pso_get(0, false, MTLPixelFormatBGRA8Unorm) ? NUM_PROGRAMS : 0);
+            pso_get(0, false, MTLPixelFormatBGRA8Unorm, false) ? NUM_PROGRAMS : 0);
     }
 }
 
@@ -1133,7 +1183,7 @@ draw_quad(bool blend, unsigned instance_count) {
 
     // Bind the pipeline state for (program, blend, current attachment format)
     if (current_program < 0 || current_program >= NUM_PROGRAMS) return;
-    id<MTLRenderPipelineState> pso = pso_get(current_program, blend, mtl_current_enc_fmt);
+    id<MTLRenderPipelineState> pso = pso_get(current_program, blend, mtl_current_enc_fmt, layered_pass_active);
     if (!pso) return;
     [mtl_current_encoder setRenderPipelineState:pso];
 
@@ -1455,7 +1505,6 @@ typedef struct {
     void *layer_ptr;
     id<MTLCommandBuffer> cb;
     id<CAMetalDrawable> drawable;
-    id<MTLTexture> drawable_srgb_view;
     id<MTLRenderCommandEncoder> enc;
     MTLPixelFormat enc_fmt;
     bool clear_pending, clear_srgb;
@@ -1464,6 +1513,7 @@ typedef struct {
     double frame_encode_start;  // Phase 0 (p99-fixed): CACurrentMediaTime after drawable acquired
     double frame_drawable_wait; // p99: seconds spent in nextDrawable this frame
     bool drawable_pass_opened;  // M3: first drawable pass seen this frame?
+    bool layered_pass_active;   // M1: mid single-pass layered render?
 } MetalWindowSlot;
 #define MAX_METAL_WINDOWS 64
 static MetalWindowSlot metal_windows[MAX_METAL_WINDOWS];
@@ -1475,7 +1525,6 @@ save_current_window_state(void) {
     if (!s) return;
     s->cb = mtl_current_command_buffer;
     s->drawable = mtl_current_drawable;
-    s->drawable_srgb_view = mtl_current_srgb_view;
     s->enc = mtl_current_encoder;
     s->enc_fmt = mtl_current_enc_fmt;
     s->clear_pending = clear_pending;
@@ -1484,13 +1533,13 @@ save_current_window_state(void) {
     s->frame_encode_start = metal_frame_encode_start;
     s->frame_drawable_wait = metal_frame_drawable_wait;
     s->drawable_pass_opened = drawable_pass_opened;
+    s->layered_pass_active = layered_pass_active;
 }
 
 static void
 load_window_state(const MetalWindowSlot *s) {
     mtl_current_command_buffer = s->cb;
     mtl_current_drawable = s->drawable;
-    mtl_current_srgb_view = s->drawable_srgb_view;
     mtl_current_encoder = s->enc;
     mtl_current_enc_fmt = s->enc_fmt;
     clear_pending = s->clear_pending;
@@ -1499,6 +1548,7 @@ load_window_state(const MetalWindowSlot *s) {
     metal_frame_encode_start = s->frame_encode_start;
     metal_frame_drawable_wait = s->frame_drawable_wait;
     drawable_pass_opened = s->drawable_pass_opened;
+    layered_pass_active = s->layered_pass_active;
 }
 
 // Set the current CAMetalLayer for rendering. Called when the OS window is
@@ -1532,7 +1582,6 @@ metal_set_current_layer(void *layer) {
     } else {
         mtl_current_command_buffer = nil;
         mtl_current_drawable = nil;
-        mtl_current_srgb_view = nil;
         mtl_current_encoder = nil;
         mtl_current_enc_fmt = MTLPixelFormatInvalid;
         clear_pending = false;
@@ -1541,6 +1590,7 @@ metal_set_current_layer(void *layer) {
         metal_frame_encode_start = 0.0;
         metal_frame_drawable_wait = 0.0;
         drawable_pass_opened = false;
+        layered_pass_active = false;
     }
     mtl_current_layer = (__bridge CAMetalLayer *)layer;
 }
@@ -1621,25 +1671,13 @@ ensure_drawable(void) {
     return mtl_current_drawable != nil;
 }
 
-// sRGB view of the current drawable, for GL_FRAMEBUFFER_SRGB parity. sRGB
-// reinterpretation of the same base format does not require the
-// PixelFormatView usage flag. Owned (+1): released in metal_end_frame.
-static id<MTLTexture>
-current_drawable_srgb_view(void) {
-    if (!mtl_current_srgb_view && mtl_current_drawable) {
-        mtl_current_srgb_view = [mtl_current_drawable.texture newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB];
-    }
-    return mtl_current_srgb_view;
-}
-
 // C4a/e: persistent offscreen render target used only in KITTY_METAL_DUMP_FRAME
-// mode. It mirrors the drawable exactly (BGRA8Unorm base + an sRGB view for
-// GL_FRAMEBUFFER_SRGB parity), so the final frame lands here byte-identically
-// to how it would on the drawable — the harness then reads THIS readable
-// texture instead of drawable.texture, which lets the drawable be
+// mode. It mirrors the drawable exactly (plain BGRA8Unorm; C1: sRGB is encoded
+// in-shader, so no sRGB view is needed), so the final frame lands here
+// byte-identically to how it would on the drawable — the harness reads THIS
+// readable texture instead of drawable.texture, which lets the drawable be
 // framebufferOnly=YES. Not on any production path.
 static id<MTLTexture> dump_offscreen_base = nil;
-static id<MTLTexture> dump_offscreen_srgb = nil;
 static NSUInteger dump_offscreen_w = 0, dump_offscreen_h = 0;
 
 static bool
@@ -1653,33 +1691,143 @@ ensure_dump_offscreen(void) {
         } else return false;
     }
     if (dump_offscreen_base && dump_offscreen_w == w && dump_offscreen_h == h) return true;
-    [dump_offscreen_srgb release]; dump_offscreen_srgb = nil;
     [dump_offscreen_base release]; dump_offscreen_base = nil;
     MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
                                                                                     width:w height:h mipmapped:NO];
-    // ShaderRead so the layered blit path can also target it; PixelFormatView so
-    // the sRGB view is creatable on a standalone texture; Shared so the harness
-    // can getBytes it directly.
-    desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+    // RenderTarget so it can be the layered pass's att1 / the opaque drawable
+    // stand-in; Shared so the harness can getBytes it directly.
+    desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
     desc.storageMode = MTLStorageModeShared;
     dump_offscreen_base = [mtl_device newTextureWithDescriptor:desc];
     if (!dump_offscreen_base) return false;
-    dump_offscreen_srgb = [dump_offscreen_base newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB];
     dump_offscreen_w = w; dump_offscreen_h = h;
     return dump_offscreen_base != nil;
 }
 
 // The attachment format the next render pass must use, given the bound
-// framebuffer and the GL_FRAMEBUFFER_SRGB state. GL applies no sRGB write
-// conversion to linear attachments, so the flag is ignored for the FBO path.
+// framebuffer. C1: the drawable is a single plain BGRA8Unorm format — sRGB is
+// encoded in-shader (opaque cells/borders) or in the resolve draw (layered), so
+// GL_FRAMEBUFFER_SRGB no longer selects a drawable view.
 static MTLPixelFormat
 wanted_attachment_format(bool for_clear) {
+    (void)for_clear;
+    // M1: during a layered pass every compositing draw targets att0 (the working
+    // surface), so the encoder must never be torn down by a format mismatch.
+    if (layered_pass_active) return LAYERED_WORK_FMT;
     if (bound_framebuffer && bound_framebuffer < MAX_FRAMEBUFFERS &&
         framebuffers[bound_framebuffer].in_use && framebuffers[bound_framebuffer].render_target) {
         return framebuffers[bound_framebuffer].render_target.pixelFormat;
     }
-    bool want_srgb = for_clear ? clear_srgb_flag : framebuffer_srgb_enabled;
-    return want_srgb ? MTLPixelFormatBGRA8Unorm_sRGB : MTLPixelFormatBGRA8Unorm;
+    return MTLPixelFormatBGRA8Unorm;
+}
+
+// M1: the memoryless RGBA16Unorm working surface (att0), grown to the drawable
+// size. Memoryless => contents live only in tile memory during the pass, never
+// DRAM, so a resize just recreates a zero-cost descriptor (no allocs= impact —
+// that counter tracks MTLBuffer allocations only). Same RGBA16Unorm format as
+// the old DRAM layers FBO, so blending precision (#8953) is unchanged.
+static bool
+ensure_layered_work_surface(NSUInteger w, NSUInteger h) {
+    if (w < 1 || h < 1) return false;
+    if (layered_work_surface && layered_work_w == w && layered_work_h == h) return true;
+    [layered_work_surface release]; layered_work_surface = nil;
+    MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:LAYERED_WORK_FMT
+                                                                                    width:w height:h mipmapped:NO];
+    desc.usage = MTLTextureUsageRenderTarget;    // framebuffer-fetch read+write; never sampled
+    desc.storageMode = MTLStorageModeMemoryless; // tile memory only, never DRAM
+    layered_work_surface = [mtl_device newTextureWithDescriptor:desc];
+    if (!layered_work_surface) { layered_work_w = layered_work_h = 0; return false; }
+    layered_work_w = w; layered_work_h = h;
+    return true;
+}
+
+// M1: the resolve PSO (fullscreen; reads att0 via [[color(0)]], writes att1).
+// Built once; committed command buffers retain it.
+static id<MTLRenderPipelineState>
+ensure_layers_resolve_pso(void) {
+    if (layers_resolve_pso) return layers_resolve_pso;
+    if (!mtl_default_library) return nil;
+    NSError *error = nil;
+    id<MTLFunction> v = [mtl_default_library newFunctionWithName:@"layers_resolve_vertex"];
+    id<MTLFunction> f = [mtl_default_library newFunctionWithName:@"layers_resolve_fragment"];
+    if (!v || !f) { log_error("Metal: layers_resolve shader functions missing from metallib"); return nil; }
+    MTLRenderPipelineDescriptor *d = [[MTLRenderPipelineDescriptor alloc] init];
+    d.vertexFunction = v;
+    d.fragmentFunction = f;
+    d.colorAttachments[0].pixelFormat = LAYERED_WORK_FMT;      // att0: read + passthrough (discarded)
+    d.colorAttachments[1].pixelFormat = LAYERED_DRAWABLE_FMT;  // att1: the drawable
+    layers_resolve_pso = [mtl_device newRenderPipelineStateWithDescriptor:d error:&error];
+    if (!layers_resolve_pso) log_error("Metal: failed to build layers resolve PSO: %s",
+            error ? [[error localizedDescription] UTF8String] : "unknown");
+    return layers_resolve_pso;
+}
+
+// M1: open the single layered render pass. att0 = memoryless RGBA16Unorm working
+// surface (cleared to transparent, mirroring clear_current_framebuffer on the old
+// FBO), att1 = the drawable (or golden-dump offscreen). All subsequent layered
+// compositing draws render linear-premultiplied into att0 via the existing
+// shaders; metal_resolve_layered_frame() finishes the pass. Replaces the GL FBO
+// setup in start_os_window_rendering on the Metal backend.
+void
+metal_begin_layered_frame(void) {
+    if (!mtl_current_layer) return;
+    end_current_encoder();
+    if (!ensure_command_buffer()) return;
+
+    id<MTLTexture> att1 = nil;
+    if (metal_capture_to_offscreen()) {
+        // Capture mode (golden dump or pending thumbnail): resolve into the
+        // readable offscreen (plain BGRA8Unorm, sRGB encoded in-shader) instead of
+        // the drawable — no drawable acquired.
+        if (!ensure_dump_offscreen()) return;
+        att1 = dump_offscreen_base;
+    } else {
+        if (!ensure_drawable()) return;
+        att1 = mtl_current_drawable.texture;  // plain BGRA8Unorm base
+    }
+    if (!att1) return;
+    if (!ensure_layered_work_surface(att1.width, att1.height)) return;
+
+    MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+    rpd.colorAttachments[0].texture = layered_work_surface;
+    rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
+    rpd.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+    rpd.colorAttachments[0].storeAction = MTLStoreActionDontCare;  // tile-only
+    rpd.colorAttachments[1].texture = att1;
+    // First drawable pass this frame => DontCare (the resolve overwrites 100%);
+    // if an earlier pass wrote the drawable (live-resize blank) => Load to keep it.
+    rpd.colorAttachments[1].loadAction = drawable_pass_opened ? MTLLoadActionLoad : MTLLoadActionDontCare;
+    rpd.colorAttachments[1].storeAction = MTLStoreActionStore;
+    mtl_current_render_pass = rpd;
+
+    mtl_current_encoder = [mtl_current_command_buffer renderCommandEncoderWithDescriptor:rpd];
+    if (!mtl_current_encoder) return;
+    mtl_current_enc_fmt = LAYERED_WORK_FMT;  // draw_quad picks the layered (2-attachment) PSOs
+    layered_pass_active = true;
+    drawable_pass_opened = true;
+    metal_pass_count++;  // the whole layered frame is this one encoder (acceptance criterion 2)
+}
+
+// M1: resolve the working surface (att0) onto the drawable (att1) in-shader and
+// end the layered pass. Replaces the separate BLIT pass in stop_os_window_
+// rendering on the Metal backend; the drawable is stored, the memoryless working
+// surface discarded. Safe to call when no layered pass is active (no-op).
+void
+metal_resolve_layered_frame(void) {
+    if (!layered_pass_active) return;
+    if (mtl_current_encoder) {
+        id<MTLRenderPipelineState> pso = ensure_layers_resolve_pso();
+        if (pso) {
+            MTLViewport full = {0, 0, (double)layered_work_w, (double)layered_work_h, 0, 1};
+            MTLScissorRect fullsr = {0, 0, layered_work_w, layered_work_h};
+            [mtl_current_encoder setViewport:full];
+            [mtl_current_encoder setScissorRect:fullsr];
+            [mtl_current_encoder setRenderPipelineState:pso];
+            [mtl_current_encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        }
+    }
+    end_current_encoder();          // stores att1 (drawable); att0 (memoryless) discarded
+    layered_pass_active = false;
 }
 
 static id<MTLRenderCommandEncoder>
@@ -1695,19 +1843,18 @@ begin_render_pass_to_drawable(bool clear) {
     if (bound_framebuffer && bound_framebuffer < MAX_FRAMEBUFFERS &&
         framebuffers[bound_framebuffer].in_use && framebuffers[bound_framebuffer].render_target) {
         target_texture = framebuffers[bound_framebuffer].render_target;
-    } else if (metal_dump_frame_path()) {
-        // Golden-dump mode: render the drawable-bound content to the readable
-        // offscreen instead. No drawable is acquired (harness reads the
-        // offscreen and does not present). Same BGRA8 base + sRGB view as the
-        // drawable, so the final bytes are identical.
+    } else if (metal_capture_to_offscreen()) {
+        // Capture mode (golden dump or pending thumbnail): render the
+        // drawable-bound content to the readable offscreen instead. No drawable
+        // is acquired (the reader takes the offscreen; nothing is presented). C1:
+        // plain BGRA8Unorm (sRGB encoded in-shader), so the bytes match the
+        // drawable exactly.
         if (!ensure_dump_offscreen()) return nil;
-        bool want_srgb = clear ? clear_srgb_flag : framebuffer_srgb_enabled;
-        target_texture = want_srgb ? dump_offscreen_srgb : dump_offscreen_base;
+        target_texture = dump_offscreen_base;
         targeting_drawable = true;
     } else {
         if (!ensure_drawable()) return nil;
-        bool want_srgb = clear ? clear_srgb_flag : framebuffer_srgb_enabled;
-        target_texture = want_srgb ? current_drawable_srgb_view() : mtl_current_drawable.texture;
+        target_texture = mtl_current_drawable.texture;  // plain BGRA8Unorm; sRGB in-shader
         targeting_drawable = true;
     }
     if (!target_texture) return nil;
@@ -1880,10 +2027,6 @@ metal_end_frame(void) {
         mtl_current_command_buffer = nil;
         mtl_current_drawable = nil;
     }
-    if (mtl_current_srgb_view) {
-        [mtl_current_srgb_view release];
-        mtl_current_srgb_view = nil;
-    }
     mtl_current_render_pass = nil;
     clear_pending = false;
     metal_pass_count = 0;         // Phase 0: reset for the next frame (per current window)
@@ -1892,6 +2035,7 @@ metal_end_frame(void) {
     metal_frame_alloc_count = 0;  // D1: reset per-frame ring allocation counter
     metal_frame_bytes_uploaded = 0; // D2: reset per-frame upload-bytes counter
     drawable_pass_opened = false; // M3: next frame's first drawable pass discards again
+    layered_pass_active = false;  // M1: defensive — resolve normally clears it
 }
 
 // ----- GL Compatibility Functions (metal_gl_*) -----
@@ -2257,6 +2401,8 @@ void metal_gl_copy_tex_image_2d(GLenum target, int level, GLenum internalformat,
     id<MTLTexture> source = nil;
     if (bound_framebuffer && bound_framebuffer < MAX_FRAMEBUFFERS && framebuffers[bound_framebuffer].render_target) {
         source = framebuffers[bound_framebuffer].render_target;
+    } else if (metal_capture_to_offscreen() && dump_offscreen_base) {
+        source = dump_offscreen_base;  // C4a: framebufferOnly drawable is unreadable; the frame rendered here
     } else if (mtl_current_drawable) {
         source = mtl_current_drawable.texture;
     }
@@ -2373,6 +2519,8 @@ void metal_gl_read_pixels(int x, int y, int width, int height, GLenum format, GL
     id<MTLTexture> source = nil;
     if (bound_framebuffer && bound_framebuffer < MAX_FRAMEBUFFERS && framebuffers[bound_framebuffer].render_target) {
         source = framebuffers[bound_framebuffer].render_target;
+    } else if (metal_capture_to_offscreen() && dump_offscreen_base) {
+        source = dump_offscreen_base;  // C4a: framebufferOnly drawable is unreadable; the frame rendered here
     } else if (mtl_current_drawable) {
         source = mtl_current_drawable.texture;
     }
