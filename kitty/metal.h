@@ -205,6 +205,18 @@ void metal_end_frame(void);
 void metal_set_current_layer(void *layer);
 void* metal_get_device(void);
 
+// M1: single-pass layered rendering. metal_begin_layered_frame opens ONE render
+// pass whose color attachment 0 is a memoryless RGBA16Unorm working surface
+// (tile-only, never DRAM) and attachment 1 is the drawable; all subsequent
+// layered compositing draws render linear-premultiplied into att0 through the
+// existing shaders/blend. metal_resolve_layered_frame issues the in-pass resolve
+// (att0 -> att1: unpremultiply, linear->sRGB, premultiply) and ends the pass,
+// replacing the old RGBA16 DRAM FBO + separate BLIT pass. Called only from the
+// KITTY_BACKEND_METAL branch of start/stop_os_window_rendering; the GL backend
+// keeps the FBO+blit path.
+void metal_begin_layered_frame(void);
+void metal_resolve_layered_frame(void);
+
 // Stub GL functions called directly in shaders.c — these become no-ops or
 // map to Metal equivalents in metal.m
 // Note: glUniform* calls are used extensively in shaders.c; in Metal these

@@ -31,42 +31,61 @@ unmodified code (`kitty/shaders.c`, `kitty/gl.h` API).
 | Draws accumulate into the bound framebuffer | Encoder-per-(target,view-kind); `MTLLoadActionLoad`, `MTLStoreActionStore` |
 | `glClear` | Deferred: recorded with the *current* clear color and sRGB flag; applied as `MTLLoadActionClear` on the next encoder for that target |
 | `glBindFramebuffer` switch | Ends the current encoder; next draw opens an encoder on the new target |
-| `GL_FRAMEBUFFER_SRGB` toggle between draws | Ends the current encoder; next encoder targets the other view kind (see below) |
+| `GL_FRAMEBUFFER_SRGB` toggle between draws | No-op on the drawable (single `BGRA8Unorm` format; sRGB is encoded in-shader — C1). The toggle only ends the encoder on a real target/format change. |
 
 An encoder is (re)created only when: no encoder is open, the render target
-changed, or the required view kind changed. Within a target+kind run, draws
+changed, or the required attachment format changed. Within such a run, draws
 share one encoder.
 
-## sRGB strategy (GL_FRAMEBUFFER_SRGB parity)
+## sRGB strategy (C1: single format, sRGB encoded in-shader)
 
-OpenGL converts linear shader outputs to sRGB on write only when the
-attachment has an sRGB format AND `GL_FRAMEBUFFER_SRGB` is enabled. kitty
-toggles the flag per draw (`kitty/shaders.c` around the cell and border draws)
-and leaves it off for image/bgimage/blit output.
+OpenGL converts linear shader outputs to sRGB on write only when the attachment
+has an sRGB format AND `GL_FRAMEBUFFER_SRGB` is enabled. kitty toggles the flag
+around the cell/border final-output draws and leaves it off elsewhere. The Metal
+backend reproduces this by encoding sRGB in the shaders, not with a drawable view:
 
-Metal implementation:
-
-- `CAMetalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm` (non-sRGB base).
-- Each drawable lazily gets an sRGB **texture view**
-  (`newTextureViewWithPixelFormat: MTLPixelFormatBGRA8Unorm_sRGB`). sRGB/linear
-  views of the same base format do not require `MTLTextureUsagePixelFormatView`.
-- Flag ON → encoder targets the sRGB view (GPU converts on write, like GL).
-  Flag OFF → encoder targets the base texture (raw writes, like GL).
-- Deferred clears capture the flag at `glClear` time and force the applying
-  encoder to that view kind, so clear colors round-trip exactly like GL.
-- Offscreen (“FBO”) targets are linear `MTLPixelFormatRGBA16Unorm`; GL performs
-  no sRGB conversion for non-sRGB attachments regardless of the flag, so the
-  flag is ignored for FBO passes.
+- `CAMetalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm` (plain, non-sRGB) and
+  `framebufferOnly = YES`. There is exactly ONE drawable format; **no sRGB
+  texture view of the drawable is ever created** — that per-frame view creation
+  was precisely what forbade `framebufferOnly = YES` (Wave-1 finding), so
+  deleting it (C1) is what unblocks the compression win (C4a).
+- **Opaque path** (cells/borders drawn straight to the drawable): the cell and
+  border fragments encode linear→sRGB on their premultiplied output when the
+  `SRGB_ENCODE_OUTPUT` function constant is set (`build_pso` sets it `= !layered`).
+  These draws have blending disabled, so the encoded channels are written 1:1 —
+  exactly what a `BGRA8Unorm_sRGB` attachment would do on write.
+- **Layered path**: compositing draws output linear into the RGBA16Unorm working
+  surface (`SRGB_ENCODE_OUTPUT` unset); the resolve draw encodes (see
+  “Single-pass layered rendering”).
+- The `GL_FRAMEBUFFER_SRGB` toggles in `kitty/shaders.c` are compiled out on the
+  Metal backend (`#ifndef KITTY_BACKEND_METAL`); the shim still tracks the flag as
+  vestigial GL state but no longer selects any drawable format from it.
+- Offscreen (“FBO”) targets stay linear `MTLPixelFormatRGBA16Unorm`; the flag is
+  irrelevant there. The screenshot path uses a real `RGBA16Unorm` render-target
+  texture, and read-back (screenshot / golden dump) renders to a readable
+  offscreen instead of the framebufferOnly drawable (`metal_capture_to_offscreen`).
+- **Precision**: in-shader `linear2srgb` (fp32) matches the hardware sRGB ROP to
+  within ≤1 LSB — measured ≤1 LSB on ~0.06% of opaque pixels, all at dark
+  antialiased-text edges (sRGB-quantization rounding, not a curve difference).
+  This also unifies the sRGB encode across the opaque and layered paths (the
+  layered path already encoded in-shader, byte-identically to base).
 
 ## Pipeline-state cache
 
-PSOs are cached by key `(program, blend, attachment format)` and built lazily.
-Formats in play: `BGRA8Unorm`, `BGRA8Unorm_sRGB` (drawable views) and
-`RGBA16Unorm` (layer FBO). Blend state mirrors `set_blending`
-(premultiplied `ONE, ONE_MINUS_SRC_ALPHA`; disabled = opaque write). A PSO’s
-`colorAttachments[0].pixelFormat` always equals the encoder’s target view
-format — mismatches are a Metal validation error and were the prior
-implementation’s layered-path black screen (triage defect D1).
+PSOs are cached by key `(program, blend, attachment format, layered)` and built
+lazily. Formats in play: `BGRA8Unorm` (the single drawable format — C1 removed the
+`BGRA8Unorm_sRGB` drawable-view variant) and `RGBA16Unorm` (the single-pass
+layered working surface, M1 below). Blend state
+mirrors `set_blending` (premultiplied `ONE, ONE_MINUS_SRC_ALPHA`; disabled =
+opaque write). A PSO’s `colorAttachments[0].pixelFormat` always equals the
+encoder’s target view format — mismatches are a Metal validation error and were
+the prior implementation’s layered-path black screen (triage defect D1). The
+`layered` key bit selects the **two-attachment** variant used inside the M1
+single layered pass: `colorAttachments[0]` = the `RGBA16Unorm` working surface
+(the program’s real output), `colorAttachments[1]` = the drawable
+(`BGRA8Unorm`) with `writeMask = None` (only the resolve draw writes it). All
+compositing programs run through this variant during a layered frame; the
+resolve draw uses its own dedicated PSO (`layers_resolve_vertex/fragment`).
 
 ## Texture format map (GL internalformat → MTLPixelFormat)
 
@@ -204,6 +223,57 @@ blocking (~60 ms observed under plain typing) was therefore silently counted as
 
 Not touched here: the encode path itself (never slow) and `maximumDrawableCount`
 (a Phase-4 decision).
+
+## Single-pass layered rendering (Phase 3 / M1)
+
+Layered OS windows — `background_opacity < 1`, background image, graphics,
+UI overlays, and the cursor trail (`kitty/child-monitor.c` `needs_layers`) —
+previously rendered the whole window into a shared **RGBA16Unorm DRAM FBO**
+(`layers_render_texture`) and then ran a second **BLIT pass** to sRGB-encode it
+onto the drawable: 2 render passes and a full-screen RGBA16 store + re-read
+(~123 MB/frame @ 3456×2234). On the Metal backend this is collapsed to **one
+on-drawable pass** with an on-tile working surface; the opaque path (already one
+pass) is unchanged.
+
+- **Two-attachment pass.** `metal_begin_layered_frame()` (called from the
+  `KITTY_BACKEND_METAL` branch of `start_os_window_rendering`, replacing the GL
+  FBO setup) opens a single render pass with:
+  - `colorAttachments[0]` = a **memoryless** `RGBA16Unorm` working surface
+    (`StorageModeMemoryless`, `loadAction=Clear` to transparent — mirroring the
+    old `clear_current_framebuffer()` — `storeAction=DontCare`). Memoryless means
+    the surface lives only in tile memory for the duration of the pass and never
+    touches DRAM, so it is created lazily, cached, grown to the drawable size,
+    and costs no `MTLBuffer` allocation (the `allocs=` stat is unaffected).
+  - `colorAttachments[1]` = the drawable (or the golden-dump offscreen in
+    `KITTY_METAL_DUMP_FRAME` mode), `storeAction=Store`; `loadAction=DontCare`
+    on the first drawable pass (M3), else `Load`.
+- **Compositing draws are unchanged.** Every layered draw (bg image, cells with
+  `for_final_output=false`, graphics, borders, trail, overlays) renders
+  linear-premultiplied into att0 through the **existing** shaders and the
+  **existing** hardware premultiplied blend (`ONE, ONE_MINUS_SRC_ALPHA`) — exactly
+  as it rendered into the RGBA16Unorm DRAM FBO before. `wanted_attachment_format`
+  returns the working-surface format for the whole pass so the encoder is never
+  torn down by a `GL_FRAMEBUFFER_SRGB` toggle, and `draw_quad` selects the
+  `layered` two-attachment PSO variant (att1 masked out).
+- **In-pass resolve replaces the BLIT.** `metal_resolve_layered_frame()` (called
+  from `stop_os_window_rendering`) issues one fullscreen draw with a dedicated PSO
+  (`layers_resolve_vertex` / `layers_resolve_fragment`) that reads att0 via
+  framebuffer fetch (`float4 [[color(0)]]`), performs the *same* unpremultiply →
+  `linear2srgb_v` → premultiply the old `blit_fragment` did, and writes att1; then
+  ends the pass. att0 is discarded (memoryless), att1 (drawable) is stored.
+- **Precision.** The working surface is `RGBA16Unorm`, identical to the old DRAM
+  FBO, so linear-blend precision (issue #8953) is preserved *exactly*: golden
+  A/B vs the pre-M1 base is **byte-identical for every config** (opaque,
+  `background_opacity 0.85`, bgimage, cursor_trail), so the #8953
+  dark-AA-text-over-translucent case cannot band differently than base.
+- **Platform.** Framebuffer fetch (`[[color(n)]]`) + memoryless render targets
+  are Apple-GPU features, empirically verified on this machine
+  (`[device supportsFamily:MTLGPUFamilyApple7]`, day-0 spike). The GL backend
+  keeps the FBO + BLIT path verbatim under `#ifndef KITTY_BACKEND_METAL`.
+- **Result.** `passes=1` for ALL configs including transparent / bgimage / trail
+  (was 2 for layered); the RGBA16 DRAM round trip is eliminated. Validated clean
+  under `MTL_DEBUG_LAYER=1` + `MTL_SHADER_VALIDATION=1` in both drawable and
+  offscreen-dump modes.
 
 ## Known deviations (tracked, intentional)
 

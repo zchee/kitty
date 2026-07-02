@@ -88,10 +88,19 @@ bool _glfwCreateContextMetal(_GLFWwindow* window)
 
     // Configure the layer
     layer.device = (id<MTLDevice>)_glfw.metal.device;
-    // Non-sRGB base format: GL_FRAMEBUFFER_SRGB parity is implemented with an
-    // sRGB texture view of the drawable, selected per render pass in metal.m.
+    // Plain (non-sRGB) BGRA8Unorm base. C1: sRGB is now encoded in-shader — the
+    // opaque cell/border fragments via the SRGB_ENCODE_OUTPUT function constant,
+    // and layered content in the single-pass resolve draw (kitty/metal.m) — so
+    // no per-frame sRGB texture view of the drawable is created any more.
     layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
-    layer.framebufferOnly = NO;  // Allow read-back for screenshots
+    // C4a: framebufferOnly=YES lets Core Animation optimize the drawable for
+    // display (lossless framebuffer compression). Safe now that nothing creates a
+    // texture view of the drawable (that per-frame view creation was the Wave-1
+    // blocker that forced this to NO). Read-back paths — the KITTY_METAL_DUMP_FRAME
+    // golden harness and take_screenshot_of_rectangular_region — render to a
+    // readable offscreen instead (metal_capture_to_offscreen in metal.m), never
+    // the drawable.
+    layer.framebufferOnly = YES;
     layer.presentsWithTransaction = NO;
     // CAMetalLayer.maximumDrawableCount accepts only 2 or 3 (any other value
     // raises an exception, Apple docs); default is 3. Two trades one frame of

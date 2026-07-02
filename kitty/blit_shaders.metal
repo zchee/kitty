@@ -162,3 +162,36 @@ fragment float4 screenshot_fragment(
     float3 srgb_color = linear2srgb_v(avg_linear);
     return float4(srgb_color, avg_alpha);
 }
+
+// ---- Layers resolve (M1: single-pass layered rendering) ----
+// The Metal backend renders layered windows (transparency, bg image, graphics,
+// overlays, cursor trail) into a MEMORYLESS RGBA16Unorm working surface (color
+// attachment 0, tile-memory only — never DRAM) using the existing linear-space
+// premultiplied-blend draws, then this resolve draw reads that surface via
+// framebuffer fetch ([[color(0)]]) and writes the final sRGB drawable (color
+// attachment 1) — all in ONE render pass. It performs exactly the same
+// linear->sRGB premultiplied conversion the old BLIT pass did (blit_fragment),
+// but reads the tile surface directly instead of sampling a DRAM texture, so
+// the ~123 MB/frame RGBA16 round trip and the second pass are eliminated. The
+// att0 value is written back unchanged so both attachments have a defined write
+// (att0 is storeAction=DontCare, so the write is discarded). Apple-GPU only.
+struct LayersResolveOut {
+    float4 work [[color(0)]];   // working surface, passthrough (discarded)
+    float4 drawable [[color(1)]];
+};
+
+vertex float4 layers_resolve_vertex(uint vid [[vertex_id]]) {
+    // Fullscreen triangle covering the whole attachment; no vertex buffer.
+    float2 pos[3] = { float2(-1.0f, -1.0f), float2(3.0f, -1.0f), float2(-1.0f, 3.0f) };
+    return float4(pos[vid], 0.0f, 1.0f);
+}
+
+fragment LayersResolveOut layers_resolve_fragment(float4 work [[color(0)]]) {
+    LayersResolveOut o;
+    o.work = work;
+    // work is linear premultiplied (same contents the RGBA16 layers FBO held).
+    float3 rgb = work.a > 0.0f ? work.rgb / work.a : float3(0.0f);
+    float3 srgb = linear2srgb_v(rgb);
+    o.drawable = float4(srgb * work.a, work.a);
+    return o;
+}

@@ -103,8 +103,13 @@ color_vec4(GLint location, color_type color, GLfloat alpha) {
 
 
 
+#ifndef KITTY_BACKEND_METAL
+// GL-only: the Metal backend clears its memoryless working surface via the
+// render pass loadAction in metal_begin_layered_frame (M1), so this shim helper
+// has no caller there.
 static void
 clear_current_framebuffer(void) { glClearColor(0, 0, 0, 0); glClear(GL_COLOR_BUFFER_BIT); }
+#endif
 
 SPRITE_MAP_HANDLE
 alloc_sprite_map(void) {
@@ -1411,9 +1416,17 @@ call_cell_program(int program, const UIRenderData *ui, ssize_t vao_idx, bool for
     bind_vao_uniform_buffer(vao_idx, uniform_buffer, CELL_RENDER_DATA_BINDING_POINT);
     bind_vao_uniform_buffer(vao_idx, color_table_buffer, COLOR_TABLE_BINDING_POINT);
     glUniform1ui(cell_program_layouts[program].uniforms.draw_bg_bitfield, draw_bg_bitfield);
+    // C1: on the Metal backend the drawable is a plain BGRA8Unorm and the cell
+    // fragment sRGB-encodes its output in-shader (SRGB_ENCODE_OUTPUT function
+    // constant, set for the opaque/drawable path), so GL_FRAMEBUFFER_SRGB is a
+    // no-op there. The GL backend keeps the sRGB framebuffer toggle.
+#ifndef KITTY_BACKEND_METAL
     if (for_final_output) glEnable(GL_FRAMEBUFFER_SRGB);
+#endif
     draw_quad(!for_final_output, render_lines_for_screen(ui->screen) * ui->screen->columns);
+#ifndef KITTY_BACKEND_METAL
     if (for_final_output) glDisable(GL_FRAMEBUFFER_SRGB);
+#endif
 }
 
 static void
@@ -1562,9 +1575,15 @@ draw_borders(ssize_t vao_idx, unsigned int num_border_rects, BorderRect *rect_bu
     };
     glUniform1uiv(border_program_layout.uniforms.colors, arraysz(colors), colors);
     glUniform1f(border_program_layout.uniforms.background_opacity, background_opacity);
+    // C1: Metal sRGB-encodes in the border fragment (SRGB_ENCODE_OUTPUT) for the
+    // opaque/drawable path, so the framebuffer toggle is a no-op there.
+#ifndef KITTY_BACKEND_METAL
     if (!w->needs_layers) glEnable(GL_FRAMEBUFFER_SRGB);
+#endif
     draw_quad(has_background_image, num_border_rects);
+#ifndef KITTY_BACKEND_METAL
     if (!w->needs_layers) glDisable(GL_FRAMEBUFFER_SRGB);
+#endif
     unbind_program(); unbind_vertex_array();
 }
 
@@ -1703,6 +1722,19 @@ start_os_window_rendering(OSWindow *os_window, Tab *tab) {
     // note that during live resize rendering is done in layers
     if (os_window->live_resize.in_progress) blank_os_window(os_window);
     if (os_window->needs_layers) {
+#ifdef KITTY_BACKEND_METAL
+        // M1: single-pass layered rendering. Open ONE render pass whose color
+        // attachment 0 is a memoryless RGBA16Unorm working surface and attachment
+        // 1 is the drawable; the bg image and all subsequent layered draws
+        // composite linear-premultiplied into att0. metal_resolve_layered_frame()
+        // (in stop_os_window_rendering) performs the in-shader linear->sRGB resolve
+        // onto the drawable in the same pass — no RGBA16 DRAM FBO, no separate BLIT
+        // pass (~123 MB/frame round trip and the 2nd pass eliminated). The
+        // save_viewport here balances the restore_viewport in stop.
+        metal_begin_layered_frame();
+        save_viewport_using_bottom_left_origin(0, 0, os_window->viewport_width, os_window->viewport_height);
+        draw_bg_image(os_window, tab);
+#else
         // Ensure the global shared texture is large enough for this window
         if (global_state.layers_render_texture.width < os_window->viewport_width ||
                 global_state.layers_render_texture.height < os_window->viewport_height) {
@@ -1727,6 +1759,7 @@ start_os_window_rendering(OSWindow *os_window, Tab *tab) {
         save_viewport_using_bottom_left_origin(0, 0, os_window->viewport_width, os_window->viewport_height);
         clear_current_framebuffer();
         draw_bg_image(os_window, tab);
+#endif
     }
 }
 
@@ -1734,6 +1767,16 @@ static void
 stop_os_window_rendering(OSWindow *os_window, Tab *tab, Window *active_window) {
     if (OPT(cursor_trail) && tab->cursor_trail.needs_render) draw_cursor_trail(&tab->cursor_trail, active_window);
     if (os_window->needs_layers) {
+#ifdef KITTY_BACKEND_METAL
+        // M1: resolve the working surface onto the drawable in the SAME pass
+        // (in-shader linear->sRGB, replacing the BLIT pass) and end it.
+        // restore_viewport balances the save in start_os_window_rendering;
+        // draw_resizing_text (live resize only) then draws on the drawable in a
+        // normal pass.
+        metal_resolve_layered_frame();
+        restore_viewport();
+        if (os_window->live_resize.in_progress) draw_resizing_text(os_window);
+#else
         set_framebuffer_to_use_for_output(0);
         bind_framebuffer_for_output(0);
         bind_program(BLIT_PROGRAM);
@@ -1751,6 +1794,7 @@ stop_os_window_rendering(OSWindow *os_window, Tab *tab, Window *active_window) {
             restore_viewport();
             draw_resizing_text(os_window);
         }
+#endif
     }
 }
 
