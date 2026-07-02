@@ -8,6 +8,7 @@
 // Include system headers first to avoid macro conflicts
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
+#import <os/signpost.h>
 
 // Undefine system MAX/MIN before data-types.h redefines them
 #undef MAX
@@ -29,6 +30,58 @@ metal_log_path(void) {
     return path;
 }
 #define METAL_TRACE(...) { const char *mlp_ = metal_log_path(); if (mlp_) { FILE *tf_ = fopen(mlp_, "a"); if (tf_) { fprintf(tf_, __VA_ARGS__); fclose(tf_); } } }
+
+// ----- Phase 0 instrumentation (os_signpost + per-frame stats) -----
+// Every hook is gated by a cached env check: when KITTY_METAL_SIGNPOST and
+// KITTY_METAL_STATS are unset each hook collapses to a single cached-bool
+// test, so instrumentation is effectively zero-cost in normal runs.
+static bool
+metal_signpost_enabled(void) {
+    static int state = -1;
+    if (state < 0) { const char *v = getenv("KITTY_METAL_SIGNPOST"); state = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0; }
+    return state == 1;
+}
+
+// os_log handle backing the signposts (subsystem/category shown in Instruments).
+// Created lazily on first use; only ever reached when signposts are enabled.
+static os_log_t
+metal_signpost_log(void) {
+    static os_log_t handle = NULL;
+    if (!handle) handle = os_log_create("net.kovidgoyal.kitty", "metal");
+    return handle;
+}
+
+static bool
+metal_stats_enabled(void) {
+    static int state = -1;
+    if (state < 0) { const char *v = getenv("KITTY_METAL_STATS"); state = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0; }
+    return state == 1;
+}
+
+// Emit one machine-parseable record (leading token + space-separated key=value
+// pairs, newline-terminated) to KITTY_METAL_STATS_FILE (append) or stderr.
+// Consumed by the latency/throughput harnesses — keep the line format stable.
+// Callers pre-format so this stays a plain fputs (no varargs); safe to call
+// from the Metal completion/present handler queues (stdio locks the stream).
+static void
+metal_stats_emit(const char *line) {
+    static bool checked = false;
+    static const char *path = NULL;
+    if (!checked) { path = getenv("KITTY_METAL_STATS_FILE"); checked = true; }
+    if (path) { FILE *f = fopen(path, "a"); if (f) { fputs(line, f); fclose(f); } }
+    else { fputs(line, stderr); }
+}
+
+// KITTY_METAL_DUMP_FRAME golden-image harness: when set, the frame is rendered
+// to a readable offscreen texture (not the drawable) so the dump — and a
+// framebufferOnly=YES drawable — never reads drawable.texture. Cached once.
+static const char*
+metal_dump_frame_path(void) {
+    static bool checked = false;
+    static const char *path = NULL;
+    if (!checked) { path = getenv("KITTY_METAL_DUMP_FRAME"); checked = true; }
+    return path;
+}
 
 // Metal global state
 static id<MTLDevice> mtl_device = nil;
@@ -107,6 +160,34 @@ static struct {
 // Gamma LUT — cached for binding to shaders
 static const float *cached_gamma_lut = NULL;
 static int cached_gamma_lut_count = 0;
+
+// M5c: a persistent MTLBuffer holding the cell gamma LUT, bound by index at
+// draw time instead of re-copied as a 1 KB setVertexBytes on every cell draw.
+// srgb_lut (kitty/shaders.c) is a fixed, process-lifetime table uploaded with a
+// stable pointer, so the buffer is (re)built only when that pointer or the entry
+// count changes — in practice exactly once. Committed command buffers retain the
+// resources they reference, so a rebuild that releases the old buffer is safe.
+static id<MTLBuffer> gamma_lut_buffer = nil;
+static const float *gamma_lut_buffer_src = NULL;
+static int gamma_lut_buffer_count = 0;
+
+static id<MTLBuffer>
+ensure_gamma_lut_buffer(void) {
+    if (!cached_gamma_lut || cached_gamma_lut_count <= 0) return nil;
+    if (gamma_lut_buffer && gamma_lut_buffer_src == cached_gamma_lut && gamma_lut_buffer_count == cached_gamma_lut_count) {
+        return gamma_lut_buffer;  // unchanged — no copy, just reuse the resident buffer
+    }
+    size_t bytes = (size_t)cached_gamma_lut_count * sizeof(float);
+    if (!gamma_lut_buffer || gamma_lut_buffer_count != cached_gamma_lut_count) {
+        [gamma_lut_buffer release];
+        gamma_lut_buffer = [mtl_device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        if (!gamma_lut_buffer) { gamma_lut_buffer_src = NULL; gamma_lut_buffer_count = 0; return nil; }
+    }
+    memcpy(gamma_lut_buffer.contents, cached_gamma_lut, bytes);
+    gamma_lut_buffer_src = cached_gamma_lut;
+    gamma_lut_buffer_count = cached_gamma_lut_count;
+    return gamma_lut_buffer;
+}
 
 // Current VAO binding for buffer access
 static ssize_t current_bound_vao = -1;
@@ -804,6 +885,25 @@ restore_viewport(void) {
 
 static int dq_log_count = 0;
 static int metal_frame_counter = 0;
+
+// Phase 0 per-frame instrumentation. metal_frame_index is a process-wide
+// monotonic id used to correlate the stats and present records; unlike
+// metal_frame_counter it advances every frame regardless of KITTY_METAL_LOG.
+// metal_pass_count (render passes/encoders opened this frame — the
+// acceptance-criterion-2 probe) and metal_frame_encode_start (CACurrentMediaTime
+// captured when this frame's command buffer is created, for CPU-encode ms) are
+// per current window: saved/restored with the window slot below.
+static uint64_t metal_frame_index = 0;
+static int metal_pass_count = 0;
+static double metal_frame_encode_start = 0.0;
+
+// M3: has any render pass targeted the drawable yet this frame? The first
+// drawable pass must not Load the recycled drawable (its contents are
+// meaningless and kitty repaints 100% of it); later passes Load to preserve
+// earlier draws. Per current window: saved/restored with the window slot,
+// reset in metal_end_frame.
+static bool drawable_pass_opened = false;
+
 void
 draw_quad(bool blend, unsigned instance_count) {
     if (!mtl_current_layer) return;
@@ -889,10 +989,10 @@ draw_quad(bool blend, unsigned instance_count) {
                 }
             }
         }
-        // Gamma LUT → buffer index 3
-        if (cached_gamma_lut) {
-            [mtl_current_encoder setVertexBytes:cached_gamma_lut length:256 * sizeof(float) atIndex:3];
-        }
+        // Gamma LUT → buffer index 3 (M5c: bind the resident buffer instead of
+        // copying 1 KB into the command stream via setVertexBytes every draw)
+        id<MTLBuffer> glut = ensure_gamma_lut_buffer();
+        if (glut) [mtl_current_encoder setVertexBuffer:glut offset:0 atIndex:3];
         // Buffer 3 (ColorTable UBO, packed uint[]) → Metal buffer index 4
         if (current_bound_vao >= 0) {
             MetalVAO *vao = &vaos[current_bound_vao];
@@ -1104,7 +1204,13 @@ save_texture_as_png(uint32_t texture_id, const char *filename) {
               fromRegion:MTLRegionMake2D(0, 0, width, height)
              mipmapLevel:0];
 
-    // Convert from linear premultiplied to sRGB straight alpha
+    // The linear->sRGB transfer below is correct only for a LINEAR source (e.g.
+    // the RGBA16Unorm layers FBO). If the texture is already an sRGB format,
+    // getBytes returns display-encoded bytes, so applying the transfer again
+    // would double-encode (washed-out output) — skip it in that case.
+    const bool src_is_srgb = (t->texture.pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB ||
+                              t->texture.pixelFormat == MTLPixelFormatBGRA8Unorm_sRGB);
+    // Premultiplied -> straight alpha (and linear -> sRGB only when linear).
     for (int i = 0; i < width * height; i++) {
         uint32_t px = data[i];
         uint8_t r = (px >> 0) & 0xFF, g = (px >> 8) & 0xFF, b = (px >> 16) & 0xFF, a = (px >> 24) & 0xFF;
@@ -1113,10 +1219,11 @@ save_texture_as_png(uint32_t texture_id, const char *filename) {
         if (alpha > 0.0f) {
             rf = (r / 255.0f) / alpha; gf = (g / 255.0f) / alpha; bf = (b / 255.0f) / alpha;
         }
-        // Linear to sRGB
-        rf = (rf <= 0.0031308f) ? 12.92f * rf : 1.055f * powf(rf, 1.0f / 2.4f) - 0.055f;
-        gf = (gf <= 0.0031308f) ? 12.92f * gf : 1.055f * powf(gf, 1.0f / 2.4f) - 0.055f;
-        bf = (bf <= 0.0031308f) ? 12.92f * bf : 1.055f * powf(bf, 1.0f / 2.4f) - 0.055f;
+        if (!src_is_srgb) {
+            rf = (rf <= 0.0031308f) ? 12.92f * rf : 1.055f * powf(rf, 1.0f / 2.4f) - 0.055f;
+            gf = (gf <= 0.0031308f) ? 12.92f * gf : 1.055f * powf(gf, 1.0f / 2.4f) - 0.055f;
+            bf = (bf <= 0.0031308f) ? 12.92f * bf : 1.055f * powf(bf, 1.0f / 2.4f) - 0.055f;
+        }
         r = (uint8_t)(rf * 255); g = (uint8_t)(gf * 255); b = (uint8_t)(bf * 255);
         data[i] = (r << 0) | (g << 8) | (b << 16) | (a << 24);
     }
@@ -1176,6 +1283,9 @@ typedef struct {
     MTLPixelFormat enc_fmt;
     bool clear_pending, clear_srgb;
     bool in_use;
+    int pass_count;             // Phase 0: passes opened this frame (per window)
+    double frame_encode_start;  // Phase 0: CACurrentMediaTime at cb creation
+    bool drawable_pass_opened;  // M3: first drawable pass seen this frame?
 } MetalWindowSlot;
 #define MAX_METAL_WINDOWS 64
 static MetalWindowSlot metal_windows[MAX_METAL_WINDOWS];
@@ -1192,6 +1302,9 @@ save_current_window_state(void) {
     s->enc_fmt = mtl_current_enc_fmt;
     s->clear_pending = clear_pending;
     s->clear_srgb = clear_srgb_flag;
+    s->pass_count = metal_pass_count;
+    s->frame_encode_start = metal_frame_encode_start;
+    s->drawable_pass_opened = drawable_pass_opened;
 }
 
 static void
@@ -1203,6 +1316,9 @@ load_window_state(const MetalWindowSlot *s) {
     mtl_current_enc_fmt = s->enc_fmt;
     clear_pending = s->clear_pending;
     clear_srgb_flag = s->clear_srgb;
+    metal_pass_count = s->pass_count;
+    metal_frame_encode_start = s->frame_encode_start;
+    drawable_pass_opened = s->drawable_pass_opened;
 }
 
 // Set the current CAMetalLayer for rendering. Called when the OS window is
@@ -1241,6 +1357,9 @@ metal_set_current_layer(void *layer) {
         mtl_current_enc_fmt = MTLPixelFormatInvalid;
         clear_pending = false;
         clear_srgb_flag = false;
+        metal_pass_count = 0;
+        metal_frame_encode_start = 0.0;
+        drawable_pass_opened = false;
     }
     mtl_current_layer = (__bridge CAMetalLayer *)layer;
 }
@@ -1273,6 +1392,14 @@ ensure_command_buffer(void) {
                           cb.error ? [[cb.error localizedDescription] UTF8String] : "unknown error");
             }
         }];
+        // Phase 0: the command buffer's lifetime is this frame's CPU-encode
+        // span. Begin it here (once per frame, keyed on the cb pointer so the
+        // matching end in metal_end_frame finds it) and stamp encode-start.
+        if (metal_signpost_enabled()) {
+            os_log_t slog = metal_signpost_log();
+            os_signpost_interval_begin(slog, os_signpost_id_make_with_pointer(slog, (__bridge void *)mtl_current_command_buffer), "frame_encode", "");
+        }
+        if (metal_stats_enabled()) metal_frame_encode_start = CACurrentMediaTime();
     }
     return true;
 }
@@ -1288,7 +1415,16 @@ ensure_drawable(void) {
                 return false;
             }
         }
-        mtl_current_drawable = [mtl_current_layer nextDrawable];
+        // Phase 0: nextDrawable can block on the drawable pool — span it.
+        if (metal_signpost_enabled()) {
+            os_log_t slog = metal_signpost_log();
+            os_signpost_id_t sid = os_signpost_id_generate(slog);
+            os_signpost_interval_begin(slog, sid, "drawable_acquire", "");
+            mtl_current_drawable = [mtl_current_layer nextDrawable];
+            os_signpost_interval_end(slog, sid, "drawable_acquire", "");
+        } else {
+            mtl_current_drawable = [mtl_current_layer nextDrawable];
+        }
     }
     return mtl_current_drawable != nil;
 }
@@ -1302,6 +1438,43 @@ current_drawable_srgb_view(void) {
         mtl_current_srgb_view = [mtl_current_drawable.texture newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB];
     }
     return mtl_current_srgb_view;
+}
+
+// C4a/e: persistent offscreen render target used only in KITTY_METAL_DUMP_FRAME
+// mode. It mirrors the drawable exactly (BGRA8Unorm base + an sRGB view for
+// GL_FRAMEBUFFER_SRGB parity), so the final frame lands here byte-identically
+// to how it would on the drawable — the harness then reads THIS readable
+// texture instead of drawable.texture, which lets the drawable be
+// framebufferOnly=YES. Not on any production path.
+static id<MTLTexture> dump_offscreen_base = nil;
+static id<MTLTexture> dump_offscreen_srgb = nil;
+static NSUInteger dump_offscreen_w = 0, dump_offscreen_h = 0;
+
+static bool
+ensure_dump_offscreen(void) {
+    if (!mtl_current_layer) return false;
+    CGSize ds = mtl_current_layer.drawableSize;
+    NSUInteger w = (NSUInteger)ds.width, h = (NSUInteger)ds.height;
+    if (w < 1 || h < 1) {
+        if (mtl_viewport.width > 0 && mtl_viewport.height > 0) {
+            w = (NSUInteger)mtl_viewport.width; h = (NSUInteger)mtl_viewport.height;
+        } else return false;
+    }
+    if (dump_offscreen_base && dump_offscreen_w == w && dump_offscreen_h == h) return true;
+    [dump_offscreen_srgb release]; dump_offscreen_srgb = nil;
+    [dump_offscreen_base release]; dump_offscreen_base = nil;
+    MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                    width:w height:h mipmapped:NO];
+    // ShaderRead so the layered blit path can also target it; PixelFormatView so
+    // the sRGB view is creatable on a standalone texture; Shared so the harness
+    // can getBytes it directly.
+    desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+    desc.storageMode = MTLStorageModeShared;
+    dump_offscreen_base = [mtl_device newTextureWithDescriptor:desc];
+    if (!dump_offscreen_base) return false;
+    dump_offscreen_srgb = [dump_offscreen_base newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB];
+    dump_offscreen_w = w; dump_offscreen_h = h;
+    return dump_offscreen_base != nil;
 }
 
 // The attachment format the next render pass must use, given the bound
@@ -1323,15 +1496,27 @@ begin_render_pass_to_drawable(bool clear) {
     if (!ensure_command_buffer()) return nil;
 
     id<MTLTexture> target_texture = nil;
+    bool targeting_drawable = false;
 
-    // Determine render target: offscreen framebuffer or main drawable
+    // Determine render target: offscreen framebuffer, golden-dump offscreen, or
+    // the main drawable.
     if (bound_framebuffer && bound_framebuffer < MAX_FRAMEBUFFERS &&
         framebuffers[bound_framebuffer].in_use && framebuffers[bound_framebuffer].render_target) {
         target_texture = framebuffers[bound_framebuffer].render_target;
+    } else if (metal_dump_frame_path()) {
+        // Golden-dump mode: render the drawable-bound content to the readable
+        // offscreen instead. No drawable is acquired (harness reads the
+        // offscreen and does not present). Same BGRA8 base + sRGB view as the
+        // drawable, so the final bytes are identical.
+        if (!ensure_dump_offscreen()) return nil;
+        bool want_srgb = clear ? clear_srgb_flag : framebuffer_srgb_enabled;
+        target_texture = want_srgb ? dump_offscreen_srgb : dump_offscreen_base;
+        targeting_drawable = true;
     } else {
         if (!ensure_drawable()) return nil;
         bool want_srgb = clear ? clear_srgb_flag : framebuffer_srgb_enabled;
         target_texture = want_srgb ? current_drawable_srgb_view() : mtl_current_drawable.texture;
+        targeting_drawable = true;
     }
     if (!target_texture) return nil;
 
@@ -1340,37 +1525,45 @@ begin_render_pass_to_drawable(bool clear) {
     if (clear) {
         rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
         rpd.colorAttachments[0].clearColor = MTLClearColorMake(clear_r, clear_g, clear_b, clear_a);
+    } else if (targeting_drawable && !drawable_pass_opened) {
+        // M3: first drawable pass of the frame. The drawable is recycled from a
+        // pool so its prior contents are meaningless, and kitty repaints 100% of
+        // it — discard instead of loading a full drawable's worth of tile memory
+        // (~31 MB @ 3456x2234 avoided per frame). Later drawable passes this
+        // frame Load, preserving the earlier draws.
+        rpd.colorAttachments[0].loadAction = MTLLoadActionDontCare;
     } else {
         rpd.colorAttachments[0].loadAction = MTLLoadActionLoad;
     }
     rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+    if (targeting_drawable) drawable_pass_opened = true;
     mtl_current_render_pass = rpd;
 
     mtl_current_encoder = [mtl_current_command_buffer renderCommandEncoderWithDescriptor:rpd];
     mtl_current_enc_fmt = target_texture.pixelFormat;
+    metal_pass_count++;  // Phase 0: acceptance-criterion-2 probe (== 1 for opaque frames)
     return mtl_current_encoder;
 }
 
-// Synchronous drawable read-back for the golden-image harness: waits for the
-// GPU, saves the frame as PNG, then presents. Enabled by setting
-// KITTY_METAL_DUMP_FRAME to the destination path (dev/testing only — this
-// stalls the render pipeline every frame).
+// Golden-image harness read-back (KITTY_METAL_DUMP_FRAME). The frame was
+// rendered into dump_offscreen_base (begin_render_pass_to_drawable redirects the
+// drawable-bound content there in dump mode); commit + wait for the GPU, then
+// read that readable texture and write the PNG. No drawable is acquired or
+// presented, so this path never touches drawable.texture and is independent of
+// the layer's framebufferOnly setting. Dev/testing only — stalls every frame.
 static void
-dump_frame_and_present(id<MTLCommandBuffer> cb, id<CAMetalDrawable> drawable, const char *path) {
+dump_offscreen_frame(id<MTLCommandBuffer> cb, const char *path) {
     METAL_TRACE("dump: commit\n");
     [cb commit];
     [cb waitUntilCompleted];
     METAL_TRACE("dump: completed status=%ld\n", (long)cb.status);
-    id<MTLTexture> tex = drawable.texture;
+    id<MTLTexture> tex = dump_offscreen_base;
+    if (!tex) return;
     size_t w = tex.width, h = tex.height;
     uint32_t *data = malloc(w * h * 4);
-    if (data) {
-        [tex getBytes:data bytesPerRow:w * 4 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
-    }
-    METAL_TRACE("dump: read %zux%zu, presenting\n", w, h);
-    [drawable present];
-    METAL_TRACE("dump: presented\n");
     if (!data) return;
+    [tex getBytes:data bytesPerRow:w * 4 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+    METAL_TRACE("dump: read offscreen %zux%zu\n", w, h);
     for (size_t i = 0; i < w * h; i++) { // BGRA -> RGBA for the PNG encoder
         uint32_t px = data[i];
         data[i] = (px & 0xff00ff00u) | ((px & 0xffu) << 16) | ((px >> 16) & 0xffu);
@@ -1433,11 +1626,48 @@ metal_end_frame(void) {
         }
     }
     if (mtl_current_command_buffer) {
-        static bool dump_env_checked = false;
-        static const char *dump_path = NULL;
-        if (!dump_env_checked) { dump_path = getenv("KITTY_METAL_DUMP_FRAME"); dump_env_checked = true; }
-        if (dump_path && mtl_current_drawable) {
-            dump_frame_and_present(mtl_current_command_buffer, mtl_current_drawable, dump_path);
+        // Phase 0: close the CPU-encode span (opened at cb creation) and open a
+        // present span around commit+present; frame stats and the present
+        // timestamp are captured into the async handlers registered below.
+        const bool sp = metal_signpost_enabled();
+        const bool st = metal_stats_enabled();
+        os_log_t slog = sp ? metal_signpost_log() : NULL;
+        os_signpost_id_t present_sid = OS_SIGNPOST_ID_INVALID;
+        if (sp) {
+            os_signpost_interval_end(slog, os_signpost_id_make_with_pointer(slog, (__bridge void *)mtl_current_command_buffer), "frame_encode", "");
+            present_sid = os_signpost_id_generate(slog);
+            os_signpost_interval_begin(slog, present_sid, "present", "");
+        }
+        const uint64_t fidx = metal_frame_index++;
+        if (st) {
+            // GPU times are valid only once the buffer completes; encode ms and
+            // the pass count are known now, so capture them into the handler.
+            const double encode_ms = metal_frame_encode_start > 0.0 ? (CACurrentMediaTime() - metal_frame_encode_start) * 1000.0 : 0.0;
+            const int passes = metal_pass_count;
+            [mtl_current_command_buffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                const double gpu_ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
+                char line[192];
+                snprintf(line, sizeof line, "metal_stats frame=%llu encode_ms=%.3f gpu_ms=%.3f passes=%d\n",
+                         (unsigned long long)fidx, encode_ms, gpu_ms, passes);
+                metal_stats_emit(line);
+            }];
+        }
+        // Present timestamp (photon-adjacent) for the latency harness. Emitted
+        // under stats OR signpost; one line per present, keyed to the frame id.
+        if ((st || sp) && mtl_current_drawable) {
+            [mtl_current_drawable addPresentedHandler:^(id<MTLDrawable> d) {
+                char line[128];
+                snprintf(line, sizeof line, "metal_present frame=%llu presented_time=%.9f\n",
+                         (unsigned long long)fidx, d.presentedTime);
+                metal_stats_emit(line);
+            }];
+        }
+
+        const char *dump_path = metal_dump_frame_path();
+        if (dump_path) {
+            // Golden dump: the frame was rendered to the readable offscreen and
+            // no drawable was acquired — commit + wait + read it + write the PNG.
+            dump_offscreen_frame(mtl_current_command_buffer, dump_path);
         } else if (mtl_current_drawable && mtl_current_layer && mtl_current_layer.presentsWithTransaction) {
             // Live resize: present inside the current CA transaction so the
             // frame stays in lockstep with the window chrome. Documented
@@ -1451,6 +1681,7 @@ metal_end_frame(void) {
             }
             [mtl_current_command_buffer commit];
         }
+        if (sp) os_signpost_interval_end(slog, present_sid, "present", "");
         mtl_current_command_buffer = nil;
         mtl_current_drawable = nil;
     }
@@ -1460,6 +1691,8 @@ metal_end_frame(void) {
     }
     mtl_current_render_pass = nil;
     clear_pending = false;
+    metal_pass_count = 0;         // Phase 0: reset for the next frame (per current window)
+    drawable_pass_opened = false; // M3: next frame's first drawable pass discards again
 }
 
 // ----- GL Compatibility Functions (metal_gl_*) -----
@@ -1610,8 +1843,38 @@ pixel_format_for_gl(int internalformat) {
     }
 }
 
+// Destination bytes-per-pixel for a Metal texture, so uploads size bytesPerRow
+// from the actual texture format rather than a hardcoded 4 (G5/H2 fix).
+static NSUInteger
+mtl_bytes_per_pixel(MTLPixelFormat f) {
+    switch (f) {
+        case MTLPixelFormatR8Unorm: return 1;
+        case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB: case MTLPixelFormatR32Uint: return 4;
+        case MTLPixelFormatRGBA16Unorm: return 8;
+        case MTLPixelFormatRGBA32Uint: return 16;
+        default: return 4;
+    }
+}
+
+// Expand a tightly-packed GL_RGB (3 bpp) source into a freshly malloc'd RGBA
+// (4 bpp) buffer with opaque alpha, matching GL's implicit alpha=1 expansion.
+// Caller frees; returns NULL on alloc failure. Metal has no 3x8-bit format, so
+// opaque graphics images (send_image_to_gpu, kitty/shaders.c GL_RGB path) must
+// be widened before replaceRegion — reading 4-wide rows from a 3-wide buffer
+// over-reads the heap and shears the image.
+static uint32_t*
+expand_rgb_to_rgba(const void *src_rgb, int width, int height) {
+    size_t n = (size_t)width * (size_t)height;
+    uint32_t *rgba = malloc(n * 4);
+    if (!rgba) return NULL;
+    const uint8_t *s = src_rgb;
+    for (size_t i = 0; i < n; i++)
+        rgba[i] = (uint32_t)s[i*3] | ((uint32_t)s[i*3+1] << 8) | ((uint32_t)s[i*3+2] << 16) | 0xFF000000u;
+    return rgba;
+}
+
 void metal_gl_tex_image_2d(GLenum target, int level, int internalformat, int width, int height, int border, GLenum format, GLenum type, const void *data) {
-    (void)level; (void)border; (void)format; (void)type;
+    (void)level; (void)border;
     GLuint tex_id = get_bound_texture_for_target(target);
     if (tex_id == 0 || tex_id >= MAX_TEXTURES) return;
     MetalTexture *t = &textures[tex_id];
@@ -1631,32 +1894,50 @@ void metal_gl_tex_image_2d(GLenum target, int level, int internalformat, int wid
     t->depth = 1;
 
     if (data) {
-        // Determine bytes per pixel based on format
-        NSUInteger bpp = 4;
-        if (internalformat == GL_RED || internalformat == GL_R8) bpp = 1;
-        else if (internalformat == GL_R32UI) bpp = 4;
-        [t->texture replaceRegion:MTLRegionMake2D(0, 0, width, height)
-                      mipmapLevel:0
-                        withBytes:data
-                      bytesPerRow:width * bpp];
+        NSUInteger dst_bpp = mtl_bytes_per_pixel(t->texture.pixelFormat);
+        if (format == GL_RGB && type == GL_UNSIGNED_BYTE && dst_bpp == 4) {
+            uint32_t *rgba = expand_rgb_to_rgba(data, width, height);
+            if (!rgba) { log_error("Metal: RGB->RGBA expand alloc failed (%dx%d); skipping image upload", width, height); }
+            else {
+                [t->texture replaceRegion:MTLRegionMake2D(0, 0, width, height)
+                              mipmapLevel:0 withBytes:rgba bytesPerRow:width * 4];
+                free(rgba);
+            }
+        } else {
+            [t->texture replaceRegion:MTLRegionMake2D(0, 0, width, height)
+                          mipmapLevel:0 withBytes:data bytesPerRow:width * dst_bpp];
+        }
     }
 }
 
 void metal_gl_tex_sub_image_2d(GLenum target, int level, int x, int y, int width, int height, GLenum format, GLenum type, const void *data) {
-    (void)level; (void)type;
+    (void)level;
     GLuint tex_id = get_bound_texture_for_target(target);
     MetalTexture *t = get_texture(tex_id);
     if (!t || !t->texture || !data) return;
 
-    NSUInteger bpp = 4;
-    if (format == GL_RED || format == GL_RED_INTEGER) bpp = 4; // R32UI is 4 bytes
-    [t->texture replaceRegion:MTLRegionMake2D(x, y, width, height)
-                  mipmapLevel:0
-                    withBytes:data
-                  bytesPerRow:width * bpp];
+    NSUInteger dst_bpp = mtl_bytes_per_pixel(t->texture.pixelFormat);
+    if (format == GL_RGB && type == GL_UNSIGNED_BYTE && dst_bpp == 4) {
+        // Opaque graphics-image update: widen 3 bpp RGB to the RGBA8 texture.
+        uint32_t *rgba = expand_rgb_to_rgba(data, width, height);
+        if (!rgba) { log_error("Metal: RGB->RGBA expand alloc failed (%dx%d); skipping image update", width, height); return; }
+        [t->texture replaceRegion:MTLRegionMake2D(x, y, width, height)
+                      mipmapLevel:0 withBytes:rgba bytesPerRow:width * 4];
+        free(rgba);
+    } else {
+        [t->texture replaceRegion:MTLRegionMake2D(x, y, width, height)
+                      mipmapLevel:0 withBytes:data bytesPerRow:width * dst_bpp];
+    }
 }
 
 static int tex_sub_3d_log_count = 0;
+
+// F2/M6: a resident, grow-only scratch buffer for the GL_UNSIGNED_INT_8_8_8_8
+// glyph byte-swap. Reused across uploads to eliminate the per-glyph
+// malloc/free churn; capacity is bounded by the largest glyph tile uploaded.
+static uint32_t *glyph_swap_scratch = NULL;
+static size_t glyph_swap_scratch_px = 0;
+
 void metal_gl_tex_sub_image_3d(GLenum target, int level, int x, int y, int z, int width, int height, int depth, GLenum format, GLenum type, const void *data) {
     (void)level; (void)format; (void)depth;
     GLuint tex_id = get_bound_texture_for_target(target);
@@ -1664,19 +1945,29 @@ void metal_gl_tex_sub_image_3d(GLenum target, int level, int x, int y, int z, in
     if (!t || !t->texture || !data) return;
 
     NSUInteger bpp = 4;
-    // GL_UNSIGNED_INT_8_8_8_8 is a packed type: the R,G,B,A components live
-    // in the uint32 from its most significant byte down, which on
-    // little-endian is the reverse of the byte-ordered RGBA that Metal's
-    // replaceRegion expects. Byte-swap each pixel (cold path: glyph uploads).
-    uint32_t *swapped = NULL;
+    // GL_UNSIGNED_INT_8_8_8_8 is a packed type: the R,G,B,A components live in
+    // the uint32 from its most significant byte down, which on little-endian is
+    // the reverse of the byte-ordered RGBA that Metal's replaceRegion expects.
+    // Byte-swap each pixel through the resident scratch buffer (no per-glyph
+    // malloc). replaceRegion on Shared storage copies synchronously, so the
+    // scratch is free to be reused by the next upload immediately after.
     if (type == GL_UNSIGNED_INT_8_8_8_8) {
         size_t n = (size_t)width * (size_t)height;
-        swapped = malloc(n * sizeof(uint32_t));
-        if (swapped) {
-            const uint32_t *src = data;
-            for (size_t i = 0; i < n; i++) swapped[i] = __builtin_bswap32(src[i]);
-            data = swapped;
+        if (n > glyph_swap_scratch_px) {
+            uint32_t *grown = realloc(glyph_swap_scratch, n * sizeof(uint32_t));
+            if (!grown) {
+                // HAZARD FIX: never fall through to upload the un-swapped bytes
+                // (reversed channels → visibly corrupt glyphs). Fail loudly and
+                // skip this upload; the atlas slot keeps its prior contents.
+                log_error("Metal: glyph byte-swap scratch alloc failed (%zu px); skipping atlas upload", n);
+                return;
+            }
+            glyph_swap_scratch = grown;
+            glyph_swap_scratch_px = n;
         }
+        const uint32_t *src = data;
+        for (size_t i = 0; i < n; i++) glyph_swap_scratch[i] = __builtin_bswap32(src[i]);
+        data = glyph_swap_scratch;
     }
     [t->texture replaceRegion:MTLRegionMake2D(x, y, width, height)
                   mipmapLevel:0
@@ -1684,7 +1975,6 @@ void metal_gl_tex_sub_image_3d(GLenum target, int level, int x, int y, int z, in
                     withBytes:data
                   bytesPerRow:width * bpp
                 bytesPerImage:0];
-    free(swapped);
     if (tex_sub_3d_log_count < 5) {
         METAL_TRACE("tex_sub_3d: id=%u pos=(%d,%d,%d) size=%dx%d\n", tex_id, x, y, z, width, height);
         tex_sub_3d_log_count++;
@@ -1811,8 +2101,15 @@ void metal_gl_copy_image_sub_data(GLuint src, GLenum srcTarget, int srcLevel, in
     }
 
     [blit endEncoding];
+    // F3: commit without stalling. This is the atlas-growth copy (old atlas ->
+    // grown atlas), issued during cell prep before the frame's render command
+    // buffer is committed in metal_end_frame. A single MTLCommandQueue runs its
+    // command buffers in commit order without overlap, so this blit completes
+    // before any later-committed frame samples the grown atlas. The new glyph
+    // written afterwards (tex_sub_image_3d -> replaceRegion on Shared storage)
+    // is a CPU-synchronous write to a disjoint region, immediately GPU-visible
+    // via unified memory — so no waitUntilCompleted is needed here.
     [cmd commit];
-    [cmd waitUntilCompleted];
 }
 
 void metal_gl_gen_framebuffers(int n, GLuint *ids) {
