@@ -81,13 +81,20 @@ _DUR_UNIT_TO_MS = {
     "h": 3_600_000.0, "m": 60_000.0, "s": 1000.0, "ms": 1.0,
     "µs": 0.001, "μs": 0.001, "us": 0.001, "ns": 0.000_001,
 }
-# metal_stats line format, fixed by task #1's metal.m instrumentation (final,
-# kitty/metal.m ~1650): metal_stats frame=<uint64> encode_ms=<float.3>
-# gpu_ms=<float.3> passes=<int>. encode_ms is the CPU-side encode span ->
-# our JSON's cpu_ms_p50/p99. (The companion metal_present line is parsed by
-# the shared parse_presented_lines() in _kitty_harness_common.)
+# metal_stats line format (kitty/metal.m; Wave-2 final):
+#   metal_stats frame=<uint64> encode_ms=<float.3> gpu_ms=<float.3>
+#     passes=<int> allocs=<int> bytes=<uint64> drawable_wait_ms=<float.3>
+# The trailing three fields are optional here so pre-Wave-2 builds still
+# parse. encode_ms was REDEFINED in Wave 2: it now spans drawable-acquired ->
+# commit (encoding only); the drawable-pool wait that used to pollute it is
+# reported separately as drawable_wait_ms. Never anchor new fields with $ --
+# the format grows tail-first by design. (The companion metal_present line is
+# parsed by the shared parse_presented_lines() in _kitty_harness_common.)
 _STATS_LINE_RE = re.compile(
-    r"^metal_stats\s+frame=(\d+)\s+encode_ms=([\d.]+)\s+gpu_ms=([\d.]+)\s+passes=(\d+)\s*$", re.MULTILINE
+    r"^metal_stats\s+frame=(?P<frame>\d+)\s+encode_ms=(?P<encode>[\d.]+)\s+gpu_ms=(?P<gpu>[\d.]+)"
+    r"\s+passes=(?P<passes>\d+)(?:\s+allocs=(?P<allocs>\d+))?(?:\s+bytes=(?P<bytes>\d+))?"
+    r"(?:\s+drawable_wait_ms=(?P<wait>[\d.]+))?\s*$",
+    re.MULTILINE,
 )
 
 
@@ -304,9 +311,16 @@ def parse_metal_stats(text: str) -> dict[str, Any]:
     _kitty_harness_common, which also drops presented_time==0.000000000
     rows -- a known first-drawable quirk).
     """
-    cpu_ms = [float(m.group(2)) for m in _STATS_LINE_RE.finditer(text)]
-    gpu_ms = [float(m.group(3)) for m in _STATS_LINE_RE.finditer(text)]
-    passes = [float(m.group(4)) for m in _STATS_LINE_RE.finditer(text)]
+    cpu_ms: list[float] = []
+    gpu_ms: list[float] = []
+    passes: list[float] = []
+    wait_ms: list[float] = []
+    for m in _STATS_LINE_RE.finditer(text):
+        cpu_ms.append(float(m.group("encode")))
+        gpu_ms.append(float(m.group("gpu")))
+        passes.append(float(m.group("passes")))
+        if m.group("wait") is not None:
+            wait_ms.append(float(m.group("wait")))
     presented, dropped_zero = parse_presented_lines(text)
 
     available = bool(cpu_ms or gpu_ms or passes or presented)
@@ -314,6 +328,8 @@ def parse_metal_stats(text: str) -> dict[str, Any]:
         "available": available,
         "cpu_ms_p50": percentile(cpu_ms, 50), "cpu_ms_p99": percentile(cpu_ms, 99),
         "gpu_ms_p50": percentile(gpu_ms, 50), "gpu_ms_p99": percentile(gpu_ms, 99),
+        "drawable_wait_ms_p50": percentile(wait_ms, 50),
+        "drawable_wait_ms_p99": percentile(wait_ms, 99),
         "passes_per_frame": (sum(passes) / len(passes)) if passes else None,
         "presented_frame_count": len(presented),
         "presented_frame_count_dropped_zero": dropped_zero,
