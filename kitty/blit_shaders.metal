@@ -11,8 +11,6 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// Include shared utilities via header (compiled into same .metallib)
-// Re-declare needed functions inline since Metal doesn't support cross-file includes
 
 inline float srgb2linear_f(float x) {
     float lower = x / 12.92f;
