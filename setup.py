@@ -690,6 +690,8 @@ def kitty_env(args: Options) -> Env:
             # Apple deprecated OpenGL in Mojave (10.14) silence the endless
             # warnings about it
             cppflags.append('-DGL_SILENCE_DEPRECATION')
+        cppflags.append('-DNDEBUG')
+        cppflags.append('-DNS_BLOCK_ASSERTIONS')
     else:
         cflags.extend(pkg_config('cairo-fc', '--cflags-only-I'))
         platform_libs = []
