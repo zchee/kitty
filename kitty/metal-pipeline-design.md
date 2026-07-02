@@ -128,6 +128,83 @@ offset 0, array stride 4), so the shared C writers (`copy_color_table_to_buffer`
 `cell_update_uniform_block`) produce exactly the bytes the MSL reads. No
 hardcoded offsets are permitted anywhere in the shim (triage defect S4).
 
+## Buffer lifecycle: the fenced ring (Phase 2 / D1 + D2)
+
+Per-frame VAO buffers (cell instance data, `is_selected`, `CellRenderData` UBO,
+`ColorTable` UBO) are backed by a small **ring of resident `MTLBuffer`s** rather
+than a fresh allocation per frame. This keeps the GL waist API byte-for-byte
+identical while removing all steady-state allocations (plan D1, acceptance §7.3).
+
+| GL-waist entry point | Backing | Contents on map |
+|---|---|---|
+| `alloc_and_map_vao_buffer(frequently_updated=true)` (cell, selection) | ring slot | fresh (caller full-rewrites the whole buffer; **no** copy) |
+| `map_vao_buffer_for_write_only(offset,size)` (uniform, color-table) | ring slot | **copy-forward** from the newest slot, so bytes outside `[offset,offset+size)` are preserved (GL `glMapBufferRange(INVALIDATE)` parity; D2's per-line partial uploads rely on this) |
+| `alloc_and_map_vao_buffer(frequently_updated=false)` (borders) | single buffer, reused in place, hazard-**tracked** | unchanged (rare writes; not a steady-state allocation) |
+
+- **Depth**: slots grow lazily on demand up to a small cap. With
+  `maximumDrawableCount = 2` at most two frames reference a buffer concurrently,
+  so the working set stabilizes at frames-in-flight + 1 (≤3); when the GPU keeps
+  pace with the CPU only a single slot is reused.
+- **Fence (never by luck)**: at draw time each bound ring slot is stamped with
+  the exact `MTLCommandBuffer` that will read it. A slot is only handed back out
+  once that command buffer reports `MTLCommandBufferStatusCompleted`. This is
+  correct regardless of how command buffers from multiple OS windows interleave
+  on the single command queue — it does **not** rely on the committed-CB retaining
+  its buffers (the Wave-1 orphan-path accident, hazard H3).
+- **Hazard tracking**: ring slots are `MTLResourceHazardTrackingModeUntracked`
+  [C3b]. Safe because the ring never writes a slot the fence says is still in
+  flight, and these buffers are only ever GPU-**read** — so there is no GPU-side
+  hazard for Metal to track (verified clean under `MTL_DEBUG_LAYER` +
+  `MTL_SHADER_VALIDATION`).
+- **Observability**: the `metal_stats` line gains `allocs=<n>` — MTLBuffer
+  allocations performed while encoding that frame (0 in steady state).
+
+### Per-line dirty upload (D2)
+
+Because the ring slot is persistent, it still holds the bytes it was last given.
+`screen_update_cell_data()` exploits this: instead of memcpy-ing the whole grid
+every dirty frame, it compares each render row's freshly-shaped `gpu_cells`
+against the slot's current bytes (`update_line_data_diff`) and uploads only rows
+that differ. A localized edit therefore uploads ~one row (e.g. 2,400 B at 120
+columns) instead of the whole grid (~110 KB); a full scroll still uploads the
+whole grid (plan D2, acceptance §7.10).
+
+- **Correctness by comparison, not by flag**: a row is re-uploaded when it was
+  re-shaped this frame (dirty / cursor / history) **or** when its bytes differ
+  from the slot. The memcmp is what makes scroll safe — `linebuf_index()` moves a
+  line to a new render position via a `line_map` rotation *without* marking it
+  dirty, and multi-slot staleness (a row changed while a different ring slot was
+  bound) is likewise caught because the comparison is against the actual slot the
+  frame will draw from, not a global "last frame" state.
+- **Full-rewrite triggers**: a freshly (re)allocated slot (`fresh` — resize/first
+  use, contents are garbage so a memcmp is meaningless), the OpenGL backend
+  (buffer is orphaned fresh every frame), an active overlay, and paused rendering.
+  `metal_cell_ring_take_fresh()` reports (and consumes) the slot's `fresh` bit.
+- **Selection / uniform / color-table**: left as full rewrites but already gated
+  (selection only when `screen_is_selection_dirty`; uniform/color-table only when
+  changed, D4) — a keystroke touches neither, so they add nothing to its budget.
+- **Observability**: the `metal_stats` line also gains `bytes=<n>` — total VAO
+  ring bytes uploaded that frame (cell dirty rows + selection + uniform +
+  color-table); the ≤8 KB 1-line-edit probe. Harness parsers must tolerate the
+  extra key (they already do).
+
+### Metric fix: encode_ms vs drawable_wait_ms (worker-prof #16)
+
+`encode_ms`'s start stamp used to be taken at command-buffer creation, which is
+*before* `nextDrawable`. With `maximumDrawableCount = 2`, drawable-acquisition
+blocking (~60 ms observed under plain typing) was therefore silently counted as
+"encode" time. Fixed by stamping `metal_frame_encode_start` only after
+`ensure_drawable()` succeeds and emitting the block separately:
+
+- `encode_ms` = drawable-acquired → present-commit (command encoding only). For
+  layered frames this excludes the pre-drawable offscreen-FBO pass encode (a minor
+  known undercount; the opaque path — the measured case — is exact).
+- `drawable_wait_ms=<float.3>` = time spent inside `nextDrawable` this frame (the
+  real keypress-to-photon backpressure with a 2-deep drawable pool).
+
+Not touched here: the encode path itself (never slow) and `maximumDrawableCount`
+(a Phase-4 decision).
+
 ## Known deviations (tracked, intentional)
 
 - Cell/graphics MSL shader *logic* is still the opus-era port; semantic drift

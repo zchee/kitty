@@ -20,6 +20,7 @@
 
 #include <string.h>
 #include <stddef.h>
+#include <sched.h> // sched_yield: ring-exhaustion safety valve (ring_acquire_slot)
 
 // Dev/debug tracing, enabled by setting KITTY_METAL_LOG to a file path.
 static const char*
@@ -517,17 +518,60 @@ unbind_program(void) {
 
 // ----- Buffers -----
 
+// D1: persistent fenced buffer ring. Each frequently-written logical buffer
+// (cell, selection, uniform, color-table) becomes a small ring of resident
+// MTLBuffers so steady-state rendering performs ZERO allocations, replacing the
+// Wave-1 fresh-buffer-per-frame orphaning. Recycling is gated by explicit GPU
+// completion (see ring_acquire_slot / stamp_ring_fences), never by the
+// committed-CB-retains-the-buffer accident (Wave-1 hazard H3).
+//
+// Depth: with maximumDrawableCount=2 at most 2 frames reference a given buffer
+// concurrently, so 3 slots always leave one GPU-idle slot to hand out. Slots
+// grow lazily on demand up to BUFFER_RING_MAX (a safety cap above the working
+// set of 3); the scan-based acquire naturally stabilizes at frames-in-flight+1.
+#define BUFFER_RING_MAX 4
+
 typedef struct {
-    id<MTLBuffer> mtl_buffer;
-    GLsizeiptr size;
+    id<MTLBuffer> buf;              // owning +1 (MRC); released in delete_buffer / on grow
+    void *ptr;                      // buf.contents (shared storage), cached
+    GLsizeiptr size;                // this slot's allocation capacity (grow-only)
+    id<MTLCommandBuffer> fence_cb;  // owning +1: the command buffer that last read
+                                    // this slot; nil == free. Stamped at draw time.
+    bool fresh;                     // D2: buffer was just (re)allocated => contents are
+                                    // garbage; the cell-buffer partial-upload path must
+                                    // do a full write before trusting a memcmp against it.
+} MetalRingSlot;
+
+typedef struct {
+    id<MTLBuffer> mtl_buffer;   // ring: alias of ring[ring_head].buf (NOT owning);
+                                // non-ring: the single owning buffer (borders)
+    GLsizeiptr size;            // logical requested size
     GLenum usage;
-    void *mapped_ptr;
+    void *mapped_ptr;           // ring: ring[ring_head].ptr; non-ring: mtl_buffer.contents
     bool in_use;
+    // D1 ring state (only populated once a buffer takes a ring write path)
+    bool is_ring;
+    int ring_count;             // slots allocated so far (0..BUFFER_RING_MAX)
+    int ring_head;              // index of the current (newest) slot
+    MetalRingSlot ring[BUFFER_RING_MAX];
 } MetalBuffer;
 
 #define MAX_CHILDREN 512
 static MetalBuffer buffers[MAX_CHILDREN * 6 + 4];
 static size_t buffer_count = 0;
+
+// D1: MTLBuffer allocations performed while encoding the current frame (initial
+// ring fill + grows). Emitted as the metal_stats allocs= field so verification
+// can assert 0 in steady state. Written on the main (encode) thread only.
+static int metal_frame_alloc_count = 0;
+
+// D2: bytes written into per-frame VAO ring buffers this frame (cell dirty rows +
+// selection + uniform + color-table). Emitted as the metal_stats bytes= field —
+// the ≤8KB 1-line-edit exit-gate probe. Main (encode) thread only.
+static uint64_t metal_frame_bytes_uploaded = 0;
+
+void
+metal_note_upload_bytes(uint64_t n) { metal_frame_bytes_uploaded += n; }
 
 static ssize_t
 create_buffer(GLenum usage) {
@@ -542,6 +586,11 @@ create_buffer(GLenum usage) {
             buffers[i].mtl_buffer = nil;
             buffers[i].mapped_ptr = NULL;
             buffers[i].in_use = true;
+            // delete_buffer fully tears down the ring, so a recycled slot starts
+            // clean; reset defensively in case this index was never used.
+            buffers[i].is_ring = false;
+            buffers[i].ring_count = 0;
+            buffers[i].ring_head = 0;
             if (i >= buffer_count) buffer_count = i + 1;
             return i;
         }
@@ -555,13 +604,28 @@ delete_buffer(ssize_t buf_idx) {
     // This file builds under MRC: newBufferWithLength returns +1, so drop
     // the reference explicitly. mapped_ptr points into the MTLBuffer's
     // memory and must never be free()d.
-    if (buffers[buf_idx].mtl_buffer) {
-        [buffers[buf_idx].mtl_buffer release];
-        buffers[buf_idx].mtl_buffer = nil;
+    MetalBuffer *b = &buffers[buf_idx];
+    if (b->is_ring) {
+        // Ring slots own their buffers and fence command buffers; b->mtl_buffer
+        // is only an alias of the current slot, so it must NOT be released here
+        // (that would double-release the slot freed in this loop).
+        for (int i = 0; i < b->ring_count; i++) {
+            if (b->ring[i].buf) [b->ring[i].buf release];
+            if (b->ring[i].fence_cb) [b->ring[i].fence_cb release];
+            b->ring[i].buf = nil; b->ring[i].fence_cb = nil;
+            b->ring[i].ptr = NULL; b->ring[i].size = 0; b->ring[i].fresh = false;
+        }
+        b->mtl_buffer = nil;
+    } else if (b->mtl_buffer) {
+        [b->mtl_buffer release];
+        b->mtl_buffer = nil;
     }
-    buffers[buf_idx].mapped_ptr = NULL;
-    buffers[buf_idx].size = 0;
-    buffers[buf_idx].in_use = false;
+    b->is_ring = false;
+    b->ring_count = 0;
+    b->ring_head = 0;
+    b->mapped_ptr = NULL;
+    b->size = 0;
+    b->in_use = false;
 }
 
 static void
@@ -648,25 +712,99 @@ alloc_vao_buffer(ssize_t vao_idx, GLsizeiptr size, size_t bufnum, GLenum usage) 
     return buf_idx;
 }
 
-void*
-alloc_and_map_vao_buffer(ssize_t vao_idx, GLsizeiptr size, size_t bufnum, bool frequently_updated) {
-    ssize_t buf_idx = alloc_vao_buffer(vao_idx, size, bufnum, GL_STREAM_DRAW);
-    // Full-buffer rewrite semantics (GL_STREAM_DRAW + glMapBuffer): when the
-    // size is unchanged alloc reuses the same MTLBuffer, so hand back fresh
-    // storage instead of racing the in-flight frame. No contents copy: the
-    // caller rewrites the whole buffer.
-    if (frequently_updated) {
-        MetalBuffer *b = &buffers[buf_idx];
-        if (b->mtl_buffer && b->size > 0) {
-            id<MTLBuffer> fresh = [mtl_device newBufferWithLength:b->size options:MTLResourceStorageModeShared];
-            if (fresh) {
-                [b->mtl_buffer release];
-                b->mtl_buffer = fresh;
-                b->mapped_ptr = fresh.contents;
-            }
+// D1: hand out a ring slot of buffer b whose GPU work is guaranteed complete,
+// and make it current (b->mtl_buffer / b->mapped_ptr alias it). A slot is
+// reusable when its fence command buffer is nil (never used) or has completed;
+// stamp_ring_fences() ties each slot to the exact command buffer that reads it,
+// so this is correct regardless of how command buffers from multiple OS windows
+// interleave on the single command queue (fence-by-completion, not by luck).
+//
+// Slots are marked MTLResourceHazardTrackingModeUntracked [C3b]: the ring
+// discipline (never write a slot the fence says is still in flight; buffers are
+// only ever GPU-READ, never GPU-written) removes every hazard Metal's automatic
+// tracking would guard, so tracking is pure overhead here.
+static MetalRingSlot*
+ring_acquire_slot(MetalBuffer *b) {
+    b->is_ring = true;
+    int chosen = -1;
+    for (int i = 0; i < b->ring_count; i++) {
+        MetalRingSlot *s = &b->ring[i];
+        if (!s->fence_cb || s->fence_cb.status == MTLCommandBufferStatusCompleted) {
+            if (s->fence_cb) { [s->fence_cb release]; s->fence_cb = nil; }
+            chosen = i; break;
         }
     }
-    return buffers[buf_idx].mapped_ptr;
+    if (chosen < 0) {
+        if (b->ring_count < BUFFER_RING_MAX) {
+            chosen = b->ring_count++;
+            MetalRingSlot *s = &b->ring[chosen];
+            s->buf = nil; s->ptr = NULL; s->size = 0; s->fence_cb = nil;
+        } else {
+            // Pathological: every slot still referenced by in-flight GPU work
+            // AND the ring is at its safety cap. Cannot happen with depth 3 and
+            // maximumDrawableCount=2, but never hand out an in-flight buffer:
+            // block on the oldest slot (the single queue guarantees progress).
+            chosen = 0;
+            MetalRingSlot *s = &b->ring[chosen];
+            while (s->fence_cb && s->fence_cb.status != MTLCommandBufferStatusCompleted) sched_yield();
+            if (s->fence_cb) { [s->fence_cb release]; s->fence_cb = nil; }
+        }
+    }
+    MetalRingSlot *s = &b->ring[chosen];
+    GLsizeiptr need = b->size > 0 ? b->size : 4; // Metal forbids zero-length buffers
+    if (!s->buf || s->size < need) {
+        id<MTLBuffer> fresh = [mtl_device newBufferWithLength:need
+                                                     options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
+        if (fresh) {
+            if (s->buf) [s->buf release];
+            s->buf = fresh;
+            s->ptr = fresh.contents;
+            s->size = need;
+            s->fresh = true; // D2: garbage contents until the first full write
+            metal_frame_alloc_count++;
+        }
+    }
+    b->ring_head = chosen;
+    b->mtl_buffer = s->buf;
+    b->mapped_ptr = s->ptr;
+    return s;
+}
+
+void*
+alloc_and_map_vao_buffer(ssize_t vao_idx, GLsizeiptr size, size_t bufnum, bool frequently_updated) {
+    ssize_t buf_idx = vaos[vao_idx].buffers[bufnum];
+    MetalBuffer *b = &buffers[buf_idx];
+    if (frequently_updated) {
+        // Full-buffer rewrite (GL_STREAM_DRAW + glMapBuffer): the caller
+        // overwrites the whole buffer this frame (screen_update_cell_data /
+        // screen_apply_selection), so return a GPU-idle ring slot with NO
+        // contents copy. Steady state (constant grid) reuses slots: zero allocs.
+        b->size = size;
+        b->usage = GL_STREAM_DRAW;
+        ring_acquire_slot(b);
+        return b->mapped_ptr;
+    }
+    // Not frequently updated (borders): keep the single hazard-tracked buffer,
+    // reused in place. Writes are rare (rect_data_is_dirty) and there is no
+    // steady-state allocation, so it stays outside the ring.
+    alloc_buffer_data(buf_idx, size);
+    return b->mapped_ptr;
+}
+
+// D2: report (and consume) whether the ring slot just handed out for buffer
+// `bufnum` was freshly (re)allocated — i.e. its contents are garbage and the
+// caller must do a FULL write rather than a per-row memcmp diff. Call this
+// immediately after alloc_and_map_vao_buffer(...true) for the cell buffer.
+// Returns true (force full) for non-ring/edge cases so callers stay safe.
+bool
+metal_cell_ring_take_fresh(ssize_t vao_idx, size_t bufnum) {
+    ssize_t buf_idx = vaos[vao_idx].buffers[bufnum];
+    MetalBuffer *b = &buffers[buf_idx];
+    if (!b->is_ring || b->ring_count == 0) return true;
+    MetalRingSlot *s = &b->ring[b->ring_head];
+    bool was_fresh = s->fresh;
+    s->fresh = false;
+    return was_fresh;
 }
 
 void*
@@ -677,31 +815,40 @@ map_vao_buffer(ssize_t vao_idx, size_t bufnum, GLenum access) {
 }
 
 // GL's glMapBufferRange(WRITE|INVALIDATE) lets the driver hand back fresh
-// storage while the previous frame keeps reading the old allocation. The
-// shim must do the same: CPU writes into the one shared MTLBuffer would
-// otherwise race the in-flight frame's vertex fetch (torn cells, stale
-// cursor). Committed command buffers retain every resource they reference,
-// so releasing the old buffer here is safe; contents are copied across
-// because some callers (graphics image data) map sub-ranges and GL
-// preserves bytes outside the invalidated range.
-static void
-orphan_buffer_preserving_contents(MetalBuffer *b) {
-    if (!b->mtl_buffer || b->size <= 0) return;
-    id<MTLBuffer> fresh = [mtl_device newBufferWithLength:b->size options:MTLResourceStorageModeShared];
-    if (!fresh) return; // keep writing in place rather than crash on alloc failure
-    memcpy(fresh.contents, b->mtl_buffer.contents, (size_t)b->size);
-    [b->mtl_buffer release];
-    b->mtl_buffer = fresh;
-    b->mapped_ptr = fresh.contents;
-}
-
+// storage while the previous frame keeps reading the old allocation. The ring
+// reproduces that without allocating: hand out a GPU-idle slot. Because a caller
+// may write only [offset, offset+size) (D2's per-line uploads) and GL preserves
+// bytes outside the invalidated range, the new slot is seeded (copy-forward)
+// from the newest slot — so slot content == the last full write into the ring,
+// exactly the map_vao_buffer_for_write_only contract. For D1 every caller still
+// writes the whole buffer at offset 0, so the copy is currently redundant but
+// keeps the invariant D2 builds on.
 void*
 map_vao_buffer_for_write_only(ssize_t vao_idx, size_t bufnum, int offset, unsigned size) {
     (void)size;
     ssize_t buf_idx = vaos[vao_idx].buffers[bufnum];
     MetalBuffer *b = &buffers[buf_idx];
-    orphan_buffer_preserving_contents(b);
-    if (!b->mapped_ptr && b->mtl_buffer) b->mapped_ptr = b->mtl_buffer.contents;
+    if (b->size <= 0) {
+        // Never sized (should not happen: uniform/color-table are alloc'd at VAO
+        // creation) — fall back to whatever single buffer exists.
+        if (!b->mapped_ptr && b->mtl_buffer) b->mapped_ptr = b->mtl_buffer.contents;
+        return b->mapped_ptr ? (uint8_t*)b->mapped_ptr + offset : NULL;
+    }
+    // First ring use: drop the single buffer pre-allocated by alloc_vao_buffer()
+    // at VAO creation so it is not leaked (b->mtl_buffer becomes a ring alias).
+    if (!b->is_ring && b->mtl_buffer) {
+        [b->mtl_buffer release];
+        b->mtl_buffer = nil;
+        b->mapped_ptr = NULL;
+    }
+    // Capture the newest slot BEFORE acquiring (ring_acquire_slot moves ring_head).
+    id<MTLBuffer> prevbuf = (b->is_ring && b->ring_count > 0) ? b->ring[b->ring_head].buf : nil;
+    GLsizeiptr prevsize = (b->is_ring && b->ring_count > 0) ? b->ring[b->ring_head].size : 0;
+    MetalRingSlot *s = ring_acquire_slot(b);
+    if (prevbuf && prevbuf != s->buf) {
+        GLsizeiptr copyable = prevsize < b->size ? prevsize : b->size;
+        if (copyable > 0) memcpy(s->ptr, prevbuf.contents, (size_t)copyable);
+    }
     if (!b->mapped_ptr) return NULL;
     return (uint8_t*)b->mapped_ptr + offset;
 }
@@ -891,11 +1038,16 @@ static int metal_frame_counter = 0;
 // metal_frame_counter it advances every frame regardless of KITTY_METAL_LOG.
 // metal_pass_count (render passes/encoders opened this frame — the
 // acceptance-criterion-2 probe) and metal_frame_encode_start (CACurrentMediaTime
-// captured when this frame's command buffer is created, for CPU-encode ms) are
+// captured AFTER the drawable is acquired — see the p99 fix in ensure_drawable —
+// so encode_ms measures command encoding, NOT drawable-acquisition blocking) are
 // per current window: saved/restored with the window slot below.
+// metal_frame_drawable_wait accumulates time spent in nextDrawable this frame
+// (emitted as drawable_wait_ms); with maximumDrawableCount=2 this is where the
+// keypress-to-photon backpressure actually lives, so it is measured separately.
 static uint64_t metal_frame_index = 0;
 static int metal_pass_count = 0;
 static double metal_frame_encode_start = 0.0;
+static double metal_frame_drawable_wait = 0.0;
 
 // M3: has any render pass targeted the drawable yet this frame? The first
 // drawable pass must not Load the recycled drawable (its contents are
@@ -903,6 +1055,28 @@ static double metal_frame_encode_start = 0.0;
 // earlier draws. Per current window: saved/restored with the window slot,
 // reset in metal_end_frame.
 static bool drawable_pass_opened = false;
+
+// D1: stamp every ring buffer bound by the currently-bound VAO with the command
+// buffer that is about to read it. This is the ring's fence: a slot can only be
+// recycled (ring_acquire_slot) once THIS command buffer reports completed, which
+// is unconditionally correct no matter how command buffers from multiple OS
+// windows interleave on the single command queue. Called at draw time (the CB is
+// guaranteed live once an encoder exists) and is idempotent within a frame.
+static void
+stamp_ring_fences(ssize_t vao_idx) {
+    if (vao_idx < 0 || !mtl_current_command_buffer) return;
+    MetalVAO *vao = &vaos[vao_idx];
+    for (size_t i = 0; i < vao->num_buffers; i++) {
+        MetalBuffer *b = &buffers[vao->buffers[i]];
+        if (!b->is_ring || b->ring_count == 0) continue;
+        MetalRingSlot *s = &b->ring[b->ring_head];
+        if (s->fence_cb != mtl_current_command_buffer) {
+            [mtl_current_command_buffer retain];
+            if (s->fence_cb) [s->fence_cb release];
+            s->fence_cb = mtl_current_command_buffer;
+        }
+    }
+}
 
 void
 draw_quad(bool blend, unsigned instance_count) {
@@ -936,6 +1110,9 @@ draw_quad(bool blend, unsigned instance_count) {
         begin_render_pass_to_drawable(false);
     }
     if (!mtl_current_encoder) return;
+
+    // D1: fence the ring buffers this draw will read to this command buffer.
+    stamp_ring_fences(current_bound_vao);
 
     // Set viewport
     [mtl_current_encoder setViewport:mtl_viewport];
@@ -1284,7 +1461,8 @@ typedef struct {
     bool clear_pending, clear_srgb;
     bool in_use;
     int pass_count;             // Phase 0: passes opened this frame (per window)
-    double frame_encode_start;  // Phase 0: CACurrentMediaTime at cb creation
+    double frame_encode_start;  // Phase 0 (p99-fixed): CACurrentMediaTime after drawable acquired
+    double frame_drawable_wait; // p99: seconds spent in nextDrawable this frame
     bool drawable_pass_opened;  // M3: first drawable pass seen this frame?
 } MetalWindowSlot;
 #define MAX_METAL_WINDOWS 64
@@ -1304,6 +1482,7 @@ save_current_window_state(void) {
     s->clear_srgb = clear_srgb_flag;
     s->pass_count = metal_pass_count;
     s->frame_encode_start = metal_frame_encode_start;
+    s->frame_drawable_wait = metal_frame_drawable_wait;
     s->drawable_pass_opened = drawable_pass_opened;
 }
 
@@ -1318,6 +1497,7 @@ load_window_state(const MetalWindowSlot *s) {
     clear_srgb_flag = s->clear_srgb;
     metal_pass_count = s->pass_count;
     metal_frame_encode_start = s->frame_encode_start;
+    metal_frame_drawable_wait = s->frame_drawable_wait;
     drawable_pass_opened = s->drawable_pass_opened;
 }
 
@@ -1359,6 +1539,7 @@ metal_set_current_layer(void *layer) {
         clear_srgb_flag = false;
         metal_pass_count = 0;
         metal_frame_encode_start = 0.0;
+        metal_frame_drawable_wait = 0.0;
         drawable_pass_opened = false;
     }
     mtl_current_layer = (__bridge CAMetalLayer *)layer;
@@ -1393,13 +1574,15 @@ ensure_command_buffer(void) {
             }
         }];
         // Phase 0: the command buffer's lifetime is this frame's CPU-encode
-        // span. Begin it here (once per frame, keyed on the cb pointer so the
-        // matching end in metal_end_frame finds it) and stamp encode-start.
+        // span. Begin the signpost here (once per frame, keyed on the cb pointer
+        // so the matching end in metal_end_frame finds it). The encode_ms STAT
+        // start stamp is NOT taken here: it is stamped after the drawable is
+        // acquired (ensure_drawable) so that nextDrawable blocking is measured as
+        // drawable_wait_ms, not silently folded into encode_ms (worker-prof #16).
         if (metal_signpost_enabled()) {
             os_log_t slog = metal_signpost_log();
             os_signpost_interval_begin(slog, os_signpost_id_make_with_pointer(slog, (__bridge void *)mtl_current_command_buffer), "frame_encode", "");
         }
-        if (metal_stats_enabled()) metal_frame_encode_start = CACurrentMediaTime();
     }
     return true;
 }
@@ -1416,6 +1599,10 @@ ensure_drawable(void) {
             }
         }
         // Phase 0: nextDrawable can block on the drawable pool — span it.
+        // p99 (worker-prof #16): time the block so it lands in drawable_wait_ms,
+        // and stamp encode_ms's start only AFTER the drawable is in hand.
+        const bool st = metal_stats_enabled();
+        const double wait_t0 = st ? CACurrentMediaTime() : 0.0;
         if (metal_signpost_enabled()) {
             os_log_t slog = metal_signpost_log();
             os_signpost_id_t sid = os_signpost_id_generate(slog);
@@ -1424,6 +1611,11 @@ ensure_drawable(void) {
             os_signpost_interval_end(slog, sid, "drawable_acquire", "");
         } else {
             mtl_current_drawable = [mtl_current_layer nextDrawable];
+        }
+        if (st) {
+            const double now = CACurrentMediaTime();
+            metal_frame_drawable_wait += now - wait_t0;      // reported as drawable_wait_ms
+            if (mtl_current_drawable) metal_frame_encode_start = now; // encode_ms starts here
         }
     }
     return mtl_current_drawable != nil;
@@ -1643,12 +1835,15 @@ metal_end_frame(void) {
             // GPU times are valid only once the buffer completes; encode ms and
             // the pass count are known now, so capture them into the handler.
             const double encode_ms = metal_frame_encode_start > 0.0 ? (CACurrentMediaTime() - metal_frame_encode_start) * 1000.0 : 0.0;
+            const double drawable_wait_ms = metal_frame_drawable_wait * 1000.0; // p99: nextDrawable block, excluded from encode_ms
             const int passes = metal_pass_count;
+            const int allocs = metal_frame_alloc_count; // D1: MTLBuffer allocs this frame (0 in steady state)
+            const uint64_t bytes = metal_frame_bytes_uploaded; // D2: VAO-buffer bytes uploaded this frame
             [mtl_current_command_buffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
                 const double gpu_ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
-                char line[192];
-                snprintf(line, sizeof line, "metal_stats frame=%llu encode_ms=%.3f gpu_ms=%.3f passes=%d\n",
-                         (unsigned long long)fidx, encode_ms, gpu_ms, passes);
+                char line[256];
+                snprintf(line, sizeof line, "metal_stats frame=%llu encode_ms=%.3f gpu_ms=%.3f passes=%d allocs=%d bytes=%llu drawable_wait_ms=%.3f\n",
+                         (unsigned long long)fidx, encode_ms, gpu_ms, passes, allocs, (unsigned long long)bytes, drawable_wait_ms);
                 metal_stats_emit(line);
             }];
         }
@@ -1692,6 +1887,10 @@ metal_end_frame(void) {
     mtl_current_render_pass = nil;
     clear_pending = false;
     metal_pass_count = 0;         // Phase 0: reset for the next frame (per current window)
+    metal_frame_encode_start = 0.0; // p99: re-stamped in ensure_drawable, so clear here
+    metal_frame_drawable_wait = 0.0; // p99: reset per-frame nextDrawable-wait accumulator
+    metal_frame_alloc_count = 0;  // D1: reset per-frame ring allocation counter
+    metal_frame_bytes_uploaded = 0; // D2: reset per-frame upload-bytes counter
     drawable_pass_opened = false; // M3: next frame's first drawable pass discards again
 }
 

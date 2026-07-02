@@ -183,6 +183,8 @@ void* alloc_and_map_vao_buffer(ssize_t vao_idx, GLsizeiptr size, size_t bufnum, 
 void unmap_vao_buffer(ssize_t vao_idx, size_t bufnum);
 void* map_vao_buffer(ssize_t vao_idx, size_t bufnum, GLenum access);
 void* map_vao_buffer_for_write_only(ssize_t vao_idx, size_t bufnum, int offset, unsigned size);
+bool metal_cell_ring_take_fresh(ssize_t vao_idx, size_t bufnum); // D2: was the current cell ring slot just (re)allocated?
+void metal_note_upload_bytes(uint64_t n);                        // D2: accumulate this frame's VAO-buffer upload bytes
 void bind_program(int program);
 void bind_vertex_array(ssize_t vao_idx);
 void bind_vao_uniform_buffer(ssize_t vao_idx, size_t bufnum, GLuint block_index);
