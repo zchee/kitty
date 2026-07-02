@@ -293,7 +293,11 @@ void screen_apply_selection(Screen *self, void *address, size_t size);
 bool screen_is_selection_dirty(Screen *self);
 bool screen_has_selection(Screen*);
 bool screen_invert_colors(Screen *self);
-void screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE, bool cursor_has_moved);
+// D2: force_full=true rewrites every render row (GL backend, resize/fresh ring slot,
+// paused rendering); force_full=false uploads only rows whose gpu_cells differ from
+// the persistent Metal ring slot already bound at `address`. Returns the number of
+// GPUCell bytes actually written (the metal_stats bytes= probe).
+uint64_t screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE, bool cursor_has_moved, bool force_full);
 bool screen_is_cursor_visible(const Screen *self);
 unsigned screen_multi_cursor_count(const Screen *self);
 bool screen_selection_range_for_line(Screen *self, index_type y, index_type *start, index_type *end);

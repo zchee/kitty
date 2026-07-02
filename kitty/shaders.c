@@ -17,6 +17,19 @@
 #include "uniforms_generated.h"
 #include "state.h"
 
+// D2: per-line dirty upload helpers. On Metal these bridge to the persistent
+// ring (metal.m): D2_TAKE_FRESH reports whether the just-mapped cell ring slot
+// is fresh (=> full write), D2_NOTE_BYTES accumulates the frame's upload bytes
+// for the metal_stats bytes= probe. On the OpenGL backend the buffer is orphaned
+// fresh every frame, so full write always (true) and byte-tracking is a no-op.
+#ifdef KITTY_BACKEND_METAL
+#define D2_TAKE_FRESH(vao_idx, bufnum) metal_cell_ring_take_fresh((vao_idx), (bufnum))
+#define D2_NOTE_BYTES(n) metal_note_upload_bytes((uint64_t)(n))
+#else
+#define D2_TAKE_FRESH(vao_idx, bufnum) true
+#define D2_NOTE_BYTES(n) ((void)(n))
+#endif
+
 enum {
     CELL_PROGRAM, CELL_FG_PROGRAM, CELL_BG_PROGRAM, CELL_PROGRAM_SENTINEL,
     BORDERS_PROGRAM,
@@ -486,9 +499,10 @@ struct GPUCellRenderData {
 
 // D4: per-VAO shadow of the last GPUCellRenderData actually written to the GPU
 // buffer. Lets cell_update_uniform_block() elide the map+write (which on the
-// Metal backend orphans the MTLBuffer -- fresh allocation plus a full-buffer
-// memcpy, see orphan_buffer_preserving_contents() in metal.m -- and on GL remaps
-// the buffer range) whenever this render produces byte-identical uniform data to
+// Metal backend advances the persistent buffer ring and copies-forward the slot
+// contents, see map_vao_buffer_for_write_only()/ring_acquire_slot() in metal.m --
+// and on GL remaps the buffer range) whenever this render produces byte-identical
+// uniform data to
 // what is already resident: idle cursor blink between opacity steps, or any
 // render triggered by another window's damage. Indexed 1:1 with the vao_idx
 // space both backends use (kitty/gl.c, kitty/metal.m: `vaos[4*MAX_CHILDREN+10]`),
@@ -517,6 +531,7 @@ cell_update_uniform_block(ssize_t vao_idx, Screen *screen, int uniform_buffer, i
         GLuint *ct_buf = (GLuint*)map_vao_buffer_for_write_only(vao_idx, color_table_buf, 0, cell_program_layouts[CELL_PROGRAM].color_table.size);
         copy_color_table_to_buffer(cp, ct_buf, 0, cell_program_layouts[CELL_PROGRAM].color_table_stride / sizeof(GLuint));
         unmap_vao_buffer(vao_idx, color_table_buf);
+        D2_NOTE_BYTES(cell_program_layouts[CELL_PROGRAM].color_table.size);
     }
     UniformBlockShadow *shadow = uniform_block_shadow_for_vao(vao_idx);
     struct GPUCellRenderData computed;
@@ -639,6 +654,7 @@ cell_update_uniform_block(ssize_t vao_idx, Screen *screen, int uniform_buffer, i
         if (gpu) {
             *gpu = computed;
             unmap_vao_buffer(vao_idx, uniform_buffer);
+            D2_NOTE_BYTES(cell_program_layouts[CELL_PROGRAM].render_data.size);
         }
         if (shadow) { shadow->data = computed; shadow->valid = true; }
     }
@@ -664,7 +680,8 @@ cell_prepare_to_render(ssize_t vao_idx, Screen *screen, FONTS_DATA_HANDLE fonts_
         const unsigned int render_lines = render_lines_for_screen(screen); \
         sz = sizeof(GPUCell) * render_lines * screen->columns; \
         address = alloc_and_map_vao_buffer(vao_idx, sz, cell_data_buffer, true); \
-        screen_update_cell_data(screen, address, fonts_data, disable_ligatures && cursor_pos_changed); \
+        const bool cell_force_full = D2_TAKE_FRESH(vao_idx, cell_data_buffer); \
+        D2_NOTE_BYTES(screen_update_cell_data(screen, address, fonts_data, disable_ligatures && cursor_pos_changed, cell_force_full)); \
         unmap_vao_buffer(vao_idx, cell_data_buffer); address = NULL; \
         changed = true; \
 }
@@ -678,6 +695,7 @@ cell_prepare_to_render(ssize_t vao_idx, Screen *screen, FONTS_DATA_HANDLE fonts_
     sz = (size_t)render_lines * screen->columns; \
     address = alloc_and_map_vao_buffer(vao_idx, sz, selection_buffer, true); \
     screen_apply_selection(screen, address, sz); \
+    D2_NOTE_BYTES(sz); /* selection stays a full rewrite, but only when dirty (already gated) */ \
     unmap_vao_buffer(vao_idx, selection_buffer); address = NULL; \
     changed = true; \
 }
