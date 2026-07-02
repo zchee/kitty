@@ -2460,6 +2460,22 @@ typedef void (*glfwCocoaRequestRenderFrame_func)(GLFWwindow*, GLFWcocoarenderfra
 GFW_EXTERN glfwCocoaRequestRenderFrame_func glfwCocoaRequestRenderFrame_impl;
 #define glfwCocoaRequestRenderFrame glfwCocoaRequestRenderFrame_impl
 
+typedef void* (*glfwGetCocoaPendingMetalDrawable_func)(GLFWwindow*);
+GFW_EXTERN glfwGetCocoaPendingMetalDrawable_func glfwGetCocoaPendingMetalDrawable_impl;
+#define glfwGetCocoaPendingMetalDrawable glfwGetCocoaPendingMetalDrawable_impl
+
+typedef void (*glfwCocoaSetRenderLinkPaused_func)(GLFWwindow*, bool);
+GFW_EXTERN glfwCocoaSetRenderLinkPaused_func glfwCocoaSetRenderLinkPaused_impl;
+#define glfwCocoaSetRenderLinkPaused glfwCocoaSetRenderLinkPaused_impl
+
+typedef void (*glfwCocoaSetRenderLinkEnabled_func)(GLFWwindow*, bool);
+GFW_EXTERN glfwCocoaSetRenderLinkEnabled_func glfwCocoaSetRenderLinkEnabled_impl;
+#define glfwCocoaSetRenderLinkEnabled glfwCocoaSetRenderLinkEnabled_impl
+
+typedef bool (*glfwCocoaResetLiveResizeGuards_func)(GLFWwindow*);
+GFW_EXTERN glfwCocoaResetLiveResizeGuards_func glfwCocoaResetLiveResizeGuards_impl;
+#define glfwCocoaResetLiveResizeGuards glfwCocoaResetLiveResizeGuards_impl
+
 typedef bool (*glfwCocoaRecreateGLDrawable_func)(GLFWwindow*);
 GFW_EXTERN glfwCocoaRecreateGLDrawable_func glfwCocoaRecreateGLDrawable_impl;
 #define glfwCocoaRecreateGLDrawable glfwCocoaRecreateGLDrawable_impl

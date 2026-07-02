@@ -561,6 +561,9 @@ void gl_init(void);
 void metal_end_frame(void);
 void metal_set_current_layer(void *layer);
 void* metal_get_device(void);
+void metal_set_link_drawable(void *drawable);  // Phase 4 (L1): link-delivered drawable for this frame
+double metal_ms_since_last_present(void);       // Phase 4 (L2): ms since last present (immediate-encode gate)
+bool metal_immediate_encode_enabled(void);      // Phase 4 (L2): runtime kill-switch
 #endif
 void remove_vao(ssize_t vao_idx);
 bool remove_os_window(id_type os_window_id);
@@ -640,7 +643,8 @@ bool update_ime_position_for_window(id_type window_id, bool force, int update_fo
 void set_ignore_os_keyboard_processing(bool enabled);
 void update_menu_bar_title(PyObject *title UNUSED);
 void change_live_resize_state(OSWindow*, bool);
-bool render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images);
+bool render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images, bool input_driven);
+void note_local_key_input(void);  // Phase 4 (L5): stamp local key input for the echo fast-path
 void update_mouse_pointer_shape(void);
 void adjust_window_size_for_csd(OSWindow *w, int width, int height, int *adjusted_width, int *adjusted_height);
 void dispatch_buffered_keys(Window *w);

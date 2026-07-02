@@ -107,6 +107,18 @@ static id<MTLRenderCommandEncoder> mtl_current_encoder = nil;
 static id<CAMetalDrawable> mtl_current_drawable = nil;
 static MTLRenderPassDescriptor *mtl_current_render_pass = nil;
 static CAMetalLayer *mtl_current_layer = nil;
+// Phase 4 (L1): the drawable delivered by the CAMetalDisplayLink for this frame,
+// set via metal_set_link_drawable() before the link-driven render and cleared
+// after. Unretained: it is owned by the CAMetalDisplayLinkUpdate for the duration
+// of the delegate callback, and by the committed command buffer once presented.
+static id<CAMetalDrawable> mtl_link_drawable = nil;
+// Phase 4 (L2 + observability): pace attribution + the last on-screen present time.
+// metal_frame_used_link_drawable distinguishes a CAMetalDisplayLink-driven frame
+// (pace=link) from an L2 immediate-encode-on-input frame (pace=immediate).
+// metal_last_present_at gates L2 so an immediate render can't outrun the display
+// (only encode when >= ~1 refresh has elapsed since the last present).
+static bool metal_frame_used_link_drawable = false;
+static double metal_last_present_at = 0.0;
 
 // Clear color state
 static float clear_r = 0, clear_g = 0, clear_b = 0, clear_a = 1;
@@ -1637,9 +1649,30 @@ ensure_command_buffer(void) {
     return true;
 }
 
+void
+metal_set_link_drawable(void *drawable) {
+    // Phase 4 (L1): stash the CAMetalDisplayLink-delivered drawable for this
+    // frame (or NULL to clear). __bridge only reinterprets the pointer — no
+    // ownership transfer (the Update / committed command buffer own it).
+    mtl_link_drawable = (__bridge id<CAMetalDrawable>)drawable;
+}
+
 static bool
 ensure_drawable(void) {
-    if (!mtl_current_drawable && mtl_current_layer) {
+    if (mtl_current_drawable) return true;
+    // Phase 4 (L1): a CAMetalDisplayLink-delivered drawable short-circuits the
+    // nextDrawable path. The vsync backpressure was already absorbed by the link
+    // scheduling this delegate callback, so there is no nextDrawable block to
+    // time — drawable_wait_ms stays 0.000 (kept for tolerant-parser stability;
+    // its meaning is redefined under the link, see metal-pipeline-design.md).
+    // encode_ms starts here, mirroring the nextDrawable path below.
+    if (mtl_link_drawable) {
+        mtl_current_drawable = mtl_link_drawable;
+        metal_frame_used_link_drawable = true;  // pace=link (vs L2 pace=immediate)
+        if (metal_stats_enabled()) metal_frame_encode_start = CACurrentMediaTime();
+        return true;
+    }
+    if (mtl_current_layer) {
         CGSize ds = mtl_current_layer.drawableSize;
         if (ds.width < 1 || ds.height < 1) {
             if (mtl_viewport.width > 0 && mtl_viewport.height > 0) {
@@ -1978,6 +2011,15 @@ metal_end_frame(void) {
             os_signpost_interval_begin(slog, present_sid, "present", "");
         }
         const uint64_t fidx = metal_frame_index++;
+        // Phase 4 step 6 (observability): attribute every frame's scheduling
+        // source. resize (presentsWithTransaction) > unsynced (sync_to_monitor=no
+        // => displaySyncEnabled=NO) > link (CAMetalDisplayLink drawable) >
+        // immediate (L2 input-driven render outside the link). String literals are
+        // static, so capturing `pace` in the async handlers below is safe.
+        const char *pace =
+            (mtl_current_layer && mtl_current_layer.presentsWithTransaction) ? "resize" :
+            (mtl_current_layer && !mtl_current_layer.displaySyncEnabled) ? "unsynced" :
+            metal_frame_used_link_drawable ? "link" : "immediate";
         if (st) {
             // GPU times are valid only once the buffer completes; encode ms and
             // the pass count are known now, so capture them into the handler.
@@ -1989,8 +2031,9 @@ metal_end_frame(void) {
             [mtl_current_command_buffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
                 const double gpu_ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
                 char line[256];
-                snprintf(line, sizeof line, "metal_stats frame=%llu encode_ms=%.3f gpu_ms=%.3f passes=%d allocs=%d bytes=%llu drawable_wait_ms=%.3f\n",
-                         (unsigned long long)fidx, encode_ms, gpu_ms, passes, allocs, (unsigned long long)bytes, drawable_wait_ms);
+                // pace= is tail-appended (tolerant parsers, never $-anchored).
+                snprintf(line, sizeof line, "metal_stats frame=%llu encode_ms=%.3f gpu_ms=%.3f passes=%d allocs=%d bytes=%llu drawable_wait_ms=%.3f pace=%s\n",
+                         (unsigned long long)fidx, encode_ms, gpu_ms, passes, allocs, (unsigned long long)bytes, drawable_wait_ms, pace);
                 metal_stats_emit(line);
             }];
         }
@@ -1999,8 +2042,8 @@ metal_end_frame(void) {
         if ((st || sp) && mtl_current_drawable) {
             [mtl_current_drawable addPresentedHandler:^(id<MTLDrawable> d) {
                 char line[128];
-                snprintf(line, sizeof line, "metal_present frame=%llu presented_time=%.9f\n",
-                         (unsigned long long)fidx, d.presentedTime);
+                snprintf(line, sizeof line, "metal_present frame=%llu presented_time=%.9f pace=%s\n",
+                         (unsigned long long)fidx, d.presentedTime, pace);
                 metal_stats_emit(line);
             }];
         }
@@ -2017,9 +2060,11 @@ metal_end_frame(void) {
             [mtl_current_command_buffer commit];
             [mtl_current_command_buffer waitUntilScheduled];
             [mtl_current_drawable present];
+            metal_last_present_at = CACurrentMediaTime();
         } else {
             if (mtl_current_drawable) {
                 [mtl_current_command_buffer presentDrawable:mtl_current_drawable];
+                metal_last_present_at = CACurrentMediaTime();  // L2: gate immediate-encode on time-since-present
             }
             [mtl_current_command_buffer commit];
         }
@@ -2036,6 +2081,36 @@ metal_end_frame(void) {
     metal_frame_bytes_uploaded = 0; // D2: reset per-frame upload-bytes counter
     drawable_pass_opened = false; // M3: next frame's first drawable pass discards again
     layered_pass_active = false;  // M1: defensive — resolve normally clears it
+    metal_frame_used_link_drawable = false; // pace: recomputed per frame in ensure_drawable
+}
+
+double
+metal_ms_since_last_present(void) {
+    // L2: milliseconds since the last on-screen present (a large value if nothing
+    // has presented yet). child-monitor.c uses this to gate immediate-encode so an
+    // input burst can't outrun the display refresh.
+    if (metal_last_present_at <= 0.0) return 1.0e9;
+    return (CACurrentMediaTime() - metal_last_present_at) * 1000.0;
+}
+
+bool
+metal_immediate_encode_enabled(void) {
+    // L2 immediate-encode-on-input is DEFERRED: rendering an input frame via
+    // nextDrawable while the CAMetalDisplayLink is attached corrupts the drawable
+    // pool (SIGSEGV — see the "L2 ... DEFERRED" note in metal-pipeline-design.md).
+    // The correct fix is the IOSurface presentation model (plan Phase-4 step 7).
+    // KITTY_METAL_IMMEDIATE is NEUTERED — it logs once and does nothing (never
+    // activates the crashing path), so the pace=immediate + metal_ms_since_last_present
+    // groundwork stays without shipping a landmine. Always returns false.
+    static bool checked = false;
+    if (!checked) {
+        checked = true;
+        const char *v = getenv("KITTY_METAL_IMMEDIATE");
+        if (v && v[0] && strcmp(v, "0") != 0)
+            log_error("KITTY_METAL_IMMEDIATE: immediate-encode requires the IOSurface "
+                      "presentation model (see kitty/metal-pipeline-design.md); ignored");
+    }
+    return false;
 }
 
 // ----- GL Compatibility Functions (metal_gl_*) -----
