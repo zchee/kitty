@@ -20,8 +20,15 @@
 #include <string.h>
 #include <stddef.h>
 
-// Dev/debug tracing to the same file used by the draw_quad logger.
-#define METAL_TRACE(...) { FILE *tf_ = fopen("/tmp/kitty_metal_debug.log", "a"); if (tf_) { fprintf(tf_, __VA_ARGS__); fclose(tf_); } }
+// Dev/debug tracing, enabled by setting KITTY_METAL_LOG to a file path.
+static const char*
+metal_log_path(void) {
+    static bool checked = false;
+    static const char *path = NULL;
+    if (!checked) { path = getenv("KITTY_METAL_LOG"); checked = true; }
+    return path;
+}
+#define METAL_TRACE(...) { const char *mlp_ = metal_log_path(); if (mlp_) { FILE *tf_ = fopen(mlp_, "a"); if (tf_) { fprintf(tf_, __VA_ARGS__); fclose(tf_); } } }
 
 // Metal global state
 static id<MTLDevice> mtl_device = nil;
@@ -450,10 +457,13 @@ create_buffer(GLenum usage) {
 
 static void
 delete_buffer(ssize_t buf_idx) {
+    // This file builds under MRC: newBufferWithLength returns +1, so drop
+    // the reference explicitly. mapped_ptr points into the MTLBuffer's
+    // memory and must never be free()d.
     if (buffers[buf_idx].mtl_buffer) {
+        [buffers[buf_idx].mtl_buffer release];
         buffers[buf_idx].mtl_buffer = nil;
     }
-    // mapped_ptr points into MTLBuffer's memory — do NOT free() it
     buffers[buf_idx].mapped_ptr = NULL;
     buffers[buf_idx].size = 0;
     buffers[buf_idx].in_use = false;
@@ -464,8 +474,7 @@ alloc_buffer_data(ssize_t idx, GLsizeiptr size) {
     MetalBuffer *b = &buffers[idx];
     if (b->size == size && b->mtl_buffer) return;
     b->size = size;
-    // Release old buffer — mapped_ptr points into MTLBuffer's memory, NOT malloc'd
-    if (b->mtl_buffer) b->mtl_buffer = nil;
+    if (b->mtl_buffer) { [b->mtl_buffer release]; b->mtl_buffer = nil; }
     b->mapped_ptr = NULL;
     if (size == 0) {
         // Metal doesn't allow zero-length buffers — allocate minimum 4 bytes
@@ -757,19 +766,13 @@ void
 draw_quad(bool blend, unsigned instance_count) {
     blend_enabled = blend;
     if (!mtl_current_layer) return;
-    if (dq_log_count < 20) {
-        FILE *f = fopen("/tmp/kitty_metal_debug.log", "a");
-        if (f) {
-            CGSize ds = mtl_current_layer.drawableSize;
-            fprintf(f, "draw_quad[%d]: prog=%d blend=%d inst=%u vao=%zd fb=%u enc_fmt=%lu vp=(%.0f,%.0f,%.0f,%.0f) ds=%.0fx%.0f pso=%p\n",
-                dq_log_count, current_program, blend, instance_count, current_bound_vao,
-                bound_framebuffer, (unsigned long)mtl_current_enc_fmt,
-                mtl_viewport.originX, mtl_viewport.originY, mtl_viewport.width, mtl_viewport.height,
-                ds.width, ds.height,
-                current_program >= 0 && current_program < NUM_PROGRAMS ?
-                    (__bridge void*)pso_get(current_program, blend, wanted_attachment_format(false)) : NULL);
-            fclose(f);
-        }
+    if (metal_log_path() && dq_log_count < 64) {
+        CGSize ds = mtl_current_layer.drawableSize;
+        METAL_TRACE("draw_quad[%d]: prog=%d blend=%d inst=%u vao=%zd fb=%u enc_fmt=%lu vp=(%.0f,%.0f,%.0f,%.0f) ds=%.0fx%.0f\n",
+            dq_log_count, current_program, blend, instance_count, current_bound_vao,
+            bound_framebuffer, (unsigned long)mtl_current_enc_fmt,
+            mtl_viewport.originX, mtl_viewport.originY, mtl_viewport.width, mtl_viewport.height,
+            ds.width, ds.height);
         dq_log_count++;
     }
 
@@ -867,29 +870,6 @@ draw_quad(bool blend, unsigned instance_count) {
         cell_draw.row_offset = uval_f("row_offset", 0);
         [mtl_current_encoder setVertexBytes:&cell_draw length:sizeof(cell_draw) atIndex:2];
         [mtl_current_encoder setFragmentBytes:&cell_draw length:sizeof(cell_draw) atIndex:2];
-        if (dq_log_count < 20) {
-            MetalCellRenderData *rdp = (current_bound_vao >= 0 && vaos[current_bound_vao].num_buffers > 2) ?
-                (MetalCellRenderData*)buffers[vaos[current_bound_vao].buffers[2]].mapped_ptr : NULL;
-            METAL_TRACE("  cell: vao=%zd nbuf=%zu rdp=%p\n", current_bound_vao,
-                current_bound_vao >= 0 ? vaos[current_bound_vao].num_buffers : 0, (void*)rdp);
-            if (rdp) METAL_TRACE("  rd: cols=%u lines=%u sx=%u sy=%u cw=%u ch=%u ita=%.2f fg=%06x bg0=%06x | cur=(%u..%u,%u..%u) shape=%u op=%.2f xfg=%08x xbg=%08x | url_style=%u inv=%u | du: tc=%.2f tga=%.2f dbb=%u ro=%.2f\n",
-                rdp->columns, rdp->lines, rdp->sprites_xnum, rdp->sprites_ynum, rdp->cell_width, rdp->cell_height,
-                rdp->inactive_text_alpha, rdp->default_fg, rdp->bg_colors0,
-                rdp->cursor_x1, rdp->cursor_x2, rdp->cursor_y1, rdp->cursor_y2, rdp->cursor_shape, rdp->cursor_opacity,
-                rdp->extra_cursor_fg, rdp->extra_cursor_bg, rdp->url_style, rdp->inverted,
-                cell_draw.text_contrast, cell_draw.text_gamma_adjustment, cell_draw.draw_bg_bitfield, cell_draw.row_offset);
-            if (vaos[current_bound_vao].num_buffers > 1) {
-                const uint8_t *sel = buffers[vaos[current_bound_vao].buffers[0] + 0].mapped_ptr ? buffers[vaos[current_bound_vao].buffers[1]].mapped_ptr : NULL;
-                typedef struct { uint32_t fg, bg, dfg, sprite, attrs; } DbgCell;
-                const DbgCell *cells = (const DbgCell*)buffers[vaos[current_bound_vao].buffers[0]].mapped_ptr;
-                if (sel && cells) {
-                    char selhex[64], attrshex[128]; size_t sp = 0, ap = 0;
-                    for (int i = 12; i < 24 && sp < 60; i++) sp += snprintf(selhex + sp, sizeof(selhex) - sp, "%02x", sel[i]);
-                    for (int i = 12; i < 24 && ap < 120; i++) ap += snprintf(attrshex + ap, sizeof(attrshex) - ap, "%x,", cells[i].attrs);
-                    METAL_TRACE("  row0 cols12-23: sel=%s attrs=%s spr12=%x\n", selhex, attrshex, cells[12].sprite);
-                }
-            }
-        }
 
         // Bind textures: unit 0 = sprite atlas (2D array), unit 2 = decorations map
         if (bound_tex_2d_array[0] && bound_tex_2d_array[0] < MAX_TEXTURES && textures[bound_tex_2d_array[0]].texture) {
@@ -957,8 +937,10 @@ draw_quad(bool blend, unsigned instance_count) {
         [mtl_current_encoder setVertexBytes:&tint_u length:sizeof(tint_u) atIndex:0];
         [mtl_current_encoder setFragmentBytes:&tint_u length:sizeof(tint_u) atIndex:0];
     } else if (current_program == 10) {
+        // Mirrors TrailUniforms: MSL float3 occupies 16 bytes, so trail_color
+        // pads to 64 and trail_opacity lands at offset 64 (sizeof == 80).
         struct { float x_coords[4]; float y_coords[4]; float cursor_edge_x[2]; float cursor_edge_y[2];
-                 float trail_color[3]; float trail_opacity; } trail_u = {0};
+                 float trail_color[3]; float _pad0; float trail_opacity; float _pad1[3]; } trail_u = {0};
         uval_fv("x_coords", trail_u.x_coords, 4);
         uval_fv("y_coords", trail_u.y_coords, 4);
         uval_fv("cursor_edge_x", trail_u.cursor_edge_x, 2);
@@ -1050,6 +1032,7 @@ disable_scissor(void) {
 void
 free_texture(GLuint *tex_id) {
     if (*tex_id && *tex_id < MAX_TEXTURES) {
+        [textures[*tex_id].texture release];
         textures[*tex_id].texture = nil;
         textures[*tex_id].target = 0;
     }
@@ -1060,6 +1043,7 @@ void
 free_framebuffer(GLuint *fb_id) {
     if (*fb_id && *fb_id < MAX_FRAMEBUFFERS) {
         framebuffers[*fb_id].in_use = false;
+        [framebuffers[*fb_id].render_target release];
         framebuffers[*fb_id].render_target = nil;
     }
     *fb_id = 0;
@@ -1227,6 +1211,14 @@ ensure_command_buffer(void) {
     if (!mtl_current_command_buffer) {
         mtl_current_command_buffer = [mtl_command_queue commandBuffer];
         if (!mtl_current_command_buffer) return false;
+        // GPU-side failures (page faults, invalid resources) surface only in
+        // the completed status; without this they are silently dropped.
+        [mtl_current_command_buffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+            if (cb.status == MTLCommandBufferStatusError) {
+                log_error("Metal: command buffer failed: %s",
+                          cb.error ? [[cb.error localizedDescription] UTF8String] : "unknown error");
+            }
+        }];
     }
     return true;
 }
@@ -1532,6 +1524,7 @@ void metal_gl_gen_textures(int n, GLuint *ids) {
 void metal_gl_delete_textures(int n, const GLuint *ids) {
     for (int i = 0; i < n; i++) {
         if (ids[i] && ids[i] < MAX_TEXTURES) {
+            [textures[ids[i]].texture release];
             textures[ids[i]].texture = nil;
             textures[ids[i]].target = 0;
         }
@@ -1566,6 +1559,7 @@ void metal_gl_tex_image_2d(GLenum target, int level, int internalformat, int wid
     desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
     desc.storageMode = MTLStorageModeShared;
 
+    [t->texture release];
     t->texture = [mtl_device newTextureWithDescriptor:desc];
     t->target = GL_TEXTURE_2D;
     t->width = width;
@@ -1628,9 +1622,7 @@ void metal_gl_tex_sub_image_3d(GLenum target, int level, int x, int y, int z, in
                 bytesPerImage:0];
     free(swapped);
     if (tex_sub_3d_log_count < 5) {
-        uint32_t first_pixel = ((const uint32_t*)data)[0];
-        FILE *f = fopen("/tmp/kitty_metal_debug.log", "a");
-        if (f) { fprintf(f, "tex_sub_3d: id=%u pos=(%d,%d,%d) size=%dx%d first_px=0x%08x tex=%p\n", tex_id, x, y, z, width, height, first_pixel, (__bridge void*)t->texture); fclose(f); }
+        METAL_TRACE("tex_sub_3d: id=%u pos=(%d,%d,%d) size=%dx%d\n", tex_id, x, y, z, width, height);
         tex_sub_3d_log_count++;
     }
 }
@@ -1651,15 +1643,13 @@ void metal_gl_tex_storage_3d(GLenum target, int levels, GLenum internalformat, i
     desc.usage = MTLTextureUsageShaderRead;
     desc.storageMode = MTLStorageModeShared;
 
+    [t->texture release];
     t->texture = [mtl_device newTextureWithDescriptor:desc];
     t->target = GL_TEXTURE_2D_ARRAY;
     t->width = width;
     t->height = height;
     t->depth = depth;
-    {
-        FILE *f = fopen("/tmp/kitty_metal_debug.log", "a");
-        if (f) { fprintf(f, "tex_storage_3d: id=%u %dx%dx%d fmt=%u tex=%p\n", tex_id, width, height, depth, (unsigned)internalformat, (__bridge void*)t->texture); fclose(f); }
-    }
+    METAL_TRACE("tex_storage_3d: id=%u %dx%dx%d fmt=%u\n", tex_id, width, height, depth, (unsigned)internalformat);
 }
 
 void metal_gl_get_tex_level_parameteriv(GLenum target, int level, GLenum pname, GLint *params) {
@@ -1703,6 +1693,7 @@ void metal_gl_copy_tex_image_2d(GLenum target, int level, GLenum internalformat,
                                                                                 mipmapped:NO];
     desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
     desc.storageMode = MTLStorageModeShared;
+    [t->texture release];
     t->texture = [mtl_device newTextureWithDescriptor:desc];
     t->target = GL_TEXTURE_2D;
     t->width = width;
@@ -1777,6 +1768,7 @@ void metal_gl_delete_framebuffers(int n, const GLuint *ids) {
     for (int i = 0; i < n; i++) {
         if (ids[i] && ids[i] < MAX_FRAMEBUFFERS) {
             framebuffers[ids[i]].in_use = false;
+            [framebuffers[ids[i]].render_target release];
             framebuffers[ids[i]].render_target = nil;
         }
     }
@@ -1796,7 +1788,10 @@ void metal_gl_framebuffer_texture_2d(GLenum target, GLenum attachment, GLenum te
     if (bound_framebuffer && bound_framebuffer < MAX_FRAMEBUFFERS) {
         framebuffers[bound_framebuffer].attached_texture_id = texture;
         MetalTexture *t = get_texture(texture);
-        if (t) framebuffers[bound_framebuffer].render_target = t->texture;
+        // The framebuffer holds its own reference: the attached texture can
+        // be deleted (and its slot reused) while the framebuffer lives.
+        [framebuffers[bound_framebuffer].render_target release];
+        framebuffers[bound_framebuffer].render_target = t ? [t->texture retain] : nil;
     }
 }
 
