@@ -366,9 +366,23 @@ cocoa_out_of_sequence_render(OSWindow *window) {
     window->needs_render = true;
 
 #ifdef KITTY_BACKEND_METAL
-    // Metal: just mark window as needing render and request a tick.
-    // Actual rendering happens in the main render loop to avoid
-    // consuming drawable pool during initialization.
+    // Metal: render synchronously inside the resize event, like the OpenGL
+    // path. During a live drag the layer has presentsWithTransaction=YES,
+    // so metal_end_frame() presents via commit/waitUntilScheduled/present
+    // and the frame stays in the same CA transaction as the window chrome.
+    // The Tahoe framebuffer-recovery dance is NSGL-specific and not needed.
+    bool metal_rendered = false;
+    if (window->fonts_data->sprite_map) {
+        window->needs_render = true;
+        window->render_state = RENDER_FRAME_READY;
+        metal_rendered = render_os_window(window, monotonic(), true);
+    }
+    if (!metal_rendered) {
+        debug_rendering("Cocoa Metal out of sequence render did not happen\n");
+        blank_os_window(window);
+        swap_window_buffers(window);
+    }
+    window->needs_render = true;
     request_tick_callback();
 #else
     // On macOS Tahoe, the default framebuffer can become undefined during

@@ -9,6 +9,12 @@
 
 #ifdef KITTY_USE_METAL
 
+#if defined(__OBJC__)
+// Full CAMetalLayer type for the .m files that toggle presentation
+// properties on window->ns.layer (live resize, backing changes).
+#import <QuartzCore/CAMetalLayer.h>
+#endif
+
 // Metal-specific per-context data (replaces _GLFWcontextNSGL)
 typedef struct _GLFWcontextMetal
 {
