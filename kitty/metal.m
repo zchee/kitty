@@ -42,9 +42,6 @@ static id<CAMetalDrawable> mtl_current_drawable = nil;
 static MTLRenderPassDescriptor *mtl_current_render_pass = nil;
 static CAMetalLayer *mtl_current_layer = nil;
 
-// Pipeline state objects
-static id<MTLRenderPipelineState> mtl_clear_pipeline UNUSED = nil;
-
 // Clear color state
 static float clear_r = 0, clear_g = 0, clear_b = 0, clear_a = 1;
 static bool clear_pending = false;
@@ -75,10 +72,6 @@ static bool clear_srgb_flag = false;
 // Attachment state of the currently open encoder (kitty/metal-pipeline-design.md)
 static id<MTLTexture> mtl_current_srgb_view = nil;
 static MTLPixelFormat mtl_current_enc_fmt = MTLPixelFormatInvalid;
-static bool mtl_current_enc_is_fbo = false;
-
-// Blend state
-static bool blend_enabled = false;
 
 // Active texture unit tracking. GL keeps an independent binding per
 // (unit, target) pair — upload paths freely bind GL_TEXTURE_2D on whatever
@@ -109,7 +102,6 @@ typedef union {
 
 static struct {
     UniformValue values[MAX_UNIFORMS_PER_PROGRAM];
-    bool dirty;
 } uniform_stores[64];
 
 // Gamma LUT — cached for binding to shaders
@@ -118,7 +110,18 @@ static int cached_gamma_lut_count = 0;
 
 // Current VAO binding for buffer access
 static ssize_t current_bound_vao = -1;
-static GLuint current_bound_uniform_block = 0;
+
+// Cell-program options that GL bakes into the GLSL via cell_defines.glsl.
+// The Metal shaders take them as function constants instead, so they are
+// parsed out of the preprocessed source each time Python (re)compiles the
+// cell programs — this keeps text_composition_strategy and
+// text_fg_override_threshold live, including on config reload.
+static struct {
+    bool do_fg_override;
+    int fg_override_algo;
+    float fg_override_threshold;
+    bool text_new_gamma;
+} cell_shader_opts = { .fg_override_algo = 1, .text_new_gamma = true };
 
 // ----- Programs -----
 
@@ -139,6 +142,21 @@ typedef struct {
 } PSOCacheEntry;
 static PSOCacheEntry pso_cache[NUM_PROGRAMS * PSO_VARIANTS_PER_PROGRAM];
 static id<MTLRenderPipelineState> build_pso(int program, bool blend, MTLPixelFormat fmt);
+
+// Drop the cell-program variants so the next pso_get rebuilds them with the
+// current cell_shader_opts (config change / live reload).
+static void
+invalidate_cell_pipeline_states(void) {
+    for (int p = 0; p <= 2; p++) {
+        size_t base = (size_t)p * PSO_VARIANTS_PER_PROGRAM;
+        for (size_t i = base; i < base + PSO_VARIANTS_PER_PROGRAM; i++) {
+            if (pso_cache[i].in_use) {
+                [pso_cache[i].pso release];
+                pso_cache[i] = (PSOCacheEntry){0};
+            }
+        }
+    }
+}
 
 static id<MTLRenderPipelineState>
 pso_get(int program, bool blend, MTLPixelFormat fmt) {
@@ -251,16 +269,12 @@ build_pso(int program, bool blend, MTLPixelFormat fmt) {
             MTLFunctionConstantValues *fc = [[MTLFunctionConstantValues alloc] init];
             bool only_fg = (program == 1);
             bool only_bg = (program == 2);
-            bool do_fg_override = false; // TODO(phase-3): wire to text_fg_override_threshold recompiles
-            int fg_algo = 1;
-            float fg_threshold = 0.0f;
-            bool new_gamma = true;
             [fc setConstantValue:&only_fg type:MTLDataTypeBool atIndex:0]; // ONLY_FOREGROUND
             [fc setConstantValue:&only_bg type:MTLDataTypeBool atIndex:1]; // ONLY_BACKGROUND
-            [fc setConstantValue:&do_fg_override type:MTLDataTypeBool atIndex:2]; // DO_FG_OVERRIDE_ENABLED
-            [fc setConstantValue:&fg_algo type:MTLDataTypeInt atIndex:3]; // FG_OVERRIDE_ALGO_VAL
-            [fc setConstantValue:&fg_threshold type:MTLDataTypeFloat atIndex:4]; // FG_OVERRIDE_THRESHOLD_VAL
-            [fc setConstantValue:&new_gamma type:MTLDataTypeBool atIndex:5]; // TEXT_NEW_GAMMA_ENABLED
+            [fc setConstantValue:&cell_shader_opts.do_fg_override type:MTLDataTypeBool atIndex:2]; // DO_FG_OVERRIDE
+            [fc setConstantValue:&cell_shader_opts.fg_override_algo type:MTLDataTypeInt atIndex:3]; // FG_OVERRIDE_ALGO
+            [fc setConstantValue:&cell_shader_opts.fg_override_threshold type:MTLDataTypeFloat atIndex:4]; // FG_OVERRIDE_THRESHOLD
+            [fc setConstantValue:&cell_shader_opts.text_new_gamma type:MTLDataTypeBool atIndex:5]; // TEXT_NEW_GAMMA
             return create_pipeline_state(@"cell_vertex", @"cell_fragment", blend, cell_vertex_descriptor(), fmt, fc);
         }
         case 4: return create_pipeline_state(@"border_vertex", @"border_fragment", blend, nil, fmt, nil);
@@ -493,7 +507,6 @@ typedef struct {
 } MetalVAO;
 
 static MetalVAO vaos[4*MAX_CHILDREN + 10] = {{0}};
-static ssize_t current_vao = -1;
 
 ssize_t
 create_vao(void) {
@@ -501,7 +514,6 @@ create_vao(void) {
         if (!vaos[i].in_use) {
             vaos[i].in_use = true;
             vaos[i].num_buffers = 0;
-            current_vao = i;
             return i;
         }
     }
@@ -535,18 +547,15 @@ remove_vao(ssize_t vao_idx) {
         delete_buffer(vao->buffers[vao->num_buffers]);
     }
     vao->in_use = false;
-    if (current_vao == vao_idx) current_vao = -1;
 }
 
 void
 bind_vertex_array(ssize_t vao_idx) {
-    current_vao = vao_idx;
     current_bound_vao = vao_idx;
 }
 
 void
 unbind_vertex_array(void) {
-    current_vao = -1;
     current_bound_vao = -1;
 }
 
@@ -560,8 +569,22 @@ alloc_vao_buffer(ssize_t vao_idx, GLsizeiptr size, size_t bufnum, GLenum usage) 
 
 void*
 alloc_and_map_vao_buffer(ssize_t vao_idx, GLsizeiptr size, size_t bufnum, bool frequently_updated) {
-    (void)frequently_updated;
     ssize_t buf_idx = alloc_vao_buffer(vao_idx, size, bufnum, GL_STREAM_DRAW);
+    // Full-buffer rewrite semantics (GL_STREAM_DRAW + glMapBuffer): when the
+    // size is unchanged alloc reuses the same MTLBuffer, so hand back fresh
+    // storage instead of racing the in-flight frame. No contents copy: the
+    // caller rewrites the whole buffer.
+    if (frequently_updated) {
+        MetalBuffer *b = &buffers[buf_idx];
+        if (b->mtl_buffer && b->size > 0) {
+            id<MTLBuffer> fresh = [mtl_device newBufferWithLength:b->size options:MTLResourceStorageModeShared];
+            if (fresh) {
+                [b->mtl_buffer release];
+                b->mtl_buffer = fresh;
+                b->mapped_ptr = fresh.contents;
+            }
+        }
+    }
     return buffers[buf_idx].mapped_ptr;
 }
 
@@ -572,11 +595,31 @@ map_vao_buffer(ssize_t vao_idx, size_t bufnum, GLenum access) {
     return buffers[buf_idx].mapped_ptr;
 }
 
+// GL's glMapBufferRange(WRITE|INVALIDATE) lets the driver hand back fresh
+// storage while the previous frame keeps reading the old allocation. The
+// shim must do the same: CPU writes into the one shared MTLBuffer would
+// otherwise race the in-flight frame's vertex fetch (torn cells, stale
+// cursor). Committed command buffers retain every resource they reference,
+// so releasing the old buffer here is safe; contents are copied across
+// because some callers (graphics image data) map sub-ranges and GL
+// preserves bytes outside the invalidated range.
+static void
+orphan_buffer_preserving_contents(MetalBuffer *b) {
+    if (!b->mtl_buffer || b->size <= 0) return;
+    id<MTLBuffer> fresh = [mtl_device newBufferWithLength:b->size options:MTLResourceStorageModeShared];
+    if (!fresh) return; // keep writing in place rather than crash on alloc failure
+    memcpy(fresh.contents, b->mtl_buffer.contents, (size_t)b->size);
+    [b->mtl_buffer release];
+    b->mtl_buffer = fresh;
+    b->mapped_ptr = fresh.contents;
+}
+
 void*
 map_vao_buffer_for_write_only(ssize_t vao_idx, size_t bufnum, int offset, unsigned size) {
     (void)size;
     ssize_t buf_idx = vaos[vao_idx].buffers[bufnum];
     MetalBuffer *b = &buffers[buf_idx];
+    orphan_buffer_preserving_contents(b);
     if (!b->mapped_ptr && b->mtl_buffer) b->mapped_ptr = b->mtl_buffer.contents;
     if (!b->mapped_ptr) return NULL;
     return (uint8_t*)b->mapped_ptr + offset;
@@ -591,9 +634,8 @@ unmap_vao_buffer(ssize_t vao_idx, size_t bufnum) {
 
 void
 bind_vao_uniform_buffer(ssize_t vao_idx, size_t bufnum, GLuint bidx) {
-    (void)bidx;
+    (void)bidx; (void)bufnum;
     current_bound_vao = vao_idx;
-    current_bound_uniform_block = (GLuint)bufnum;
 }
 
 // ----- Textures -----
@@ -764,7 +806,6 @@ static int dq_log_count = 0;
 static int metal_frame_counter = 0;
 void
 draw_quad(bool blend, unsigned instance_count) {
-    blend_enabled = blend;
     if (!mtl_current_layer) return;
     if (metal_log_path() && dq_log_count < 64) {
         CGSize ds = mtl_current_layer.drawableSize;
@@ -1029,13 +1070,11 @@ disable_scissor(void) {
 
 // ----- Texture Management -----
 
+static void recycle_texture_id(GLuint id);
+
 void
 free_texture(GLuint *tex_id) {
-    if (*tex_id && *tex_id < MAX_TEXTURES) {
-        [textures[*tex_id].texture release];
-        textures[*tex_id].texture = nil;
-        textures[*tex_id].target = 0;
-    }
+    if (*tex_id && *tex_id < MAX_TEXTURES) recycle_texture_id(*tex_id);
     *tex_id = 0;
 }
 
@@ -1092,12 +1131,32 @@ save_texture_as_png(uint32_t texture_id, const char *filename) {
 
 // ----- Shader Compilation -----
 
+static bool
+parse_define_value(const char *source, const char *name, float *val) {
+    const char *p = strstr(source, name);
+    if (!p) return false;
+    p += strlen(name);
+    *val = strtof(p, NULL);
+    return true;
+}
+
+static void invalidate_cell_pipeline_states(void);
+
 GLuint
 compile_shaders(GLenum shader_type, GLsizei count, const GLchar * const *source) {
-    (void)shader_type; (void)count; (void)source;
-    // In Metal, shaders are pre-compiled into .metallib files.
-    // This function is called from the Python compile_program() path.
-    // For now, return a dummy non-zero value to indicate success.
+    (void)shader_type;
+    // The MSL equivalents live pre-compiled in the metallib; this call only
+    // harvests the option defines Python substituted into the GLSL source.
+    for (GLsizei i = 0; i < count; i++) {
+        if (!source[i] || !strstr(source[i], "#define TEXT_NEW_GAMMA")) continue;
+        float v;
+        if (parse_define_value(source[i], "#define TEXT_NEW_GAMMA ", &v)) cell_shader_opts.text_new_gamma = v != 0.f;
+        if (parse_define_value(source[i], "#define DO_FG_OVERRIDE ", &v)) cell_shader_opts.do_fg_override = v != 0.f;
+        if (parse_define_value(source[i], "#define FG_OVERRIDE_ALGO ", &v)) cell_shader_opts.fg_override_algo = (int)v;
+        if (parse_define_value(source[i], "#define FG_OVERRIDE_THRESHOLD ", &v)) cell_shader_opts.fg_override_threshold = v;
+        invalidate_cell_pipeline_states();
+        break;
+    }
     static GLuint next_shader_id = 1;
     return next_shader_id++;
 }
@@ -1115,7 +1174,6 @@ typedef struct {
     id<MTLTexture> drawable_srgb_view;
     id<MTLRenderCommandEncoder> enc;
     MTLPixelFormat enc_fmt;
-    bool enc_is_fbo;
     bool clear_pending, clear_srgb;
     bool in_use;
 } MetalWindowSlot;
@@ -1132,7 +1190,6 @@ save_current_window_state(void) {
     s->drawable_srgb_view = mtl_current_srgb_view;
     s->enc = mtl_current_encoder;
     s->enc_fmt = mtl_current_enc_fmt;
-    s->enc_is_fbo = mtl_current_enc_is_fbo;
     s->clear_pending = clear_pending;
     s->clear_srgb = clear_srgb_flag;
 }
@@ -1144,7 +1201,6 @@ load_window_state(const MetalWindowSlot *s) {
     mtl_current_srgb_view = s->drawable_srgb_view;
     mtl_current_encoder = s->enc;
     mtl_current_enc_fmt = s->enc_fmt;
-    mtl_current_enc_is_fbo = s->enc_is_fbo;
     clear_pending = s->clear_pending;
     clear_srgb_flag = s->clear_srgb;
 }
@@ -1183,7 +1239,6 @@ metal_set_current_layer(void *layer) {
         mtl_current_srgb_view = nil;
         mtl_current_encoder = nil;
         mtl_current_enc_fmt = MTLPixelFormatInvalid;
-        mtl_current_enc_is_fbo = false;
         clear_pending = false;
         clear_srgb_flag = false;
     }
@@ -1203,7 +1258,6 @@ end_current_encoder(void) {
         mtl_current_encoder = nil;
     }
     mtl_current_enc_fmt = MTLPixelFormatInvalid;
-    mtl_current_enc_is_fbo = false;
 }
 
 static bool
@@ -1269,13 +1323,11 @@ begin_render_pass_to_drawable(bool clear) {
     if (!ensure_command_buffer()) return nil;
 
     id<MTLTexture> target_texture = nil;
-    bool is_fbo = false;
 
     // Determine render target: offscreen framebuffer or main drawable
     if (bound_framebuffer && bound_framebuffer < MAX_FRAMEBUFFERS &&
         framebuffers[bound_framebuffer].in_use && framebuffers[bound_framebuffer].render_target) {
         target_texture = framebuffers[bound_framebuffer].render_target;
-        is_fbo = true;
     } else {
         if (!ensure_drawable()) return nil;
         bool want_srgb = clear ? clear_srgb_flag : framebuffer_srgb_enabled;
@@ -1296,7 +1348,6 @@ begin_render_pass_to_drawable(bool clear) {
 
     mtl_current_encoder = [mtl_current_command_buffer renderCommandEncoderWithDescriptor:rpd];
     mtl_current_enc_fmt = target_texture.pixelFormat;
-    mtl_current_enc_is_fbo = is_fbo;
     return mtl_current_encoder;
 }
 
@@ -1416,7 +1467,7 @@ metal_end_frame(void) {
 
 void metal_gl_enable(GLenum cap) {
     switch (cap) {
-        case GL_BLEND: blend_enabled = true; break;
+        case GL_BLEND: break; // blending is baked into each PSO
         case GL_FRAMEBUFFER_SRGB: framebuffer_srgb_enabled = true; break;
         case GL_SCISSOR_TEST: scissor_enabled = true; break;
         default: break;
@@ -1425,7 +1476,7 @@ void metal_gl_enable(GLenum cap) {
 
 void metal_gl_disable(GLenum cap) {
     switch (cap) {
-        case GL_BLEND: blend_enabled = false; break;
+        case GL_BLEND: break; // blending is baked into each PSO
         case GL_FRAMEBUFFER_SRGB: framebuffer_srgb_enabled = false; break;
         case GL_SCISSOR_TEST: scissor_enabled = false; break;
         default: break;
@@ -1510,9 +1561,26 @@ get_bound_texture_for_target(GLenum target) {
     return currently_bound_texture_2d;
 }
 
+// Freed texture names are recycled like GL object names; a monotonic counter
+// would exhaust the table in long image-heavy sessions (icat/file-manager
+// previews) after which new images silently stop rendering.
+static GLuint free_texture_ids[MAX_TEXTURES];
+static size_t num_free_texture_ids = 0;
+
+static void
+recycle_texture_id(GLuint id) {
+    [textures[id].texture release];
+    textures[id].texture = nil;
+    textures[id].target = 0;
+    if (num_free_texture_ids < MAX_TEXTURES) free_texture_ids[num_free_texture_ids++] = id;
+}
+
 void metal_gl_gen_textures(int n, GLuint *ids) {
     for (int i = 0; i < n; i++) {
-        if (texture_id_counter < MAX_TEXTURES) {
+        if (num_free_texture_ids > 0) {
+            ids[i] = free_texture_ids[--num_free_texture_ids];
+            memset(&textures[ids[i]], 0, sizeof(MetalTexture));
+        } else if (texture_id_counter < MAX_TEXTURES) {
             ids[i] = texture_id_counter++;
             memset(&textures[ids[i]], 0, sizeof(MetalTexture));
         } else {
@@ -1523,11 +1591,7 @@ void metal_gl_gen_textures(int n, GLuint *ids) {
 
 void metal_gl_delete_textures(int n, const GLuint *ids) {
     for (int i = 0; i < n; i++) {
-        if (ids[i] && ids[i] < MAX_TEXTURES) {
-            [textures[ids[i]].texture release];
-            textures[ids[i]].texture = nil;
-            textures[ids[i]].target = 0;
-        }
+        if (ids[i] && ids[i] < MAX_TEXTURES) recycle_texture_id(ids[i]);
     }
 }
 
@@ -1753,13 +1817,18 @@ void metal_gl_copy_image_sub_data(GLuint src, GLenum srcTarget, int srcLevel, in
 
 void metal_gl_gen_framebuffers(int n, GLuint *ids) {
     for (int i = 0; i < n; i++) {
-        if (framebuffer_id_counter < MAX_FRAMEBUFFERS) {
-            ids[i] = framebuffer_id_counter++;
+        ids[i] = 0;
+        // Recycle released slots first (in_use false, id previously handed
+        // out); the monotonic counter alone exhausts the table over a long
+        // session of layers-FBO regeneration.
+        for (GLuint id = 1; id < framebuffer_id_counter; id++) {
+            if (!framebuffers[id].in_use) { ids[i] = id; break; }
+        }
+        if (!ids[i] && framebuffer_id_counter < MAX_FRAMEBUFFERS) ids[i] = framebuffer_id_counter++;
+        if (ids[i]) {
             framebuffers[ids[i]].in_use = true;
             framebuffers[ids[i]].attached_texture_id = 0;
             framebuffers[ids[i]].render_target = nil;
-        } else {
-            ids[i] = 0;
         }
     }
 }
@@ -1827,27 +1896,24 @@ void metal_gl_read_pixels(int x, int y, int width, int height, GLenum format, GL
     }
 }
 
-// ----- Uniform Stubs -----
-// These store values that will be passed to shaders during draw calls.
-// For Phase 1, they are no-ops.
+// ----- Uniform value store -----
+// Plain glUniform* values are captured here and marshalled into each
+// program uniform struct at draw time (resolved by name in draw_quad).
 
 void metal_gl_uniform1i(GLint loc, int v) {
     if (current_program >= 0 && loc >= 0 && loc < MAX_UNIFORMS_PER_PROGRAM) {
         uniform_stores[current_program].values[loc].i[0] = v;
-        uniform_stores[current_program].dirty = true;
     }
 }
 void metal_gl_uniform1f(GLint loc, float v) {
     if (current_program >= 0 && loc >= 0 && loc < MAX_UNIFORMS_PER_PROGRAM) {
         uniform_stores[current_program].values[loc].f[0] = v;
-        uniform_stores[current_program].dirty = true;
     }
 }
 void metal_gl_uniform2f(GLint loc, float x, float y) {
     if (current_program >= 0 && loc >= 0 && loc < MAX_UNIFORMS_PER_PROGRAM) {
         uniform_stores[current_program].values[loc].f[0] = x;
         uniform_stores[current_program].values[loc].f[1] = y;
-        uniform_stores[current_program].dirty = true;
     }
 }
 void metal_gl_uniform3f(GLint loc, float x, float y, float z) {
@@ -1855,7 +1921,6 @@ void metal_gl_uniform3f(GLint loc, float x, float y, float z) {
         uniform_stores[current_program].values[loc].f[0] = x;
         uniform_stores[current_program].values[loc].f[1] = y;
         uniform_stores[current_program].values[loc].f[2] = z;
-        uniform_stores[current_program].dirty = true;
     }
 }
 void metal_gl_uniform4f(GLint loc, float x, float y, float z, float w) {
@@ -1864,13 +1929,11 @@ void metal_gl_uniform4f(GLint loc, float x, float y, float z, float w) {
         uniform_stores[current_program].values[loc].f[1] = y;
         uniform_stores[current_program].values[loc].f[2] = z;
         uniform_stores[current_program].values[loc].f[3] = w;
-        uniform_stores[current_program].dirty = true;
     }
 }
 void metal_gl_uniform1ui(GLint loc, unsigned v) {
     if (current_program >= 0 && loc >= 0 && loc < MAX_UNIFORMS_PER_PROGRAM) {
         uniform_stores[current_program].values[loc].u[0] = v;
-        uniform_stores[current_program].dirty = true;
     }
 }
 void metal_gl_uniform1fv(GLint loc, int count, const float *v) {
@@ -1883,7 +1946,6 @@ void metal_gl_uniform1fv(GLint loc, int count, const float *v) {
         // Also store first few values in the uniform store
         if (loc < MAX_UNIFORMS_PER_PROGRAM) {
             uniform_stores[current_program].values[loc].f[0] = v[0];
-            uniform_stores[current_program].dirty = true;
         }
     }
 }
@@ -1899,7 +1961,6 @@ void metal_gl_uniform1uiv(GLint loc, int count, const unsigned *v) {
         } else if (loc < MAX_UNIFORMS_PER_PROGRAM) {
             uniform_stores[current_program].values[loc].u[0] = v[0];
         }
-        uniform_stores[current_program].dirty = true;
     }
 }
 void metal_gl_uniform2fv(GLint loc, int count, const float *v) {
@@ -1907,7 +1968,6 @@ void metal_gl_uniform2fv(GLint loc, int count, const float *v) {
         for (int i = 0; i < count * 2 && i < 4; i++) {
             uniform_stores[current_program].values[loc].f[i] = v[i];
         }
-        uniform_stores[current_program].dirty = true;
     }
 }
 void metal_gl_uniform4fv(GLint loc, int count, const float *v) {
@@ -1915,7 +1975,6 @@ void metal_gl_uniform4fv(GLint loc, int count, const float *v) {
         for (int i = 0; i < count * 4 && i < 4; i++) {
             uniform_stores[current_program].values[loc].f[i] = v[i];
         }
-        uniform_stores[current_program].dirty = true;
     }
 }
 
