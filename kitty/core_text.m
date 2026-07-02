@@ -708,11 +708,34 @@ struct RenderBuffers {
 };
 static struct RenderBuffers buffers = {0};
 
+// F7: cached CoreGraphics colorspaces + bitmap contexts for the glyph-miss render
+// path (render_color_glyph, render_glyphs below). Both were previously created
+// fresh on every single glyph render. Colorspaces are stateless and cached for
+// the process lifetime; contexts are bound to one backing buffer address for
+// their lifetime, so each is recreated only when its (buffer pointer, width,
+// height) key changes -- which in the steady state (buffer already grown to a
+// stable size) it does not.
+static CGColorSpaceRef color_glyph_color_space = NULL;
+static CGContextRef color_glyph_ctx = NULL;
+static uint8_t *color_glyph_ctx_buf = NULL;
+static unsigned int color_glyph_ctx_width = 0, color_glyph_ctx_height = 0;
+
+static CGColorSpaceRef mono_glyph_color_space = NULL;
+static CGContextRef mono_glyph_ctx = NULL;
+static uint8_t *mono_glyph_ctx_buf = NULL;
+static unsigned int mono_glyph_ctx_width = 0, mono_glyph_ctx_height = 0;
+
 static void
 finalize(void) {
     free(ft_buffer.buf); ft_buffer.buf = NULL; ft_buffer.capacity = 0;
     free(buffers.render_buf); free(buffers.glyphs); free(buffers.boxes); free(buffers.positions);
     memset(&buffers, 0, sizeof(struct RenderBuffers));
+    if (color_glyph_ctx) { CGContextRelease(color_glyph_ctx); color_glyph_ctx = NULL; }
+    if (color_glyph_color_space) { CGColorSpaceRelease(color_glyph_color_space); color_glyph_color_space = NULL; }
+    color_glyph_ctx_buf = NULL; color_glyph_ctx_width = 0; color_glyph_ctx_height = 0;
+    if (mono_glyph_ctx) { CGContextRelease(mono_glyph_ctx); mono_glyph_ctx = NULL; }
+    if (mono_glyph_color_space) { CGColorSpaceRelease(mono_glyph_color_space); mono_glyph_color_space = NULL; }
+    mono_glyph_ctx_buf = NULL; mono_glyph_ctx_width = 0; mono_glyph_ctx_height = 0;
     if (all_fonts_collection_data) CFRelease(all_fonts_collection_data);
     if (system_ui_font) CFRelease(system_ui_font);
     system_ui_font = nil;
@@ -724,10 +747,17 @@ finalize(void) {
 
 static void
 render_color_glyph(CTFontRef font, uint8_t *buf, int glyph_id, unsigned int width, unsigned int height, unsigned int baseline) {
-    CGColorSpaceRef color_space = CGColorSpaceCreateDeviceRGB();
-    if (color_space == NULL) fatal("Out of memory");
-    CGContextRef ctx = CGBitmapContextCreate(buf, width, height, 8, 4 * width, color_space, kCGImageAlphaPremultipliedLast | kCGBitmapByteOrderDefault);
-    if (ctx == NULL) fatal("Out of memory");
+    if (!color_glyph_color_space) {
+        color_glyph_color_space = CGColorSpaceCreateDeviceRGB();
+        if (color_glyph_color_space == NULL) fatal("Out of memory");
+    }
+    if (!color_glyph_ctx || color_glyph_ctx_buf != buf || color_glyph_ctx_width != width || color_glyph_ctx_height != height) {
+        if (color_glyph_ctx) CGContextRelease(color_glyph_ctx);
+        color_glyph_ctx = CGBitmapContextCreate(buf, width, height, 8, 4 * width, color_glyph_color_space, kCGImageAlphaPremultipliedLast | kCGBitmapByteOrderDefault);
+        if (color_glyph_ctx == NULL) fatal("Out of memory");
+        color_glyph_ctx_buf = buf; color_glyph_ctx_width = width; color_glyph_ctx_height = height;
+    }
+    CGContextRef ctx = color_glyph_ctx;
     CGContextSetShouldAntialias(ctx, true);
     CGContextSetShouldSmoothFonts(ctx, true);  // sub-pixel antialias
     CGContextSetRGBFillColor(ctx, 1, 1, 1, 1);
@@ -738,8 +768,6 @@ render_color_glyph(CTFontRef font, uint8_t *buf, int glyph_id, unsigned int widt
     CGContextSetTextPosition(ctx, -buffers.boxes[0].origin.x, MAX(2, height - baseline));
     CGPoint p = CGPointMake(0, 0);
     CTFontDrawGlyphs(font, &glyph, &p, 1, ctx);
-    CGContextRelease(ctx);
-    CGColorSpaceRelease(color_space);
     for (size_t r = 0; r < width; r++) {
         for (size_t c = 0; c < height; c++, buf += 4) {
             uint32_t px = (buf[0] << 24) | (buf[1] << 16) | (buf[2] << 8) | buf[3];
@@ -780,15 +808,20 @@ setup_ctx_for_alpha_mask(CGContextRef render_ctx) {
 static void
 render_glyphs(CTFontRef font, unsigned int width, unsigned int height, unsigned int baseline, unsigned int num_glyphs) {
     memset(buffers.render_buf, 0, width * height);
-    CGColorSpaceRef gray_color_space = CGColorSpaceCreateDeviceGray();
-    if (gray_color_space == NULL) fatal("Out of memory");
-    CGContextRef render_ctx = CGBitmapContextCreate(buffers.render_buf, width, height, 8, width, gray_color_space, (kCGBitmapAlphaInfoMask & kCGImageAlphaNone));
-    CGColorSpaceRelease(gray_color_space);
-    if (render_ctx == NULL) fatal("Out of memory");
+    if (!mono_glyph_color_space) {
+        mono_glyph_color_space = CGColorSpaceCreateDeviceGray();
+        if (mono_glyph_color_space == NULL) fatal("Out of memory");
+    }
+    if (!mono_glyph_ctx || mono_glyph_ctx_buf != buffers.render_buf || mono_glyph_ctx_width != width || mono_glyph_ctx_height != height) {
+        if (mono_glyph_ctx) CGContextRelease(mono_glyph_ctx);
+        mono_glyph_ctx = CGBitmapContextCreate(buffers.render_buf, width, height, 8, width, mono_glyph_color_space, (kCGBitmapAlphaInfoMask & kCGImageAlphaNone));
+        if (mono_glyph_ctx == NULL) fatal("Out of memory");
+        mono_glyph_ctx_buf = buffers.render_buf; mono_glyph_ctx_width = width; mono_glyph_ctx_height = height;
+    }
+    CGContextRef render_ctx = mono_glyph_ctx;
     setup_ctx_for_alpha_mask(render_ctx);
     CGContextSetTextPosition(render_ctx, 0, height - baseline);
     CTFontDrawGlyphs(font, buffers.glyphs, buffers.positions, num_glyphs, render_ctx);
-    CGContextRelease(render_ctx);
 }
 
 StringCanvas
@@ -1043,7 +1076,16 @@ static bool
 do_render(CTFontRef ct_font, unsigned int units_per_em, bool bold, bool italic, hb_glyph_info_t *info, hb_glyph_position_t *hb_positions, unsigned int num_glyphs, pixel *canvas, unsigned int cell_width, unsigned int cell_height, unsigned int num_cells, unsigned int baseline, bool *was_colored, bool allow_resize, FONTS_DATA_HANDLE fg, GlyphRenderInfo *ri) {
     unsigned int canvas_width = cell_width * num_cells;
     ensure_render_space(canvas_width, cell_height, num_glyphs);
-    CGRect br = CTFontGetBoundingRectsForGlyphs(ct_font, kCTFontOrientationHorizontal, buffers.glyphs, buffers.boxes, num_glyphs);
+    // F7: buffers.boxes[] (the per-glyph array) is read below only by the resize
+    // bleed-check (needs allow_resize) and, via render_color_glyph(), at index 0
+    // (needs *was_colored). When neither applies -- the common case of the
+    // recursive already-resized call for a non-colored glyph -- skip populating
+    // it: CTFontGetBoundingRectsForGlyphs accepts NULL for boundingRects (Core
+    // Text's per-glyph output arrays are uniformly optional across this family of
+    // APIs) and still returns the aggregate rect `br`, which is always needed
+    // below for the ligature x-offset.
+    const bool need_per_glyph_boxes = allow_resize || *was_colored;
+    CGRect br = CTFontGetBoundingRectsForGlyphs(ct_font, kCTFontOrientationHorizontal, buffers.glyphs, need_per_glyph_boxes ? buffers.boxes : NULL, num_glyphs);
     const bool debug_rendering = false;
     if (allow_resize) {
         // Resize glyphs that would bleed into neighboring cells, by scaling the font size
