@@ -33,6 +33,28 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 KITTY_BINARY = REPO_ROOT / "kitty" / "launcher" / "kitty"
 BUILD_LOCK = REPO_ROOT / ".omc" / "build.lock"
 
+# Environment variables a spawned kitty legitimately needs. Everything else in
+# the ambient shell environment is withheld: on a developer machine os.environ
+# can carry live API keys and plaintext passwords, and Instruments/xctrace
+# captures a target process's full environment into the trace bundle as
+# forensic metadata (xctrace export --toc dumps it back out as plaintext XML).
+# Inheriting the whole environment leaked exactly that during a Wave-2 profiling
+# attempt; a minimal allowlist removes the exposure without affecting rendering.
+# Callers pass anything extra (KITTY_METAL_*, KITTY_USE_METAL, ...) explicitly
+# via extra_env.
+_ENV_ALLOWLIST = (
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL",
+    "LC_CTYPE", "TERM", "TERMINFO", "SSH_AUTH_SOCK", "XPC_SERVICE_NAME",
+    "XPC_FLAGS", "__CF_USER_TEXT_ENCODING", "DISPLAY",
+)
+
+
+def _sanitized_env() -> dict[str, str]:
+    """Minimal launch environment: only allowlisted keys pass through, so a
+    spawned kitty (and any Instruments trace of it) never carries the user's
+    ambient secrets. Extra needs are added explicitly by the caller."""
+    return {k: os.environ[k] for k in _ENV_ALLOWLIST if k in os.environ}
+
 # metal_present line format, fixed by task #1's metal.m instrumentation
 # (final, kitty/metal.m ~1657-1663):
 #   metal_present frame=<uint64> presented_time=<float seconds, 9 decimals>
@@ -251,7 +273,7 @@ def spawn_kitty(
         argv += ["-o", opt]
     if argv_command:
         argv += ["--", *argv_command]
-    run_env = dict(os.environ)
+    run_env = _sanitized_env()
     if extra_env:
         run_env.update(extra_env)
     return subprocess.Popen(argv, env=run_env, stdout=stdout, stderr=stderr)
