@@ -213,11 +213,10 @@ void* metal_get_device(void);
 // keep the nextDrawable path.
 void metal_set_link_drawable(void *drawable);
 
-// Phase 4 (L2): milliseconds since the last on-screen present (huge if none yet).
-// Used to gate immediate-encode-on-input so an input burst can't outrun refresh.
-double metal_ms_since_last_present(void);
-bool metal_immediate_encode_enabled(void);  // Phase 4 (L2) runtime kill-switch
-bool metal_iosurface_enabled(void);         // Phase 4 step 7 spike (KITTY_METAL_IOSURFACE=1): IOSurface presentation model
+bool metal_immediate_encode_enabled(void);  // true on the IOSurface path (L2 is intrinsic there); neutered on legacy
+bool metal_iosurface_enabled(void);         // IOSurface presentation model (the default; KITTY_METAL_IOSURFACE=0 = legacy kill switch)
+void metal_set_frame_link_driven(bool v);   // pace attribution: bracketed around link-tick renders
+void metal_forget_layer(void *layer);       // window teardown: free the surface ring + state slot
 
 // M1: single-pass layered rendering. metal_begin_layered_frame opens ONE render
 // pass whose color attachment 0 is a memoryless RGBA16Unorm working surface

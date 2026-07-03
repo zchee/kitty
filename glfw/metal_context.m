@@ -121,6 +121,52 @@ link_trace(const char *event, _GLFWwindow *w, double extra) {
 }
 @end
 
+// Wave-5 default: IOSurface presentation. KITTY_METAL_IOSURFACE=0 is the kill
+// switch back to the legacy CAMetalDisplayLink + drawable path. Must agree
+// with metal_iosurface_enabled() in kitty/metal.m (same env var, same default).
+static bool
+iosurface_present_mode(void) {
+    static int state = -1;
+    if (state < 0) { const char *v = getenv("KITTY_METAL_IOSURFACE"); state = (v && v[0] && strcmp(v, "0") == 0) ? 0 : 1; }
+    return state == 1;
+}
+
+// Wave-5 governor: under the IOSurface model the render driver is a plain
+// CADisplayLink — the same per-window vsync-timed callback cadence as
+// CAMetalDisplayLink, but a pure timer: it owns NO drawable pool, so the
+// kitty-side input fast path (immediate encode) can render at any instant
+// without corrupting anything, and glfwGetCocoaPendingMetalDrawable() simply
+// returns NULL during its ticks (kitty's ensure_drawable takes the IOSurface
+// ring instead). This link IS the flood pacing governor: the render gate
+// defers sustained damage to these ticks, so flood encodes at the refresh
+// rate instead of the parse rate. Same lifecycle as the CAMetalDisplayLink it
+// replaces: created unpaused, idle pause = runloop removal, destroyed for
+// live resize and sync_to_monitor=no.
+@interface KittyIOSurfacePaceLinkTarget : NSObject
+{
+    @public
+    _GLFWwindow *window;
+    uint64_t tick_count;
+}
+- (void)tick:(CADisplayLink *)link;
+@end
+
+@implementation KittyIOSurfacePaceLinkTarget
+- (void)tick:(CADisplayLink *)link {
+    (void)link;
+    _GLFWwindow *w = window;
+    if (!w || !w->ns.renderFrameCallback) return;
+    tick_count++;
+    if (tick_count == 1) link_trace("FIRST_TICK", w, 0);
+    else if (tick_count % 60 == 0) link_trace("TICK", w, (double)tick_count);
+    // Same resize non-guard as the CAMetalDisplayLink delegate: the kitty-side
+    // live_resize check in cocoa_metal_frame_callback is the only guard that
+    // matters (see the NOTE in metalDisplayLink:needsUpdate: above).
+    w->ns.renderFrameRequested = false;
+    w->ns.renderFrameCallback((GLFWwindow*)w);
+}
+@end
+
 // Phase 4 (L1/L3): create/destroy this window's CAMetalDisplayLink. Factored so
 // sync_to_monitor can toggle it AND so live-resize can DESTROY it (an attached link
 // — even removed from the runloop — owns the layer's drawable pool and makes
@@ -129,16 +175,6 @@ link_trace(const char *event, _GLFWwindow *w, double extra) {
 // added to the runloop; the idle pause/resume toggles runloop membership.
 static void create_metal_display_link(_GLFWwindow *window)
 {
-    // Phase-4 step 7 spike (KITTY_METAL_IOSURFACE=1): the IOSurface presentation
-    // model owns presentation — kitty renders into IOSurface-backed textures and
-    // swaps them into layer.contents itself, so no link is created (the layer's
-    // drawable pool goes unused; kitty-side, USE_RENDER_FRAMES turns the render
-    // gate off so damage renders inline, as sync_to_monitor=no does).
-    {
-        static int iosurface_mode = -1;
-        if (iosurface_mode < 0) { const char *v = getenv("KITTY_METAL_IOSURFACE"); iosurface_mode = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0; }
-        if (iosurface_mode) return;
-    }
     if (window->context.metal.display_link || !window->context.metal.layer) return;
     CAMetalLayer *layer = (CAMetalLayer*)window->context.metal.layer;
     // A link means normal (non-resize) rendering, so clear a stale
@@ -151,6 +187,25 @@ static void create_metal_display_link(_GLFWwindow *window)
     // (the DEFECT-1 flicker). [NSEvent pressedMouseButtons] is AppKit ground truth;
     // a genuine drag keeps the transaction, a stuck/programmatic resize clears it.
     if (!([NSEvent pressedMouseButtons] & 1)) layer.presentsWithTransaction = NO;
+    if (iosurface_present_mode()) {
+        // IOSurface default: a plain CADisplayLink paces render frames (see
+        // KittyIOSurfacePaceLinkTarget above). NSWindow-vended so it tracks
+        // the display the window is actually on (macOS 14+; build floor 15.3).
+        NSWindow *nswin = (NSWindow*)window->ns.object;
+        if (!nswin) return;
+        KittyIOSurfacePaceLinkTarget *tgt = [[KittyIOSurfacePaceLinkTarget alloc] init];
+        tgt->window = window;
+        CADisplayLink *dl = [nswin displayLinkWithTarget:tgt selector:@selector(tick:)];
+        if (!dl) { [tgt release]; return; }
+        [dl retain];  // MRC: vended autoreleased; released in destroy_metal_display_link
+        dl.preferredFrameRateRange = CAFrameRateRangeDefault;  // ProMotion; system-driven cadence
+        [dl addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+        window->context.metal.display_link = dl;
+        window->context.metal.display_link_delegate = tgt;
+        window->context.metal.link_in_runloop = true;
+        link_trace("CREATE_PACE", window, 0);
+        return;
+    }
     KittyMetalDisplayLinkDelegate *dlDelegate = [[KittyMetalDisplayLinkDelegate alloc] init];
     dlDelegate->window = window;
     CAMetalDisplayLink *dl = [[CAMetalDisplayLink alloc] initWithMetalLayer:layer];
@@ -182,14 +237,20 @@ static void destroy_metal_display_link(_GLFWwindow *window)
 {
     if (window->context.metal.display_link) link_trace("DESTROY", window, 0);
     if (window->context.metal.display_link) {
-        CAMetalDisplayLink *dl = (CAMetalDisplayLink*)window->context.metal.display_link;
-        dl.delegate = nil;
-        [dl invalidate];
-        [dl release];
+        if (iosurface_present_mode()) {
+            CADisplayLink *dl = (CADisplayLink*)window->context.metal.display_link;
+            [dl invalidate];  // removes it from all runloops (and drops its own target retain)
+            [dl release];
+        } else {
+            CAMetalDisplayLink *dl = (CAMetalDisplayLink*)window->context.metal.display_link;
+            dl.delegate = nil;
+            [dl invalidate];
+            [dl release];
+        }
         window->context.metal.display_link = nil;
     }
     if (window->context.metal.display_link_delegate) {
-        [(KittyMetalDisplayLinkDelegate*)window->context.metal.display_link_delegate release];
+        [(NSObject*)window->context.metal.display_link_delegate release];
         window->context.metal.display_link_delegate = nil;
     }
     window->context.metal.link_in_runloop = false;
@@ -387,7 +448,10 @@ void _glfwCocoaSetMetalLinkPaused(_GLFWwindow* window, bool paused)
     // reliably. The once-then-freeze defect was never here — it was the resize
     // handoff. Idempotent via link_in_runloop; safe to toggle from the delegate.
     if (!window || !window->context.metal.display_link) return;
-    CAMetalDisplayLink *dl = (CAMetalDisplayLink*)window->context.metal.display_link;
+    // id, not a concrete cast: the link is a CADisplayLink under the IOSurface
+    // default and a CAMetalDisplayLink on the legacy path; both implement the
+    // runloop add/remove selectors used below.
+    id dl = window->context.metal.display_link;
     if (paused) {
         if (window->context.metal.link_in_runloop) {
             [dl removeFromRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];

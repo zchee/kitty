@@ -73,14 +73,7 @@ child_monitor_signpost_log(void) {
 // Apple does not implement MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
 #endif
-#ifdef KITTY_BACKEND_METAL
-// Phase-4 step 7 spike: under the IOSurface presentation model there is no
-// CAMetalDisplayLink delivering render frames, so the gate must not defer to
-// them; damage renders inline on the next tick, as sync_to_monitor=no does.
-#define USE_RENDER_FRAMES (global_state.has_render_frames && OPT(sync_to_monitor) && !metal_iosurface_enabled())
-#else
 #define USE_RENDER_FRAMES (global_state.has_render_frames && OPT(sync_to_monitor))
-#endif
 
 typedef struct {
     char *data;
@@ -969,6 +962,12 @@ render_prepared_os_window(OSWindow *os_window, unsigned int active_window_id, co
         global_state.thumbnail_callback.os_window = 0;
     }
     swap_window_buffers(os_window);
+#ifdef KITTY_BACKEND_METAL
+    // Governor floor: on the IOSurface path the present happens synchronously
+    // inside the swap, so this is the per-window last-present stamp the
+    // immediate-encode gate compares against.
+    os_window->last_gpu_present_at = monotonic();
+#endif
     os_window->last_active_tab = os_window->active_tab; os_window->last_num_tabs = os_window->num_tabs; os_window->last_active_window_id = active_window_id;
     os_window->focused_at_last_render = os_window->is_focused;
     if (os_window->redraw_count) os_window->redraw_count--;
@@ -1003,23 +1002,26 @@ render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images, bo
     os_log_t slog = sp ? child_monitor_signpost_log() : NULL;
     os_signpost_id_t render_gate_sid = sp ? os_signpost_id_make_with_pointer(slog, w) : OS_SIGNPOST_ID_INVALID;
 #endif
-    // Phase 4 (L2): immediate-encode-on-input. When damage is input-driven and the
-    // CAMetalDisplayLink is paused (render_state NOT_REQUESTED) and >= ~1 refresh
-    // (8 ms) has passed since the last present, render THIS frame now instead of
-    // deferring to the next link tick — which costs ~1 frame of windowed-mode
-    // frame latency (the link drawable is timed for a future vsync). This uses the
-    // nextDrawable path (pace=immediate). render_prepared_os_window's
-    // request_frame_render resyncs the link afterward, so continuous input (flood)
-    // transitions to link pacing on its next frame (keeping drawable_wait_ms 0);
-    // only sparse input (typing) takes this fast path. The 8 ms floor caps a
-    // key-repeat storm and dedupes within a refresh (present coalesces at vsync).
+    // L2 immediate-encode-on-input — the low-latency half of the IOSurface
+    // flood governor. When damage is input-driven and the pace link is idle
+    // (render_state NOT_REQUESTED) and >= ~1 refresh (8 ms) has passed since
+    // THIS window last presented, render the frame now instead of deferring to
+    // the next link tick (which costs ~1 frame of latency). On the IOSurface
+    // path the present is a layer.contents swap — no drawable pool exists, so
+    // rendering at an arbitrary instant is safe (pace=immediate).
+    // render_prepared_os_window's request_frame_render resyncs the link
+    // afterward, so continuous output (flood) transitions to link pacing on
+    // its next frame — that resync IS the governor's throughput half: flood
+    // encodes at the refresh rate, not the parse rate. The 8 ms floor is
+    // per-window (one window's flood must not starve another's fast path) and
+    // caps a key-repeat storm within a refresh.
     bool immediate_encode = false;
 #ifdef KITTY_BACKEND_METAL
     if (metal_immediate_encode_enabled()
         && input_driven && !w->keep_rendering_till_swap && USE_RENDER_FRAMES
         && w->render_state == RENDER_FRAME_NOT_REQUESTED && !w->live_resize.in_progress
         && global_state.thumbnail_callback.os_window != w->id
-        && metal_ms_since_last_present() >= 8.0) immediate_encode = true;
+        && now - w->last_gpu_present_at >= ms_to_monotonic_t(8ll)) immediate_encode = true;
 #else
     (void)input_driven;
 #endif
