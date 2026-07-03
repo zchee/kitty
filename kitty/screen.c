@@ -1174,6 +1174,72 @@ draw_control_char(Screen *self, text_loop_state *s, uint32_t ch) {
     }
 }
 
+// P1 (Phase 5): batched printable-ASCII run fill. Runtime levers:
+// KITTY_DISABLE_ASCII_RUNFILL=1 forces the scalar loop for a whole process;
+// set_ascii_runfill_enabled() (fast_data_types) toggles it in-process so the
+// differential fuzz test can compare both paths byte-for-byte.
+static int ascii_runfill_state = -1;
+
+static bool
+ascii_runfill_enabled(void) {
+    if (UNLIKELY(ascii_runfill_state < 0)) {
+        const char *v = getenv("KITTY_DISABLE_ASCII_RUNFILL");
+        ascii_runfill_state = (v && v[0] && strcmp(v, "0") != 0) ? 0 : 1;
+    }
+    return ascii_runfill_state == 1;
+}
+
+// P1 (Phase 5): fill a run of printable-ASCII chars in bulk — one GPUCell
+// template broadcast per line chunk (memset_array, the linebuf_clear_lines
+// pattern) and a tight CPUCell scatter, with one cursor advance per chunk —
+// instead of the full per-char loop. Exactly the scalar fast path's
+// semantics, under conditions the caller guarantees: identity charset (so
+// ch == chars[i] for the whole run), no IRM, no pending grapheme state,
+// every char in [0x20, 0x7E]. The fill STOPS EARLY (returning how much it
+// consumed) at anything it cannot replicate exactly: a multicell cell in the
+// span (the scalar nuke/move-past semantics take over at that char) or a
+// full line with DECAWM off (the scalar clamp path). DECAWM wrapping is
+// chunked here, mirroring the scalar continue_to_next_line +
+// init_text_loop_line sequence — including the scroll that a linefeed at the
+// bottom performs, which is why s->cp/s->gp must be re-fetched per chunk.
+static size_t
+draw_ascii_run(Screen *self, const uint32_t *chars, size_t num, text_loop_state *s) {
+    size_t consumed = 0;
+    while (consumed < num) {
+        if (UNLIKELY(self->cursor->x >= self->columns)) {
+            if (!self->modes.mDECAWM) break;  // clamp-overwrite semantics: scalar handles exactly
+            continue_to_next_line(self);
+            init_text_loop_line(self, s);
+        }
+        const index_type x = self->cursor->x;
+        size_t n = MIN(num - consumed, (size_t)(self->columns - x));
+        for (size_t j = 0; j < n; j++) {
+            if (UNLIKELY(s->cp[x + j].is_multicell)) { n = j; break; }
+        }
+        if (!n) break;  // cursor sits on a multicell cell: scalar nuke/move-past handles it
+        memset_array(s->gp + x, s->g, n);
+        const uint32_t *rc = chars + consumed;
+        for (size_t j = 0; j < n; j++) {
+            // Build the cell in registers so each cell is one 12-byte store,
+            // not a template copy followed by a read-modify-write of word 0.
+            CPUCell c = s->cc;
+            cell_set_char(&c, rc[j]);
+            s->cp[x + j] = c;
+        }
+        // prev tracks the last written cell ON ITS LINE (pointers into s->cp
+        // are only valid for the current line, so stamp per chunk, before any
+        // later chunk wraps and re-inits the line state).
+        s->prev.y = self->cursor->y;
+        s->prev.x = x + n - 1;
+        s->prev.cc = s->cp + x + n - 1;
+        self->last_graphic_char = rc[n - 1];
+        self->cursor->x = x + n;
+        consumed += n;
+    }
+    if (consumed) s->seg = (GraphemeSegmentationResult){.grapheme_break=GBP_None};
+    return consumed;
+}
+
 static void
 draw_text_loop(Screen *self, const uint32_t *chars, size_t num_chars, text_loop_state *s) {
     init_text_loop_line(self, s);
@@ -1184,6 +1250,19 @@ draw_text_loop(Screen *self, const uint32_t *chars, size_t num_chars, text_loop_
             if (ch < ' ') {
                 draw_control_char(self, s, ch);
                 continue;
+            }
+            // P1 (Phase 5): batched run-fill. When the next char extends a
+            // printable-ASCII run and per-char semantics collapse to a plain
+            // fill (identity charset so ch == chars[i] for the whole run, no
+            // IRM inserts), scan the run once and fill it in bulk. Whatever
+            // draw_ascii_run cannot replicate exactly makes it stop early and
+            // the scalar path resumes at the first unconsumed char.
+            if (i + 1 < num_chars && chars[i + 1] >= ' ' && chars[i + 1] < DEL
+                    && !self->charset.current && !self->modes.mIRM && ascii_runfill_enabled()) {
+                size_t run = 2;
+                while (i + run < num_chars && chars[i + run] >= ' ' && chars[i + run] < DEL) run++;
+                const size_t consumed = draw_ascii_run(self, chars + i, run, s);
+                if (consumed) { i += consumed - 1; continue; }
             }
             char_width = 1;
             s->seg = (GraphemeSegmentationResult){.grapheme_break=GBP_None};
@@ -6520,8 +6599,20 @@ PyTypeObject Screen_Type = {
     .tp_getset = getsetters,
 };
 
+static PyObject*
+py_set_ascii_runfill_enabled(PyObject *self UNUSED, PyObject *val) {
+    // P1 differential-test lever: switch the batched ASCII run-fill on/off
+    // in-process; returns the previous state so tests can restore it.
+    const int t = PyObject_IsTrue(val);
+    if (t < 0) return NULL;
+    const bool old = ascii_runfill_enabled();
+    ascii_runfill_state = t ? 1 : 0;
+    return PyBool_FromLong(old);
+}
+
 static PyMethodDef module_methods[] = {
     {"is_emoji_presentation_base", (PyCFunction)screen_is_emoji_presentation_base, METH_O, ""},
+    {"set_ascii_runfill_enabled", (PyCFunction)py_set_ascii_runfill_enabled, METH_O, ""},
     {"truncate_point_for_length", (PyCFunction)screen_truncate_point_for_length, METH_VARARGS, ""},
     {"test_ch_and_idx", test_ch_and_idx, METH_O, ""},
     {NULL}  /* Sentinel */

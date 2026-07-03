@@ -877,6 +877,11 @@ def wcswidth(string: str) -> int:
 def is_emoji_presentation_base(code: int) -> bool:
     pass
 
+
+def set_ascii_runfill_enabled(enabled: bool) -> bool:
+    pass
+
+
 def x11_window_id(os_window_id: int) -> int:
     pass
 
