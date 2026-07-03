@@ -143,9 +143,10 @@ DETERMINISTIC_CASES = _deterministic_cases()
 
 def _snapshot(screen):
     # Comparator surface: visible-line text+SGR (as_ansi encodes fg/bg/
-    # decoration_fg/bold/italic/etc via SGR transitions), per-cell hyperlink
-    # ids (as_ansi() alone can't see these, see module docstring below),
-    # wrap-continuation flags, and final cursor position.
+    # decoration_fg/bold/italic/etc via SGR transitions), scrolled-off
+    # historybuf lines, per-line dirty flags, per-cell hyperlink ids (not
+    # part of as_ansi output), wrap-continuation flags, and the final
+    # cursor position.
     #
     # NOTE: Line.width(x) is deliberately NOT compared here: kitty/line.c's
     # width() returns a bare C `0` (i.e. NULL) instead of PyLong_FromLong(0)
@@ -160,8 +161,14 @@ def _snapshot(screen):
         lines.append(line.as_ansi())
         hyperlink_ids.append(line.hyperlink_ids())
         continued.append(screen.linebuf.is_continued(y))
+    # Scrolled-off content must match too: floods push most of the stream
+    # into the historybuf, so "byte-identical" has to cover it, not just the
+    # visible viewport.
+    history = tuple(screen.historybuf.line(y).as_ansi() for y in range(screen.historybuf.count))
     return {
         'lines': tuple(lines),
+        'history': history,
+        'dirty_lines': tuple(screen.linebuf.dirty_lines()),
         'hyperlink_ids': tuple(hyperlink_ids),
         'continued': tuple(continued),
         'cursor': (screen.cursor.x, screen.cursor.y),
@@ -172,6 +179,10 @@ def _diff_snapshots(snap_a, snap_b, label_a='bulk', label_b='scalar'):
     diffs = []
     if snap_a['cursor'] != snap_b['cursor']:
         diffs.append(f"cursor: {label_a}={snap_a['cursor']!r} {label_b}={snap_b['cursor']!r}")
+    if snap_a['history'] != snap_b['history']:
+        diffs.append(f"historybuf: {label_a}={snap_a['history']!r} {label_b}={snap_b['history']!r}")
+    if snap_a['dirty_lines'] != snap_b['dirty_lines']:
+        diffs.append(f"dirty_lines: {label_a}={snap_a['dirty_lines']!r} {label_b}={snap_b['dirty_lines']!r}")
     for y in range(len(snap_a['lines'])):
         if snap_a['lines'][y] != snap_b['lines'][y]:
             diffs.append(f"line {y} text/sgr: {label_a}={snap_a['lines'][y]!r} {label_b}={snap_b['lines'][y]!r}")
