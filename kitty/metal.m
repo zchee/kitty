@@ -114,22 +114,24 @@ static CAMetalLayer *mtl_current_layer = nil;
 // after. Unretained: it is owned by the CAMetalDisplayLinkUpdate for the duration
 // of the delegate callback, and by the committed command buffer once presented.
 static id<CAMetalDrawable> mtl_link_drawable = nil;
-// Phase 4 (L2 + observability): pace attribution + the last on-screen present time.
-// metal_frame_used_link_drawable distinguishes a CAMetalDisplayLink-driven frame
-// (pace=link) from an L2 immediate-encode-on-input frame (pace=immediate).
-// metal_last_present_at gates L2 so an immediate render can't outrun the display
-// (only encode when >= ~1 refresh has elapsed since the last present).
+// Pace attribution (legacy drawable path): distinguishes a
+// CAMetalDisplayLink-driven frame (pace=link) from anything else. The
+// immediate-encode floor is per-OSWindow now (last_gpu_present_at,
+// kitty/child-monitor.c), so no global present timestamp is kept.
 static bool metal_frame_used_link_drawable = false;
-static double metal_last_present_at = 0.0;
 // Phase-4 step 7 spike (KITTY_METAL_IOSURFACE=1): IOSurface presentation model.
 // The frame renders into an IOSurface-backed texture from a per-window ring
 // instead of a CAMetalLayer drawable, and presents by assigning the surface to
-// layer.contents once the GPU completes — no drawable pool, no display link,
-// no nextDrawable. These hold the CURRENT window's in-flight target
+// layer.contents once the GPU completes — no drawable pool, no nextDrawable
+// (pacing comes from a plain CADisplayLink). These hold the CURRENT window's in-flight target
 // (register-file pattern; saved/loaded with the window slot). Both are
 // borrowed from the ring — never retained/released here.
 static id<MTLTexture> mtl_iosurface_target = nil;
 static IOSurfaceRef mtl_iosurface_surface = NULL;
+// Governor attribution: set (via metal_set_frame_link_driven) around the render
+// invoked from the CADisplayLink pace-tick callback, so metal_end_frame can tag
+// link-paced frames pace=iosurface vs input-immediate frames pace=immediate.
+static bool metal_frame_link_driven = false;
 
 // Clear color state
 static float clear_r = 0, clear_g = 0, clear_b = 0, clear_a = 1;
@@ -1632,21 +1634,26 @@ metal_get_device(void) {
     return (__bridge void *)mtl_device;
 }
 
-// ----- Phase-4 step 7 spike: IOSurface presentation model -----
-// KITTY_METAL_IOSURFACE=1 replaces drawable presentation wholesale: frames
-// render into IOSurface-backed BGRA8 textures (a 3-deep per-window ring) and
-// present by assigning the surface to layer.contents inside an explicit
-// CATransaction once the GPU completes. Core Animation composites the new
-// contents at the next display refresh — vsync-clean with no drawable pool,
-// which is what makes input-driven immediate rendering safe (the L2 blocker
-// was nextDrawable corrupting the pool under an attached CAMetalDisplayLink).
-// Spike scope: rings are never freed on window close (as with the window
-// slots, the table is bounded by MAX_METAL_WINDOWS); no colorspace is
+// ----- IOSurface presentation model (the default; Phase-4 step 7 graduated) -----
+// Frames render into IOSurface-backed BGRA8 textures (a 3-deep per-window
+// ring) and present by assigning the surface to layer.contents inside an
+// explicit CATransaction once the GPU completes. Core Animation composites
+// the new contents at the next display refresh — vsync-clean with no drawable
+// pool, which is what makes input-driven immediate rendering safe (the L2
+// blocker was nextDrawable corrupting the pool under an attached
+// CAMetalDisplayLink). Pacing (the flood governor) is a plain CADisplayLink
+// in glfw/metal_context.m driving the render gate at the refresh rate; cold
+// input bypasses it via the immediate-encode gate (kitty/child-monitor.c).
+// Rings are freed on window close (metal_forget_layer). No colorspace is
 // attached to the surfaces (see metal-pipeline-design.md).
+// KITTY_METAL_IOSURFACE=0 = legacy CAMetalDisplayLink + drawable path.
 bool
 metal_iosurface_enabled(void) {
+    // Wave-5 default: the IOSurface model IS the Metal presentation path.
+    // KITTY_METAL_IOSURFACE=0 is the kill switch back to the legacy
+    // CAMetalDisplayLink + drawable-pool path.
     static int state = -1;
-    if (state < 0) { const char *v = getenv("KITTY_METAL_IOSURFACE"); state = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0; }
+    if (state < 0) { const char *v = getenv("KITTY_METAL_IOSURFACE"); state = (v && v[0] && strcmp(v, "0") == 0) ? 0 : 1; }
     return state == 1;
 }
 
@@ -1792,6 +1799,41 @@ iosurface_acquire_target(void) {
 }
 @end
 
+// Window teardown: free the per-window IOSurface ring (3 surfaces pin up to
+// ~90 MB for a retina-fullscreen window) and retire the per-window state slot,
+// so neither outlives the window. Core Animation retains whatever surface is
+// still set as layer.contents, so releasing our refs here is safe even if the
+// closing window is mid-composite.
+void
+metal_forget_layer(void *layer) {
+    if (!layer) return;
+    for (unsigned i = 0; i < MAX_METAL_WINDOWS; i++) {
+        if (iosurface_rings[i].in_use && iosurface_rings[i].layer_ptr == layer) {
+            iosurface_ring_release(&iosurface_rings[i]);
+            iosurface_rings[i].in_use = false;
+            iosurface_rings[i].layer_ptr = NULL;
+            break;
+        }
+    }
+    for (int i = 0; i < MAX_METAL_WINDOWS; i++) {
+        if (metal_windows[i].in_use && metal_windows[i].layer_ptr == layer) {
+            if (current_window_slot == &metal_windows[i]) {
+                // The dying window was current: drop the register-file copies too
+                // (the slot never owned these refs; the queue/autorelease pool does).
+                current_window_slot = NULL;
+                mtl_current_command_buffer = nil;
+                mtl_current_drawable = nil;
+                mtl_current_encoder = nil;
+                mtl_iosurface_target = nil;
+                mtl_iosurface_surface = NULL;
+                if (mtl_current_layer == (__bridge CAMetalLayer *)layer) mtl_current_layer = nil;
+            }
+            memset(&metal_windows[i], 0, sizeof(metal_windows[i]));
+            break;
+        }
+    }
+}
+
 static KittyIOSurfacePresentStamper *iosurface_stamper = nil;
 
 static void
@@ -1854,6 +1896,15 @@ ensure_command_buffer(void) {
         }
     }
     return true;
+}
+
+void
+metal_set_frame_link_driven(bool v) {
+    // Pace attribution for the IOSurface model: cocoa_metal_frame_callback
+    // brackets its render with true/false so a link-tick render is tagged
+    // pace=iosurface and everything else (input-immediate, sync=no inline,
+    // resize) falls through to the other tags.
+    metal_frame_link_driven = v;
 }
 
 void
@@ -2236,7 +2287,10 @@ metal_end_frame(void) {
         // immediate (L2 input-driven render outside the link). String literals are
         // static, so capturing `pace` in the async handlers below is safe.
         const char *pace =
-            mtl_iosurface_target ? "iosurface" :
+            mtl_iosurface_target ? (
+                (mtl_current_layer && mtl_current_layer.presentsWithTransaction) ? "resize" :
+                (mtl_current_layer && !mtl_current_layer.displaySyncEnabled) ? "unsynced" :
+                metal_frame_link_driven ? "iosurface" : "immediate") :
             (mtl_current_layer && mtl_current_layer.presentsWithTransaction) ? "resize" :
             (mtl_current_layer && !mtl_current_layer.displaySyncEnabled) ? "unsynced" :
             metal_frame_used_link_drawable ? "link" : "immediate";
@@ -2289,9 +2343,8 @@ metal_end_frame(void) {
             mtl_current_layer.contents = (__bridge id)mtl_iosurface_surface;
             [CATransaction commit];
             [CATransaction flush];
-            metal_last_present_at = CACurrentMediaTime();
             METAL_TRACE("iosurface: presented frame %llu\n", (unsigned long long)fidx);
-            if (st || sp) iosurface_note_present(fidx, metal_last_present_at, pace);
+            if (st || sp) iosurface_note_present(fidx, CACurrentMediaTime(), pace);
         } else if (mtl_current_drawable && mtl_current_layer && mtl_current_layer.presentsWithTransaction) {
             // Live resize: present inside the current CA transaction so the
             // frame stays in lockstep with the window chrome. Documented
@@ -2299,11 +2352,9 @@ metal_end_frame(void) {
             [mtl_current_command_buffer commit];
             [mtl_current_command_buffer waitUntilScheduled];
             [mtl_current_drawable present];
-            metal_last_present_at = CACurrentMediaTime();
         } else {
             if (mtl_current_drawable) {
                 [mtl_current_command_buffer presentDrawable:mtl_current_drawable];
-                metal_last_present_at = CACurrentMediaTime();  // L2: gate immediate-encode on time-since-present
             }
             [mtl_current_command_buffer commit];
         }
@@ -2321,28 +2372,25 @@ metal_end_frame(void) {
     drawable_pass_opened = false; // M3: next frame's first drawable pass discards again
     layered_pass_active = false;  // M1: defensive — resolve normally clears it
     metal_frame_used_link_drawable = false; // pace: recomputed per frame in ensure_drawable
-    mtl_iosurface_target = nil;   // spike: next frame acquires a fresh ring slot
+    mtl_iosurface_target = nil;   // next frame acquires a fresh ring slot
     mtl_iosurface_surface = NULL;
-}
-
-double
-metal_ms_since_last_present(void) {
-    // L2: milliseconds since the last on-screen present (a large value if nothing
-    // has presented yet). child-monitor.c uses this to gate immediate-encode so an
-    // input burst can't outrun the display refresh.
-    if (metal_last_present_at <= 0.0) return 1.0e9;
-    return (CACurrentMediaTime() - metal_last_present_at) * 1000.0;
+    metal_frame_link_driven = false; // pace: re-marked per link-tick render
 }
 
 bool
 metal_immediate_encode_enabled(void) {
-    // L2 immediate-encode-on-input is DEFERRED: rendering an input frame via
-    // nextDrawable while the CAMetalDisplayLink is attached corrupts the drawable
-    // pool (SIGSEGV — see the "L2 ... DEFERRED" note in metal-pipeline-design.md).
-    // The correct fix is the IOSurface presentation model (plan Phase-4 step 7).
-    // KITTY_METAL_IMMEDIATE is NEUTERED — it logs once and does nothing (never
-    // activates the crashing path), so the pace=immediate + metal_ms_since_last_present
-    // groundwork stays without shipping a landmine. Always returns false.
+    // Under the IOSurface presentation model (the default) there is no drawable
+    // pool, so an input-driven frame can render + present at any instant — L2
+    // immediate-encode is intrinsic and always on. This is the low-latency half
+    // of the flood pacing governor: cold input renders NOW (~14 ms
+    // PTY-write→present), and render_prepared_os_window's request_frame_render
+    // resumes the pace link so sustained damage collapses to refresh-rate ticks.
+    if (metal_iosurface_enabled()) return true;
+    // Legacy (KITTY_METAL_IOSURFACE=0) drawable path: rendering an input frame
+    // via nextDrawable while the CAMetalDisplayLink is attached corrupts the
+    // drawable pool (SIGSEGV — see the "L2 ... DEFERRED" note in
+    // metal-pipeline-design.md). KITTY_METAL_IMMEDIATE stays NEUTERED there —
+    // it logs once and does nothing.
     static bool checked = false;
     if (!checked) {
         checked = true;

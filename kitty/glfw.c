@@ -2188,6 +2188,12 @@ destroy_os_window(OSWindow *w) {
         // Ensure mouse cursor is visible and reset to default shape, needed on macOS
         show_mouse_cursor(w->handle);
         glfwSetCursor(w->handle, NULL);
+#ifdef KITTY_BACKEND_METAL
+        // Free the window's IOSurface ring + per-window Metal state before the
+        // layer pointer dies with the GLFW window (else the surfaces, up to
+        // ~90 MB for a retina-fullscreen window, leak until process exit).
+        metal_forget_layer(glfwGetCocoaMetalLayer(w->handle));
+#endif
         glfwDestroyWindow(w->handle);
     }
     w->handle = NULL;
@@ -2965,7 +2971,9 @@ cocoa_metal_frame_callback(GLFWwindow *window) {
         global_state.check_for_active_animated_images = false;
         w->render_state = RENDER_FRAME_READY;
         metal_set_link_drawable(glfwGetCocoaPendingMetalDrawable(window));
+        metal_set_frame_link_driven(true);  // pace attribution: this render is link-paced
         bool rendered = render_os_window(w, monotonic(), scan, false);
+        metal_set_frame_link_driven(false);
         metal_set_link_drawable(NULL);
         if (!rendered) {
             // Nothing to draw this tick: pause the link (remove it from the runloop)
