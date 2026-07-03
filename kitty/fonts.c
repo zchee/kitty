@@ -2104,7 +2104,7 @@ static void
 send_prerendered_ascii_glyphs(FontGroup *fg) {
     if (fg->medium_font_idx < 0) return;  // no base font loaded (e.g. test font groups)
     TextCache *tc = tc_alloc();
-    if (!tc) { fatal("Out of memory allocating TextCache for ASCII pre-raster"); return; }
+    if (!tc) fatal("Out of memory allocating TextCache for ASCII pre-raster");
     const monotonic_t started_at = monotonic();
     CPUCell cpu_cells[ASCII_PRERASTER_COUNT] = {0};
     GPUCell gpu_cells[ASCII_PRERASTER_COUNT] = {0};
