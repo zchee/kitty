@@ -550,6 +550,13 @@ groundwork, but `KITTY_METAL_IMMEDIATE` is **neutered** — it logs one line
 nothing (never activates the crashing path), so there is no shippable landmine.
 Until then the default mode's low-latency answer is `sync_to_monitor=no` (L3).
 
+**Wave-5b update: GRADUATED.** The IOSurface presentation model shipped as the
+default (see "Wave-5b: the flood pacing governor" below): there is no drawable
+pool to corrupt, so `metal_immediate_encode_enabled()` is true on that path and
+input-driven frames render immediately. `KITTY_METAL_IMMEDIATE` stays inert —
+the fast path no longer needs a flag (it is intrinsic to the model), and the
+env is only a logged no-op on the legacy (`KITTY_METAL_IOSURFACE=0`) path.
+
 ### `preferredFrameLatency` is a no-op for cold latency (measured)
 
 Before deferring, we swept the one remaining default-mode knob. apple-docs:
@@ -574,7 +581,7 @@ smoothness + `drawable_wait_ms=0` at ~+1 frame cold-keypress cost vs the old
 CVDisplayLink baseline; `sync_to_monitor=no` (L3, ~42 ms) is the low-latency path;
 closing the default-mode gap is the **IOSurface follow-up** (priority-next).
 
-### Wave-5 spike: the IOSurface presentation model (KITTY_METAL_IOSURFACE=1) — ADOPT
+### Wave-5 spike: the IOSurface presentation model — ADOPT (now the DEFAULT; =0 is the kill switch)
 
 `KITTY_METAL_IOSURFACE=1` (spike, default off) replaces drawable presentation
 wholesale, following the Ghostty model the L2 deferral pointed at (plan Phase-4
@@ -634,9 +641,9 @@ cold-latency gap (§ "`preferredFrameLatency` is a no-op") and it also removes
 the link's own resume tail. Productization prerequisites before it can replace
 the link as the default:
 
-1. **Flood pacing governor** — cap encode at the refresh cadence during
-   sustained damage (the pre-mortem's content-driven collapse), settling the
-   186→58 fps waste and the energy criterion (§7 #9).
+1. **Flood pacing governor** — DONE (Wave-5b below): flood encodes at the
+   refresh cadence (measured 59.3 fps, cadence p50=p99 16.6667 ms), settling
+   the 186→58 fps waste and the energy criterion (§7 #9).
 2. **Colorspace decision** — the spike attaches no colorspace to the surfaces;
    composite parity with the CAMetalLayer nil-colorspace policy is plausible
    but UNVERIFIED (the golden harness reads the pre-composite offscreen, and
@@ -645,18 +652,81 @@ the link as the default:
 3. **Resize / multi-display / occlusion soak** — live resize takes the same
    contents-swap path inside the resize transaction (structurally sound, only
    smoke-tested); the measurement stamper is `NSScreen.mainScreen`-bound.
-4. **Ring lifecycle** — surfaces (3 × ~1–31 MB per window by size) are never
-   freed on window close in the spike (bounded by the same table pattern as
-   the per-window state slots).
-5. **L2/L5 groundwork subsumed** — under this model the gate bypass makes
-   every damaged tick an immediate render, so `pace=immediate` and
-   `KITTY_METAL_IMMEDIATE` (still neutered) can be deleted together with the
-   link path when this model graduates.
+4. **Ring lifecycle** — DONE (Wave-5b): `metal_forget_layer` frees the ring
+   AND the per-window state slot from `destroy_os_window` (kitty/glfw.c), so
+   the 3 × ~1–31 MB surfaces die with their window.
+5. **L2/L5 groundwork subsumed** — DONE (Wave-5b): the immediate-encode gate
+   is live on this path (`pace=immediate`), `KITTY_METAL_IMMEDIATE` is inert,
+   and the per-window floor lives in `OSWindow.last_gpu_present_at`.
 
 Keypress→presented (CGEvent) A/B remains blocked on the Accessibility grant
 (`CGPreflightPostEventAccess()` returns false — the same user-checklist item
 as the DEFECT-1 empirical drive); PTY-write→present is the decisive proxy
 meanwhile.
+
+### Wave-5b: the flood pacing governor, and the default flip
+
+The governor is the Wave-4 render-frame architecture with the drawable pool
+removed — not a new mechanism:
+
+- **Pace link.** `create_metal_display_link` (glfw/metal_context.m) now vends
+  a plain **CADisplayLink** (NSWindow-bound, macOS 14+) instead of a
+  CAMetalDisplayLink: the same per-window vsync-timed callback cadence and the
+  same lifecycle (created unpaused; idle pause = runloop removal; DESTROYED
+  for live resize and `sync_to_monitor=no`; recreated on resize end by
+  `change_live_resize_state`), but a pure timer that owns no drawable pool.
+  Its tick publishes no drawable — `glfwGetCocoaPendingMetalDrawable()`
+  returns NULL and `ensure_drawable()` takes the IOSurface ring.
+  `USE_RENDER_FRAMES` is restored to its Wave-4 form, so the render gate
+  defers sustained damage to link ticks: **flood encodes at the refresh rate,
+  not the parse rate**.
+- **Input fast path.** The L2 immediate-encode gate is live
+  (`metal_immediate_encode_enabled()` == true on this path): input-driven
+  damage arriving while the link is idle (`render_state NOT_REQUESTED`)
+  renders + presents immediately (`pace=immediate`), then
+  `render_prepared_os_window`'s `request_frame_render` resumes the link so a
+  flood transitions to paced ticks after ONE immediate frame. The 8 ms floor
+  is **per-window** (`OSWindow.last_gpu_present_at`, stamped at swap — the
+  present is synchronous with the swap here), so one window's flood cannot
+  starve another window's fast path.
+- **Default flip.** `KITTY_METAL_IOSURFACE` unset (or any value but `0`) =
+  the IOSurface model; `=0` = the legacy CAMetalDisplayLink + drawable path,
+  kept intact as the kill switch (it also revives
+  `KITTY_METAL_FORCE_STUCK_RESIZE`, which lives in the legacy link's
+  delegate). Both env checks (kitty/metal.m and glfw/metal_context.m) must
+  stay in agreement.
+- **Ring lifecycle.** `metal_forget_layer` (called from `destroy_os_window`)
+  releases the window's surface ring and its per-window state slot; CA retains
+  whatever surface is still on glass, so the release is safe mid-composite.
+
+Measured (no-focus arms, SAME conditions, M3 Max 60 Hz session, user-active
+machine at loadavg ~3–5; `.omc/verify/wave5/gov_*.json`):
+
+| PTY-write→present | legacy (=0) | default (governor) |
+|---|---|---|
+| typing p50 / p90 | 64.4 / 73.7 ms | **25.8 / 33.3 ms** |
+| typing pace mix | link ×40 | iosurface ×38, immediate ×2 |
+| flood fps / pace | 53.7 (all link) | 59.3 (all iosurface) |
+| flood cadence p50 / p99 | 16.6667 / **66.7 ms** (4-frame stalls) | **16.6667 / 16.6667 ms** |
+| idle presents (3 s) | 0 | 0 |
+| worst single burst | 436.6 ms (link-resume tail) | 297.0 ms (ambient load; n=1) |
+
+The governor closes the spike's one measured cost: flood encode collapsed
+from ~186 fps to the refresh rate with a byte-perfect cadence — under load
+where the LEGACY path dropped frames (cadence p99 66.7 ms). Cold typing is
+2.5× faster than legacy under identical conditions.
+
+**Honest nuance — why typing shows ~26 ms, not ~14 ms:** a lone PTY-write
+burst is batched by `input_delay` (3 ms), so the render usually happens on a
+LATER main-loop tick where `input_driven` is false — the burst takes the
+paced path (one link tick, ~26 ms), not the immediate path. A real keyboard
+echo does NOT hit this: the L5 fast path parses the echo on the arrival tick
+(input_read true at render), which is exactly the immediate gate's condition
+— the debug smokes show first-damage frames at `pace=immediate` with
+presented−commit ≈ 2–15 ms. Empirical keypress→present percentiles still
+await the Accessibility grant (CGEvent injection). If PTY-burst latency ever
+matters in its own right, the follow-up is carrying an "input pending render"
+flag across the input_delay boundary.
 
 ## Known deviations (tracked, intentional)
 
