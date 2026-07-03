@@ -728,6 +728,81 @@ await the Accessibility grant (CGEvent injection). If PTY-burst latency ever
 matters in its own right, the follow-up is carrying an "input pending render"
 flag across the input_delay boundary.
 
+## Phase 5 (Wave 6): CPU throughput — the flood path
+
+Plan items P1/P2/P4/F6a (.omc/plans/…-worlds-fastest-optimization.md §Phase 5),
+measured on the Wave-5b (IOSurface+governor) build. Artifacts:
+`.omc/verify/phase5/*.json`.
+
+**P1 — batched ASCII run-fill (kitty/screen.c)**: inside the draw loop's
+ASCII fast path, a printable-[0x20,0x7E] run is scanned once and filled in
+bulk per line chunk — `memset_array` GPUCell template broadcast (the
+linebuf_clear_lines pattern) plus register-built 12-byte CPUCell stores, one
+cursor advance per chunk. Gate conditions: identity charset, no IRM, no
+pending grapheme state; `draw_ascii_run` stops early (consumed count) at a
+multicell cell in the span or a full line with DECAWM off, so the scalar
+loop's nuke/clamp semantics take over exactly. Levers:
+`KITTY_DISABLE_ASCII_RUNFILL=1` (process) and
+`set_ascii_runfill_enabled()` (in-process, for the differential test).
+
+Same-binary interleaved lever A/B (kitten `__benchmark__ --render`,
+spawn_kitty, load 4.4–5.0 NOT degraded):
+
+| MB/s | scalar (lever off) | bulk | ratio |
+|---|---|---|---|
+| ASCII | 110.8 / 110.9 | 144.0 / 143.7 | **1.30×** |
+| ASCII + scrollback | 92.4 | 110.8 / 111.1 | **1.20×** |
+| CSI (REP flows through the same path) | ~52 | ~60 | 1.15× |
+| Unicode | ~121 | ~121 | 1.00× (no regression) |
+
+Differential fuzz (`kitty_tests/ascii_runfill.py`): comparator self-check +
+16 deterministic adversarial cases (wrap ±1, DECAWM off, IRM, charset
+shifts, wide/emoji/ZWJ, combining, tabs, CSI REP, SGR, hyperlinks,
+cursor-move overwrite) + 200 seeded random cases (KITTY_FUZZ_SEED) — bulk vs
+scalar byte-identical on as_ansi + hyperlink_ids + continuation flags +
+cursor. It also surfaced a PRE-EXISTING bug (out of scope, documented in the
+test): `Line.width()` returns a bare C 0 instead of `PyLong_FromLong(0)`
+for empty cells → SystemError at the CPython boundary.
+
+**P2 — decoder run signal: satisfied by measurement, plumbing rejected.**
+The draw side scans each char exactly once by construction (the plan's
+re-scan concern does not exist in the implementation). A fair double-scan
+experiment (register loop + asm sink, same-load pair) put the single scan at
+**~5.6% of ASCII time / ~3.3% of scroll** — the ceiling any decoder-side run
+plumbing could recover, at real cross-module complexity (the decoder would
+pay the same boundary detection unless fused into its SIMD masks). Rejected
+per the plan's own over-engineering guard; revisit only if the parser is
+ever SIMD-fused end-to-end.
+
+**P4 — SIMD width**: KITTY_SIMD=128 vs 256 (SIMDE over NEON), same-conditions
+pairs (LOAD-DEGRADED marked, relative comparison consistent): 256 ≥ 128
+everywhere (ASCII 142–143 vs 140.8; unicode ~121 vs 115–119). **Keep 256**
+(the current default). No change.
+
+**F6a — ASCII pre-raster (kitty/fonts.c)**: at sprite-map init (one-shot,
+GPU context guaranteed), 94 glyphs 0x21–0x7E for the base font render
+through the exact live miss path (render_run → shape → CoreText →
+send_sprite); 0x20 is excluded by design (BLANK_FONT never renders a
+glyph). Measured 1.9 ms; sprites byte-identical to live-miss output 94/94.
+Note: the benchmark kitten pre-warms all chars itself, so F6a is
+benchmark-invisible — its value is the first flood after startup/font-size
+change never hitting the miss path mid-frame.
+
+**Exit-gate honesty (the plan's "≥2× Phase-0 Metal baseline")**: no Phase-0
+throughput artifact was ever captured, and the Phase-0-era binary
+(b1f94df47, rebuilt today in a worktree) SIGABRTs at startup on the current
+stack ("fragmentFunction border_fragment cannot be used to build a pipeline
+state" — function-constants validation), so a same-day Phase-0 anchor is
+impossible. Against the only clean anchor — the same binary with the
+run-fill lever off — Phase 5 lands **1.30× ASCII / 1.20× scroll**, short of
+2×. The shortfall is decomposed (flood `sample` profile, post-P1): the
+remaining wall is ~30% render-side main-thread work at 60 fps (present's
+`waitUntilCompleted` + upload/encode — the async-present follow-up already
+identified in Wave-5b productization), ~20% control-char/scroll structural
+cost (linefeed clears 3.2 KB/line that the very next fill overwrites — a
+clear/fill fusion candidate), and ~30% parser/decode. Those are the
+quantified next levers; none of them is a Phase-5 plan item.
+
 ## Known deviations (tracked, intentional)
 
 - Cell/graphics MSL shader *logic* is still the opus-era port; semantic drift
