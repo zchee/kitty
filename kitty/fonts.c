@@ -2082,6 +2082,44 @@ send_prerendered_sprites(FontGroup *fg) {
 #undef do_one
 }
 
+// F6a: eagerly rasterize printable-ASCII (0x21-0x7E) for the medium/base font
+// through the exact same path a live cache miss would take (render_run ->
+// shape_run -> render_groups -> render_group -> current_send_sprite_to_gpu),
+// so a flood of plain ASCII text right after startup/font-size-change never
+// pays the miss-path cost (HarfBuzz shape + CoreText render + GPU upload)
+// mid-frame. 0x20 (space) is deliberately excluded: font_for_cell() special
+// cases a lone space as BLANK_FONT (sprite_idx=0, no glyph is ever rendered
+// for it -- see the comment there), so pre-rasterizing it would synthesize a
+// sprite real rendering never creates. Runs once, gated by the same
+// "sprite_map didn't exist yet" one-shot condition as send_prerendered_sprites
+// (see send_prerendered_sprites_for_window): alloc_sprite_map() just queried
+// the live GL/Metal context via glGetIntegerv(), so a GPU context is
+// guaranteed by the time this runs; headless/test callers that never reach
+// send_prerendered_sprites_for_window never trigger this path either.
+#define ASCII_PRERASTER_FIRST 0x21u
+#define ASCII_PRERASTER_LAST 0x7eu
+#define ASCII_PRERASTER_COUNT (ASCII_PRERASTER_LAST - ASCII_PRERASTER_FIRST + 1u)
+
+static void
+send_prerendered_ascii_glyphs(FontGroup *fg) {
+    if (fg->medium_font_idx < 0) return;  // no base font loaded (e.g. test font groups)
+    TextCache *tc = tc_alloc();
+    if (!tc) { fatal("Out of memory allocating TextCache for ASCII pre-raster"); return; }
+    const monotonic_t started_at = monotonic();
+    CPUCell cpu_cells[ASCII_PRERASTER_COUNT] = {0};
+    GPUCell gpu_cells[ASCII_PRERASTER_COUNT] = {0};
+    for (unsigned i = 0; i < ASCII_PRERASTER_COUNT; i++) cell_set_char(cpu_cells + i, ASCII_PRERASTER_FIRST + i);
+    RunFont rf = {.scale=1, .font_idx=(ssize_t)fg->medium_font_idx};
+    RAII_ListOfChars(lc);
+    render_run(fg, cpu_cells, gpu_cells, ASCII_PRERASTER_COUNT, rf, false, false, -1, DISABLE_LIGATURES_ALWAYS, tc, &lc);
+    tc_decref(tc);
+    const double elapsed_ms = monotonic_t_to_s_double(monotonic() - started_at) * 1000.0;
+    debug("F6a: pre-rasterized %u ASCII glyphs in %.3f ms\n", ASCII_PRERASTER_COUNT, elapsed_ms);
+}
+#undef ASCII_PRERASTER_FIRST
+#undef ASCII_PRERASTER_LAST
+#undef ASCII_PRERASTER_COUNT
+
 static size_t
 initialize_font(FontGroup *fg, unsigned int desc_idx, const char *ftype) {
     PyObject *d = PyObject_CallFunction(descriptor_for_idx, "I", desc_idx);
@@ -2142,6 +2180,7 @@ send_prerendered_sprites_for_window(OSWindow *w) {
     if (!fg->sprite_map) {
         fg->sprite_map = alloc_sprite_map();
         send_prerendered_sprites(fg);
+        send_prerendered_ascii_glyphs(fg);
     }
 }
 
