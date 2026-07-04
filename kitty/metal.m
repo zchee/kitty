@@ -657,6 +657,11 @@ static int metal_frame_tex_alloc_count = 0;
 // this to just the frame's delta rect when the delta is a non-blended copy.
 static uint64_t metal_frame_tex_upload_bytes = 0;
 
+// G2: graphics-program (image) draw calls this frame. Emitted as gfx_draws=.
+// Instancing collapses a same-texture group's N refs into one draw; the kill
+// switch KITTY_NO_INSTANCED_IMAGE_DRAWS=1 keeps the old one-draw-per-ref count.
+static int metal_frame_gfx_draw_count = 0;
+
 // D2: bytes written into per-frame VAO ring buffers this frame (cell dirty rows +
 // selection + uniform + color-table). Emitted as the metal_stats bytes= field —
 // the ≤8KB 1-line-edit exit-gate probe. Main (encode) thread only.
@@ -1328,12 +1333,27 @@ draw_quad(bool blend, unsigned instance_count) {
         // Mirrors GraphicsUniforms in graphics_shaders.metal: the float3
         // amask_fg is 16-byte aligned in MSL, so the CPU twin needs explicit
         // padding (MSL sizeof == 80, not the packed 64).
-        struct { float src_rect[4]; float dest_rect[4]; float extra_alpha; float _pad0[3]; float amask_fg[3]; float _pad1; float amask_bg_premult[4]; } gfx_u = {0};
-        uval_fv("src_rect", gfx_u.src_rect, 4);
-        uval_fv("dest_rect", gfx_u.dest_rect, 4);
+        // G2: per-instance rect arrays (src_rects/dest_rects) read from the
+        // array-uniform store (16-slot stride at ARRAY_UNIFORM_BASE, same as
+        // the border colors[9] path). Layout mirrors GraphicsUniforms in
+        // graphics_shaders.metal (float4[16] arrays then the scalar tail).
+        struct { float src_rects[MAX_IMAGE_INSTANCES*4]; float dest_rects[MAX_IMAGE_INSTANCES*4]; float extra_alpha; float _pad0[3]; float amask_fg[3]; float _pad1; float amask_bg_premult[4]; } gfx_u = {0};
+        GLint src_slot = find_uniform_slot(current_program, "src_rects");
+        if (src_slot >= 0) {
+            int base = ARRAY_UNIFORM_BASE + src_slot * 16;
+            for (int i = 0; i < MAX_IMAGE_INSTANCES && base + i < MAX_UNIFORMS_PER_PROGRAM; i++)
+                for (int c = 0; c < 4; c++) gfx_u.src_rects[i*4+c] = uniform_stores[current_program].values[base+i].f[c];
+        }
+        GLint dst_slot = find_uniform_slot(current_program, "dest_rects");
+        if (dst_slot >= 0) {
+            int base = ARRAY_UNIFORM_BASE + dst_slot * 16;
+            for (int i = 0; i < MAX_IMAGE_INSTANCES && base + i < MAX_UNIFORMS_PER_PROGRAM; i++)
+                for (int c = 0; c < 4; c++) gfx_u.dest_rects[i*4+c] = uniform_stores[current_program].values[base+i].f[c];
+        }
         gfx_u.extra_alpha = uval_f("extra_alpha", 0);
         uval_fv("amask_fg", gfx_u.amask_fg, 3);
         uval_fv("amask_bg_premult", gfx_u.amask_bg_premult, 4);
+        metal_frame_gfx_draw_count++;  // G2: graphics-program draw call this frame
         [mtl_current_encoder setVertexBytes:&gfx_u length:sizeof(gfx_u) atIndex:0];
         [mtl_current_encoder setFragmentBytes:&gfx_u length:sizeof(gfx_u) atIndex:0];
         // Bind image texture from unit 1 (GRAPHICS_UNIT)
@@ -2448,13 +2468,14 @@ metal_end_frame(void) {
             const int allocs = metal_frame_alloc_count; // D1: MTLBuffer allocs this frame (0 in steady state)
             const int tex_allocs = metal_frame_tex_alloc_count; // G1: MTLTexture (re)allocs this frame (0 in steady-state animation)
             const uint64_t tex_bytes = metal_frame_tex_upload_bytes; // G3-lite: image-texture upload bytes this frame (delta rect vs full image)
+            const int gfx_draws = metal_frame_gfx_draw_count; // G2: graphics-program draw calls this frame (instancing collapses group refs)
             const uint64_t bytes = metal_frame_bytes_uploaded; // D2: VAO-buffer bytes uploaded this frame
             [mtl_current_command_buffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
                 const double gpu_ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
-                char line[288];
+                char line[320];
                 // pace= is tail-appended (tolerant parsers, never $-anchored).
-                snprintf(line, sizeof line, "metal_stats frame=%llu encode_ms=%.3f gpu_ms=%.3f passes=%d allocs=%d tex_allocs=%d tex_bytes=%llu bytes=%llu drawable_wait_ms=%.3f pace=%s\n",
-                         (unsigned long long)fidx, encode_ms, gpu_ms, passes, allocs, tex_allocs, (unsigned long long)tex_bytes, (unsigned long long)bytes, drawable_wait_ms, pace);
+                snprintf(line, sizeof line, "metal_stats frame=%llu encode_ms=%.3f gpu_ms=%.3f passes=%d allocs=%d tex_allocs=%d tex_bytes=%llu gfx_draws=%d bytes=%llu drawable_wait_ms=%.3f pace=%s\n",
+                         (unsigned long long)fidx, encode_ms, gpu_ms, passes, allocs, tex_allocs, (unsigned long long)tex_bytes, gfx_draws, (unsigned long long)bytes, drawable_wait_ms, pace);
                 metal_stats_emit(line);
             }];
         }
@@ -2556,6 +2577,7 @@ metal_end_frame(void) {
     metal_frame_alloc_count = 0;  // D1: reset per-frame ring allocation counter
     metal_frame_tex_alloc_count = 0;  // G1: reset per-frame texture (re)alloc counter
     metal_frame_tex_upload_bytes = 0;  // G3-lite: reset per-frame image-upload-bytes counter
+    metal_frame_gfx_draw_count = 0;  // G2: reset per-frame graphics draw-call counter
     metal_frame_bytes_uploaded = 0; // D2: reset per-frame upload-bytes counter
     drawable_pass_opened = false; // M3: next frame's first drawable pass discards again
     layered_pass_active = false;  // M1: defensive — resolve normally clears it
@@ -3195,10 +3217,17 @@ void metal_gl_uniform2fv(GLint loc, int count, const float *v) {
     }
 }
 void metal_gl_uniform4fv(GLint loc, int count, const float *v) {
-    if (current_program >= 0 && loc >= 0 && loc < MAX_UNIFORMS_PER_PROGRAM) {
-        for (int i = 0; i < count * 4 && i < 4; i++) {
-            uniform_stores[current_program].values[loc].f[i] = v[i];
+    if (current_program < 0 || loc < 0) return;
+    if (count > 1) {
+        // G2: vec4 array. Store each element's 4 floats in one slot at
+        // ARRAY_UNIFORM_BASE + loc*16 (the same 16-element stride used by
+        // metal_gl_uniform1uiv), so it never collides with the scalar slots.
+        int base = ARRAY_UNIFORM_BASE + loc * 16;
+        for (int i = 0; i < count && (base + i) < MAX_UNIFORMS_PER_PROGRAM; i++) {
+            for (int c = 0; c < 4; c++) uniform_stores[current_program].values[base + i].f[c] = v[i * 4 + c];
         }
+    } else if (loc < MAX_UNIFORMS_PER_PROGRAM) {
+        for (int i = 0; i < 4; i++) uniform_stores[current_program].values[loc].f[i] = v[i];
     }
 }
 

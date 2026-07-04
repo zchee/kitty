@@ -31,9 +31,12 @@ inline float4 alpha_blend_premul(float4 over, float4 under) {
 constant bool IS_ALPHA_MASK [[function_constant(0)]];
 constant bool IS_PREMULTIPLIED [[function_constant(1)]];
 
+// G2: per-instance rect arrays (one image ref per instance), indexed by
+// instance_id. MAX_IMAGE_INSTANCES must match graphics_vertex.glsl / shaders.c.
+constant constexpr int MAX_IMAGE_INSTANCES = 16;
 struct GraphicsUniforms {
-    float4 src_rect;
-    float4 dest_rect;
+    float4 src_rects[MAX_IMAGE_INSTANCES];
+    float4 dest_rects[MAX_IMAGE_INSTANCES];
     float extra_alpha;
     float3 amask_fg;
     float4 amask_bg_premult;
@@ -54,12 +57,15 @@ constant int2 gfx_pos_map[4] = {
 
 vertex GraphicsVertexOut graphics_vertex(
     uint vid [[vertex_id]],
+    uint iid [[instance_id]],
     constant GraphicsUniforms& uniforms [[buffer(0)]]
 ) {
     GraphicsVertexOut out;
     int2 pos = gfx_pos_map[vid];
-    out.texcoord = float2(uniforms.src_rect[pos.x], uniforms.src_rect[pos.y]);
-    out.position = float4(uniforms.dest_rect[pos.x], uniforms.dest_rect[pos.y], 0, 1);
+    float4 src_rect = uniforms.src_rects[iid];
+    float4 dest_rect = uniforms.dest_rects[iid];
+    out.texcoord = float2(src_rect[pos.x], src_rect[pos.y]);
+    out.position = float4(dest_rect[pos.x], dest_rect[pos.y], 0, 1);
     return out;
 }
 
