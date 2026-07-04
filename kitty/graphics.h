@@ -81,6 +81,14 @@ typedef enum { ANIMATION_STOPPED = 0, ANIMATION_LOADING = 1, ANIMATION_RUNNING =
 
 typedef struct TextureRef {
     uint32_t id, refcnt;
+    // G1: dimensions the GPU texture was last allocated at. Lets upload_to_gpu
+    // update an existing texture in place (glTexSubImage2D -> replaceRegion, no
+    // realloc) whenever the dims are unchanged -- the common case for animation
+    // frame advance, where the coalesced frame is always image-sized. 0 until
+    // the first allocation. The internal format is always GL_SRGB_ALPHA, so an
+    // is_opaque change is handled by the SubImage source format and does NOT
+    // force a realloc.
+    uint32_t alloc_width, alloc_height;
 } TextureRef;
 
 #define NAME ref_map
@@ -97,6 +105,11 @@ typedef struct {
     id_type ref_id_counter;
     Frame *extra_frames, root_frame;
     uint32_t current_frame_index, frame_id_counter;
+    // G3-lite: id of the frame whose fully-coalesced pixels currently live in the
+    // GPU texture. When the next frame is a non-blended delta on exactly this
+    // frame, only its delta rect needs uploading (SubImage) rather than a full
+    // coalesce + full-image upload. 0 = unknown/invalid (forces a full upload).
+    uint32_t last_uploaded_frame_id;
     uint64_t animation_duration;
     size_t extra_framecnt;
     monotonic_t atime;

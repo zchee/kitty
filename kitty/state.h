@@ -609,6 +609,11 @@ void set_gpu_viewport(unsigned w, unsigned h);
 void free_texture(uint32_t*);
 void free_framebuffer(uint32_t*);
 void send_image_to_gpu(uint32_t*, const void*, int32_t, int32_t, bool, bool, bool, RepeatStrategy);
+// G1: update an already-allocated image texture in place (no realloc). Caller
+// guarantees the texture exists at these exact dimensions.
+void update_image_on_gpu(uint32_t tex_id, const void* data, int32_t width, int32_t height, bool is_opaque, bool is_4byte_aligned);
+// G3-lite: update only a sub-rectangle of an already-allocated image texture.
+void update_image_sub_region(uint32_t tex_id, const void* data, int32_t x, int32_t y, int32_t width, int32_t height, bool is_opaque, bool is_4byte_aligned);
 void send_sprite_to_gpu(FONTS_DATA_HANDLE fg, sprite_index, pixel*, sprite_index, bool colored);
 void blank_canvas(float, color_type, bool);
 void blank_os_window(OSWindow *);
