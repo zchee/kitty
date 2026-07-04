@@ -626,6 +626,11 @@ void send_image_to_gpu(uint32_t*, const void*, int32_t, int32_t, bool, bool, boo
 void update_image_on_gpu(uint32_t tex_id, const void* data, int32_t width, int32_t height, bool is_opaque, bool is_4byte_aligned);
 // G3-lite: update only a sub-rectangle of an already-allocated image texture.
 void update_image_sub_region(uint32_t tex_id, const void* data, int32_t x, int32_t y, int32_t width, int32_t height, bool is_opaque, bool is_4byte_aligned);
+// US-307: true when the newest committed frame that drew this image texture may
+// still be sampling it on the GPU (Metal async present). The Metal backend tracks
+// a completion watermark; the GL backend has driver-managed glTexSubImage2D
+// ordering and always returns false (keeps today's in-place upload behavior).
+bool texture_upload_in_flight(uint32_t tex_id);
 void send_sprite_to_gpu(FONTS_DATA_HANDLE fg, sprite_index, pixel*, sprite_index, bool colored);
 void blank_canvas(float, color_type, bool);
 void blank_os_window(OSWindow *);

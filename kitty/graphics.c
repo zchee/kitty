@@ -749,6 +749,11 @@ try_delta_upload_to_gpu(GraphicsManager *self, Image *img, const Frame *f) {
     if (!persistent_image_texture_enabled() || !delta_image_upload_enabled()) return false;
     if (!img->texture || !img->texture->id) return false;
     TextureRef *t = img->texture;
+    // US-307: if an async-presented committed frame may still be sampling this
+    // texture, do NOT replaceRegion the delta into it in place -- bail so the
+    // caller takes the coalesce path (upload_to_gpu then forces a fresh texture;
+    // Metal keeps the old one alive until the in-flight frame completes).
+    if (texture_upload_in_flight(t->id)) return false;
     if (t->alloc_width != img->width || t->alloc_height != img->height) return false;  // base not resident at image dims
     if (!f->base_frame_id || f->base_frame_id != img->last_uploaded_frame_id) return false;  // GPU does not hold f's base
     if (f->alpha_blend && !f->is_opaque) return false;  // delta needs blending -> not a pure copy
@@ -775,7 +780,11 @@ upload_to_gpu(GraphicsManager *self, Image *img, const bool is_opaque, const boo
         // replaceRegion, no release/newTexture per frame. Only a genuine dims
         // change (a re-transmit resets img->texture to a fresh ref) falls back
         // to a full (re)allocation.
-        if (persistent_image_texture_enabled() && t->id && t->alloc_width == img->width && t->alloc_height == img->height) {
+        // US-307: also force the fresh-texture branch when the current texture is
+        // still in flight -- an in-place replaceRegion would race the GPU sampling
+        // it under async present. send_image_to_gpu allocates a NEW texture; Metal
+        // retains the old one for the committed frame until it completes.
+        if (persistent_image_texture_enabled() && t->id && t->alloc_width == img->width && t->alloc_height == img->height && !texture_upload_in_flight(t->id)) {
             update_image_on_gpu(t->id, data, img->width, img->height, is_opaque, is_4byte_aligned);
         } else {
             send_image_to_gpu(&t->id, data, img->width, img->height, is_opaque, is_4byte_aligned, true, REPEAT_CLAMP);
