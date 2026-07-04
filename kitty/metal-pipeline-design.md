@@ -931,7 +931,7 @@ verification gap a clean build cannot). KITTY_NO_INSTANCED_IMAGE_DRAWS=1.
 
 **G4 — async upload ring: DESCOPED on a measure-first gate.** The icat
 large-image (24MB RGBA) main-thread wall splits: decode (inflate_png)
-91.4%, upload (replaceRegion) 7.1%, cache 1.1%, parse 0.1% (median of 12,
+91.6%, upload (replaceRegion) 7.1%, cache 1.1%, parse 0.1% (median of 12,
 tight ranges; .omc/verify/g4/FINDINGS.md). An async ring removes at most
 the 2.63 ms upload from a ~37 ms hitch — the plan's own over-engineering
 guard applies. The real lever is off-thread DECODE, deliberately out of
@@ -955,6 +955,37 @@ the meaningful axis) and the icat wall-time number for the doc table —
 its verdict is already determined by the split above (decode-bound;
 unchanged by this phase, documented shortfall vs the original gate
 wording, with the analysis that G4 could never have moved it).
+
+### Phase 7 evaluations
+
+**D5 (GPUCell SoA/shrink): REJECT** — the struct is already 20 bytes with
+no padding (5×uint32, static_asserted), and cell-buffer traffic does not
+show on any realistic profile: GPU-side reads are 0.03% of M3 Max
+bandwidth at 1440p/120Hz and 0.7% even at a deliberately pessimistic
+6K-retina/240Hz/3-pass corner; D2 dirty-row uploads measure ~2.2 KB/frame
+typing and ~42 KB/frame full-flood at 100×30. An AoSoA hot/cold split
+would trim only the transparent bg-pass fetch (~0.006% of bandwidth) at
+the cost of a second buffer, second dirty tracking, and per-variant VAOs;
+bit-packing below 20 B adds shader unpack ALU and screen.c hot-path pack
+cost on both backends to shave 30% of a 0.03% number. The plan's own gate
+("implement only if bandwidth still shows") fails cleanly. Reconsider
+only if a future profile at 8K-class geometry actually surfaces
+cell-buffer bandwidth. (.omc/verify/us302/FINDINGS.md)
+
+**G1 in-place-upload race (Phase-6 review finding, FIXED 2ef2e3462)** —
+under async present a committed frame can still be sampling an image
+texture while the next animation advance replaceRegions it; the per-frame
+realloc that G1 removed had been an accidental guard. An ungated
+completion watermark plus per-texture last-drawn frame tags now detect
+in-flight use; both mutation sites (delta and in-place) fall back to the
+fresh-texture path with a full coalesced upload that keeps the delta
+chain resumable. Steady state remains zero-alloc; the racy fallback is
+exercised by the KITTY_METAL_TEST_FORCE_INFLIGHT lever (alloc spike →
+delta recovery, byte-identical output). Note for verification honesty:
+synchronous/occluded goldens structurally cannot exercise async-present
+races (the dump path waits for completion), so race coverage rests on
+the watermark logic, the contention lever, and validation-layer stress —
+not on golden parity.
 
 ## Known deviations (tracked, intentional)
 
