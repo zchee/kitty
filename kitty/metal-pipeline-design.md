@@ -987,6 +987,38 @@ races (the dump path waits for completion), so race coverage rests on
 the watermark logic, the contention lever, and validation-layer stress —
 not on golden parity.
 
+## Final architecture (post-Phase-7 consolidation)
+
+The frame path is native end to end; the GL-name shim survives only where
+it is cheap and cold:
+
+- **Presentation**: IOSurface ring (4-deep, use-count-guarded) presented by
+  assigning `layer.contents` from the completed handler via the main queue
+  (Wave-5c), ordered by the per-layer generation guard; paced by a plain
+  CADisplayLink render gate + the intrinsic immediate-encode input path
+  (Wave-5b governor). Kill switches: KITTY_METAL_IOSURFACE=0 (legacy
+  CAMetalDisplayLink + drawable pool), KITTY_METAL_SYNC_PRESENT=1
+  (synchronous swap).
+- **Sprites**: dual atlas — R8Unorm mono (swizzled A←R) + small RGBA
+  colored — with per-namespace decorations LUTs, selected by the cell's
+  bit31 (F1). KITTY_NO_R8_SPRITE_ATLAS=1 reverts.
+- **Images**: persistent textures updated in place (G1) with delta-rect
+  uploads for resident non-blended bases (G3-lite), instanced same-texture
+  group draws (G2), all guarded against in-flight sampling by the
+  completion watermark (US-307).
+- **Uniforms**: per-program C structs pinned to MSL layouts by
+  _Static_assert, filled through slot caches resolved once per program
+  lifetime (C5); the name-keyed store remains only as the value hop from
+  the shared GL-shim setters, measured ~free (encode_ms 0.056 ms median).
+- **Shim surface**: after the US-305 audit, the Metal build's shim exports
+  only what shared code actually calls; 22 dead entry points (viewport /
+  scissor / FBO-binding / raw draws / VAO / buffer ops the backend does
+  natively) were deleted with grep proofs. The FBO surface is deliberately
+  split: id + attachment tracking stay in the shim, binding is native.
+  Kill-switch and test-lever paths (legacy present, FORCE_STUCK_RESIZE,
+  TEST_FORCE_INFLIGHT, the neutered KITTY_METAL_IMMEDIATE logger) are
+  policy, not dead code, and remain.
+
 ## Known deviations (tracked, intentional)
 
 - Cell/graphics MSL shader *logic* is still the opus-era port; semantic drift
