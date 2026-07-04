@@ -35,6 +35,13 @@ typedef struct MetalCellRenderData {
 
     uint32 bg_colors0, bg_colors1, bg_colors2, bg_colors3, bg_colors4, bg_colors5, bg_colors6, bg_colors7;
     float bg_opacities0, bg_opacities1, bg_opacities2, bg_opacities3, bg_opacities4, bg_opacities5, bg_opacities6, bg_opacities7;
+
+    // F1: R8 mask sprite atlas. color_sprites_xnum/ynum are the colored-atlas
+    // layout (mono layout stays in sprites_xnum/ynum); color_atlas_active is 1
+    // when the split R8-mono + RGBA-color atlases are in use and 0 under the
+    // KITTY_NO_R8_SPRITE_ATLAS kill switch. Appended at the end so all existing
+    // std140/MSL offsets are unchanged.
+    uint32 color_sprites_xnum, color_sprites_ynum, color_atlas_active;
 } MetalCellRenderData;
 
 // Per-draw uniforms for the cell programs, marshalled by draw_quad() in
@@ -47,12 +54,13 @@ typedef struct MetalCellDrawUniforms {
 } MetalCellDrawUniforms;
 
 #ifndef __METAL_VERSION__
-_Static_assert(sizeof(MetalCellRenderData) == 176, "MetalCellRenderData must match the GPUCellRenderData layout in shaders.c");
+_Static_assert(sizeof(MetalCellRenderData) == 188, "MetalCellRenderData must match the GPUCellRenderData layout in shaders.c");
 _Static_assert(offsetof(MetalCellRenderData, default_fg) == 12, "selection flags must occupy bytes 0-11");
 _Static_assert(offsetof(MetalCellRenderData, columns) == 52, "color block must occupy bytes 12-51");
 _Static_assert(offsetof(MetalCellRenderData, cursor_x1) == 80, "geometry block must occupy bytes 52-79");
 _Static_assert(offsetof(MetalCellRenderData, cursor_opacity) == 96, "cursor rect must occupy bytes 80-95");
 _Static_assert(offsetof(MetalCellRenderData, bg_colors0) == 112, "opacity block must occupy bytes 96-111");
 _Static_assert(offsetof(MetalCellRenderData, bg_opacities0) == 144, "bg colors must occupy bytes 112-143");
+_Static_assert(offsetof(MetalCellRenderData, color_sprites_xnum) == 176, "R8-atlas block must occupy bytes 176-187");
 _Static_assert(sizeof(MetalCellDrawUniforms) == 16, "MetalCellDrawUniforms layout drifted");
 #endif

@@ -42,7 +42,7 @@ enum {
     ROUNDED_RECT_PROGRAM,
     NUM_PROGRAMS
 };
-enum { SPRITE_MAP_UNIT, GRAPHICS_UNIT, SPRITE_DECORATIONS_MAP_UNIT };
+enum { SPRITE_MAP_UNIT, GRAPHICS_UNIT, SPRITE_DECORATIONS_MAP_UNIT, COLOR_SPRITE_MAP_UNIT, COLOR_SPRITE_DECORATIONS_MAP_UNIT };
 
 typedef struct UIRenderData {
     unsigned screen_width, screen_height, cell_width, cell_height, screen_left, screen_top, full_framebuffer_width, full_framebuffer_height;
@@ -76,9 +76,16 @@ typedef struct {
         unsigned width, height;
         size_t count;
     } decorations_map;
+    // F1: the colored (RGBA emoji) atlas and its own decorations map. Only
+    // populated when r8_sprite_atlas_enabled(); the mono texture_id above then
+    // becomes single-channel R8. Under the kill switch these stay zero and all
+    // sprites live in the single RGBA texture_id/decorations_map as before.
+    GLuint color_texture_id;
+    int color_last_num_of_layers, color_last_ynum;
+    struct decorations_map color_decorations_map;
 } SpriteMap;
 
-static const SpriteMap NEW_SPRITE_MAP = { .xnum = 1, .ynum = 1, .last_num_of_layers = 1, .last_ynum = -1 };
+static const SpriteMap NEW_SPRITE_MAP = { .xnum = 1, .ynum = 1, .last_num_of_layers = 1, .last_ynum = -1, .color_last_num_of_layers = 1, .color_last_ynum = -1 };
 static GLint max_texture_size = 0, max_array_texture_layers = 0;
 
 static GLfloat
@@ -138,6 +145,8 @@ free_sprite_data(FONTS_DATA_HANDLE fg) {
     if (sprite_map) {
         if (sprite_map->texture_id) free_texture(&sprite_map->texture_id);
         if (sprite_map->decorations_map.texture_id) free_texture(&sprite_map->decorations_map.texture_id);
+        if (sprite_map->color_texture_id) free_texture(&sprite_map->color_texture_id);
+        if (sprite_map->color_decorations_map.texture_id) free_texture(&sprite_map->color_decorations_map.texture_id);
         free(sprite_map);
         fg->sprite_map = NULL;
     }
@@ -164,6 +173,7 @@ copy_32bit_texture(GLuint old_texture, GLuint new_texture, GLenum texture_type) 
     GLint internal_format;
     glGetTexLevelParameteriv(texture_type, 0, GL_TEXTURE_INTERNAL_FORMAT, &internal_format);
     GLenum format, type;
+    unsigned bpp;  // bytes per texel of the round-trip (GPU->CPU->GPU) buffer
     switch(internal_format) {
         case GL_R8UI: case GL_R8I: case GL_R16UI: case GL_R16I: case GL_R32UI: case GL_R32I: case GL_RG8UI: case GL_RG8I:
         case GL_RG16UI: case GL_RG16I: case GL_RG32UI: case GL_RG32I: case GL_RGB8UI: case GL_RGB8I: case GL_RGB16UI:
@@ -171,18 +181,30 @@ copy_32bit_texture(GLuint old_texture, GLuint new_texture, GLenum texture_type) 
         case GL_RGBA32UI: case GL_RGBA32I:
             format = GL_RED_INTEGER;
             type = GL_UNSIGNED_INT;
+            bpp = 4;
+            break;
+        case GL_R8: case GL_RED:
+            // F1: single-channel mono atlas. macOS GL 4.1 has no ARB_copy_image,
+            // so this slow round-trip runs for real on the GL backend during
+            // atlas growth; read/write one byte per texel rather than assuming 4.
+            format = GL_RED;
+            type = GL_UNSIGNED_BYTE;
+            bpp = 1;
             break;
         default:
             format = GL_RGBA;
             type = GL_UNSIGNED_INT_8_8_8_8;
+            bpp = 4;
             break;
     }
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    RAII_ALLOC(uint8_t, pixels, malloc((size_t)width * height * layers * 4u));
+    const GLint alignment = bpp >= 4 ? 4 : 1;  // R8 rows are byte-tight
+    RAII_ALLOC(uint8_t, pixels, malloc((size_t)width * height * layers * bpp));
     if (!pixels) fatal("Out of memory");
+    // glGetTexImage is a pack (GPU->CPU) op, glTexSubImage an unpack (CPU->GPU) op.
+    glPixelStorei(GL_PACK_ALIGNMENT, alignment);
     glGetTexImage(texture_type, 0, format, type, pixels);
     glBindTexture(texture_type, new_texture);
-    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
     if (texture_type == GL_TEXTURE_2D_ARRAY) glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0, width, height, layers, format, type, pixels);
     else glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, format, type, pixels);
 }
@@ -201,13 +223,52 @@ setup_new_sprites_texture(GLenum texture_type) {
     return tex;
 }
 
+// F1: GL_TEXTURE_SWIZZLE_* are core GL 3.3 but this build's GLAD header
+// (kitty/gl-wrapper.h) and the Metal shim both omit them, so define them here
+// for whichever backend is compiling. On the Metal backend glTexParameteri is a
+// no-op (metal.h) and the swizzle is instead applied in metal_gl_tex_storage_3d.
+#ifndef GL_TEXTURE_SWIZZLE_R
+#define GL_TEXTURE_SWIZZLE_R 0x8E42
+#endif
+#ifndef GL_TEXTURE_SWIZZLE_G
+#define GL_TEXTURE_SWIZZLE_G 0x8E43
+#endif
+#ifndef GL_TEXTURE_SWIZZLE_B
+#define GL_TEXTURE_SWIZZLE_B 0x8E44
+#endif
+#ifndef GL_TEXTURE_SWIZZLE_A
+#define GL_TEXTURE_SWIZZLE_A 0x8E45
+#endif
+
+// F1: report the atlas byte totals on every atlas (re)alloc when KITTY_METAL_STATS
+// or debug_rendering is on, so the harness can confirm the mono atlas shrank to
+// ~1/4 its former size (R8 vs the old RGBA). mono/color are the two array-texture
+// atlases; the small R32UI decorations maps are not counted here.
 static void
-realloc_sprite_decorations_texture_if_needed(FONTS_DATA_HANDLE fg) {
-#define dm (sm->decorations_map)
+log_sprite_atlas_bytes(FONTS_DATA_HANDLE fg) {
+    static int env = -1;
+    if (env < 0) { const char *v = getenv("KITTY_METAL_STATS"); env = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0; }
+    if (!env && !global_state.debug_rendering) return;
+    unsigned mx, my, mz;
+    sprite_tracker_current_layout(fg, &mx, &my, &mz);
+    size_t cell_w = fg->fcm.cell_width, cell_h1 = (size_t)fg->fcm.cell_height + 1u;
+    size_t mono_bpp = r8_sprite_atlas_enabled() ? 1u : 4u;
+    size_t mono = (size_t)mx * cell_w * (size_t)my * cell_h1 * (mz + 1u) * mono_bpp;
+    size_t color = 0;
+    if (r8_sprite_atlas_enabled()) {
+        unsigned cx, cy, cz;
+        color_sprite_tracker_current_layout(fg, &cx, &cy, &cz);
+        color = (size_t)cx * cell_w * (size_t)cy * cell_h1 * (cz + 1u) * 4u;
+    }
+    fprintf(stderr, "sprite_atlas_bytes total=%zu mono=%zu color=%zu\n", mono + color, mono, color);
+}
+
+static void
+realloc_sprite_decorations_texture_if_needed(FONTS_DATA_HANDLE fg, struct decorations_map *dm) {
     SpriteMap *sm = (SpriteMap*)fg->sprite_map;
-    size_t current_capacity = (size_t)dm.width * dm.height;
-    if (dm.count < current_capacity && dm.texture_id) return;
-    GLint new_capacity = dm.count + 256;
+    size_t current_capacity = (size_t)dm->width * dm->height;
+    if (dm->count < current_capacity && dm->texture_id) return;
+    GLint new_capacity = dm->count + 256;
     GLint width = new_capacity, height = 1;
     if (new_capacity > sm->max_texture_size) {
         width = sm->max_texture_size;
@@ -217,13 +278,12 @@ realloc_sprite_decorations_texture_if_needed(FONTS_DATA_HANDLE fg) {
     const GLenum texture_type = GL_TEXTURE_2D;
     GLuint tex = setup_new_sprites_texture(texture_type);
     glTexImage2D(texture_type, 0, GL_R32UI, width, height, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, NULL);
-    if (dm.texture_id) {  // copy data from old texture
-        copy_32bit_texture(dm.texture_id, tex, texture_type);
-        free_texture(&dm.texture_id);
+    if (dm->texture_id) {  // copy data from old texture
+        copy_32bit_texture(dm->texture_id, tex, texture_type);
+        free_texture(&dm->texture_id);
     }
     glBindTexture(texture_type, 0);
-    dm.texture_id = tex; dm.width = width; dm.height = height;
-#undef dm
+    dm->texture_id = tex; dm->width = width; dm->height = height;
 }
 
 static void
@@ -235,7 +295,19 @@ realloc_sprite_texture(FONTS_DATA_HANDLE fg) {
     width = xnum * fg->fcm.cell_width; height = ynum * (fg->fcm.cell_height + 1);
     const GLenum texture_type = GL_TEXTURE_2D_ARRAY;
     GLuint tex = setup_new_sprites_texture(texture_type);
-    glTexStorage3D(texture_type, 1, GL_SRGB8_ALPHA8, width, height, znum);
+    // F1: the mono atlas only ever needs the coverage (alpha) channel, so store
+    // it single-channel R8 and swizzle so a sampler still reads coverage in .a
+    // (RGB<-1). glyph .rgb is unused for mono cells (colored_sprite==0 selects
+    // cell_foreground), so the visible result is identical to the old
+    // SRGB8_ALPHA8 atlas whose alpha channel is likewise linear coverage.
+    const bool r8 = r8_sprite_atlas_enabled();
+    glTexStorage3D(texture_type, 1, r8 ? GL_R8 : GL_SRGB8_ALPHA8, width, height, znum);
+    if (r8) {
+        glTexParameteri(texture_type, GL_TEXTURE_SWIZZLE_R, GL_ONE);
+        glTexParameteri(texture_type, GL_TEXTURE_SWIZZLE_G, GL_ONE);
+        glTexParameteri(texture_type, GL_TEXTURE_SWIZZLE_B, GL_ONE);
+        glTexParameteri(texture_type, GL_TEXTURE_SWIZZLE_A, GL_RED);
+    }
     if (sprite_map->texture_id) { // copy old texture data into new texture
         copy_32bit_texture(sprite_map->texture_id, tex, texture_type);
         free_texture(&sprite_map->texture_id);
@@ -244,46 +316,127 @@ realloc_sprite_texture(FONTS_DATA_HANDLE fg) {
     sprite_map->last_num_of_layers = znum;
     sprite_map->last_ynum = ynum;
     sprite_map->texture_id = tex;
+    log_sprite_atlas_bytes(fg);
+}
+
+// F1: the colored (emoji) atlas — always RGBA, its own index namespace/layout
+// (color_sprite_tracker). Only reached when r8_sprite_atlas_enabled(); under the
+// kill switch colored sprites go into the single mono atlas via
+// realloc_sprite_texture above, exactly as before F1.
+static void
+realloc_color_sprite_texture(FONTS_DATA_HANDLE fg) {
+    unsigned int xnum, ynum, z, znum, width, height;
+    color_sprite_tracker_current_layout(fg, &xnum, &ynum, &z);
+    znum = z + 1;
+    SpriteMap *sprite_map = (SpriteMap*)fg->sprite_map;
+    width = xnum * fg->fcm.cell_width; height = ynum * (fg->fcm.cell_height + 1);
+    const GLenum texture_type = GL_TEXTURE_2D_ARRAY;
+    GLuint tex = setup_new_sprites_texture(texture_type);
+    glTexStorage3D(texture_type, 1, GL_SRGB8_ALPHA8, width, height, znum);
+    if (sprite_map->color_texture_id) {
+        copy_32bit_texture(sprite_map->color_texture_id, tex, texture_type);
+        free_texture(&sprite_map->color_texture_id);
+    }
+    glBindTexture(texture_type, 0);
+    sprite_map->color_last_num_of_layers = znum;
+    sprite_map->color_last_ynum = ynum;
+    sprite_map->color_texture_id = tex;
+    log_sprite_atlas_bytes(fg);
 }
 
 static void
 ensure_sprite_map(FONTS_DATA_HANDLE fg) {
     SpriteMap *sprite_map = (SpriteMap*)fg->sprite_map;
+    const bool r8 = r8_sprite_atlas_enabled();
     if (!sprite_map->texture_id) realloc_sprite_texture(fg);
-    if (!sprite_map->decorations_map.texture_id) realloc_sprite_decorations_texture_if_needed(fg);
+    if (!sprite_map->decorations_map.texture_id) realloc_sprite_decorations_texture_if_needed(fg, &sprite_map->decorations_map);
+    if (r8) {
+        if (!sprite_map->color_texture_id) realloc_color_sprite_texture(fg);
+        if (!sprite_map->color_decorations_map.texture_id) realloc_sprite_decorations_texture_if_needed(fg, &sprite_map->color_decorations_map);
+    }
     // We have to rebind since we don't know if the texture was ever bound
-    // in the context of the current OSWindow
+    // in the context of the current OSWindow.
+    // F1: keep the color-atlas sampler units complete. When the split atlas is
+    // active they hold the real colored atlas + its decorations map; under the
+    // kill switch they mirror the mono textures so the (never-sampled, because
+    // color_atlas_active==0) color samplers still reference a valid texture.
+    // These are bound FIRST so the last glActiveTexture leaves the mono
+    // SPRITE_MAP_UNIT active exactly as the pre-F1 code did -- a later
+    // send_image_to_gpu() (graphics upload this same frame) binds without
+    // re-selecting a unit, so the trailing active unit must stay unit 0.
+    glActiveTexture(GL_TEXTURE0 + COLOR_SPRITE_MAP_UNIT);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, r8 ? sprite_map->color_texture_id : sprite_map->texture_id);
+    glActiveTexture(GL_TEXTURE0 + COLOR_SPRITE_DECORATIONS_MAP_UNIT);
+    glBindTexture(GL_TEXTURE_2D, r8 ? sprite_map->color_decorations_map.texture_id : sprite_map->decorations_map.texture_id);
     glActiveTexture(GL_TEXTURE0 + SPRITE_DECORATIONS_MAP_UNIT);
     glBindTexture(GL_TEXTURE_2D, sprite_map->decorations_map.texture_id);
     glActiveTexture(GL_TEXTURE0 + SPRITE_MAP_UNIT);
     glBindTexture(GL_TEXTURE_2D_ARRAY, sprite_map->texture_id);
 }
 
+// F1: grow-only scratch for extracting the R8 coverage byte from an RGBA canvas
+// tile. Main-thread only (render path), so a single shared buffer is safe.
+static uint8_t *r8_extract_scratch = NULL;
+static size_t r8_extract_scratch_px = 0;
+
 void
-send_sprite_to_gpu(FONTS_DATA_HANDLE fg, sprite_index idx, pixel *buf, sprite_index decoration_idx) {
+send_sprite_to_gpu(FONTS_DATA_HANDLE fg, sprite_index idx, pixel *buf, sprite_index decoration_idx, bool colored) {
     SpriteMap *sprite_map = (SpriteMap*)fg->sprite_map;
+    const bool use_color = colored && r8_sprite_atlas_enabled();
+    const bool r8_mono = !colored && r8_sprite_atlas_enabled();
     unsigned int xnum, ynum, znum, x, y, z;
-#define dm (sprite_map->decorations_map)
-    if (idx >= dm.count) dm.count = idx + 1;
-    realloc_sprite_decorations_texture_if_needed(fg);
-    div_t d = div(idx, dm.width);
+
+    // Decorations map: colored and mono sprites have separate index namespaces,
+    // so each has its own map. The value written is always a mono-namespace
+    // decoration index (decorations are only ever rendered into the mono atlas).
+    struct decorations_map *dm = use_color ? &sprite_map->color_decorations_map : &sprite_map->decorations_map;
+    if (idx >= dm->count) dm->count = idx + 1;
+    realloc_sprite_decorations_texture_if_needed(fg, dm);
+    div_t d = div(idx, dm->width);
     x = d.rem; y = d.quot;
-    glActiveTexture(GL_TEXTURE0 + SPRITE_DECORATIONS_MAP_UNIT);
-    glBindTexture(GL_TEXTURE_2D, dm.texture_id);
+    glActiveTexture(GL_TEXTURE0 + (use_color ? COLOR_SPRITE_DECORATIONS_MAP_UNIT : SPRITE_DECORATIONS_MAP_UNIT));
+    glBindTexture(GL_TEXTURE_2D, dm->texture_id);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
     glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, 1, 1, GL_RED_INTEGER, GL_UNSIGNED_INT, &decoration_idx);
-#undef dm
-    sprite_tracker_current_layout(fg, &xnum, &ynum, &znum);
-    if ((int)znum >= sprite_map->last_num_of_layers || (znum == 0 && (int)ynum > sprite_map->last_ynum)) {
-        realloc_sprite_texture(fg);
+
+    // Atlas upload into the selected namespace.
+    if (use_color) {
+        color_sprite_tracker_current_layout(fg, &xnum, &ynum, &znum);
+        if ((int)znum >= sprite_map->color_last_num_of_layers || (znum == 0 && (int)ynum > sprite_map->color_last_ynum)) {
+            realloc_color_sprite_texture(fg);
+            color_sprite_tracker_current_layout(fg, &xnum, &ynum, &znum);
+        }
+        glActiveTexture(GL_TEXTURE0 + COLOR_SPRITE_MAP_UNIT);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, sprite_map->color_texture_id);
+    } else {
         sprite_tracker_current_layout(fg, &xnum, &ynum, &znum);
+        if ((int)znum >= sprite_map->last_num_of_layers || (znum == 0 && (int)ynum > sprite_map->last_ynum)) {
+            realloc_sprite_texture(fg);
+            sprite_tracker_current_layout(fg, &xnum, &ynum, &znum);
+        }
+        glActiveTexture(GL_TEXTURE0 + SPRITE_MAP_UNIT);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, sprite_map->texture_id);
     }
-    glActiveTexture(GL_TEXTURE0 + SPRITE_MAP_UNIT);
-    glBindTexture(GL_TEXTURE_2D_ARRAY, sprite_map->texture_id);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
     sprite_index_to_pos(idx, xnum, ynum, &x, &y, &z);
     x *= fg->fcm.cell_width; y *= (fg->fcm.cell_height + 1);
-    glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, x, y, z, fg->fcm.cell_width, fg->fcm.cell_height + 1, 1, GL_RGBA, GL_UNSIGNED_INT_8_8_8_8, buf);
+    if (r8_mono) {
+        // Extract the coverage (alpha) byte from each RGBA canvas pixel into a
+        // tight R8 buffer. GL_UNSIGNED_INT_8_8_8_8 keeps alpha in the low byte
+        // (buf[i] & 0xff) — exactly the channel the sampler reads as .a today —
+        // so the R8 upload is byte-identical in coverage to the old RGBA upload.
+        size_t npx = (size_t)fg->fcm.cell_width * (fg->fcm.cell_height + 1u);
+        if (npx > r8_extract_scratch_px) {
+            uint8_t *grown = realloc(r8_extract_scratch, npx);
+            if (!grown) { log_error("Out of memory extracting R8 sprite mask (%zu px); skipping upload", npx); return; }
+            r8_extract_scratch = grown; r8_extract_scratch_px = npx;
+        }
+        for (size_t i = 0; i < npx; i++) r8_extract_scratch[i] = (uint8_t)(buf[i] & 0xffu);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, x, y, z, fg->fcm.cell_width, fg->fcm.cell_height + 1, 1, GL_RED, GL_UNSIGNED_BYTE, r8_extract_scratch);
+    } else {
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, x, y, z, fg->fcm.cell_width, fg->fcm.cell_height + 1, 1, GL_RGBA, GL_UNSIGNED_INT_8_8_8_8, buf);
+    }
 }
 
 void
@@ -500,6 +653,11 @@ struct GPUCellRenderData {
 
     GLuint bg_colors0, bg_colors1, bg_colors2, bg_colors3, bg_colors4, bg_colors5, bg_colors6, bg_colors7;
     GLfloat bg_opacities0, bg_opacities1, bg_opacities2, bg_opacities3, bg_opacities4, bg_opacities5, bg_opacities6, bg_opacities7;
+
+    // F1: colored-atlas layout + activation flag. Appended so all prior std140
+    // offsets are unchanged; mirrors MetalCellRenderData / the CellRenderData UBO
+    // block in cell_vertex.glsl.
+    GLuint color_sprites_xnum, color_sprites_ynum, color_atlas_active;
 };
 
 // D4: per-VAO shadow of the last GPUCellRenderData actually written to the GPU
@@ -640,6 +798,13 @@ cell_update_uniform_block(ssize_t vao_idx, Screen *screen, int uniform_buffer, i
     unsigned int x, y, z;
     sprite_tracker_current_layout(os_window->fonts_data, &x, &y, &z);
     rd->sprites_xnum = x; rd->sprites_ynum = y;
+    // F1: colored-atlas layout + activation. When disabled the shader keeps
+    // sampling the single mono atlas (color_atlas_active==0), so these values are
+    // unused; set them anyway to keep the uniform block deterministic.
+    unsigned int cx, cy, cz;
+    color_sprite_tracker_current_layout(os_window->fonts_data, &cx, &cy, &cz);
+    rd->color_sprites_xnum = cx; rd->color_sprites_ynum = cy;
+    rd->color_atlas_active = r8_sprite_atlas_enabled() ? 1u : 0u;
     rd->inverted = screen_invert_colors(screen) ? 1 : 0;
     rd->cell_width = os_window->fonts_data->fcm.cell_width;
     rd->cell_height = os_window->fonts_data->fcm.cell_height;
@@ -809,6 +974,8 @@ set_cell_uniforms(bool force) {
             bind_program(i); const CellUniforms *cu = &cell_program_layouts[i].uniforms;
             glUniform1i(cu->sprites, SPRITE_MAP_UNIT);
             glUniform1i(cu->sprite_decorations_map, SPRITE_DECORATIONS_MAP_UNIT);
+            glUniform1i(cu->color_sprites, COLOR_SPRITE_MAP_UNIT);
+            glUniform1i(cu->color_sprite_decorations_map, COLOR_SPRITE_DECORATIONS_MAP_UNIT);
             glUniform1f(cu->text_contrast, text_contrast);
             glUniform1f(cu->text_gamma_adjustment, text_gamma_adjustment);
         }

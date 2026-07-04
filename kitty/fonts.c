@@ -124,6 +124,11 @@ typedef struct {
     Font *fonts;
     Canvas canvas;
     GPUSpriteTracker sprite_tracker;
+    // F1: separate index namespace for colored (RGBA emoji) sprites, allocated
+    // from a small dedicated atlas so the big mono atlas can be single-channel
+    // R8. Only used when r8_sprite_atlas_enabled(); under the kill switch every
+    // sprite (mono and colored) is allocated from sprite_tracker as before.
+    GPUSpriteTracker color_sprite_tracker;
     fallback_font_map_t fallback_font_map;
     scaled_font_map_t scaled_font_map;
     decorations_index_map_t decorations_index_map;
@@ -301,6 +306,24 @@ font_group_for(double font_sz_in_pts, double logical_dpi_x, double logical_dpi_y
 // cell_width, so dividing by it keeps total preallocated slots roughly constant.
 #define SPRITE_ATLAS_GROWTH_MIN_ROWS 8u
 #define INITIAL_SPRITE_ATLAS_CAPACITY 4096u
+// F1: the colored (RGBA emoji) atlas holds far fewer sprites than the mono
+// atlas, so it preallocates a small capacity and grows in small chunks to keep
+// its RGBA bytes negligible next to the R8 mono atlas.
+#define COLOR_SPRITE_ATLAS_GROWTH_MIN_ROWS 4u
+#define INITIAL_COLOR_SPRITE_ATLAS_CAPACITY 128u
+
+// F1: env-cached kill switch. KITTY_NO_R8_SPRITE_ATLAS=1 reverts to a single
+// RGBA atlas (mono + colored share sprite_tracker), which is byte-for-byte the
+// pre-F1 behavior. Default (unset) uses the split R8-mono + RGBA-color atlases.
+bool
+r8_sprite_atlas_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("KITTY_NO_R8_SPRITE_ATLAS");
+        cached = (v && v[0] && strcmp(v, "0") != 0) ? 0 : 1;
+    }
+    return cached == 1;
+}
 
 void
 sprite_tracker_set_limits(size_t max_texture_size_, size_t max_array_len_) {
@@ -309,20 +332,20 @@ sprite_tracker_set_limits(size_t max_texture_size_, size_t max_array_len_) {
 }
 
 static bool
-do_increment(FontGroup *fg) {
-    fg->sprite_tracker.x++;
-    if (fg->sprite_tracker.x >= fg->sprite_tracker.xnum) {
-        fg->sprite_tracker.x = 0; fg->sprite_tracker.y++;
-        if (fg->sprite_tracker.y + 1 > fg->sprite_tracker.ynum) {
+do_increment(GPUSpriteTracker *st, unsigned int min_growth_rows) {
+    st->x++;
+    if (st->x >= st->xnum) {
+        st->x = 0; st->y++;
+        if (st->y + 1 > st->ynum) {
             // Grow by a chunk instead of exactly the one row just entered, but
             // never past max_y; this still always covers y+1, matching the floor
             // of the un-chunked formula it replaces: MIN(MAX(ynum, y+1), max_y).
-            unsigned int chunk = MAX(SPRITE_ATLAS_GROWTH_MIN_ROWS, fg->sprite_tracker.ynum / 2);
-            fg->sprite_tracker.ynum = MIN(MAX(fg->sprite_tracker.y + 1, fg->sprite_tracker.ynum + chunk), fg->sprite_tracker.max_y);
+            unsigned int chunk = MAX(min_growth_rows, st->ynum / 2);
+            st->ynum = MIN(MAX(st->y + 1, st->ynum + chunk), st->max_y);
         }
-        if (fg->sprite_tracker.y >= fg->sprite_tracker.max_y) {
-            fg->sprite_tracker.y = 0; fg->sprite_tracker.z++;
-            if (fg->sprite_tracker.z >= MIN((size_t)UINT16_MAX, max_array_len)) { PyErr_SetString(PyExc_RuntimeError, "Out of texture space for sprites"); return false; }
+        if (st->y >= st->max_y) {
+            st->y = 0; st->z++;
+            if (st->z >= MIN((size_t)UINT16_MAX, max_array_len)) { PyErr_SetString(PyExc_RuntimeError, "Out of texture space for sprites"); return false; }
         }
     }
     return true;
@@ -351,15 +374,22 @@ sprite_tracker_current_layout(FONTS_DATA_HANDLE data, unsigned int *x, unsigned 
     *x = fg->sprite_tracker.xnum; *y = fg->sprite_tracker.ynum; *z = fg->sprite_tracker.z;
 }
 
+void
+color_sprite_tracker_current_layout(FONTS_DATA_HANDLE data, unsigned int *x, unsigned int *y, unsigned int *z) {
+    FontGroup *fg = (FontGroup*)data;
+    *x = fg->color_sprite_tracker.xnum; *y = fg->color_sprite_tracker.ynum; *z = fg->color_sprite_tracker.z;
+}
+
 
 static void
-sprite_tracker_set_layout(GPUSpriteTracker *sprite_tracker, unsigned int cell_width, unsigned int cell_height) {
+sprite_tracker_set_layout(GPUSpriteTracker *sprite_tracker, unsigned int cell_width, unsigned int cell_height, unsigned int initial_capacity) {
     sprite_tracker->xnum = MIN(MAX(1u, max_texture_size / cell_width), (size_t)UINT16_MAX);
     sprite_tracker->max_y = MIN(MAX(1u, max_texture_size / cell_height), (size_t)UINT16_MAX);
     // F3: preallocate several rows up front (see INITIAL_SPRITE_ATLAS_CAPACITY
     // above) instead of starting at a single row, so ordinary sessions rarely
-    // trigger realloc_sprite_texture() (shaders.c) at all.
-    unsigned int initial_ynum = (INITIAL_SPRITE_ATLAS_CAPACITY + sprite_tracker->xnum - 1) / sprite_tracker->xnum;
+    // trigger realloc_sprite_texture() (shaders.c) at all. The colored atlas
+    // passes a much smaller initial_capacity (F1) since emoji sprites are rare.
+    unsigned int initial_ynum = (initial_capacity + sprite_tracker->xnum - 1) / sprite_tracker->xnum;
     sprite_tracker->ynum = MIN(MAX(1u, initial_ynum), sprite_tracker->max_y);
     sprite_tracker->x = 0; sprite_tracker->y = 0; sprite_tracker->z = 0;
 }
@@ -402,13 +432,20 @@ calculate_underline_exclusion_zones(pixel *buf, const FontGroup *fg, DecorationG
 }
 
 static sprite_index
-current_send_sprite_to_gpu(FontGroup *fg, pixel *buf, DecorationMetadata dec, FontCellMetrics scaled_metrics) {
-    sprite_index ans = current_sprite_index(&fg->sprite_tracker);
-    if (!do_increment(fg)) return 0;
+current_send_sprite_to_gpu(FontGroup *fg, pixel *buf, DecorationMetadata dec, FontCellMetrics scaled_metrics, bool colored) {
+    // F1: colored sprites draw their index from the small color atlas namespace;
+    // everything else (mono glyphs, box drawing, decorations, cursors) uses the
+    // mono atlas. The python test path always renders into the single RGBA
+    // canvas via the mono tracker, matching pre-F1 behavior.
+    bool use_color = colored && !python_send_to_gpu_impl && r8_sprite_atlas_enabled();
+    GPUSpriteTracker *st = use_color ? &fg->color_sprite_tracker : &fg->sprite_tracker;
+    unsigned int min_growth = use_color ? COLOR_SPRITE_ATLAS_GROWTH_MIN_ROWS : SPRITE_ATLAS_GROWTH_MIN_ROWS;
+    sprite_index ans = current_sprite_index(st);
+    if (!do_increment(st, min_growth)) return 0;
     if (python_send_to_gpu_impl) { python_send_to_gpu(fg, ans, buf); return ans; }
     if (dec.underline_region.height && OPT(underline_exclusion).thickness > 0) calculate_underline_exclusion_zones(
             buf, fg, dec.underline_region, scaled_metrics);
-    send_sprite_to_gpu((FONTS_DATA_HANDLE)fg, ans, buf, dec.start_idx);
+    send_sprite_to_gpu((FONTS_DATA_HANDLE)fg, ans, buf, dec.start_idx, colored);
     if (0) { printf("Sprite: %u dec_idx: %u\n", ans, dec.start_idx); display_glyph(buf, fg->fcm.cell_width, fg->fcm.cell_height); printf("\n"); }
     return ans;
 }
@@ -1024,7 +1061,7 @@ render_decorations(FontGroup *fg, Region src, Region dest, FontCellMetrics scale
     memset(alpha_mask, 0, sizeof(alpha_mask[0]) * scaled_metrics.cell_width * scaled_metrics.cell_height); \
     DecorationGeometry sdg = call; \
     render_scaled_decoration(unscaled_metrics, scaled_metrics, alpha_mask, buf, src, dest); \
-    sprite_index q = current_send_sprite_to_gpu(fg, buf, (DecorationMetadata){0}, scaled_metrics); \
+    sprite_index q = current_send_sprite_to_gpu(fg, buf, (DecorationMetadata){0}, scaled_metrics, false); \
     if (!ans) ans = q; \
     if (is_underline) { \
         Region r = map_scaled_decoration_geometry(sdg, src, dest); \
@@ -1122,7 +1159,7 @@ render_box_cell(FontGroup *fg, RunFont rf, CPUCell *cpu_cell, GPUCell *gpu_cell,
         if (!sp[i]->rendered) {
             pixel *b = extract_cell_region(&fg->canvas, i, &src, &dest, mask_stride, unscaled_metrics);
             /*printf("cell %u src -> dest: (%u %u) -> (%u %u)\n", i, src.left, src.right, dest.left, dest.right);*/
-            sp[i]->idx = current_send_sprite_to_gpu(fg, b, dm, scaled_metrics);
+            sp[i]->idx = current_send_sprite_to_gpu(fg, b, dm, scaled_metrics, false);
             if (!sp[i]->idx) failed;
             /*dump_sprite(b, unscaled_metrics.cell_width, unscaled_metrics.cell_height);*/
             sp[i]->rendered = true; sp[i]->colored = false;
@@ -1278,7 +1315,7 @@ render_group(
                 bool is_repeat_sprite = is_infinite_ligature && i > 0 && sp[i]->idx == sp[i-1]->idx;
                 if (!is_repeat_sprite) {
                     pixel *b = num_cells == 1 ? canvas : extract_cell_from_canvas(fg, i, num_cells);
-                    sp[i]->idx = current_send_sprite_to_gpu(fg, b, dm, scaled_metrics);
+                    sp[i]->idx = current_send_sprite_to_gpu(fg, b, dm, scaled_metrics, was_colored);
                     if (!sp[i]->idx) failed;
                 } else sp[i]->idx = sp[i-1]->idx;
                 sp[i]->rendered = true; sp[i]->colored = was_colored;
@@ -1296,7 +1333,7 @@ render_group(
                 pixel *b = extract_cell_region(
                     &fg->canvas, i, &src, &dest, scaled_canvas_width, unscaled_metrics);
                 /*printf("cell %u src -> dest: (%u %u) -> (%u %u)\n", i, src.left, src.right, dest.left, dest.right);*/
-                sp[i]->idx = current_send_sprite_to_gpu(fg, b, dm, scaled_metrics);
+                sp[i]->idx = current_send_sprite_to_gpu(fg, b, dm, scaled_metrics, was_colored);
                 if (!sp[i]->idx) failed;
                 /*dump_sprite(b, unscaled_metrics.cell_width, unscaled_metrics.cell_height);*/
                 sp[i]->rendered = true; sp[i]->colored = was_colored;
@@ -2055,7 +2092,7 @@ send_prerendered_sprites(FontGroup *fg) {
     // blank cell
     ensure_canvas_can_fit(fg, 1, 1);
     DecorationMetadata dm = {.start_idx=5};
-    current_send_sprite_to_gpu(fg, fg->canvas.buf, dm, fg->fcm);
+    current_send_sprite_to_gpu(fg, fg->canvas.buf, dm, fg->fcm, false);
     const unsigned cell_area = fg->fcm.cell_height * fg->fcm.cell_width;
     RAII_ALLOC(uint8_t, alpha_mask, malloc(cell_area));
     if (!alpha_mask) fatal("Out of memory");
@@ -2065,7 +2102,7 @@ send_prerendered_sprites(FontGroup *fg) {
     call; \
     ensure_canvas_can_fit(fg, 1, 1);  /* clear canvas */ \
     render_alpha_mask(alpha_mask, fg->canvas.buf, &r, &r, fg->fcm.cell_width, fg->fcm.cell_width, 0xffffff); \
-    current_send_sprite_to_gpu(fg, fg->canvas.buf, dm, fg->fcm);
+    current_send_sprite_to_gpu(fg, fg->canvas.buf, dm, fg->fcm, false);
 
     // If you change the mapping of these cells you will need to change
     // BEAM_IDX in shader.c and STRIKE_SPRITE_INDEX in
@@ -2163,7 +2200,17 @@ initialize_font_group(FontGroup *fg) {
 #undef I
     calc_cell_metrics(fg, fg->fonts[fg->medium_font_idx].face);
     ensure_canvas_can_fit(fg, 8, 1);
-    sprite_tracker_set_layout(&fg->sprite_tracker, fg->fcm.cell_width, fg->fcm.cell_height);
+    sprite_tracker_set_layout(&fg->sprite_tracker, fg->fcm.cell_width, fg->fcm.cell_height, INITIAL_SPRITE_ATLAS_CAPACITY);
+    sprite_tracker_set_layout(&fg->color_sprite_tracker, fg->fcm.cell_width, fg->fcm.cell_height, INITIAL_COLOR_SPRITE_ATLAS_CAPACITY);
+    // F1: reserve colored index 0 so the first real colored glyph gets a
+    // non-zero index. current_send_sprite_to_gpu() returns the sprite index and
+    // every glyph caller treats a 0 return as a failed render (if (!sp[i]->idx)
+    // failed). The mono atlas is safe because index 0 is the prerendered blank
+    // sprite, so real mono glyphs are always >= 1; the colored atlas has no such
+    // reservation, so without this the very first emoji would be mis-detected as
+    // a failed render and drawn blank. Reserving here (not in send_prerendered_
+    // sprites) makes the invariant hold regardless of upload ordering.
+    do_increment(&fg->color_sprite_tracker, COLOR_SPRITE_ATLAS_GROWTH_MIN_ROWS);
     // rescale the symbol_map faces for the desired cell height, this is how fallback fonts are sized as well
     for (size_t i = 0; i < descriptor_indices.num_symbol_fonts; i++) {
         Font *font = fg->fonts + i + fg->first_symbol_font_idx;
@@ -2211,7 +2258,9 @@ sprite_map_set_layout(PyObject UNUSED *self, PyObject *args) {
     unsigned int w, h;
     if(!PyArg_ParseTuple(args, "II", &w, &h)) return NULL;
     if (!num_font_groups) { PyErr_SetString(PyExc_RuntimeError, "must create font group first"); return NULL; }
-    sprite_tracker_set_layout(&font_groups->sprite_tracker, w, h);
+    sprite_tracker_set_layout(&font_groups->sprite_tracker, w, h, INITIAL_SPRITE_ATLAS_CAPACITY);
+    sprite_tracker_set_layout(&font_groups->color_sprite_tracker, w, h, INITIAL_COLOR_SPRITE_ATLAS_CAPACITY);
+    do_increment(&font_groups->color_sprite_tracker, COLOR_SPRITE_ATLAS_GROWTH_MIN_ROWS);  // F1: reserve colored index 0 (see initialize_font_group)
     Py_RETURN_NONE;
 }
 
@@ -2221,7 +2270,7 @@ test_sprite_position_increment(PyObject UNUSED *self, PyObject *args UNUSED) {
     FontGroup *fg = font_groups;
     unsigned int x, y, z;
     sprite_index_to_pos(current_sprite_index(&fg->sprite_tracker), fg->sprite_tracker.xnum, fg->sprite_tracker.ynum, &x, &y, &z);
-    if (!do_increment(fg)) return NULL;
+    if (!do_increment(&fg->sprite_tracker, SPRITE_ATLAS_GROWTH_MIN_ROWS)) return NULL;
     return Py_BuildValue("III", x, y, z);
 }
 

@@ -81,6 +81,7 @@ typedef float GLfloat;
 #define GL_COLOR_ATTACHMENT0 0x8CE0
 #define GL_SRC_ALPHA        0x0302
 #define GL_ONE_MINUS_SRC_ALPHA 0x0303
+#define GL_ONE              1     // F1: R8-atlas swizzle source (RGB<-ONE)
 #define GL_NO_ERROR         0
 #define GL_VIEWPORT         0x0BA2
 #define GL_INVALID_INDEX    0xFFFFFFFF

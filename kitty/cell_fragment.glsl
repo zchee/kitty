@@ -6,6 +6,7 @@
 uniform float text_contrast;
 uniform float text_gamma_adjustment;
 uniform sampler2DArray sprites;
+uniform sampler2DArray color_sprites;  // F1: colored (RGBA emoji) atlas
 
 in vec3 background;
 in vec4 effective_background_premul;
@@ -20,6 +21,7 @@ in vec3 cell_foreground;
 in vec4 cursor_color_premult;
 in vec3 decoration_fg;
 in float colored_sprite;
+flat in float use_color_atlas;  // F1: sample the text texel from color_sprites when >0.5
 #endif
 
 out vec4 output_color;
@@ -60,17 +62,22 @@ vec4 foreground_contrast(vec4 over, vec3 under) {
 
 vec4 load_text_foreground_color() {
     // For colored sprites use the color from the sprite rather than the text foreground
-    // Return non-premultiplied foreground color
-    vec4 text_fg = texture(sprites, sprite_pos);
+    // Return non-premultiplied foreground color. F1: colored text sprites live in
+    // the RGBA color atlas; mono glyphs (and everything under the kill switch)
+    // stay in the R8 mono atlas whose swizzle exposes coverage in .a.
+    vec4 text_fg = (use_color_atlas > 0.5) ? texture(color_sprites, sprite_pos) : texture(sprites, sprite_pos);
     return vec4(mix(cell_foreground, text_fg.rgb, colored_sprite), text_fg.a);
 }
 
 vec4 calculate_premul_foreground_from_sprites(vec4 text_fg) {
-    // Return premul foreground color from decorations (cursor, underline, strikethrough)
-    ivec3 sz = textureSize(sprites, 0);
+    // Return premul foreground color from decorations (cursor, underline, strikethrough).
+    // Underline/strike/cursor are always mono-atlas sprites; only the per-glyph
+    // exclusion mask follows the text sprite into whichever atlas it lives in.
     float underline_alpha = texture(sprites, underline_pos).a;
-    float underline_exclusion = texelFetch(sprites, ivec3(int(
-        sprite_pos.x * float(sz.x)), int(underline_exclusion_pos), int(sprite_pos.z)), 0).a;
+    ivec3 tsz = (use_color_atlas > 0.5) ? textureSize(color_sprites, 0) : textureSize(sprites, 0);
+    float underline_exclusion = (use_color_atlas > 0.5)
+        ? texelFetch(color_sprites, ivec3(int(sprite_pos.x * float(tsz.x)), int(underline_exclusion_pos), int(sprite_pos.z)), 0).a
+        : texelFetch(sprites, ivec3(int(sprite_pos.x * float(tsz.x)), int(underline_exclusion_pos), int(sprite_pos.z)), 0).a;
     underline_alpha *= 1.0f - underline_exclusion;
     float strike_alpha = texture(sprites, strike_pos).a;
     float cursor_alpha = texture(sprites, cursor_pos).a;

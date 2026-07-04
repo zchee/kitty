@@ -55,6 +55,12 @@ bool face_equals_descriptor(PyObject *face_, PyObject *descriptor);
 const char* postscript_name_for_face(const PyObject*);
 
 void sprite_tracker_current_layout(FONTS_DATA_HANDLE data, unsigned int *x, unsigned int *y, unsigned int *z);
+// F1: colored-sprite (RGBA) atlas layout, mirror of sprite_tracker_current_layout
+// for the mono R8 atlas. r8_sprite_atlas_enabled() reports whether the split
+// atlas is active (false under the KITTY_NO_R8_SPRITE_ATLAS kill switch, which
+// reverts to a single RGBA atlas that is byte-for-byte the pre-F1 behavior).
+void color_sprite_tracker_current_layout(FONTS_DATA_HANDLE data, unsigned int *x, unsigned int *y, unsigned int *z);
+bool r8_sprite_atlas_enabled(void);
 void render_alpha_mask(const uint8_t *alpha_mask, pixel* dest, const Region *src_rect, const Region *dest_rect, size_t src_stride, size_t dest_stride, pixel color_rgb);
 void render_line(FONTS_DATA_HANDLE, Line *line, index_type lnum, Cursor *cursor, DisableLigature, ListOfChars*);
 void sprite_tracker_set_limits(size_t max_texture_size, size_t max_array_len);

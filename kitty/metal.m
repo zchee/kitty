@@ -1268,13 +1268,24 @@ draw_quad(bool blend, unsigned instance_count) {
         [mtl_current_encoder setVertexBytes:&cell_draw length:sizeof(cell_draw) atIndex:2];
         [mtl_current_encoder setFragmentBytes:&cell_draw length:sizeof(cell_draw) atIndex:2];
 
-        // Bind textures: unit 0 = sprite atlas (2D array), unit 2 = decorations map
+        // Bind textures: unit 0 = mono sprite atlas (2D array), unit 2 = mono
+        // decorations map. F1: unit 3 = colored sprite atlas (fragment+vertex
+        // tex 1), unit 4 = colored decorations map (vertex tex 3). ensure_sprite_map
+        // keeps units 3/4 bound to a valid texture even under the kill switch, so
+        // the fragment/vertex color samplers are always complete.
         if (bound_tex_2d_array[0] && bound_tex_2d_array[0] < MAX_TEXTURES && textures[bound_tex_2d_array[0]].texture) {
             [mtl_current_encoder setFragmentTexture:textures[bound_tex_2d_array[0]].texture atIndex:0];
             [mtl_current_encoder setVertexTexture:textures[bound_tex_2d_array[0]].texture atIndex:0];
         }
         if (bound_tex_2d[2] && bound_tex_2d[2] < MAX_TEXTURES && textures[bound_tex_2d[2]].texture) {
             [mtl_current_encoder setVertexTexture:textures[bound_tex_2d[2]].texture atIndex:2];
+        }
+        if (bound_tex_2d_array[3] && bound_tex_2d_array[3] < MAX_TEXTURES && textures[bound_tex_2d_array[3]].texture) {
+            [mtl_current_encoder setFragmentTexture:textures[bound_tex_2d_array[3]].texture atIndex:1];
+            [mtl_current_encoder setVertexTexture:textures[bound_tex_2d_array[3]].texture atIndex:1];
+        }
+        if (bound_tex_2d[4] && bound_tex_2d[4] < MAX_TEXTURES && textures[bound_tex_2d[4]].texture) {
+            [mtl_current_encoder setVertexTexture:textures[bound_tex_2d[4]].texture atIndex:3];
         }
     } else if (current_program == 4) {
         // Borders — bind rect buffer from VAO, uniforms as buffer
@@ -2818,7 +2829,11 @@ void metal_gl_tex_sub_image_3d(GLenum target, int level, int x, int y, int z, in
     MetalTexture *t = get_texture(tex_id);
     if (!t || !t->texture || !data) return;
 
-    NSUInteger bpp = 4;
+    // F1: size bytesPerRow from the actual destination format. The mono atlas is
+    // now single-channel R8 (GL_RED/GL_UNSIGNED_BYTE upload, bpp 1), while the
+    // RGBA atlases stay 4 bpp. The byte-swap below only applies to the packed
+    // GL_UNSIGNED_INT_8_8_8_8 RGBA uploads.
+    NSUInteger bpp = mtl_bytes_per_pixel(t->texture.pixelFormat);
     // GL_UNSIGNED_INT_8_8_8_8 is a packed type: the R,G,B,A components live in
     // the uint32 from its most significant byte down, which on little-endian is
     // the reverse of the byte-ordered RGBA that Metal's replaceRegion expects.
@@ -2864,6 +2879,14 @@ void metal_gl_tex_storage_3d(GLenum target, int levels, GLenum internalformat, i
     MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
     desc.textureType = MTLTextureType2DArray;
     desc.pixelFormat = pixel_format_for_gl(internalformat);
+    // F1: the mono R8 atlas stores coverage in the single red channel; swizzle so
+    // a sampler reads coverage in .a (RGB<-1), matching the GL_TEXTURE_SWIZZLE_*
+    // set on the GL backend and the .a-only sampling the cell fragment does for
+    // mono glyphs. (glTexParameteri is a no-op on Metal, hence the swizzle here.)
+    if (desc.pixelFormat == MTLPixelFormatR8Unorm) {
+        desc.swizzle = MTLTextureSwizzleChannelsMake(
+            MTLTextureSwizzleOne, MTLTextureSwizzleOne, MTLTextureSwizzleOne, MTLTextureSwizzleRed);
+    }
     desc.width = width;
     desc.height = height;
     desc.arrayLength = depth;
