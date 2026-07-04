@@ -53,6 +53,74 @@ typedef struct MetalCellDrawUniforms {
     float text_gamma_adjustment;
 } MetalCellDrawUniforms;
 
+// C5: per-draw uniform structs for the remaining frame-path programs, hoisted
+// out of the metal.m draw dispatch (were anonymous inline structs) so the C
+// filler writes MSL-layout memory directly and the _Static_asserts below pin the
+// padding-sensitive offsets against the per-program .metal declarations. Each
+// mirrors a struct in its shader: MetalBorderUniforms<->BorderUniforms
+// (border_*.metal), MetalGraphicsUniforms<->GraphicsUniforms
+// (graphics_shaders.metal), etc. MSL aligns float3 to 16 bytes, hence the pads.
+// The byte-identical golden set is the cross-check that these match the shaders.
+typedef struct MetalBorderUniforms {
+    uint32 colors[9];         // colors[9] multi-element array (packs, no padding)
+    float background_opacity;
+    float gamma_lut[256];
+} MetalBorderUniforms;
+
+typedef struct MetalGraphicsUniforms {
+    float src_rects[16 * 4];  // 16 == MAX_IMAGE_INSTANCES (state.h); asserted in metal.m
+    float dest_rects[16 * 4];
+    float extra_alpha;
+    float _pad0[3];           // float3 amask_fg is 16-byte aligned in MSL
+    float amask_fg[3];
+    float _pad1;
+    float amask_bg_premult[4];
+} MetalGraphicsUniforms;
+
+typedef struct MetalBgimageUniforms {
+    float sizes[4];
+    float positions[4];
+    float background[4];
+    float tiled;
+    float _pad[3];
+} MetalBgimageUniforms;
+
+typedef struct MetalTintUniforms {
+    float tint_color[4];
+    float edges[4];
+} MetalTintUniforms;
+
+typedef struct MetalTrailUniforms {
+    float x_coords[4];
+    float y_coords[4];
+    float cursor_edge_x[2];
+    float cursor_edge_y[2];
+    float trail_color[3];     // float3 -> 16-byte slot, so trail_opacity lands at 64
+    float _pad0;
+    float trail_opacity;
+    float _pad1[3];
+} MetalTrailUniforms;
+
+typedef struct MetalBlitUniforms {
+    float src_rect[4];
+    float dest_rect[4];
+} MetalBlitUniforms;
+
+typedef struct MetalScreenshotUniforms {
+    float src_rect[4];
+    float dest_rect[4];
+    float src_size[2];
+    float _pad[2];
+} MetalScreenshotUniforms;
+
+typedef struct MetalRoundedRectUniforms {
+    float color[4];
+    float background_color[4];
+    float rect[4];
+    float params[2];
+    float _pad[2];
+} MetalRoundedRectUniforms;
+
 #ifndef __METAL_VERSION__
 _Static_assert(sizeof(MetalCellRenderData) == 188, "MetalCellRenderData must match the GPUCellRenderData layout in shaders.c");
 _Static_assert(offsetof(MetalCellRenderData, default_fg) == 12, "selection flags must occupy bytes 0-11");
@@ -63,4 +131,32 @@ _Static_assert(offsetof(MetalCellRenderData, bg_colors0) == 112, "opacity block 
 _Static_assert(offsetof(MetalCellRenderData, bg_opacities0) == 144, "bg colors must occupy bytes 112-143");
 _Static_assert(offsetof(MetalCellRenderData, color_sprites_xnum) == 176, "R8-atlas block must occupy bytes 176-187");
 _Static_assert(sizeof(MetalCellDrawUniforms) == 16, "MetalCellDrawUniforms layout drifted");
+
+// C5: pin the frame-path uniform structs to their MSL layouts.
+_Static_assert(sizeof(MetalBorderUniforms) == 1064, "MetalBorderUniforms layout drifted");
+_Static_assert(offsetof(MetalBorderUniforms, background_opacity) == 36, "border colors[9] must occupy bytes 0-35");
+_Static_assert(offsetof(MetalBorderUniforms, gamma_lut) == 40, "border gamma_lut must start at 40");
+
+_Static_assert(sizeof(MetalGraphicsUniforms) == 560, "MetalGraphicsUniforms layout drifted");
+_Static_assert(offsetof(MetalGraphicsUniforms, dest_rects) == 256, "graphics src_rects[16] must occupy bytes 0-255");
+_Static_assert(offsetof(MetalGraphicsUniforms, extra_alpha) == 512, "graphics dest_rects[16] must occupy bytes 256-511");
+_Static_assert(offsetof(MetalGraphicsUniforms, amask_fg) == 528, "graphics amask_fg (float3) must be 16-aligned at 528");
+_Static_assert(offsetof(MetalGraphicsUniforms, amask_bg_premult) == 544, "graphics amask_bg_premult must start at 544");
+
+_Static_assert(sizeof(MetalBgimageUniforms) == 64, "MetalBgimageUniforms layout drifted");
+_Static_assert(offsetof(MetalBgimageUniforms, tiled) == 48, "bgimage tiled must land at 48");
+
+_Static_assert(sizeof(MetalTintUniforms) == 32, "MetalTintUniforms layout drifted");
+_Static_assert(offsetof(MetalTintUniforms, edges) == 16, "tint edges must start at 16");
+
+_Static_assert(sizeof(MetalTrailUniforms) == 80, "MetalTrailUniforms layout drifted");
+_Static_assert(offsetof(MetalTrailUniforms, trail_opacity) == 64, "trail_opacity must land at 64 (float3 trail_color 16-aligned)");
+
+_Static_assert(sizeof(MetalBlitUniforms) == 32, "MetalBlitUniforms layout drifted");
+
+_Static_assert(sizeof(MetalScreenshotUniforms) == 48, "MetalScreenshotUniforms layout drifted");
+_Static_assert(offsetof(MetalScreenshotUniforms, src_size) == 32, "screenshot src_size must start at 32");
+
+_Static_assert(sizeof(MetalRoundedRectUniforms) == 64, "MetalRoundedRectUniforms layout drifted");
+_Static_assert(offsetof(MetalRoundedRectUniforms, params) == 48, "rounded_rect params must start at 48");
 #endif
