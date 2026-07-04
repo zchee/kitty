@@ -21,6 +21,7 @@
 #include "png-reader.h"
 
 #include <string.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <sched.h> // sched_yield: ring-exhaustion safety valve (ring_acquire_slot)
 
@@ -211,6 +212,18 @@ typedef union {
 static struct {
     UniformValue values[MAX_UNIFORMS_PER_PROGRAM];
 } uniform_stores[64];
+
+// US-307 (G2 minor): array uniforms pack at ARRAY_UNIFORM_BASE + slot*16, spanning
+// MAX_IMAGE_INSTANCES elements. The graphics program registers 6 uniforms
+// (get_uniform_locations_graphics: image, amask_fg, amask_bg_premult, extra_alpha,
+// src_rects, dest_rects), so dest_rects is slot 5 -> base 280, ending at slot 295
+// of MAX_UNIFORMS_PER_PROGRAM. Guard the headroom at compile time so growing
+// MAX_IMAGE_INSTANCES or shrinking the store fails the build instead of
+// metal_gl_uniform4fv silently clamping (base+i < MAX_UNIFORMS_PER_PROGRAM). Adding
+// a uniform ahead of dest_rects means bumping GRAPHICS_ARRAY_UNIFORM_MAX_SLOT.
+#define GRAPHICS_ARRAY_UNIFORM_MAX_SLOT 5  // dest_rects slot in get_uniform_locations_graphics
+_Static_assert(ARRAY_UNIFORM_BASE + GRAPHICS_ARRAY_UNIFORM_MAX_SLOT * 16 + MAX_IMAGE_INSTANCES <= MAX_UNIFORMS_PER_PROGRAM,
+               "graphics dest_rects array overflows the uniform value store");
 
 // Gamma LUT — cached for binding to shaders
 static const float *cached_gamma_lut = NULL;
@@ -1120,6 +1133,11 @@ typedef struct {
     id<MTLTexture> texture;
     GLenum target; // GL_TEXTURE_2D or GL_TEXTURE_2D_ARRAY
     int width, height, depth;
+    // US-307: newest frame index whose command buffer bound this texture for a
+    // graphics draw. Compared against the completion watermark to tell whether an
+    // async-presented committed frame may still be sampling it (see
+    // texture_upload_in_flight). Written on the main thread (draw + realloc).
+    uint64_t last_drawn_fidx;
 } MetalTexture;
 
 #define MAX_TEXTURES 1024
@@ -1293,9 +1311,35 @@ static int metal_frame_counter = 0;
 // (emitted as drawable_wait_ms); with maximumDrawableCount=2 this is where the
 // keypress-to-photon backpressure actually lives, so it is measured separately.
 static uint64_t metal_frame_index = 0;
+// US-307: ungated per-frame GPU-completion watermark. Advanced (monotonically) by
+// each committed frame's completed handler to that frame's metal_frame_index, so
+// the CPU can tell whether a texture a committed frame referenced is still in
+// flight. Written on Metal's completion thread, read on the main thread -> atomic.
+static _Atomic uint64_t metal_completed_fidx = 0;
 static int metal_pass_count = 0;
 static double metal_frame_encode_start = 0.0;
 static double metal_frame_drawable_wait = 0.0;
+
+// US-307: is a still-in-flight committed frame potentially sampling this image
+// texture? True when the newest frame that bound it has not yet completed on the
+// GPU. The graphics.c upload paths consult this to avoid an in-place replaceRegion
+// into a texture an async-presented frame is still reading (the G1 race). Called
+// on the main thread (draw/upload); reads the atomic completion watermark.
+bool
+texture_upload_in_flight(uint32_t tex_id) {
+    if (tex_id == 0 || tex_id >= MAX_TEXTURES) return false;
+    // US-307 verification lever: KITTY_METAL_TEST_FORCE_INFLIGHT=N forces the first
+    // N checks true to synthesize async-present contention deterministically, then
+    // reverts to the real watermark. Lets a test drive an image through the racy
+    // fresh-texture fallback and confirm deltas resume afterward. Inert when unset.
+    static int force_remaining = -1;
+    if (force_remaining < 0) {
+        const char *v = getenv("KITTY_METAL_TEST_FORCE_INFLIGHT");
+        force_remaining = (v && v[0]) ? atoi(v) : 0;
+    }
+    if (force_remaining > 0) { force_remaining--; return true; }
+    return textures[tex_id].last_drawn_fidx > atomic_load_explicit(&metal_completed_fidx, memory_order_acquire);
+}
 
 // M3: has any render pass targeted the drawable yet this frame? The first
 // drawable pass must not Load the recycled drawable (its contents are
@@ -1481,6 +1525,9 @@ draw_quad(bool blend, unsigned instance_count) {
         // Bind image texture from unit 1 (GRAPHICS_UNIT)
         if (bound_tex_2d[1] && bound_tex_2d[1] < MAX_TEXTURES && textures[bound_tex_2d[1]].texture) {
             [mtl_current_encoder setFragmentTexture:textures[bound_tex_2d[1]].texture atIndex:0];
+            // US-307: record the frame that samples this image texture, so the
+            // upload path can detect it is still in flight under async present.
+            textures[bound_tex_2d[1]].last_drawn_fidx = metal_frame_index;
         }
     } else if (current_program == 8) {
         MetalBgimageUniforms bg_u;
@@ -2552,6 +2599,19 @@ metal_end_frame(void) {
             os_signpost_interval_begin(slog, present_sid, "present", "");
         }
         const uint64_t fidx = metal_frame_index++;
+        // US-307: ungated per-frame completion watermark. When THIS frame's GPU
+        // work finishes, advance metal_completed_fidx so the CPU can tell whether
+        // an image texture a committed frame referenced is still being sampled
+        // (async present). Must be unconditional -- the in-place-upload race exists
+        // whenever a committed frame is in flight, independent of stats/signpost.
+        // Single queue => FIFO completion, so the max is a formality that also
+        // stays correct if a future path completes buffers out of order.
+        [mtl_current_command_buffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+            (void)cb;
+            uint64_t prev = atomic_load_explicit(&metal_completed_fidx, memory_order_relaxed);
+            while (prev < fidx && !atomic_compare_exchange_weak_explicit(
+                       &metal_completed_fidx, &prev, fidx, memory_order_release, memory_order_relaxed)) { }
+        }];
         // Phase 4 step 6 (observability): attribute every frame's scheduling
         // source. resize (presentsWithTransaction) > unsynced (sync_to_monitor=no
         // => displaySyncEnabled=NO) > link (CAMetalDisplayLink drawable) >
@@ -2918,6 +2978,7 @@ void metal_gl_tex_image_2d(GLenum target, int level, int internalformat, int wid
 
     [t->texture release];
     t->texture = [mtl_device newTextureWithDescriptor:desc];
+    t->last_drawn_fidx = 0;  // US-307: a freshly (re)allocated texture has no in-flight draws
     // G1: count only IMAGE-texture (re)allocs (the graphics/animation upload path
     // uses GL_SRGB_ALPHA). This excludes render-target textures such as the
     // thumbnail-capture scratch (setup_texture_as_render_target, GL_RGBA16), so

@@ -137,6 +137,15 @@ draw_quad(bool blend, unsigned instance_count) {
     else glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
 }
 
+// US-307: GL relies on the driver ordering glTexSubImage2D after prior sampling of
+// the same texture, so an in-place image upload is never treated as in-flight here
+// (preserves pre-G1 GL behavior). The completion-watermark machinery is Metal-only.
+bool
+texture_upload_in_flight(uint32_t tex_id) {
+    (void)tex_id;
+    return false;
+}
+
 static struct {
     GLsizei items[16][4];
     size_t used;
