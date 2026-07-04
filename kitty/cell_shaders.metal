@@ -111,6 +111,7 @@ struct CellVertexOut {
     float4 cursor_color_premult;
     float3 decoration_fg;
     float colored_sprite;
+    float use_color_atlas [[flat]];  // F1: sample the text texel from color_sprites when >0.5
 };
 
 // ---- Utility functions (cell_vertex.glsl) ----
@@ -196,29 +197,31 @@ static inline ColorPair resolve_extra_cursor_colors(
     return if_one_then_pair(zero_or_one(abs(float(rd.extra_cursor_bg & BYTE_MASK) - float(COLOR_IS_SPECIAL))), ans, special);
 }
 
-static inline uint3 to_sprite_coords(uint idx, constant MetalCellRenderData& rd) {
-    uint sprites_per_page = rd.sprites_xnum * rd.sprites_ynum;
+// F1: xnum/ynum/cell_height passed explicitly so the same math serves both the
+// mono atlas (rd.sprites_xnum/ynum) and the colored atlas (rd.color_sprites_*).
+static inline uint3 to_sprite_coords(uint idx, uint xnum, uint ynum) {
+    uint sprites_per_page = xnum * ynum;
     uint z = idx / sprites_per_page;
     uint num_on_last_page = idx - sprites_per_page * z;
-    uint y = num_on_last_page / rd.sprites_xnum;
-    uint x = num_on_last_page - rd.sprites_xnum * y;
+    uint y = num_on_last_page / xnum;
+    uint x = num_on_last_page - xnum * y;
     return uint3(x, y, z);
 }
 
-static inline float3 to_sprite_pos(uint2 pos, uint idx, constant MetalCellRenderData& rd) {
-    uint3 c = to_sprite_coords(idx, rd);
-    float2 s_xpos = float2(c.x, float(c.x) + 1.0f) * (1.0f / float(rd.sprites_xnum));
-    float2 s_ypos = float2(c.y, float(c.y) + 1.0f) * (1.0f / float(rd.sprites_ynum));
-    uint texture_height_px = (rd.cell_height + 1u) * rd.sprites_ynum;
+static inline float3 to_sprite_pos(uint2 pos, uint idx, uint xnum, uint ynum, uint cell_height) {
+    uint3 c = to_sprite_coords(idx, xnum, ynum);
+    float2 s_xpos = float2(c.x, float(c.x) + 1.0f) * (1.0f / float(xnum));
+    float2 s_ypos = float2(c.y, float(c.y) + 1.0f) * (1.0f / float(ynum));
+    uint texture_height_px = (cell_height + 1u) * ynum;
     float row_height = 1.0f / float(texture_height_px);
     s_ypos[1] -= row_height;  // skip the decorations_exclude row
     return float3(s_xpos[pos.x], s_ypos[pos.y], c.z);
 }
 
-static inline uint to_underline_exclusion_pos(uint sprite_idx0, constant MetalCellRenderData& rd) {
-    uint3 c = to_sprite_coords(sprite_idx0, rd);
-    uint cell_top_px = c.y * (rd.cell_height + 1u);
-    return cell_top_px + rd.cell_height;
+static inline uint to_underline_exclusion_pos(uint sprite_idx0, uint xnum, uint ynum, uint cell_height) {
+    uint3 c = to_sprite_coords(sprite_idx0, xnum, ynum);
+    uint cell_top_px = c.y * (cell_height + 1u);
+    return cell_top_px + cell_height;
 }
 
 static inline uint read_sprite_decorations_idx(uint sprite_idx0, texture2d<uint, access::read> sprite_decorations_map) {
@@ -296,7 +299,8 @@ vertex CellVertexOut cell_vertex(
     constant MetalCellDrawUniforms& du [[buffer(2)]],
     constant float *gamma_lut [[buffer(3)]],
     constant uint32 *color_table [[buffer(4)]],
-    texture2d<uint, access::read> sprite_decorations_map [[texture(2)]]
+    texture2d<uint, access::read> sprite_decorations_map [[texture(2)]],
+    texture2d<uint, access::read> color_sprite_decorations_map [[texture(3)]]  // F1
 ) {
     CellVertexOut out;
     out.effective_background_premul = float4(0.f);
@@ -310,6 +314,7 @@ vertex CellVertexOut cell_vertex(
     out.cursor_color_premult = float4(0.f);
     out.decoration_fg = float3(0.f);
     out.colored_sprite = 0.f;
+    out.use_color_atlas = 0.f;
 
     // set cell color indices {{{
     uint2 default_colors = uint2(rd.default_fg, rd.bg_colors0);
@@ -340,8 +345,13 @@ vertex CellVertexOut cell_vertex(
     out.position = float4(float2(left, left + dx)[pos.x], float2(top, top - dy)[pos.y], 0.f, 1.f);
     // The character sprite being rendered
     if (!ONLY_BACKGROUND) {
-        out.sprite_pos = to_sprite_pos(pos, in.sprite_idx[0] & SPRITE_INDEX_MASK, rd);
         out.colored_sprite = float((in.sprite_idx[0] & SPRITE_COLORED_MASK) >> SPRITE_COLORED_SHIFT);
+        // F1: colored sprites only live in the separate atlas when the split is
+        // active; under the kill switch (color_atlas_active==0) everything is mono.
+        out.use_color_atlas = out.colored_sprite * float(rd.color_atlas_active);
+        uint text_sprite_idx = in.sprite_idx[0] & SPRITE_INDEX_MASK;
+        if (out.use_color_atlas > 0.5f) out.sprite_pos = to_sprite_pos(pos, text_sprite_idx, rd.color_sprites_xnum, rd.color_sprites_ynum, rd.cell_height);
+        else out.sprite_pos = to_sprite_pos(pos, text_sprite_idx, rd.sprites_xnum, rd.sprites_ynum, rd.cell_height);
     }
     // Cursor shape and colors
     float has_main_cursor = float(is_cursor(column, row, rd));
@@ -370,17 +380,26 @@ vertex CellVertexOut cell_vertex(
         foreground = if_one_then(float(in.is_selected & BIT_MASK), selection_color, foreground);
         out.decoration_fg = if_one_then(float(in.is_selected & BIT_MASK), selection_color, out.decoration_fg);
         // Underline and strike through (rendered via sprites)
-        uint2 decs = get_decorations_indices(uint(in_url), text_attrs, in.sprite_idx[0], sprite_decorations_map, rd);
-        out.strike_pos = to_sprite_pos(pos, decs[0], rd);
-        out.underline_pos = to_sprite_pos(pos, decs[1], rd);
-        out.underline_exclusion_pos = to_underline_exclusion_pos(in.sprite_idx[0] & SPRITE_INDEX_MASK, rd);
+        // Read the decoration index from the atlas namespace this cell's text
+        // sprite belongs to; the stored value is always a mono-namespace sprite
+        // index, so the strike/underline positions use the mono layout.
+        uint2 decs = (out.use_color_atlas > 0.5f)
+            ? get_decorations_indices(uint(in_url), text_attrs, in.sprite_idx[0], color_sprite_decorations_map, rd)
+            : get_decorations_indices(uint(in_url), text_attrs, in.sprite_idx[0], sprite_decorations_map, rd);
+        out.strike_pos = to_sprite_pos(pos, decs[0], rd.sprites_xnum, rd.sprites_ynum, rd.cell_height);
+        out.underline_pos = to_sprite_pos(pos, decs[1], rd.sprites_xnum, rd.sprites_ynum, rd.cell_height);
+        // The exclusion mask lives in the text glyph's own cell, so use the atlas
+        // the text sprite is in.
+        uint excl_idx = in.sprite_idx[0] & SPRITE_INDEX_MASK;
+        if (out.use_color_atlas > 0.5f) out.underline_exclusion_pos = to_underline_exclusion_pos(excl_idx, rd.color_sprites_xnum, rd.color_sprites_ynum, rd.cell_height);
+        else out.underline_exclusion_pos = to_underline_exclusion_pos(excl_idx, rd.sprites_xnum, rd.sprites_ynum, rd.cell_height);
 
         // Cursor
         out.cursor_color_premult = float4(cursor.bg * rd.cursor_opacity, rd.cursor_opacity);
         float3 final_cursor_text_color = mix(foreground, cursor.fg, rd.cursor_opacity);
         foreground = if_one_then(has_block_cursor, final_cursor_text_color, foreground);
         out.decoration_fg = if_one_then(has_block_cursor, final_cursor_text_color, out.decoration_fg);
-        out.cursor_pos = to_sprite_pos(pos, cursor_fg_sprite_idx * uint(has_cursor), rd);
+        out.cursor_pos = to_sprite_pos(pos, cursor_fg_sprite_idx * uint(has_cursor), rd.sprites_xnum, rd.sprites_ynum, rd.cell_height);
     }
     // }}}
 
@@ -478,7 +497,8 @@ constexpr sampler sprite_sampler(coord::normalized, address::clamp_to_edge, filt
 fragment float4 cell_fragment(
     CellVertexOut in [[stage_in]],
     constant MetalCellDrawUniforms& du [[buffer(2)]],
-    texture2d_array<float> sprites [[texture(0)]]
+    texture2d_array<float> sprites [[texture(0)]],
+    texture2d_array<float> color_sprites [[texture(1)]]  // F1: colored (RGBA) atlas
 ) {
     float4 ans_premul = float4(0.f);
     if (!ONLY_FOREGROUND) {
@@ -488,16 +508,22 @@ fragment float4 cell_fragment(
     if (!ONLY_BACKGROUND) {
         uint sprite_layer = uint(in.sprite_pos.z + 0.5f);
         // load_text_foreground_color(): for colored sprites use the color from
-        // the sprite rather than the text foreground (non-premultiplied)
-        float4 sprite_texel = sprites.sample(sprite_sampler, in.sprite_pos.xy, sprite_layer);
+        // the sprite rather than the text foreground (non-premultiplied). F1:
+        // colored text lives in the RGBA color atlas; mono glyphs (and everything
+        // under the kill switch) stay in the R8 mono atlas (swizzled coverage->.a).
+        float4 sprite_texel = (in.use_color_atlas > 0.5f)
+            ? color_sprites.sample(sprite_sampler, in.sprite_pos.xy, sprite_layer)
+            : sprites.sample(sprite_sampler, in.sprite_pos.xy, sprite_layer);
         float4 text_fg = float4(mix(in.cell_foreground, sprite_texel.rgb, in.colored_sprite), sprite_texel.a);
         // adjust_foreground_contrast_with_background()
         text_fg = foreground_contrast(text_fg, in.background, du);
         // calculate_premul_foreground_from_sprites()
         float underline_alpha = sprites.sample(sprite_sampler, in.underline_pos.xy, uint(in.underline_pos.z + 0.5f)).a;
-        uint sz_x = sprites.get_width();
-        float underline_exclusion = sprites.read(
-            uint2(uint(in.sprite_pos.x * float(sz_x)), in.underline_exclusion_pos), sprite_layer).a;
+        // Exclusion mask lives in the text glyph's own atlas (color or mono).
+        uint sz_x = (in.use_color_atlas > 0.5f) ? color_sprites.get_width() : sprites.get_width();
+        float underline_exclusion = (in.use_color_atlas > 0.5f)
+            ? color_sprites.read(uint2(uint(in.sprite_pos.x * float(sz_x)), in.underline_exclusion_pos), sprite_layer).a
+            : sprites.read(uint2(uint(in.sprite_pos.x * float(sz_x)), in.underline_exclusion_pos), sprite_layer).a;
         underline_alpha *= 1.0f - underline_exclusion;
         float strike_alpha = sprites.sample(sprite_sampler, in.strike_pos.xy, uint(in.strike_pos.z + 0.5f)).a;
         float cursor_alpha = sprites.sample(sprite_sampler, in.cursor_pos.xy, uint(in.cursor_pos.z + 0.5f)).a;
