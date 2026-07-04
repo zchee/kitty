@@ -528,22 +528,173 @@ find_uniform_slot(int program, const char *name) {
     return -1;
 }
 
-static float
-uval_f(const char *name, int comp) {
-    GLint s = find_uniform_slot(current_program, name);
-    return s >= 0 ? uniform_stores[current_program].values[s].f[comp] : 0.f;
-}
+// C5: the graphics rect arrays in MetalGraphicsUniforms are sized [16*4]; pin the
+// instance count the shim marshals so a MAX_IMAGE_INSTANCES change can't silently
+// under/over-run them (metal_uniforms.h can't see this state.h macro).
+_Static_assert(MAX_IMAGE_INSTANCES == 16, "MetalGraphicsUniforms rect arrays are sized for 16 instances");
 
-static uint32_t
-uval_u(const char *name, int comp) {
-    GLint s = find_uniform_slot(current_program, name);
-    return s >= 0 ? uniform_stores[current_program].values[s].u[comp] : 0u;
+// C5: direct MSL-layout uniform fills. Each program's name->slot map is resolved
+// once (function-static, -2 = unresolved), so the per-draw strcmp in
+// find_uniform_slot leaves the steady-state frame path (init/program-setup keeps
+// the GL-name shim). The fill then reads the value store by cached slot straight
+// into the MetalXxxUniforms struct whose layout is pinned by _Static_asserts in
+// metal_uniforms.h. Programs with variant siblings (cell 0-2, graphics 5-7)
+// register identical names in identical order via the same get_uniform_locations_*
+// call, so their slots match; VALUES are always read from the passed program's
+// store. The byte-identical golden set cross-checks the whole path.
+static inline float
+slot_f(int program, GLint s, int comp) {
+    return s >= 0 ? uniform_stores[program].values[s].f[comp] : 0.f;
+}
+static inline void
+slot_fv(int program, GLint s, float *dest, int n) {
+    for (int i = 0; i < n; i++) dest[i] = s >= 0 ? uniform_stores[program].values[s].f[i] : 0.f;
 }
 
 static void
-uval_fv(const char *name, float *dest, int n) {
-    GLint s = find_uniform_slot(current_program, name);
-    for (int i = 0; i < n; i++) dest[i] = s >= 0 ? uniform_stores[current_program].values[s].f[i] : 0.f;
+fill_cell_draw_uniforms(int program, MetalCellDrawUniforms *u) {
+    static GLint s_tc = -2, s_tga, s_bg, s_ro;
+    if (s_tc == -2) {
+        s_tc = find_uniform_slot(program, "text_contrast");
+        s_tga = find_uniform_slot(program, "text_gamma_adjustment");
+        s_bg = find_uniform_slot(program, "draw_bg_bitfield");
+        s_ro = find_uniform_slot(program, "row_offset");
+    }
+    u->draw_bg_bitfield = s_bg >= 0 ? uniform_stores[program].values[s_bg].u[0] : 0u;
+    u->row_offset = slot_f(program, s_ro, 0);
+    u->text_contrast = slot_f(program, s_tc, 0);
+    u->text_gamma_adjustment = slot_f(program, s_tga, 0);
+}
+
+static void
+fill_border_uniforms(int program, MetalBorderUniforms *u) {
+    static GLint s_colors = -2, s_bg;
+    if (s_colors == -2) {
+        s_colors = find_uniform_slot(program, "colors");
+        s_bg = find_uniform_slot(program, "background_opacity");
+    }
+    memset(u, 0, sizeof(*u));
+    if (s_colors >= 0) {
+        int base = ARRAY_UNIFORM_BASE + s_colors * 16;
+        for (int i = 0; i < 9 && base + i < MAX_UNIFORMS_PER_PROGRAM; i++)
+            u->colors[i] = uniform_stores[program].values[base + i].u[0];
+    }
+    u->background_opacity = slot_f(program, s_bg, 0);
+    if (cached_gamma_lut) memcpy(u->gamma_lut, cached_gamma_lut, sizeof(u->gamma_lut));
+}
+
+static void
+fill_graphics_uniforms(int program, MetalGraphicsUniforms *u) {
+    static GLint s_src = -2, s_dst, s_ea, s_afg, s_abg;
+    if (s_src == -2) {
+        s_src = find_uniform_slot(program, "src_rects");
+        s_dst = find_uniform_slot(program, "dest_rects");
+        s_ea = find_uniform_slot(program, "extra_alpha");
+        s_afg = find_uniform_slot(program, "amask_fg");
+        s_abg = find_uniform_slot(program, "amask_bg_premult");
+    }
+    memset(u, 0, sizeof(*u));
+    if (s_src >= 0) {
+        int base = ARRAY_UNIFORM_BASE + s_src * 16;
+        for (int i = 0; i < MAX_IMAGE_INSTANCES && base + i < MAX_UNIFORMS_PER_PROGRAM; i++)
+            for (int c = 0; c < 4; c++) u->src_rects[i * 4 + c] = uniform_stores[program].values[base + i].f[c];
+    }
+    if (s_dst >= 0) {
+        int base = ARRAY_UNIFORM_BASE + s_dst * 16;
+        for (int i = 0; i < MAX_IMAGE_INSTANCES && base + i < MAX_UNIFORMS_PER_PROGRAM; i++)
+            for (int c = 0; c < 4; c++) u->dest_rects[i * 4 + c] = uniform_stores[program].values[base + i].f[c];
+    }
+    u->extra_alpha = slot_f(program, s_ea, 0);
+    slot_fv(program, s_afg, u->amask_fg, 3);
+    slot_fv(program, s_abg, u->amask_bg_premult, 4);
+}
+
+static void
+fill_bgimage_uniforms(int program, MetalBgimageUniforms *u) {
+    static GLint s_sizes = -2, s_pos, s_bg, s_tiled;
+    if (s_sizes == -2) {
+        s_sizes = find_uniform_slot(program, "sizes");
+        s_pos = find_uniform_slot(program, "positions");
+        s_bg = find_uniform_slot(program, "background");
+        s_tiled = find_uniform_slot(program, "tiled");
+    }
+    memset(u, 0, sizeof(*u));
+    slot_fv(program, s_sizes, u->sizes, 4);
+    slot_fv(program, s_pos, u->positions, 4);
+    slot_fv(program, s_bg, u->background, 4);
+    u->tiled = slot_f(program, s_tiled, 0);
+}
+
+static void
+fill_tint_uniforms(int program, MetalTintUniforms *u) {
+    static GLint s_color = -2, s_edges;
+    if (s_color == -2) {
+        s_color = find_uniform_slot(program, "tint_color");
+        s_edges = find_uniform_slot(program, "edges");
+    }
+    slot_fv(program, s_color, u->tint_color, 4);
+    slot_fv(program, s_edges, u->edges, 4);
+}
+
+static void
+fill_trail_uniforms(int program, MetalTrailUniforms *u) {
+    static GLint s_x = -2, s_y, s_cx, s_cy, s_col, s_op;
+    if (s_x == -2) {
+        s_x = find_uniform_slot(program, "x_coords");
+        s_y = find_uniform_slot(program, "y_coords");
+        s_cx = find_uniform_slot(program, "cursor_edge_x");
+        s_cy = find_uniform_slot(program, "cursor_edge_y");
+        s_col = find_uniform_slot(program, "trail_color");
+        s_op = find_uniform_slot(program, "trail_opacity");
+    }
+    memset(u, 0, sizeof(*u));
+    slot_fv(program, s_x, u->x_coords, 4);
+    slot_fv(program, s_y, u->y_coords, 4);
+    slot_fv(program, s_cx, u->cursor_edge_x, 2);
+    slot_fv(program, s_cy, u->cursor_edge_y, 2);
+    slot_fv(program, s_col, u->trail_color, 3);
+    u->trail_opacity = slot_f(program, s_op, 0);
+}
+
+static void
+fill_blit_uniforms(int program, MetalBlitUniforms *u) {
+    static GLint s_src = -2, s_dst;
+    if (s_src == -2) {
+        s_src = find_uniform_slot(program, "src_rect");
+        s_dst = find_uniform_slot(program, "dest_rect");
+    }
+    slot_fv(program, s_src, u->src_rect, 4);
+    slot_fv(program, s_dst, u->dest_rect, 4);
+}
+
+static void
+fill_screenshot_uniforms(int program, MetalScreenshotUniforms *u) {
+    static GLint s_src = -2, s_dst, s_size;
+    if (s_src == -2) {
+        s_src = find_uniform_slot(program, "src_rect");
+        s_dst = find_uniform_slot(program, "dest_rect");
+        s_size = find_uniform_slot(program, "src_size");
+    }
+    memset(u, 0, sizeof(*u));
+    slot_fv(program, s_src, u->src_rect, 4);
+    slot_fv(program, s_dst, u->dest_rect, 4);
+    slot_fv(program, s_size, u->src_size, 2);
+}
+
+static void
+fill_rounded_rect_uniforms(int program, MetalRoundedRectUniforms *u) {
+    static GLint s_color = -2, s_bg, s_rect, s_params;
+    if (s_color == -2) {
+        s_color = find_uniform_slot(program, "color");
+        s_bg = find_uniform_slot(program, "background_color");
+        s_rect = find_uniform_slot(program, "rect");
+        s_params = find_uniform_slot(program, "params");
+    }
+    memset(u, 0, sizeof(*u));
+    slot_fv(program, s_color, u->color, 4);
+    slot_fv(program, s_bg, u->background_color, 4);
+    slot_fv(program, s_rect, u->rect, 4);
+    slot_fv(program, s_params, u->params, 2);
 }
 
 // Number of entries in the ColorTable UBO: NUM_COLORS + MARK_MASK + MARK_MASK + 2
@@ -1278,11 +1429,8 @@ draw_quad(bool blend, unsigned instance_count) {
             }
         }
         // Per-draw uniforms (draw_bg_bitfield, row_offset, etc.) → buffer index 2
-        MetalCellDrawUniforms cell_draw = {0};
-        cell_draw.text_contrast = uval_f("text_contrast", 0);
-        cell_draw.text_gamma_adjustment = uval_f("text_gamma_adjustment", 0);
-        cell_draw.draw_bg_bitfield = uval_u("draw_bg_bitfield", 0);
-        cell_draw.row_offset = uval_f("row_offset", 0);
+        MetalCellDrawUniforms cell_draw;
+        fill_cell_draw_uniforms(current_program, &cell_draw);
         [mtl_current_encoder setVertexBytes:&cell_draw length:sizeof(cell_draw) atIndex:2];
         [mtl_current_encoder setFragmentBytes:&cell_draw length:sizeof(cell_draw) atIndex:2];
 
@@ -1316,43 +1464,17 @@ draw_quad(bool blend, unsigned instance_count) {
                 }
             }
         }
-        // Multi-element uniform arrays (colors[9]) live at ARRAY_UNIFORM_BASE +
-        // slot*16 (see metal_gl_uniform1uiv), keeping scalar slots intact.
-        struct { uint32_t colors[9]; float background_opacity; float gamma_lut[256]; } border_u = {0}; // mirrors BorderUniforms: scalar arrays pack, no padding
-        GLint colors_slot = find_uniform_slot(current_program, "colors");
-        if (colors_slot >= 0) {
-            int base = ARRAY_UNIFORM_BASE + colors_slot * 16;
-            for (int i = 0; i < 9 && base + i < MAX_UNIFORMS_PER_PROGRAM; i++) {
-                border_u.colors[i] = uniform_stores[current_program].values[base + i].u[0];
-            }
-        }
-        border_u.background_opacity = uval_f("background_opacity", 0);
-        if (cached_gamma_lut) memcpy(border_u.gamma_lut, cached_gamma_lut, sizeof(border_u.gamma_lut));
+        // C5: MetalBorderUniforms (colors[9] array at ARRAY_UNIFORM_BASE +
+        // background_opacity + resident gamma_lut[256]); see fill_border_uniforms.
+        MetalBorderUniforms border_u;
+        fill_border_uniforms(current_program, &border_u);
         [mtl_current_encoder setVertexBytes:&border_u length:sizeof(border_u) atIndex:1];
     } else if (current_program >= 5 && current_program <= 7) {
-        // Mirrors GraphicsUniforms in graphics_shaders.metal: the float3
-        // amask_fg is 16-byte aligned in MSL, so the CPU twin needs explicit
-        // padding (MSL sizeof == 80, not the packed 64).
-        // G2: per-instance rect arrays (src_rects/dest_rects) read from the
-        // array-uniform store (16-slot stride at ARRAY_UNIFORM_BASE, same as
-        // the border colors[9] path). Layout mirrors GraphicsUniforms in
-        // graphics_shaders.metal (float4[16] arrays then the scalar tail).
-        struct { float src_rects[MAX_IMAGE_INSTANCES*4]; float dest_rects[MAX_IMAGE_INSTANCES*4]; float extra_alpha; float _pad0[3]; float amask_fg[3]; float _pad1; float amask_bg_premult[4]; } gfx_u = {0};
-        GLint src_slot = find_uniform_slot(current_program, "src_rects");
-        if (src_slot >= 0) {
-            int base = ARRAY_UNIFORM_BASE + src_slot * 16;
-            for (int i = 0; i < MAX_IMAGE_INSTANCES && base + i < MAX_UNIFORMS_PER_PROGRAM; i++)
-                for (int c = 0; c < 4; c++) gfx_u.src_rects[i*4+c] = uniform_stores[current_program].values[base+i].f[c];
-        }
-        GLint dst_slot = find_uniform_slot(current_program, "dest_rects");
-        if (dst_slot >= 0) {
-            int base = ARRAY_UNIFORM_BASE + dst_slot * 16;
-            for (int i = 0; i < MAX_IMAGE_INSTANCES && base + i < MAX_UNIFORMS_PER_PROGRAM; i++)
-                for (int c = 0; c < 4; c++) gfx_u.dest_rects[i*4+c] = uniform_stores[current_program].values[base+i].f[c];
-        }
-        gfx_u.extra_alpha = uval_f("extra_alpha", 0);
-        uval_fv("amask_fg", gfx_u.amask_fg, 3);
-        uval_fv("amask_bg_premult", gfx_u.amask_bg_premult, 4);
+        // C5: MetalGraphicsUniforms — per-instance src_rects/dest_rects[16] arrays
+        // (ARRAY_UNIFORM_BASE, G2) then the extra_alpha/amask scalar tail; layout
+        // pinned in metal_uniforms.h, filled by fill_graphics_uniforms.
+        MetalGraphicsUniforms gfx_u;
+        fill_graphics_uniforms(current_program, &gfx_u);
         metal_frame_gfx_draw_count++;  // G2: graphics-program draw call this frame
         [mtl_current_encoder setVertexBytes:&gfx_u length:sizeof(gfx_u) atIndex:0];
         [mtl_current_encoder setFragmentBytes:&gfx_u length:sizeof(gfx_u) atIndex:0];
@@ -1361,60 +1483,44 @@ draw_quad(bool blend, unsigned instance_count) {
             [mtl_current_encoder setFragmentTexture:textures[bound_tex_2d[1]].texture atIndex:0];
         }
     } else if (current_program == 8) {
-        struct { float sizes[4]; float positions[4]; float background[4]; float tiled; float pad[3]; } bg_u = {0};
-        uval_fv("sizes", bg_u.sizes, 4);
-        uval_fv("positions", bg_u.positions, 4);
-        uval_fv("background", bg_u.background, 4);
-        bg_u.tiled = uval_f("tiled", 0);
+        MetalBgimageUniforms bg_u;
+        fill_bgimage_uniforms(current_program, &bg_u);
         [mtl_current_encoder setVertexBytes:&bg_u length:sizeof(bg_u) atIndex:0];
         [mtl_current_encoder setFragmentBytes:&bg_u length:sizeof(bg_u) atIndex:0];
         if (bound_tex_2d[1] && bound_tex_2d[1] < MAX_TEXTURES && textures[bound_tex_2d[1]].texture) {
             [mtl_current_encoder setFragmentTexture:textures[bound_tex_2d[1]].texture atIndex:0];
         }
     } else if (current_program == 9) {
-        struct { float tint_color[4]; float edges[4]; } tint_u = {0};
-        uval_fv("tint_color", tint_u.tint_color, 4);
-        uval_fv("edges", tint_u.edges, 4);
+        MetalTintUniforms tint_u;
+        fill_tint_uniforms(current_program, &tint_u);
         [mtl_current_encoder setVertexBytes:&tint_u length:sizeof(tint_u) atIndex:0];
         [mtl_current_encoder setFragmentBytes:&tint_u length:sizeof(tint_u) atIndex:0];
     } else if (current_program == 10) {
-        // Mirrors TrailUniforms: MSL float3 occupies 16 bytes, so trail_color
-        // pads to 64 and trail_opacity lands at offset 64 (sizeof == 80).
-        struct { float x_coords[4]; float y_coords[4]; float cursor_edge_x[2]; float cursor_edge_y[2];
-                 float trail_color[3]; float _pad0; float trail_opacity; float _pad1[3]; } trail_u = {0};
-        uval_fv("x_coords", trail_u.x_coords, 4);
-        uval_fv("y_coords", trail_u.y_coords, 4);
-        uval_fv("cursor_edge_x", trail_u.cursor_edge_x, 2);
-        uval_fv("cursor_edge_y", trail_u.cursor_edge_y, 2);
-        uval_fv("trail_color", trail_u.trail_color, 3);
-        trail_u.trail_opacity = uval_f("trail_opacity", 0);
+        // C5: MetalTrailUniforms (float3 trail_color 16-aligned so trail_opacity
+        // lands at 64); see fill_trail_uniforms + metal_uniforms.h assert.
+        MetalTrailUniforms trail_u;
+        fill_trail_uniforms(current_program, &trail_u);
         [mtl_current_encoder setVertexBytes:&trail_u length:sizeof(trail_u) atIndex:0];
         [mtl_current_encoder setFragmentBytes:&trail_u length:sizeof(trail_u) atIndex:0];
     } else if (current_program == 11) {
-        struct { float src_rect[4]; float dest_rect[4]; } blit_u = {0};
-        uval_fv("src_rect", blit_u.src_rect, 4);
-        uval_fv("dest_rect", blit_u.dest_rect, 4);
+        MetalBlitUniforms blit_u;
+        fill_blit_uniforms(current_program, &blit_u);
         [mtl_current_encoder setVertexBytes:&blit_u length:sizeof(blit_u) atIndex:0];
         [mtl_current_encoder setFragmentBytes:&blit_u length:sizeof(blit_u) atIndex:0];
         if (bound_tex_2d[1] && bound_tex_2d[1] < MAX_TEXTURES && textures[bound_tex_2d[1]].texture) {
             [mtl_current_encoder setFragmentTexture:textures[bound_tex_2d[1]].texture atIndex:0];
         }
     } else if (current_program == 12) {
-        struct { float src_rect[4]; float dest_rect[4]; float src_size[2]; float pad[2]; } ss_u = {0};
-        uval_fv("src_rect", ss_u.src_rect, 4);
-        uval_fv("dest_rect", ss_u.dest_rect, 4);
-        uval_fv("src_size", ss_u.src_size, 2);
+        MetalScreenshotUniforms ss_u;
+        fill_screenshot_uniforms(current_program, &ss_u);
         [mtl_current_encoder setVertexBytes:&ss_u length:sizeof(ss_u) atIndex:0];
         [mtl_current_encoder setFragmentBytes:&ss_u length:sizeof(ss_u) atIndex:0];
         if (bound_tex_2d[1] && bound_tex_2d[1] < MAX_TEXTURES && textures[bound_tex_2d[1]].texture) {
             [mtl_current_encoder setFragmentTexture:textures[bound_tex_2d[1]].texture atIndex:0];
         }
     } else if (current_program == 13) {
-        struct { float color[4]; float background_color[4]; float rect[4]; float params[2]; float pad[2]; } rr_u = {0};
-        uval_fv("color", rr_u.color, 4);
-        uval_fv("background_color", rr_u.background_color, 4);
-        uval_fv("rect", rr_u.rect, 4);
-        uval_fv("params", rr_u.params, 2);
+        MetalRoundedRectUniforms rr_u;
+        fill_rounded_rect_uniforms(current_program, &rr_u);
         [mtl_current_encoder setVertexBytes:&rr_u length:sizeof(rr_u) atIndex:0];
         [mtl_current_encoder setFragmentBytes:&rr_u length:sizeof(rr_u) atIndex:0];
     }
