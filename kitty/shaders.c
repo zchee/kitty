@@ -464,6 +464,32 @@ send_image_to_gpu(GLuint *tex_id, const void* data, GLsizei width, GLsizei heigh
     glTexImage2D(GL_TEXTURE_2D, 0, GL_SRGB_ALPHA, width, height, 0, is_opaque ? GL_RGB : GL_RGBA, GL_UNSIGNED_BYTE, data);
 }
 
+void
+update_image_on_gpu(GLuint tex_id, const void* data, GLsizei width, GLsizei height, bool is_opaque, bool is_4byte_aligned) {
+    // G1: in-place pixel update of an already-allocated GL_SRGB_ALPHA texture
+    // (filter/wrap/storage were set by send_image_to_gpu at allocation time and
+    // survive a SubImage). On Metal this maps to replaceRegion -- no MTLTexture
+    // release/newTextureWithDescriptor, i.e. no per-frame realloc for animations.
+    // is_opaque only selects the source format (GL_RGB expands to RGBA, alpha=1);
+    // the texture's internal format is unchanged, so switching opaque<->alpha
+    // between frames needs no reallocation.
+    glBindTexture(GL_TEXTURE_2D, tex_id);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, is_4byte_aligned ? 4 : 1);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, is_opaque ? GL_RGB : GL_RGBA, GL_UNSIGNED_BYTE, data);
+}
+
+void
+update_image_sub_region(GLuint tex_id, const void* data, GLsizei x, GLsizei y, GLsizei width, GLsizei height, bool is_opaque, bool is_4byte_aligned) {
+    // G3-lite: upload only a sub-rectangle of an already-allocated image texture.
+    // The rest of the texture (the coalesced base frame) is left intact, so a
+    // non-blended animation delta becomes a small replaceRegion instead of a full
+    // coalesce + full-image upload. `data` is the tightly packed delta (width px
+    // per row); is_opaque selects the source format exactly as update_image_on_gpu.
+    glBindTexture(GL_TEXTURE_2D, tex_id);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, is_4byte_aligned ? 4 : 1);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, width, height, is_opaque ? GL_RGB : GL_RGBA, GL_UNSIGNED_BYTE, data);
+}
+
 // }}}
 
 // Rounded rect {{{

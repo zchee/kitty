@@ -699,15 +699,88 @@ initialize_load_data(GraphicsManager *self, const GraphicsCommand *g, Image *img
     fmt = g->format ? g->format : RGBA; \
 }
 
-static void
-upload_to_gpu(GraphicsManager *self, Image *img, const bool is_opaque, const bool is_4byte_aligned, const uint8_t *data) {
+// G1 kill switch: KITTY_NO_PERSISTENT_IMAGE_TEXTURE=1 reverts to the pre-G1
+// behavior (full glTexImage2D re-spec / MTLTexture realloc every upload), for
+// A/B verification and as a safety revert. Env-cached.
+static bool
+persistent_image_texture_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("KITTY_NO_PERSISTENT_IMAGE_TEXTURE");
+        cached = (v && v[0] && strcmp(v, "0") != 0) ? 0 : 1;
+    }
+    return cached == 1;
+}
+
+// Ensure a GPU context is current for an image upload / animation advance.
+// Returns false when no window/context is available (caller skips the upload).
+static bool
+ensure_graphics_gpu_context(GraphicsManager *self) {
     if (!self->context_made_current_for_this_command) {
-        if (!self->window_id) return;
-        if (!make_window_context_current(self->window_id)) return;
+        if (!self->window_id) return false;
+        if (!make_window_context_current(self->window_id)) return false;
         self->context_made_current_for_this_command = true;
     }
+    return true;
+}
+
+// G3-lite: when the current frame f is a non-blended delta laid down onto exactly
+// the frame whose coalesced pixels are already resident in the persistent GPU
+// texture, upload just f's delta rect (SubImage) instead of coalescing the whole
+// delta chain and re-uploading the full image. Returns true on success; the
+// caller falls back to the full-coalesce path otherwise. Correctness rests on the
+// invariant that last_uploaded_frame_id names the frame currently on the GPU, so
+// GPU == coalesced(base) and GPU + f's copy-rect == coalesced(f).
+// G3-lite kill switch: KITTY_NO_DELTA_IMAGE_UPLOAD=1 keeps G1 (persistent texture)
+// but disables delta-rect uploads (always full coalesce + full-image SubImage),
+// for isolating the G3-lite effect and as a safety revert. Env-cached.
+static bool
+delta_image_upload_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("KITTY_NO_DELTA_IMAGE_UPLOAD");
+        cached = (v && v[0] && strcmp(v, "0") != 0) ? 0 : 1;
+    }
+    return cached == 1;
+}
+
+static bool
+try_delta_upload_to_gpu(GraphicsManager *self, Image *img, const Frame *f) {
+    if (!persistent_image_texture_enabled() || !delta_image_upload_enabled()) return false;
+    if (!img->texture || !img->texture->id) return false;
+    TextureRef *t = img->texture;
+    if (t->alloc_width != img->width || t->alloc_height != img->height) return false;  // base not resident at image dims
+    if (!f->base_frame_id || f->base_frame_id != img->last_uploaded_frame_id) return false;  // GPU does not hold f's base
+    if (f->alpha_blend && !f->is_opaque) return false;  // delta needs blending -> not a pure copy
+    if (!f->width || !f->height) return false;
+    if ((uint64_t)f->x + f->width > img->width || (uint64_t)f->y + f->height > img->height) return false;  // rect out of bounds
+    void *fdata = NULL; size_t fdata_sz = 0;
+    if (!read_from_cache(self, (const ImageAndFrame){.image_id=img->internal_id, .frame_id=f->id}, &fdata, &fdata_sz)) return false;
+    const size_t need = (size_t)(f->is_opaque ? 3 : 4) * f->width * f->height;
+    if (fdata_sz < need) { free(fdata); return false; }
+    if (!ensure_graphics_gpu_context(self)) { free(fdata); return false; }
+    if (img->texture) update_image_sub_region(img->texture->id, fdata, f->x, f->y, f->width, f->height, f->is_opaque, f->is_4byte_aligned);
+    free(fdata);
+    return true;
+}
+
+static void
+upload_to_gpu(GraphicsManager *self, Image *img, const bool is_opaque, const bool is_4byte_aligned, const uint8_t *data) {
+    if (!ensure_graphics_gpu_context(self)) return;
     if (img->texture) {
-        send_image_to_gpu(&img->texture->id, data, img->width, img->height, is_opaque, is_4byte_aligned, true, REPEAT_CLAMP);
+        TextureRef *t = img->texture;
+        // G1: reuse the existing GPU texture in place when its allocated
+        // dimensions are unchanged (animation frame advance always composes to
+        // image dims, so this is the steady-state path) -- glTexSubImage2D ->
+        // replaceRegion, no release/newTexture per frame. Only a genuine dims
+        // change (a re-transmit resets img->texture to a fresh ref) falls back
+        // to a full (re)allocation.
+        if (persistent_image_texture_enabled() && t->id && t->alloc_width == img->width && t->alloc_height == img->height) {
+            update_image_on_gpu(t->id, data, img->width, img->height, is_opaque, is_4byte_aligned);
+        } else {
+            send_image_to_gpu(&t->id, data, img->width, img->height, is_opaque, is_4byte_aligned, true, REPEAT_CLAMP);
+            t->alloc_width = img->width; t->alloc_height = img->height;
+        }
     }
 }
 
@@ -726,6 +799,7 @@ handle_add_command(GraphicsManager *self, const GraphicsCommand *g, const uint8_
         if (existing) {
             free_image_resources(self, img);
             img->texture = new_texture_ref();
+            img->last_uploaded_frame_id = 0;  // G3-lite: fresh texture holds no frame yet
             img->root_frame_data_loaded = false;
             img->is_drawn = false;
             img->current_frame_shown_at = 0;
@@ -779,6 +853,7 @@ handle_add_command(GraphicsManager *self, const GraphicsCommand *g, const uint8_
                 ABRT("ENOSPC", "Failed to store image data in cache");
             }
             upload_to_gpu(self, img, img->root_frame.is_opaque, img->root_frame.is_4byte_aligned, self->currently_loading.data);
+            img->last_uploaded_frame_id = img->root_frame.id;  // G3-lite: GPU now holds the root frame; a delta on it can SubImage
             self->used_storage += required_sz;
             img->used_storage = required_sz;
         }
@@ -1532,9 +1607,17 @@ static void
 update_current_frame(GraphicsManager *self, Image *img, const CoalescedFrameData *data) {
     bool needs_load = data == NULL;
     CoalescedFrameData cfd;
+    Frame *f = NULL;
     if (needs_load) {
-        Frame *f = current_frame(img);
+        f = current_frame(img);
         if (f == NULL) return;
+        // G3-lite: try uploading just this frame's delta rect before paying for a
+        // full coalesce + full-image upload.
+        if (try_delta_upload_to_gpu(self, img, f)) {
+            img->last_uploaded_frame_id = f->id;
+            img->current_frame_shown_at = monotonic();
+            return;
+        }
         cfd = get_coalesced_frame_data(self, img, f);
         if (!cfd.buf) {
             if (PyErr_Occurred()) PyErr_Print();
@@ -1544,6 +1627,11 @@ update_current_frame(GraphicsManager *self, Image *img, const CoalescedFrameData
     }
     upload_to_gpu(self, img, data->is_opaque, data->is_4byte_aligned, data->buf);
     if (needs_load) free(data->buf);
+    // Track what the GPU texture now holds so the next delta can build on it.
+    // The full-coalesce path names the loaded frame; the data-provided path
+    // (frame edits) uploads arbitrary composed pixels, so invalidate to force the
+    // next advance through a full upload.
+    img->last_uploaded_frame_id = (needs_load && f) ? f->id : 0;
     img->current_frame_shown_at = monotonic();
 }
 

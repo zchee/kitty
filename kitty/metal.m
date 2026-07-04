@@ -644,6 +644,19 @@ static size_t buffer_count = 0;
 // can assert 0 in steady state. Written on the main (encode) thread only.
 static int metal_frame_alloc_count = 0;
 
+// G1: MTLTexture (re)allocations this frame -- newTextureWithDescriptor in
+// metal_gl_tex_image_2d, the image-texture upload path. Before G1 an animation
+// frame advance re-specced the whole texture every frame (1 alloc/advance);
+// after G1 the steady-state path is replaceRegion (0). Emitted as tex_allocs=
+// so verification can assert 0 texture allocs per steady-state animation frame.
+static int metal_frame_tex_alloc_count = 0;
+
+// G3-lite: bytes replaceRegion'd into IMAGE textures this frame (the graphics
+// SubImage path: GL_RGB/GL_RGBA source into the RGBA image texture). Emitted as
+// tex_bytes=. G1 alone uploads the full image each animation frame; G3-lite drops
+// this to just the frame's delta rect when the delta is a non-blended copy.
+static uint64_t metal_frame_tex_upload_bytes = 0;
+
 // D2: bytes written into per-frame VAO ring buffers this frame (cell dirty rows +
 // selection + uniform + color-table). Emitted as the metal_stats bytes= field —
 // the ≤8KB 1-line-edit exit-gate probe. Main (encode) thread only.
@@ -2433,13 +2446,15 @@ metal_end_frame(void) {
             const double drawable_wait_ms = metal_frame_drawable_wait * 1000.0; // p99: nextDrawable block, excluded from encode_ms
             const int passes = metal_pass_count;
             const int allocs = metal_frame_alloc_count; // D1: MTLBuffer allocs this frame (0 in steady state)
+            const int tex_allocs = metal_frame_tex_alloc_count; // G1: MTLTexture (re)allocs this frame (0 in steady-state animation)
+            const uint64_t tex_bytes = metal_frame_tex_upload_bytes; // G3-lite: image-texture upload bytes this frame (delta rect vs full image)
             const uint64_t bytes = metal_frame_bytes_uploaded; // D2: VAO-buffer bytes uploaded this frame
             [mtl_current_command_buffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
                 const double gpu_ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
-                char line[256];
+                char line[288];
                 // pace= is tail-appended (tolerant parsers, never $-anchored).
-                snprintf(line, sizeof line, "metal_stats frame=%llu encode_ms=%.3f gpu_ms=%.3f passes=%d allocs=%d bytes=%llu drawable_wait_ms=%.3f pace=%s\n",
-                         (unsigned long long)fidx, encode_ms, gpu_ms, passes, allocs, (unsigned long long)bytes, drawable_wait_ms, pace);
+                snprintf(line, sizeof line, "metal_stats frame=%llu encode_ms=%.3f gpu_ms=%.3f passes=%d allocs=%d tex_allocs=%d tex_bytes=%llu bytes=%llu drawable_wait_ms=%.3f pace=%s\n",
+                         (unsigned long long)fidx, encode_ms, gpu_ms, passes, allocs, tex_allocs, (unsigned long long)tex_bytes, (unsigned long long)bytes, drawable_wait_ms, pace);
                 metal_stats_emit(line);
             }];
         }
@@ -2539,6 +2554,8 @@ metal_end_frame(void) {
     metal_frame_encode_start = 0.0; // p99: re-stamped in ensure_drawable, so clear here
     metal_frame_drawable_wait = 0.0; // p99: reset per-frame nextDrawable-wait accumulator
     metal_frame_alloc_count = 0;  // D1: reset per-frame ring allocation counter
+    metal_frame_tex_alloc_count = 0;  // G1: reset per-frame texture (re)alloc counter
+    metal_frame_tex_upload_bytes = 0;  // G3-lite: reset per-frame image-upload-bytes counter
     metal_frame_bytes_uploaded = 0; // D2: reset per-frame upload-bytes counter
     drawable_pass_opened = false; // M3: next frame's first drawable pass discards again
     layered_pass_active = false;  // M1: defensive — resolve normally clears it
@@ -2773,6 +2790,12 @@ void metal_gl_tex_image_2d(GLenum target, int level, int internalformat, int wid
 
     [t->texture release];
     t->texture = [mtl_device newTextureWithDescriptor:desc];
+    // G1: count only IMAGE-texture (re)allocs (the graphics/animation upload path
+    // uses GL_SRGB_ALPHA). This excludes render-target textures such as the
+    // thumbnail-capture scratch (setup_texture_as_render_target, GL_RGBA16), so
+    // tex_allocs= isolates exactly the per-frame image realloc G1 removes: it is
+    // 1/frame per animation advance before G1, 0 after (replaceRegion reuse).
+    if (internalformat == GL_SRGB_ALPHA) metal_frame_tex_alloc_count++;
     t->target = GL_TEXTURE_2D;
     t->width = width;
     t->height = height;
@@ -2802,6 +2825,9 @@ void metal_gl_tex_sub_image_2d(GLenum target, int level, int x, int y, int width
     if (!t || !t->texture || !data) return;
 
     NSUInteger dst_bpp = mtl_bytes_per_pixel(t->texture.pixelFormat);
+    // G3-lite: account image-texture upload bytes (RGB/RGBA source). A full-image
+    // SubImage covers width*height==image; a delta upload covers only its rect.
+    if (format == GL_RGB || format == GL_RGBA) metal_frame_tex_upload_bytes += (uint64_t)width * (uint64_t)height * dst_bpp;
     if (format == GL_RGB && type == GL_UNSIGNED_BYTE && dst_bpp == 4) {
         // Opaque graphics-image update: widen 3 bpp RGB to the RGBA8 texture.
         uint32_t *rgba = expand_rgb_to_rgba(data, width, height);
