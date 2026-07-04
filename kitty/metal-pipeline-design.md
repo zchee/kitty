@@ -749,7 +749,7 @@ Ring safety under async: the frame's GPU write is now in flight after
 tail for frames that never hand off) — the existing `IOSurfaceIsInUse`
 probe therefore skips slots held EITHER by the window server OR by an
 uncompleted GPU write. Governor pacing keeps at most ~1 frame in flight +
-1 on glass, so the 3-deep ring still always has a clean slot in steady
+1 on glass, so the 4-deep ring still always has a clean slot in steady
 state; when none is clean (present burst), the frame is marked dirty and
 presents synchronously rather than rendering into a surface someone still
 reads. Three cases always swap synchronously: live resize

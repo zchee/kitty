@@ -1838,7 +1838,8 @@ iosurface_acquire_target(void) {
     // Skipped under the kill switch so KITTY_METAL_SYNC_PRESENT=1 keeps
     // Wave-5b's exact IsInUse semantics (sync never has >1 frame in flight).
     if (!metal_sync_present_forced()) IOSurfaceIncrementUseCount(mtl_iosurface_surface);
-    iosurface_present_gen_find((__bridge void*)mtl_current_layer, true);  // guard entry exists while the window lives
+    if (!iosurface_present_gen_find((__bridge void*)mtl_current_layer, true))  // guard entry lives while the window does
+        log_error("Metal: present-generation table full; frame ordering unguarded for this window");
     METAL_TRACE("iosurface: acquired slot %u (%lux%lu)\n", chosen, (unsigned long)w, (unsigned long)h);
     if (metal_stats_enabled()) metal_frame_encode_start = CACurrentMediaTime();  // encode_ms starts here, as on the drawable paths
     return true;
