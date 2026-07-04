@@ -728,6 +728,85 @@ await the Accessibility grant (CGEvent injection). If PTY-burst latency ever
 matters in its own right, the follow-up is carrying an "input pending render"
 flag across the input_delay boundary.
 
+### Wave-5c: asynchronous present
+
+The Wave-5b present stalled the main thread in `waitUntilCompleted` for
+every frame (~0.3–2.5 ms GPU time each; ~30% of flood main-thread time in
+the Phase-5 profile). Wave-5c moves the swap off that wait: the frame
+commits, and the command buffer's completed handler dispatches the
+`layer.contents` swap to the main queue (Ghostty's `setSurface` requires
+the same main-thread affinity — `isMainThread ? direct : dispatch_async`;
+we always dispatch, which also serializes the swap with resize-path layer
+mutations and keeps the measurement stamper main-thread-only with no
+locking). The swap block owns its references: the CF surface is explicitly
+retained into the block and the layer is retained by the block copy (MRC),
+so a window closing mid-flight cannot UAF — `metal_forget_layer` and ring
+release stay safe.
+
+Ring safety under async: the frame's GPU write is now in flight after
+`metal_end_frame` returns, so acquire marks the chosen surface with
+`IOSurfaceIncrementUseCount` (dropped after the swap, or in the end-frame
+tail for frames that never hand off) — the existing `IOSurfaceIsInUse`
+probe therefore skips slots held EITHER by the window server OR by an
+uncompleted GPU write. Governor pacing keeps at most ~1 frame in flight +
+1 on glass, so the 3-deep ring still always has a clean slot in steady
+state; when none is clean (present burst), the frame is marked dirty and
+presents synchronously rather than rendering into a surface someone still
+reads. Three cases always swap synchronously: live resize
+(`presentsWithTransaction` — the swap must land inside the resize
+transaction), dirty ring slots, and the `KITTY_METAL_SYNC_PRESENT=1` kill
+switch (restores Wave-5b behavior wholesale).
+
+Measurement semantics update: `metal_present … commit_time=` now records
+the SWAP time (post-GPU-completion, when contents was assigned on the main
+queue), not the command-buffer commit; `presented_time` semantics are
+unchanged (first refresh at/after the swap). `gpu_ms` was already emitted
+from a completed handler, so it needed no change.
+
+Measured (interleaved same-conditions arms, async vs KITTY_METAL_SYNC_PRESENT=1,
+loadavg 5.0–5.4 NOT degraded; artifacts .omc/verify/phase5/w5c-*.json and
+.omc/verify/wave5/w5c_async_probe.json):
+
+| metric | sync (Wave-5b) | async (Wave-5c) |
+|---|---|---|
+| ASCII MB/s, default 100×30 window | 146.4 | 147.2 (no change) |
+| ASCII MB/s, 2560×1440 window | 116.1 / 115.7 | **118.7 / 118.2 (+2.2%, both pairs)** |
+| scroll-ASCII MB/s, default | 112.7 | 112.7 |
+| cold typing p50 / p99 (pace_probe) | 25.8 / 46.1 ms (5b ref) | **14.7 / 38.0 ms** |
+| typing pace mix | iosurface 38 / immediate 2 | iosurface 32 / immediate 8 |
+| flood fps / cadence p50=p99 | 59.3 / 16.6667 ms | 59.7 / 16.6667 ms |
+| idle presents (3 s) | 0 | 0 |
+
+Review hardening (architect pre-review, 1 major + 2 minors, all fixed):
+**(f) async→sync reorder** — a dirty-slot/resize frame swaps synchronously
+while an older async frame's swap block may still sit on the main queue, so
+the older contents could land after the newer (stale frame on glass, most
+likely exactly under flood bursts). Fixed with a per-layer monotonic
+**present-generation guard**: every swap (all main-thread) records the global
+frame index; a swap older than the last recorded for that layer is dropped
+(references still released). Entries are created at acquire, recycled in
+metal_forget_layer — a pending block for a destroyed window misses its lookup
+and skips. **(g)** ring depth 3→4 (async keeps encoding + GPU-in-flight +
+queued-swap + on-glass alive at once) so the dirty-slot fallback — whose
+blind pick can tear one refresh — becomes rare; the guard makes its sync swap
+reorder-safe. **(a-leak)** metal_forget_layer now drops the GPU-in-flight
+mark symmetrically for an acquired-but-never-presented frame. **(nit)**
+KITTY_METAL_SYNC_PRESENT=1 skips the use-count marks entirely, keeping the
+kill switch byte-identical to Wave-5b IsInUse semantics. Post-fix: smoke
+async=2/sync=1 + kill-switch all-sync + MTL_DEBUG_LAYER clean; probe p50
+15.4 ms / idle 0 / 59.7 fps (one 33.3 ms flood interval in 179 = a single
+coalesced tick, p50 cadence exact).
+
+Honest attribution: the throughput ceiling of async present is the per-frame
+GPU wait itself (~gpu_ms × ~59 fps ≈ 2–9%), and the measurement matches — the
+Phase-5 profile's "~30% render-side" bucket was dominated by encode + upload,
+which remain synchronous by design (the next lever there would be a render
+thread, out of scope). The real win is responsiveness: the main loop never
+stalls on the GPU, which shows up as cold typing p50 dropping from ~26 ms to
+~15 ms (the loop is free to parse the moment damage arrives) and a larger
+immediate-path share. MTL_DEBUG_LAYER clean; kill-switch arm behaves
+identically to Wave-5b (async=0, all swaps sync).
+
 ## Phase 5 (Wave 6): CPU throughput — the flood path
 
 Plan items P1/P2/P4/F6a (.omc/plans/…-worlds-fastest-optimization.md §Phase 5),
