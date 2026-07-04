@@ -615,6 +615,11 @@ bool update_cursor_trail(CursorTrail *ct, Window *w, monotonic_t now, OSWindow *
 void set_gpu_viewport(unsigned w, unsigned h);
 void free_texture(uint32_t*);
 void free_framebuffer(uint32_t*);
+// G2: max image refs drawn per instanced graphics draw call. MUST match the
+// src_rects[]/dest_rects[] array sizes in kitty/graphics_vertex.glsl and
+// kitty/graphics_shaders.metal, and fit the Metal array-uniform 16-slot stride
+// (ARRAY_UNIFORM_BASE) in kitty/metal.m. Larger groups are drawn in chunks.
+#define MAX_IMAGE_INSTANCES 16
 void send_image_to_gpu(uint32_t*, const void*, int32_t, int32_t, bool, bool, bool, RepeatStrategy);
 // G1: update an already-allocated image texture in place (no realloc). Caller
 // guarantees the texture exists at these exact dimensions.

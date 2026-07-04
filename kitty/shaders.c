@@ -919,22 +919,50 @@ cell_prepare_to_render(ssize_t vao_idx, Screen *screen, FONTS_DATA_HANDLE fonts_
     return changed;
 }
 
+// G2 kill switch: KITTY_NO_INSTANCED_IMAGE_DRAWS=1 reverts to one draw call per
+// image ref (chunk size 1), for A/B verification and as a safety revert.
+static bool
+instanced_image_draws_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("KITTY_NO_INSTANCED_IMAGE_DRAWS");
+        cached = (v && v[0] && strcmp(v, "0") != 0) ? 0 : 1;
+    }
+    return cached == 1;
+}
+
 static void
 draw_graphics(int program, ImageRenderData *data, GLuint start, GLuint count, float extra_alpha) {
     bind_program(program);
     if (program != GRAPHICS_ALPHA_MASK_PROGRAM) glUniform1f(graphics_program_layouts[program].uniforms.extra_alpha, extra_alpha);
     glActiveTexture(GL_TEXTURE0 + GRAPHICS_UNIT);
     GraphicsUniforms *u = &graphics_program_layouts[program].uniforms;
+    const GLuint max_chunk = instanced_image_draws_enabled() ? MAX_IMAGE_INSTANCES : 1;
     for (GLuint i=0; i < count;) {
         ImageRenderData *group = data + start + i;
         glBindTexture(GL_TEXTURE_2D, group->texture_id);
         if (group->group_count == 0) { i++; continue; }
-        for (GLuint k=0; k < group->group_count; k++, i++) {
-            ImageRenderData *rd = data + start + i;
-            glUniform4f(u->src_rect, rd->src_rect.left, rd->src_rect.top, rd->src_rect.right, rd->src_rect.bottom);
-            glUniform4f(u->dest_rect, rd->dest_rect.left, rd->dest_rect.top, rd->dest_rect.right, rd->dest_rect.bottom);
-            draw_quad(true, 0);
+        const GLuint g = group->group_count;
+        // G2: draw the whole same-texture group as instanced quads -- one image
+        // ref per instance -- chunked to MAX_IMAGE_INSTANCES. Refs are consumed in
+        // their sorted order and chunks issue in sequence, so overlapping blends
+        // resolve identically to the old one-draw-per-ref path.
+        for (GLuint done = 0; done < g; ) {
+            const GLuint chunk = MIN(g - done, max_chunk);
+            float srcs[MAX_IMAGE_INSTANCES * 4] = {0}, dests[MAX_IMAGE_INSTANCES * 4] = {0};
+            for (GLuint k = 0; k < chunk; k++) {
+                ImageRenderData *rd = data + start + i + done + k;
+                srcs[k*4+0] = rd->src_rect.left;   srcs[k*4+1] = rd->src_rect.top;   srcs[k*4+2] = rd->src_rect.right;   srcs[k*4+3] = rd->src_rect.bottom;
+                dests[k*4+0] = rd->dest_rect.left;  dests[k*4+1] = rd->dest_rect.top;  dests[k*4+2] = rd->dest_rect.right;  dests[k*4+3] = rd->dest_rect.bottom;
+            }
+            // Always upload the full array so the Metal shim routes it to the
+            // array-uniform store (its count>1 rule); only `chunk` instances draw.
+            glUniform4fv(u->src_rects, MAX_IMAGE_INSTANCES, srcs);
+            glUniform4fv(u->dest_rects, MAX_IMAGE_INSTANCES, dests);
+            draw_quad(true, chunk);
+            done += chunk;
         }
+        i += g;
     }
 }
 
