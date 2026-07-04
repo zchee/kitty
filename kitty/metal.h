@@ -240,14 +240,11 @@ void metal_resolve_layered_frame(void);
 #define glDisable(cap) metal_gl_disable(cap)
 #define glClearColor(r, g, b, a) metal_gl_clear_color(r, g, b, a)
 #define glClear(mask) metal_gl_clear(mask)
-#define glViewport(x, y, w, h) metal_gl_viewport(x, y, w, h)
-#define glScissor(x, y, w, h) metal_gl_scissor(x, y, w, h)
 #define glGetIntegerv(pname, params) metal_gl_get_integerv(pname, params)
 #define glPixelStorei(pname, param) ((void)(pname), (void)(param))  // no-op for Metal
 #define glActiveTexture(unit) metal_gl_active_texture(unit)
 #define glBindTexture(target, id) metal_gl_bind_texture(target, id)
 #define glGenTextures(n, ids) metal_gl_gen_textures(n, ids)
-#define glDeleteTextures(n, ids) metal_gl_delete_textures(n, ids)
 #define glTexParameteri(target, pname, param) ((void)(target), (void)(pname), (void)(param)) // handled during texture creation
 #define glTexParameterfv(target, pname, params) ((void)(target), (void)(pname), (void)(params))
 #define glTexImage2D(...) metal_gl_tex_image_2d(__VA_ARGS__)
@@ -259,10 +256,7 @@ void metal_resolve_layered_frame(void);
 #define glCopyTexImage2D(...) metal_gl_copy_tex_image_2d(__VA_ARGS__)
 #define glCopyImageSubData(...) metal_gl_copy_image_sub_data(__VA_ARGS__)
 #define glGenFramebuffers(n, ids) metal_gl_gen_framebuffers(n, ids)
-#define glDeleteFramebuffers(n, ids) metal_gl_delete_framebuffers(n, ids)
-#define glBindFramebuffer(target, id) metal_gl_bind_framebuffer(target, id)
 #define glFramebufferTexture2D(...) metal_gl_framebuffer_texture_2d(__VA_ARGS__)
-#define glCheckFramebufferStatus(target) metal_gl_check_framebuffer_status(target)
 #define glReadPixels(...) metal_gl_read_pixels(__VA_ARGS__)
 static inline void metal_gl_uniform_block_binding(GLuint program, GLuint uniformBlockIndex, GLuint uniformBlockBinding) { (void)program; (void)uniformBlockIndex; (void)uniformBlockBinding; }
 #define glUniformBlockBinding metal_gl_uniform_block_binding
@@ -276,9 +270,6 @@ static inline void metal_gl_uniform_block_binding(GLuint program, GLuint uniform
 #define glUniform1uiv(loc, count, v) metal_gl_uniform1uiv(loc, count, v)
 #define glUniform2fv(loc, count, v) metal_gl_uniform2fv(loc, count, v)
 #define glUniform4fv(loc, count, v) metal_gl_uniform4fv(loc, count, v)
-#define glDrawArrays(mode, first, count) metal_gl_draw_arrays(mode, first, count)
-#define glDrawArraysInstanced(mode, first, count, instancecount) metal_gl_draw_arrays_instanced(mode, first, count, instancecount)
-#define glGetString(name) metal_gl_get_string(name)
 #define glBlendFunc(sfactor, dfactor) ((void)(sfactor), (void)(dfactor)) // configured in pipeline state
 
 // Metal GL-compat function declarations (implemented in metal.m)
@@ -286,13 +277,10 @@ void metal_gl_enable(GLenum cap);
 void metal_gl_disable(GLenum cap);
 void metal_gl_clear_color(float r, float g, float b, float a);
 void metal_gl_clear(unsigned mask);
-void metal_gl_viewport(int x, int y, int w, int h);
-void metal_gl_scissor(int x, int y, int w, int h);
 void metal_gl_get_integerv(GLenum pname, GLint *params);
 void metal_gl_active_texture(GLenum unit);
 void metal_gl_bind_texture(GLenum target, GLuint id);
 void metal_gl_gen_textures(int n, GLuint *ids);
-void metal_gl_delete_textures(int n, const GLuint *ids);
 void metal_gl_tex_image_2d(GLenum target, int level, int internalformat, int width, int height, int border, GLenum format, GLenum type, const void *data);
 void metal_gl_tex_sub_image_2d(GLenum target, int level, int x, int y, int width, int height, GLenum format, GLenum type, const void *data);
 void metal_gl_tex_sub_image_3d(GLenum target, int level, int x, int y, int z, int width, int height, int depth, GLenum format, GLenum type, const void *data);
@@ -302,10 +290,7 @@ void metal_gl_get_tex_image(GLenum target, int level, GLenum format, GLenum type
 void metal_gl_copy_tex_image_2d(GLenum target, int level, GLenum internalformat, int x, int y, int width, int height, int border);
 void metal_gl_copy_image_sub_data(GLuint src, GLenum srcTarget, int srcLevel, int srcX, int srcY, int srcZ, GLuint dst, GLenum dstTarget, int dstLevel, int dstX, int dstY, int dstZ, int width, int height, int depth);
 void metal_gl_gen_framebuffers(int n, GLuint *ids);
-void metal_gl_delete_framebuffers(int n, const GLuint *ids);
-void metal_gl_bind_framebuffer(GLenum target, GLuint id);
 void metal_gl_framebuffer_texture_2d(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, int level);
-GLenum metal_gl_check_framebuffer_status(GLenum target);
 void metal_gl_read_pixels(int x, int y, int width, int height, GLenum format, GLenum type, void *data);
 void metal_gl_uniform1i(GLint loc, int v);
 void metal_gl_uniform1f(GLint loc, float v);
@@ -317,9 +302,6 @@ void metal_gl_uniform1fv(GLint loc, int count, const float *v);
 void metal_gl_uniform1uiv(GLint loc, int count, const unsigned *v);
 void metal_gl_uniform2fv(GLint loc, int count, const float *v);
 void metal_gl_uniform4fv(GLint loc, int count, const float *v);
-void metal_gl_draw_arrays(GLenum mode, int first, int count);
-void metal_gl_draw_arrays_instanced(GLenum mode, int first, int count, int instancecount);
-const unsigned char* metal_gl_get_string(GLenum name);
 
 // GLAD compat stubs — used in gl_init() and version checking
 #define GLAD_VERSION_MAJOR(v) ((v) >> 16)
@@ -336,10 +318,8 @@ typedef void* GLADapiproc;
 #define glfwGetProcAddress(name) NULL
 
 // Additional GL function stubs used in shaders.c that need no-op or mapping
-#define glCreateShader(type) metal_gl_create_shader(type)
 #define glShaderSource(id, count, src, len) ((void)(id), (void)(count), (void)(src), (void)(len))
 #define glCompileShader(id) ((void)(id))
-#define glGetShaderiv(id, pname, params) metal_gl_get_shaderiv(id, pname, params)
 #define glGetShaderInfoLog(id, bufsize, len, buf) ((void)(id), (void)(bufsize), (void)(len), (void)(buf))
 #define glDeleteShader(id) ((void)(id))
 #define glCreateProgram() metal_gl_create_program()
@@ -348,7 +328,6 @@ typedef void* GLADapiproc;
 #define glGetProgramiv(prog, pname, params) metal_gl_get_programiv(prog, pname, params)
 #define glGetProgramInfoLog(prog, bufsize, len, buf) ((void)(prog), (void)(bufsize), (void)(len), (void)(buf))
 #define glDeleteProgram(prog) metal_gl_delete_program(prog)
-#define glUseProgram(prog) metal_gl_use_program(prog)
 #define glGetActiveUniform(prog, idx, bufsize, len, size, type, name) ((void)(prog), (void)(idx), (void)(bufsize), (void)(len), (void)(size), (void)(type), (void)(name))
 #define glGetUniformLocation(prog, name) 0
 #define glGetUniformIndices(prog, count, names, indices) ((void)(prog), (void)(count), (void)(names), (void)(indices))
@@ -356,38 +335,15 @@ typedef void* GLADapiproc;
 #define glGetAttribLocation(prog, name) 0
 #define glGetUniformBlockIndex(prog, name) 0
 #define glGetActiveUniformBlockiv(prog, block, pname, params) ((void)(prog), (void)(block), (void)(pname), (void)(params))
-#define glGenVertexArrays(n, ids) metal_gl_gen_vertex_arrays(n, ids)
-#define glDeleteVertexArrays(n, ids) metal_gl_delete_vertex_arrays(n, ids)
-#define glBindVertexArray(id) metal_gl_bind_vertex_array(id)
-#define glGenBuffers(n, ids) metal_gl_gen_buffers(n, ids)
-#define glDeleteBuffers(n, ids) metal_gl_delete_buffers(n, ids)
-#define glBindBuffer(target, id) metal_gl_bind_buffer(target, id)
-#define glBufferData(target, size, data, usage) metal_gl_buffer_data(target, size, data, usage)
-#define glMapBuffer(target, access) metal_gl_map_buffer(target, access)
 #define glMapBufferRange(target, offset, length, access) metal_gl_map_buffer_range(target, offset, length, access)
-#define glUnmapBuffer(target) metal_gl_unmap_buffer(target)
 #define glEnableVertexAttribArray(idx) ((void)(idx))
 #define glVertexAttribIPointer(idx, size, type, stride, offset) ((void)(idx), (void)(size), (void)(type), (void)(stride), (void)(offset))
 #define glVertexAttribPointer(idx, size, type, normalized, stride, offset) ((void)(idx), (void)(size), (void)(type), (void)(normalized), (void)(stride), (void)(offset))
 #define glVertexAttribDivisorARB(idx, divisor) ((void)(idx), (void)(divisor))
-#define glBindBufferBase(target, index, buffer) metal_gl_bind_buffer_base(target, index, buffer)
 
 // Additional GL compat function declarations
-GLuint metal_gl_create_shader(GLenum type);
-void metal_gl_get_shaderiv(GLuint id, GLenum pname, GLint *params);
 GLuint metal_gl_create_program(void);
 void metal_gl_get_programiv(GLuint prog, GLenum pname, GLint *params);
 void metal_gl_delete_program(GLuint prog);
-void metal_gl_use_program(GLuint prog);
-void metal_gl_gen_vertex_arrays(int n, GLuint *ids);
-void metal_gl_delete_vertex_arrays(int n, const GLuint *ids);
-void metal_gl_bind_vertex_array(GLuint id);
-void metal_gl_gen_buffers(int n, GLuint *ids);
-void metal_gl_delete_buffers(int n, const GLuint *ids);
-void metal_gl_bind_buffer(GLenum target, GLuint id);
-void metal_gl_buffer_data(GLenum target, GLsizeiptr size, const void *data, GLenum usage);
-void* metal_gl_map_buffer(GLenum target, GLenum access);
 void* metal_gl_map_buffer_range(GLenum target, int offset, unsigned length, unsigned access);
-void metal_gl_unmap_buffer(GLenum target);
-void metal_gl_bind_buffer_base(GLenum target, GLuint index, GLuint buffer);
 

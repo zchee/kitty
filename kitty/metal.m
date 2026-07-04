@@ -2823,13 +2823,7 @@ void metal_gl_clear(unsigned mask) {
     }
 }
 
-void metal_gl_viewport(int x, int y, int w, int h) {
-    mtl_viewport = (MTLViewport){(double)x, (double)y, (double)w, (double)h, 0, 1};
-}
 
-void metal_gl_scissor(int x, int y, int w, int h) {
-    mtl_scissor = (MTLScissorRect){(NSUInteger)x, (NSUInteger)y, (NSUInteger)w, (NSUInteger)h};
-}
 
 void metal_gl_get_integerv(GLenum pname, GLint *params) {
     switch (pname) {
@@ -2912,11 +2906,6 @@ void metal_gl_gen_textures(int n, GLuint *ids) {
     }
 }
 
-void metal_gl_delete_textures(int n, const GLuint *ids) {
-    for (int i = 0; i < n; i++) {
-        if (ids[i] && ids[i] < MAX_TEXTURES) recycle_texture_id(ids[i]);
-    }
-}
 
 static MTLPixelFormat
 pixel_format_for_gl(int internalformat) {
@@ -3244,24 +3233,7 @@ void metal_gl_gen_framebuffers(int n, GLuint *ids) {
     }
 }
 
-void metal_gl_delete_framebuffers(int n, const GLuint *ids) {
-    for (int i = 0; i < n; i++) {
-        if (ids[i] && ids[i] < MAX_FRAMEBUFFERS) {
-            framebuffers[ids[i]].in_use = false;
-            [framebuffers[ids[i]].render_target release];
-            framebuffers[ids[i]].render_target = nil;
-        }
-    }
-}
 
-void metal_gl_bind_framebuffer(GLenum target, GLuint id) {
-    // Direct glBindFramebuffer: binds literally (no output indirection).
-    (void)target;
-    if (id != bound_framebuffer) {
-        end_current_encoder();
-        bound_framebuffer = id;
-    }
-}
 
 void metal_gl_framebuffer_texture_2d(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, int level) {
     (void)target; (void)attachment; (void)textarget; (void)level;
@@ -3275,10 +3247,6 @@ void metal_gl_framebuffer_texture_2d(GLenum target, GLenum attachment, GLenum te
     }
 }
 
-GLenum metal_gl_check_framebuffer_status(GLenum target) {
-    (void)target;
-    return GL_FRAMEBUFFER_COMPLETE;
-}
 
 void metal_gl_read_pixels(int x, int y, int width, int height, GLenum format, GLenum type, void *data) {
     (void)format; (void)type;
@@ -3399,39 +3367,12 @@ void metal_gl_uniform4fv(GLint loc, int count, const float *v) {
 }
 
 // ----- Draw -----
-void metal_gl_draw_arrays(GLenum mode, int first, int count) {
-    (void)mode; (void)first; (void)count;
-    // Stub — actual drawing happens in draw_quad()
-}
 
-void metal_gl_draw_arrays_instanced(GLenum mode, int first, int count, int instancecount) {
-    (void)mode; (void)first; (void)count; (void)instancecount;
-    // Stub — actual drawing happens in draw_quad()
-}
 
-const unsigned char* metal_gl_get_string(GLenum name) {
-    switch (name) {
-        case GL_VERSION: return (const unsigned char*)"Metal";
-        case GL_VENDOR: return (const unsigned char*)"Apple";
-        case GL_RENDERER: return (const unsigned char*)(mtl_device ? [mtl_device.name UTF8String] : "Metal");
-        case GL_SHADING_LANGUAGE_VERSION: return (const unsigned char*)"MSL 2.4";
-        default: return (const unsigned char*)"";
-    }
-}
 
 // ----- Shader/Program Stubs -----
 
-GLuint metal_gl_create_shader(GLenum type) {
-    (void)type;
-    static GLuint next_id = 1;
-    return next_id++;
-}
 
-void metal_gl_get_shaderiv(GLuint id, GLenum pname, GLint *params) {
-    (void)id;
-    if (pname == GL_COMPILE_STATUS) *params = GL_TRUE;
-    else *params = 0;
-}
 
 GLuint metal_gl_create_program(void) {
     static GLuint next_id = 1;
@@ -3446,52 +3387,20 @@ void metal_gl_get_programiv(GLuint prog, GLenum pname, GLint *params) {
 }
 
 void metal_gl_delete_program(GLuint prog) { (void)prog; }
-void metal_gl_use_program(GLuint prog) { (void)prog; }
 
 // ----- VAO/Buffer GL stubs -----
 
-void metal_gl_gen_vertex_arrays(int n, GLuint *ids) {
-    for (int i = 0; i < n; i++) {
-        static GLuint next_id = 1;
-        ids[i] = next_id++;
-    }
-}
 
-void metal_gl_delete_vertex_arrays(int n, const GLuint *ids) {
-    (void)n; (void)ids;
-}
 
-void metal_gl_bind_vertex_array(GLuint id) { (void)id; }
 
-void metal_gl_gen_buffers(int n, GLuint *ids) {
-    for (int i = 0; i < n; i++) {
-        static GLuint next_id = 1;
-        ids[i] = next_id++;
-    }
-}
 
-void metal_gl_delete_buffers(int n, const GLuint *ids) {
-    (void)n; (void)ids;
-}
 
-void metal_gl_bind_buffer(GLenum target, GLuint id) { (void)target; (void)id; }
 
-void metal_gl_buffer_data(GLenum target, GLsizeiptr size, const void *data, GLenum usage) {
-    (void)target; (void)size; (void)data; (void)usage;
-}
 
-void* metal_gl_map_buffer(GLenum target, GLenum access) {
-    (void)target; (void)access;
-    return NULL;
-}
 
 void* metal_gl_map_buffer_range(GLenum target, int offset, unsigned length, unsigned access) {
     (void)target; (void)offset; (void)length; (void)access;
     return NULL;
 }
 
-void metal_gl_unmap_buffer(GLenum target) { (void)target; }
 
-void metal_gl_bind_buffer_base(GLenum target, GLuint index, GLuint buffer) {
-    (void)target; (void)index; (void)buffer;
-}
