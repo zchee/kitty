@@ -882,6 +882,80 @@ cost (linefeed clears 3.2 KB/line that the very next fill overwrites — a
 clear/fill fusion candidate), and ~30% parser/decode. Those are the
 quantified next levers; none of them is a Phase-5 plan item.
 
+## Phase 6 (Wave 7): Atlas & graphics protocol
+
+Plan items F1 / G1+G3 / G2 / G4 / G6 / F5, on top of Wave-5c. Artifacts:
+`.omc/verify/f1|g1|g2|g4/` (goldens, alloc counts, wall-time split).
+
+**F1 — R8 mask atlas (e1e901106).** The shaders read only `.a` for
+monochrome text and every decoration; `.rgb` is consumed solely by colored
+emoji (bit31). Mono sprites now live in an R8Unorm atlas — alpha extracted
+at upload, texture swizzled A←R (Metal: descriptor swizzle; GL: texture
+swizzle parameters) so all sampling code kept its `.a` reads — with colored
+emoji in a small separate RGBA atlas + its own decorations LUT, both
+selected by bit31. Two sprite trackers (mono keeps the F3 growth tuning;
+colored is small, index 0 reserved). Measured: mono atlas exactly 1/4 the
+bytes, −72% total on the golden content; goldens byte-identical (delta 0,
+md5-equal) across ASCII+emoji+decorations+box on BOTH backends;
+KITTY_NO_R8_SPRITE_ATLAS=1 restores the single-RGBA world. The golden
+caught a real bug the suites could not: colored-atlas index 0 collided
+with the `!idx` failure sentinel — first emoji rendered blank. Index 0 is
+now reserved, mirroring the mono blank-at-0 invariant.
+
+**G1+G3-lite — persistent animation textures + delta rects (1e3106dc8).**
+Every frame advance re-specified the image texture (a full MTLTexture
+release+realloc on Metal) and re-uploaded the whole coalesced frame. Frames
+now update the persistent texture in place when dims are unchanged —
+steady-state animation performs ZERO texture allocations per frame (was
+one; proven by the new tex_allocs= stat) — and a non-blended delta frame
+whose base is GPU-resident uploads only its rect (100× fewer bytes on a
+synthetic partial-delta client). Honest scope note: icat transmits FULL
+frames, so gif playback gains the realloc fix, not the byte win; the delta
+path serves partial-delta protocol clients. is_opaque flips do NOT force
+reallocs (internal format is uniformly SRGB_ALPHA; opacity only selects
+the SubImage source format). Kill switches:
+KITTY_NO_PERSISTENT_IMAGE_TEXTURE=1, KITTY_NO_DELTA_IMAGE_UPLOAD=1.
+
+**G2 — instanced image draws (08daadff2).** Refs were already sorted into
+same-texture group runs but drew one non-instanced quad each. Rects now
+travel as vec4[16] uniform arrays (reusing the Metal array-uniform store
+stride; GL 4.1 limits trivially satisfied) and each group draws as
+16-instance chunks — blend order inside chunks and the
+below/negative/positive z-split boundaries are exactly preserved
+(kitty_tests/graphics.py locks the grouping). A 10-ref, 3-split, 2-texture
+scene: 10 draws → 5 (gfx_draws= counter). Goldens byte-identical on BOTH
+backends — the GL golden is a new capability (the backend-agnostic
+thumbnail path reads the fully-rendered frame pre-swap and bypasses the
+occlusion gate; GLSL only compiles at runtime, so this closes a
+verification gap a clean build cannot). KITTY_NO_INSTANCED_IMAGE_DRAWS=1.
+
+**G4 — async upload ring: DESCOPED on a measure-first gate.** The icat
+large-image (24MB RGBA) main-thread wall splits: decode (inflate_png)
+91.4%, upload (replaceRegion) 7.1%, cache 1.1%, parse 0.1% (median of 12,
+tight ranges; .omc/verify/g4/FINDINGS.md). An async ring removes at most
+the 2.63 ms upload from a ~37 ms hitch — the plan's own over-engineering
+guard applies. The real lever is off-thread DECODE, deliberately out of
+this phase; queued as follow-up. **G6 (zero-copy decode targets):
+defer** — MTLBuffer-backed textures are genuinely zero-copy but Apple
+documents they may forgo tiling optimization; trading a one-time 2.6 ms
+upload for a recurring per-frame sampling penalty on long-lived images is
+likely net negative today. **F5 (buffer-backed atlas): reject** — the
+atlas is sampling-hot and write-cold; a linear layout would tax the
+hottest read in the cell shader to speed a rare, tiny write. F1 already
+captured the actual atlas win (memory).
+
+**Exit-gate status (Phase 6):** atlas memory −72% (target ~−70%: PASS);
+steady-state animation allocs 0/frame (PASS); goldens across
+text/emoji/decorations/z-order configs byte-identical both backends
+(PASS); suites at documented baseline both backends (PASS);
+MTL_DEBUG_LAYER clean (PASS). PENDING VISIBILITY (recorded when a screen
+window allows real rendering): animated-gif main-thread CPU% A/B
+(fps is governor-capped at refresh by design since Wave-5b, so CPU% is
+the meaningful axis) and the icat wall-time number for the doc table —
+its verdict is already determined by the split above (decode-bound;
+unchanged by this phase, documented shortfall vs the original gate
+wording, with the analysis that G4 could never have moved it).
+
 ## Known deviations (tracked, intentional)
 
 - Cell/graphics MSL shader *logic* is still the opus-era port; semantic drift
