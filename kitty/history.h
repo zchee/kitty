@@ -8,14 +8,7 @@
 #pragma once
 
 #include "line.h"
-
-typedef struct {
-    GPUCell *gpu_cells;
-    CPUCell *cpu_cells;
-    LineAttrs *line_attrs;
-    void *mem;
-    size_t mmap_size;
-} HistoryBufSegment;
+#include "line-pool.h"
 
 typedef struct {
     void *ringbuf;
@@ -27,8 +20,16 @@ typedef struct {
 typedef struct {
     PyObject_HEAD
 
-    index_type xnum, ynum, num_segments;
-    HistoryBufSegment *segments;
+    index_type xnum, ynum;
+    // cell storage lives in pool slots; slot_ring[position] holds the
+    // slot id and attrs_ring[position] the per-line attrs (by value).
+    // Positions are allocated lazily in chunks, like the segments the
+    // pool replaced; the ring arrays hold ids/values, so realloc growth
+    // is safe (slot ADDRESSES stay stable inside the pool's slabs).
+    LineSlotPool *pool;
+    index_type *slot_ring;
+    LineAttrs *attrs_ring;
+    index_type positions_allocated;
     PagerHistoryBuf *pagerhist;
     Line *line;
     TextCache *text_cache;

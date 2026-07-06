@@ -10,72 +10,49 @@
 #include "charsets.h"
 #include "resize.h"
 #include <structmember.h>
-#include <sys/mman.h>
 #include "../3rdparty/ringbuf/ringbuf.h"
 
 extern PyTypeObject Line_Type;
+// position-chunk granularity, matching the segment size the pool replaced
 #define SEGMENT_SIZE 2048
 
 static void
-add_segment(HistoryBuf *self, index_type num) {
-    self->segments = realloc(self->segments, sizeof(HistoryBufSegment) * (self->num_segments + num));
-    if (self->segments == NULL) fatal("Out of memory allocating new history buffer segment");
-    const size_t cpu_cells_size = self->xnum * SEGMENT_SIZE * sizeof(CPUCell);
-    const size_t gpu_cells_size = self->xnum * SEGMENT_SIZE * sizeof(GPUCell);
-    const size_t segment_size = cpu_cells_size + gpu_cells_size + SEGMENT_SIZE * sizeof(LineAttrs);
-    if (num > SIZE_MAX / segment_size) fatal("History buffer segment allocation is too large");
-    const size_t mmap_size = num * segment_size;
-    // We use mmap to avoid fragmentation in libc malloc pool, see
-    // https://github.com/kovidgoyal/kitty/pull/10254
-    char *mem = mmap(NULL, mmap_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (mem == MAP_FAILED) fatal("Out of memory allocating new history buffer segment");
-    char *needs_free = mem;
-    for (HistoryBufSegment *s = self->segments + self->num_segments; s < self->segments + self->num_segments + num; s++, mem += segment_size) {
-        s->cpu_cells = (CPUCell*)mem;
-        s->gpu_cells = (GPUCell*)(((uint8_t*)s->cpu_cells) + cpu_cells_size);
-        s->line_attrs = (LineAttrs*)(((uint8_t*)s->gpu_cells) + gpu_cells_size);
-        s->mem = NULL;
-        s->mmap_size = 0;
+ensure_position(HistoryBuf *self, index_type y) {
+    while (UNLIKELY(y >= self->positions_allocated)) {
+        if (UNLIKELY(self->positions_allocated >= self->ynum)) fatal("Out of bounds access to history buffer line number: %u", y);
+        const index_type grow = MIN(self->ynum - self->positions_allocated, (index_type)SEGMENT_SIZE);
+        const size_t n = (size_t)self->positions_allocated + grow;
+        index_type *sr = realloc(self->slot_ring, n * sizeof(index_type));
+        if (!sr) fatal("Out of memory allocating history slot ring");
+        self->slot_ring = sr;
+        LineAttrs *ar = realloc(self->attrs_ring, n * sizeof(LineAttrs));
+        if (!ar) fatal("Out of memory allocating history attrs ring");
+        self->attrs_ring = ar;
+        for (size_t i = self->positions_allocated; i < n; i++) {
+            self->slot_ring[i] = line_slot_pool_take(self->pool);
+            self->attrs_ring[i] = (LineAttrs){0};
+        }
+        self->positions_allocated = (index_type)n;
     }
-    self->segments[self->num_segments].mem = needs_free;
-    self->segments[self->num_segments].mmap_size = mmap_size;
-    self->num_segments += num;
-}
-
-static void
-free_segment(HistoryBufSegment *s) {
-    if (s->mem && munmap(s->mem, s->mmap_size) != 0) log_error("Failed to unmap history buffer segment: %s", strerror(errno));
-    zero_at_ptr(s);
-}
-
-static index_type
-segment_for(HistoryBuf *self, index_type y) {
-    index_type seg_num = y / SEGMENT_SIZE;
-    while (UNLIKELY(seg_num >= self->num_segments && SEGMENT_SIZE * self->num_segments < self->ynum)) add_segment(self, 1);
-    if (UNLIKELY(seg_num >= self->num_segments)) fatal("Out of bounds access to history buffer line number: %u", y);
-    return seg_num;
-}
-
-#define seg_ptr(which, stride) { \
-    index_type seg_num = segment_for(self, y); \
-    y -= seg_num * SEGMENT_SIZE; \
-    return self->segments[seg_num].which + y * stride; \
 }
 
 static CPUCell*
 cpu_lineptr(HistoryBuf *self, index_type y) {
-    seg_ptr(cpu_cells, self->xnum);
+    ensure_position(self, y);
+    return pool_cpu_lineptr(self->pool, self->slot_ring[y]);
 }
 
 static GPUCell*
 gpu_lineptr(HistoryBuf *self, index_type y) {
-    seg_ptr(gpu_cells, self->xnum);
+    ensure_position(self, y);
+    return pool_gpu_lineptr(self->pool, self->slot_ring[y]);
 }
 
 
 static LineAttrs*
 attrptr(HistoryBuf *self, index_type y) {
-    seg_ptr(line_attrs, 1);
+    ensure_position(self, y);
+    return self->attrs_ring + y;
 }
 
 static size_t
@@ -138,8 +115,9 @@ create_historybuf(PyTypeObject *type, unsigned int xnum, unsigned int ynum, unsi
     if (self != NULL) {
         self->xnum = xnum;
         self->ynum = ynum;
-        self->num_segments = 0;
-        add_segment(self, 1);
+        self->pool = line_slot_pool_alloc(xnum, SEGMENT_SIZE);
+        if (!self->pool) { Py_CLEAR(self); PyErr_NoMemory(); return NULL; }
+        ensure_position(self, 0);  // first chunk upfront, as the first segment was
         self->text_cache = tc_incref(tc);
         self->line = alloc_line(self->text_cache);
         self->line->xnum = xnum;
@@ -162,8 +140,8 @@ new_history_object(PyTypeObject *type, PyObject *args, PyObject UNUSED *kwds) {
 static void
 dealloc(HistoryBuf* self) {
     Py_CLEAR(self->line);
-    for (size_t i = 0; i < self->num_segments; i++) free_segment(self->segments + i);
-    free(self->segments);
+    free(self->slot_ring); free(self->attrs_ring);
+    line_slot_pool_decref(self->pool);
     free_pagerhist(self);
     tc_decref(self->text_cache);
     Py_TYPE(self)->tp_free((PyObject*)self);
@@ -239,10 +217,19 @@ historybuf_clear(HistoryBuf *self) {
     pagerhist_clear(self);
     self->count = 0;
     self->start_of_data = 0;
-    for (size_t i = 0; i < self->num_segments; i++) free_segment(self->segments + i);
-    free(self->segments); self->segments = NULL;
-    self->num_segments = 0;
-    add_segment(self, 1);
+    if (self->pool->refcnt == 1) {
+        // private pool: release the cell memory, as freeing the segments
+        // did before; with a shared pool (stage 3) the slots belong to
+        // the pool's lifetime and count=0 alone hides the content
+        LineSlotPool *fresh = line_slot_pool_alloc(self->xnum, SEGMENT_SIZE);
+        if (fresh) {
+            line_slot_pool_decref(self->pool); self->pool = fresh;
+            free(self->slot_ring); self->slot_ring = NULL;
+            free(self->attrs_ring); self->attrs_ring = NULL;
+            self->positions_allocated = 0;
+            ensure_position(self, 0);
+        }
+    }
 }
 
 static bool
@@ -683,10 +670,7 @@ HistoryBuf*
 historybuf_alloc_for_rewrap(unsigned int columns, HistoryBuf *self) {
     if (!self) return NULL;
     HistoryBuf *ans = alloc_historybuf(self->ynum, columns, 0, self->text_cache);
-    if (ans) {
-        if (ans->num_segments < self->num_segments) add_segment(ans, self->num_segments - ans->num_segments);
-        ans->count = 0; ans->start_of_data = 0;
-    }
+    if (ans) { ans->count = 0; ans->start_of_data = 0; }  // positions grow on demand
     return ans;
 }
 
@@ -699,10 +683,12 @@ historybuf_finish_rewrap(HistoryBuf *dest, HistoryBuf *src) {
 
 void
 historybuf_fast_rewrap(HistoryBuf *dest, HistoryBuf *src) {
-    for (index_type i = 0; i < src->num_segments; i++) {
-        memcpy(dest->segments[i].cpu_cells, src->segments[i].cpu_cells, SEGMENT_SIZE * src->xnum * sizeof(CPUCell));
-        memcpy(dest->segments[i].gpu_cells, src->segments[i].gpu_cells, SEGMENT_SIZE * src->xnum * sizeof(GPUCell));
-        memcpy(dest->segments[i].line_attrs, src->segments[i].line_attrs, SEGMENT_SIZE * sizeof(LineAttrs));
+    // per-line: slot ids must not cross pools, so content is copied into
+    // the dest's own slots (same total bytes as the old segment memcpys)
+    for (index_type i = 0; i < src->positions_allocated; i++) {
+        memcpy(cpu_lineptr(dest, i), cpu_lineptr(src, i), (size_t)src->xnum * sizeof(CPUCell));
+        memcpy(gpu_lineptr(dest, i), gpu_lineptr(src, i), (size_t)src->xnum * sizeof(GPUCell));
+        *attrptr(dest, i) = *attrptr(src, i);
     }
     dest->count = src->count; dest->start_of_data = src->start_of_data;
 }
