@@ -197,9 +197,14 @@ trade — with ``input_delay 0`` kitty measures 0.470 s on the same
 workload) and the remaining **10.6%** is structural: kitty parses and
 renders on one thread where Alacritty parses on a dedicated thread.
 Parser-stage CPU is *not* the limiter — halving the draw-loop self-time
-moved this wall by under 1% — which is also why the Metal and OpenGL
-backends measure equal here: the pty→parse pipeline, not rendering,
-bounds this axis. (An earlier revision of this table showed Metal ~13%
+moved this wall by under 1% — and neither is rendering: suppressing the
+render path entirely (a test lever that skips shaping, upload, encode
+and present) moves the default-config wall by only **0.6%**. Even with
+rendering fully off *and* ``input_delay 0``, kitty's pty→parse drain
+(45.4 ms per 5.4 MB pass) is slower than Alacritty's entire loop
+(42.5 ms, rendering included): the residual is the io-thread→main-tick
+handoff architecture itself, not any per-stage CPU. That is also why the
+Metal and OpenGL backends measure equal here. (An earlier revision of this table showed Metal ~13%
 ahead of OpenGL on devlog-006; that delta does not reproduce under
 same-window interleaving and is attributed to load-window confounding.
 The backend's wins are on the latency, CPU-per-frame, and memory axes
@@ -216,10 +221,17 @@ Ghostty          8             20         8
 kitty (Metal)    15            69         9
 ===============  ============  =========  ========
 
-kitty trails on vtebench's SGR-dense and scrolling patterns; the
-scrolling gap aligns with the profiled scroll-machinery share
-(history-buffer line copy) and is queued for analysis. Energy
-(powermetrics) columns will be added when captured.
+kitty trails on vtebench's SGR-dense and scrolling patterns. The
+scrolling gap is now fully attributed: ~70% of kitty's scrolling CPU is
+the scroll-copy machinery — each scrolled line is copied into the
+scrollback ring (memmove, 44.5%) and the recycled row cleared (memset,
+25.4%), ~32 bytes/cell streaming through a ring too large for cache,
+while Alacritty rotates a ring grid in O(1) with zero copy. Rendering is
+0.4% of this workload, so no render offload can help; the fix is a
+grid-container redesign (visible screen as a window over the scrollback
+ring, or per-line pointer swaps between the screen and history buffers),
+tracked as the top follow-up. Energy (powermetrics) columns will be
+added when captured.
 
 Instrumenting kitty
 -----------------------
