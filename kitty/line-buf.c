@@ -14,14 +14,59 @@
 extern PyTypeObject Line_Type;
 extern PyTypeObject HistoryBuf_Type;
 
+// Line-slot pool (line-pool.h): slab storage with stable addresses shared
+// between a LineBuf and its HistoryBuf so scroll moves slot ids, not cells.
+
+LineSlotPool*
+line_slot_pool_alloc(index_type xnum, index_type slab_capacity) {
+    LineSlotPool *pool = calloc(1, sizeof(LineSlotPool));
+    if (!pool) return NULL;
+    pool->xnum = xnum; pool->slab_capacity = MAX(1u, slab_capacity); pool->refcnt = 1;
+    return pool;
+}
+
+void
+line_slot_pool_incref(LineSlotPool *pool) { if (pool) pool->refcnt++; }
+
+void
+line_slot_pool_decref(LineSlotPool *pool) {
+    if (!pool || --pool->refcnt) return;
+    for (size_t i = 0; i < pool->num_slabs; i++) free(pool->slabs[i].mem);
+    free(pool->slabs);
+    free(pool);
+}
+
+static bool
+pool_add_slab(LineSlotPool *pool) {
+    LineSlotSlab *slabs = realloc(pool->slabs, sizeof(LineSlotSlab) * (pool->num_slabs + 1));
+    if (!slabs) return false;
+    pool->slabs = slabs;
+    const size_t cpu_sz = (size_t)pool->xnum * pool->slab_capacity * sizeof(CPUCell);
+    const size_t gpu_sz = (size_t)pool->xnum * pool->slab_capacity * sizeof(GPUCell);
+    void *mem = calloc(1, cpu_sz + gpu_sz);
+    if (!mem) return false;
+    LineSlotSlab *s = pool->slabs + pool->num_slabs;
+    s->mem = mem; s->cpu = mem; s->gpu = (GPUCell*)((uint8_t*)mem + cpu_sz);
+    pool->num_slabs++;
+    return true;
+}
+
+index_type
+line_slot_pool_take(LineSlotPool *pool) {
+    if (pool->slots_used >= pool->num_slabs * pool->slab_capacity) {
+        if (!pool_add_slab(pool)) fatal("Out of memory allocating a line-slot slab");
+    }
+    return (index_type)pool->slots_used++;
+}
+
 static CPUCell*
 cpu_lineptr(LineBuf *linebuf, index_type y) {
-    return linebuf->cpu_cell_buf + y * linebuf->xnum;
+    return pool_cpu_lineptr(linebuf->pool, y);
 }
 
 static GPUCell*
 gpu_lineptr(LineBuf *linebuf, index_type y) {
-    return linebuf->gpu_cell_buf + y * linebuf->xnum;
+    return pool_gpu_lineptr(linebuf->pool, y);
 }
 
 static void
@@ -31,13 +76,17 @@ clear_chars_to(LineBuf* linebuf, index_type y, char_type ch) {
 
 void
 linebuf_clear(LineBuf *self, char_type ch) {
-    zero_at_ptr_count(self->cpu_cell_buf, self->xnum * self->ynum);
-    zero_at_ptr_count(self->gpu_cell_buf, self->xnum * self->ynum);
+    // per-line via line_map: slot assignments are preserved, only the
+    // content is cleared (cell storage is pool slots, not one block)
+    for (index_type i = 0; i < self->ynum; i++) {
+        const index_type slot = self->line_map[i];
+        zero_at_ptr_count(cpu_lineptr(self, slot), self->xnum);
+        zero_at_ptr_count(gpu_lineptr(self, slot), self->xnum);
+    }
     zero_at_ptr_count(self->line_attrs, self->ynum);
-    for (index_type i = 0; i < self->ynum; i++) self->line_map[i] = i;
     if (ch != 0) {
         for (index_type i = 0; i < self->ynum; i++) {
-            clear_chars_to(self, i, ch);
+            clear_chars_to(self, self->line_map[i], ch);
             self->line_attrs[i].val = 0;
             self->line_attrs[i].has_dirty_text = true;
         }
@@ -89,18 +138,20 @@ alloc_linebuf_(PyTypeObject *cls, unsigned int lines, unsigned int columns, Text
     if (self != NULL) {
         self->xnum = columns;
         self->ynum = lines;
-        self->cpu_cell_buf = PyMem_Calloc(1, area * (sizeof(CPUCell) + sizeof(GPUCell)) + lines * (sizeof(index_type) + sizeof(index_type) + sizeof(LineAttrs)));
-        if (!self->cpu_cell_buf) { Py_CLEAR(self); return NULL; }
-        self->gpu_cell_buf = (GPUCell*)(self->cpu_cell_buf + area);
-        self->line_map = (index_type*)(self->gpu_cell_buf + area);
+        // Cell storage lives in the slot pool; the private pool's slab is
+        // sized exactly for this container (shared pools use
+        // history-segment-sized slabs and grow with scrollback).
+        self->pool = line_slot_pool_alloc(columns, lines);
+        self->line_map = self->pool ? PyMem_Calloc(1, lines * (sizeof(index_type) + sizeof(index_type) + sizeof(LineAttrs))) : NULL;
+        if (!self->line_map) { line_slot_pool_decref(self->pool); self->pool = NULL; Py_CLEAR(self); return NULL; }
         self->scratch = self->line_map + lines;
+        self->line_attrs = (LineAttrs*)(self->scratch + lines);
         self->text_cache = tc_incref(text_cache);
         self->line = alloc_line(self->text_cache);
-        self->line_attrs = (LineAttrs*)(self->scratch + lines);
         self->line->xnum = columns;
         for(index_type i = 0; i < lines; i++) {
-            self->line_map[i] = i;
-            if (BLANK_CHAR != 0) clear_chars_to(self, i, BLANK_CHAR);
+            self->line_map[i] = line_slot_pool_take(self->pool);
+            if (BLANK_CHAR != 0) clear_chars_to(self, self->line_map[i], BLANK_CHAR);
         }
     }
     return self;
@@ -121,7 +172,8 @@ new_linebuf_object(PyTypeObject *type, PyObject *args, PyObject UNUSED *kwds) {
 static void
 dealloc(LineBuf* self) {
     self->text_cache = tc_decref(self->text_cache);
-    PyMem_Free(self->cpu_cell_buf);
+    PyMem_Free(self->line_map);
+    line_slot_pool_decref(self->pool);
     Py_CLEAR(self->line);
     Py_TYPE(self)->tp_free((PyObject*)self);
 }
@@ -217,7 +269,7 @@ set_attribute(LineBuf *self, PyObject *args) {
     char *which;
     if (!PyArg_ParseTuple(args, "sI", &which, &val)) return NULL;
     for (index_type y = 0; y < self->ynum; y++) {
-        if (!set_named_attribute_on_line(gpu_lineptr(self, y), which, val, self->xnum)) {
+        if (!set_named_attribute_on_line(gpu_lineptr(self, self->line_map[y]), which, val, self->xnum)) {
             PyErr_SetString(PyExc_KeyError, "Unknown cell attribute"); return NULL;
         }
         self->line_attrs[y].has_dirty_text = true;

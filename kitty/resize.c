@@ -255,10 +255,17 @@ rewrap(Rewrap *r) {
     r->src.hb_count = r->src.hb ? r->src.hb->count : 0;
     // Fast path
     if (r->dest.lb->xnum == r->src.lb->xnum && r->dest.lb->ynum == r->src.lb->ynum) {
-        memcpy(r->dest.lb->line_map, r->src.lb->line_map, sizeof(index_type) * r->src.lb->ynum);
+        // per-line: cell storage is pool slots and the dest must keep its
+        // OWN slot ids (they must never cross pools); copying by visual
+        // order preserves the content ordering the old map memcpy carried
         memcpy(r->dest.lb->line_attrs, r->src.lb->line_attrs, sizeof(LineAttrs) * r->src.lb->ynum);
-        memcpy(r->dest.lb->cpu_cell_buf, r->src.lb->cpu_cell_buf, (size_t)r->src.lb->xnum * r->src.lb->ynum * sizeof(CPUCell));
-        memcpy(r->dest.lb->gpu_cell_buf, r->src.lb->gpu_cell_buf, (size_t)r->src.lb->xnum * r->src.lb->ynum * sizeof(GPUCell));
+        for (index_type y = 0; y < r->src.lb->ynum; y++) {
+            CPUCell *sc, *dc; GPUCell *sg, *dg;
+            linebuf_init_cells(r->src.lb, y, &sc, &sg);
+            linebuf_init_cells(r->dest.lb, y, &dc, &dg);
+            memcpy(dc, sc, (size_t)r->src.lb->xnum * sizeof(CPUCell));
+            memcpy(dg, sg, (size_t)r->src.lb->xnum * sizeof(GPUCell));
+        }
         r->num_content_lines_before = r->src.lb->ynum;
         if (r->dest.hb && r->src.hb) historybuf_fast_rewrap(r->dest.hb, r->src.hb);
         r->dest.y = r->src.lb->ynum - 1;
