@@ -987,6 +987,111 @@ races (the dump path waits for completion), so race coverage rests on
 the watermark logic, the contention lever, and validation-layer stress —
 not on golden parity.
 
+## Phase 8 (Wave 8): parser/decode throughput & the pipeline decomposition
+
+Goal: close the devlog-006 gap to Alacritty (~15–17% at phase start).
+Discipline: measure-first — a sample(1) decomposition gates every lever
+(≥10% of flood-busy to act, else numbers-backed reject; harness at
+`.omc/verify/phase8/profile_split.py`, findings in `P8-0-FINDINGS.md` and
+`P8-LEVERS.md`).
+
+### P8-0 decomposition (devlog-006 flood, main-thread busy shares)
+
+`draw_text` self **42.0%** (char_props/wcwidth/grapheme inlined there),
+scroll copy **~25%** (memmove ← `historybuf_add_line`, memset ←
+`screen_index` new-line clear), `utf8_decode_to_esc_256` **19.1%**,
+render-shape 6.1%, escape dispatch 0.2%. The main thread was only **59%
+busy** during floods — the tell that the wall was not parse-CPU-bound,
+which US-402d later proved out.
+
+### Landed: batched width-2 run fill (US-402a, 8b90ec273)
+
+`draw_wide_run()` in `kitty/screen.c` — the `draw_ascii_run` analog for
+CJK/emoji floods: line-confined (never wraps: the scalar path owns the
+DECAWM wrap and its segmentation-state re-derivation and multicell-nuke
+semantics), stop-early at anything it cannot replicate exactly, chunked
+stores (one GPUCell `memset_array` broadcast + a tight CPUCell pair
+loop). A **plain-wide fast class** (kana/CJK/fullwidth ranges) skips the
+per-char `char_props_for` + `grapheme_segmentation_step` chain — the
+serial state-machine dependency that dominates the scalar loop — via a
+steady-state theorem: once the segmentation state equals the plain
+constant, stepping any fast-class char returns that constant.
+
+The theorem is enforced by an **exhaustive checker**
+(`test_wide_runfill_fast_class` in fast_data_types, asserted by the
+fuzz): every admitted codepoint × every raw segmentation state must (a)
+never join, (b) land on `GBP_None`, and (c) be a steady-state fixpoint
+from the plain constant. During development it caught three real
+hazards — `step(AtStart, ·)` returns `add_to_current_cell=1` (synthetic
+pre-start state), emoji-context flag carry (an unconditional
+constant-write diverges on `[ExtPic][kanji][ZWJ][ExtPic]`), and
+U+3030/U+303D being Extended_Pictographic — which is the pattern to
+reuse: declare generous ranges, let the checker shrink them.
+
+Levers: `KITTY_DISABLE_WIDE_RUNFILL=1` (process) /
+`set_wide_runfill_enabled()` (in-process, differential fuzz). Fuzz
+extended with CJK-run corpora + wrap-parity/joiner adversarial cases,
+all arms compared against the both-fills-off scalar reference.
+
+Numbers (interleaved medians): `kitten __benchmark__` unicode **121.5 →
+129.8 MB/s (+6.8%)**, ascii unchanged (−0.6%, noise); `draw_text`
+self-time **−53%**; devlog-006 wall **1.0089× ≈ nil** (see US-402d).
+Goldens byte-identical both backends; suites at baseline both backends;
+MTL_DEBUG_LAYER clean.
+
+### Deferred / rejected with numbers (US-402b / US-402c)
+
+- **utf8 decoder (19.1% share): DEFER.** Isolated: scalar 0.32 /
+  simd-128 0.79 / simd-256 **0.96 GB/s** on Japanese (matches in-flood
+  effective ~1.0; the "avx2-emulated beats native-128 on ARM" upstream
+  note holds). ~2.5–3× headroom exists (ESC pre-scan via the existing
+  SIMD `find_either_of_two_bytes`, then a NEON-native UTF-8→UTF-32
+  kernel for the ESC-free span) but the goal metric is pipeline-bound
+  and the movable axis (`__benchmark__` unicode, where kitty already
+  leads ~2×) gains an estimated +8–12% for a high-risk rewrite of
+  upstream-hardened decode code.
+- **historybuf line steal/swap (~25% share): REJECT.** `LineBuf` and
+  `HistoryBuf` both use flat contiguous cell storage (line_map offsets /
+  ring arithmetic); swapping line buffers between them requires
+  per-line heap indirection in BOTH containers (resize / pagerhist /
+  serialization redesign) — fails the bounded-blast-radius bar, and the
+  goal metric is unaffected anyway.
+
+### The pipeline decomposition (US-402d — the phase's key finding)
+
+Three-way same-load-window devlog-006 interleave (medians): Alacritty
+**0.425 s** < kitty `input_delay=0` **0.470 s** < kitty default
+**0.498 s**. The default-config gap to Alacritty (**17.2%**) decomposes
+as:
+
+- **6.0% — the `input_delay` batching policy** (deliberate
+  energy/latency trade; fair to measure at defaults, wrong to silently
+  change).
+- **10.6% — structural**: kitty multiplexes parse+render on the main
+  thread (render-shape ≈ 6% of flood busy, plus io-thread→main-tick
+  handoff); Alacritty parses on a dedicated thread. Parse-CPU cuts
+  provably do not move this (US-402a: −53% draw self → 1.0089× wall;
+  vt-parser BUF_SZ is already 1 MiB).
+
+Consequences: (1) pipeline-bound axes are **backend-insensitive** —
+fresh same-window measurement has kitty-Metal 0.496 ≈ kitty-GL 0.500 on
+devlog-006, which retracts the earlier "Metal ~13% over GL on devlog"
+claim (load-window confounding; the backend's real wins are the
+latency / CPU-per-frame / memory axes, all same-binary anchored);
+(2) the named lever for the residual is the **render-thread split**
+(promoted in Future work); (3) adaptive input batching (skip the delay
+when saturated) would change flood-time energy policy — upstream/user
+decision, not a unilateral default flip.
+
+### vtebench (captured 2026-07-06, subset, median ms/sample)
+
+Alacritty 7 / 26 / 6, Ghostty 8 / 20 / 8, kitty-Metal **15 / 69 / 9**
+(dense_cells / scrolling / unicode). kitty trails on SGR-dense and
+scrolling patterns; the scrolling gap aligns with the profiled
+scroll-machinery share and is queued in Future work. Harness:
+`.omc/verify/phase8/p8_vtebench.py` (payload to the tty, results via
+`--dat --silent`).
+
 ## Final architecture (post-Phase-7 consolidation)
 
 The frame path is native end to end; the GL-name shim survives only where
@@ -1030,7 +1135,7 @@ condition. Updated as captures land.
 | 2 | passes/frame == 1 all configs, tile-load ≈ 0 | PASS | M1 single-pass layered; passes=1 in every stats capture since Wave 3 |
 | 3 | zero steady-state allocs | PASS (counters) / PARTIAL (formal) | D1 allocs=0 + tex_allocs=0 across captures; the formal 5-min Instruments soak not run (sanitized-env Instruments session pending) |
 | 4 | keypress→present p50 ≤ 9 ms (120 Hz), p99 ≤ 17 ms; sync=no p50 ≤ 3 ms | BLOCKED (Accessibility) | CGPreflightPostEventAccess=false; PTY proxy on 60 Hz: p50 ≈ 15 ms incl. input_delay+refresh. Also tracked: icat-transmitted GIF animations do not animate in ANY config (incl. legacy/kill-switch arms — pre-existing, not a phase regression; synthetic APC animation works) |
-| 5 | throughput ≥ 2× Phase-0 AND ≥ kitty-GL AND vtebench ≥ Ghostty −10% AND devlog-006 first | MIXED (measured) | 2×: documented shortfall (lever A/B 1.30×/1.20×; Phase-0 binary unrunnable). ≥ kitty-GL: **MET** (devlog-006 0.50–0.52 s vs 0.58; churn 52 vs 47 MB/s, same commit). devlog-006 first: **NOT MET** — Alacritty 0.436–0.443 < Ghostty 0.445–0.463 < kitty 0.504–0.516 (LOAD-DEGRADED 14–15.6, grids equalized; gap ≈ the profiled parser share). vtebench: not captured this batch |
+| 5 | throughput ≥ 2× Phase-0 AND ≥ kitty-GL AND vtebench ≥ Ghostty −10% AND devlog-006 first | MIXED (measured) | 2×: documented shortfall (lever A/B 1.30×/1.20×; Phase-0 binary unrunnable). ≥ kitty-GL: **MET** (Phase-8 same-window: devlog 0.496 vs 0.500, churn 52 vs 51 MB/s — backend-equal on this pipeline-bound axis; the earlier 13% Metal-over-GL devlog delta retracted as load-confounded). devlog-006 first: **NOT MET** — Alacritty 0.435 < Ghostty 0.484 < kitty 0.496 (2026-07-06 interleave); gap decomposed in Phase 8: 6.0% input_delay policy + 10.6% structural (parse/render multiplex), NOT parser CPU. vtebench: captured 2026-07-06 — **NOT MET** vs Ghostty (dense_cells 15 vs 8 ms, scrolling 69 vs 20 ms, unicode 9 vs 8 ms); gap analysis queued in Future work |
 | 6 | pixel goldens ≤ 1 LSB vs GL reference | PARTIAL (characterized) | Cross-backend capture landed (.omc/verify/phase7/xbackend_golden.py, occlusion-immune; Metal via DUMP — the Metal thumbnail read is racy, a known pre-existing screenshot-path issue — GL via thumbnail): same scene visually, backgrounds and sampled solid interiors byte-identical, but glyph/edge composition differs up to 89/255 on ~12% of pixels (delta spectrum 1→89, ink-mask flicker 4% at thr=8; a black-vs-33 sample rules out a pure transfer-function mismatch). Root-cause (text composition/AA curve vs subpixel placement) queued as follow-up; not adjudicable as ≤1 LSB today and not yet documented as a deliberate policy exception |
 | 7 | idle: blink-only presents, CPU < 0.3%, link paused | **PASS (formal)** | 60 s focused-idle capture: CPU 0.0% mean and max, presents beyond blink = 0 |
 | 8 | stability: suites, DEBUG_LAYER, 10-min flood soak RSS < 5% | **PASS** | 10-min visible churn soak: RSS +0.35% (117.9→118.3 MB), 35,248 presents at 16.67 ms median cadence, 4 frames > 2× median in 35 k (none alloc-attributable; max interval is the teardown artifact), LOAD-DEGRADED noted |
@@ -1039,19 +1144,26 @@ condition. Updated as captures land.
 
 ## Future work (consolidated queue)
 
-1. **Off-thread image decode** — the real icat-hitch lever (decode = 91.6%
+1. **Render-thread split (parse/render de-multiplexing)** — the Phase-8
+   headline lever: the structural 10.6% devlog residual vs Alacritty
+   (US-402d) plus the encode+upload offload named since Phase 5.
+2. **Off-thread image decode** — the real icat-hitch lever (decode = 91.6%
    of the 24 MB wall; .omc/verify/g4/FINDINGS.md).
-2. **Parser/decode throughput** — the devlog-006 gap to Alacritty (~15%)
-   lives here (~30% of flood time profiled); candidate levers: SIMD-fused
-   decode→draw, render thread for encode+upload.
-3. **Cross-backend composition difference** — §7 #6, tracked in
+3. **vtebench dense_cells/scrolling gap analysis** — kitty 15/69 ms vs
+   Alacritty 7/26 (Phase-8 capture); scrolling aligns with the
+   scroll-machinery share (historybuf line copy — the steal/swap redesign
+   rejected in US-402c would be its container-level fix).
+4. **utf8 decoder NEON kernel** — 0.96 GB/s today on Japanese, ~2.5–3×
+   headroom via ESC-prescan + dedicated UTF-8→UTF-32 kernel (US-402b
+   defer, numbers in P8-LEVERS.md).
+5. **Cross-backend composition difference** — §7 #6, tracked in
    .scratch/metal-gl-composition-diff/.
-4. **icat-GIF animation failure** — pre-existing, all configs; tracked in
+6. **icat-GIF animation failure** — pre-existing, all configs; tracked in
    .scratch/icat-gif-animation/.
-5. **Keypress→photon latency capture** — needs the Accessibility grant
+7. **Keypress→photon latency capture** — needs the Accessibility grant
    (§7 #4); PTY proxy stands in meanwhile.
-6. **Energy (powermetrics) + vtebench columns** — operator sudo + a quiet
-   machine (§7 #9, performance.rst table).
+8. **Energy (powermetrics)** — operator sudo + a quiet machine (§7 #9;
+   vtebench columns landed in Phase 8).
 
 ## Known deviations (tracked, intentional)
 

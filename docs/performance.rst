@@ -174,25 +174,51 @@ change under test is the only variable:
 - **1-line edit cost**: ≈ 2.2 KB uploaded per typed-character frame
   (dirty-row uploads), versus a full-grid upload previously.
 
-Same-machine comparison (Apple M3 Max, 100×30 cells, default configs,
-interleaved arms; **all runs under elevated system load (loadavg 10–15),
+Same-machine comparison (Apple M3 Max; kitty 0.47.4-dev, Alacritty
+0.17.0, Ghostty 1.3.1; 100×30 cells, default configs, interleaved arms,
+2026-07-06; **all runs under elevated system load (loadavg ≈ 8–14),
 flagged per protocol** — treat as indicative until quiet-machine
 replication):
 
-===============  ======================  ==========================
-Terminal         devlog-006 (54 MB JP)   full-grid churn drain
-===============  ======================  ==========================
-Alacritty        **0.436 – 0.443 s**     **≈ 62 MB/s**
-Ghostty          0.445 – 0.463 s         ≈ 48 MB/s
-kitty (Metal)    0.504 – 0.516 s         ≈ 52 MB/s
-kitty (OpenGL)   0.575 – 0.581 s         ≈ 47 MB/s
-===============  ======================  ==========================
+===============  =========================  ==========================
+Terminal         devlog-006 (54 MB JP)      full-grid churn drain
+===============  =========================  ==========================
+Alacritty        **0.435 s** (0.427–0.444)  **≈ 62 MB/s**
+Ghostty          0.484 s (0.446–0.767)      ≈ 47 MB/s
+kitty (Metal)    0.496 s (0.479–0.500)      ≈ 52 MB/s
+kitty (OpenGL)   0.500 s (0.499–0.512)      ≈ 51 MB/s
+===============  =========================  ==========================
 
-The Metal backend beats the OpenGL backend on the same commit by ~13% on
-devlog-006 and ~11% on churn drain. Alacritty currently leads the wide-character throughput
-test; the gap is concentrated in kitty's parser/decode stage (profiled
-at ~30% of flood time), which is the identified follow-up lever.
-vtebench and energy (powermetrics) columns will be added when captured.
+The devlog-006 gap decomposes cleanly (three-way interleave, medians):
+of kitty's **17.2%** deficit to Alacritty, **6.0%** is kitty's
+:opt:`input_delay` input-batching policy (a deliberate energy/latency
+trade — with ``input_delay 0`` kitty measures 0.470 s on the same
+workload) and the remaining **10.6%** is structural: kitty parses and
+renders on one thread where Alacritty parses on a dedicated thread.
+Parser-stage CPU is *not* the limiter — halving the draw-loop self-time
+moved this wall by under 1% — which is also why the Metal and OpenGL
+backends measure equal here: the pty→parse pipeline, not rendering,
+bounds this axis. (An earlier revision of this table showed Metal ~13%
+ahead of OpenGL on devlog-006; that delta does not reproduce under
+same-window interleaving and is attributed to load-window confounding.
+The backend's wins are on the latency, CPU-per-frame, and memory axes
+above, which are same-binary kill-switch-anchored.)
+
+`vtebench <https://github.com/alacritty/vtebench>`__ (subset, median
+ms per ~1 MiB sample, lower is better, same conditions):
+
+===============  ============  =========  ========
+Terminal         dense_cells   scrolling  unicode
+===============  ============  =========  ========
+Alacritty        7             26         6
+Ghostty          8             20         8
+kitty (Metal)    15            69         9
+===============  ============  =========  ========
+
+kitty trails on vtebench's SGR-dense and scrolling patterns; the
+scrolling gap aligns with the profiled scroll-machinery share
+(history-buffer line copy) and is queued for analysis. Energy
+(powermetrics) columns will be added when captured.
 
 Instrumenting kitty
 -----------------------
