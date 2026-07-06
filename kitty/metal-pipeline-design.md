@@ -1271,6 +1271,84 @@ handover switch → resize fast-path adaptation — with the harness, full
 suites, and goldens green at every stage boundary; before/after binary
 A/B for the numbers.
 
+## Phase 11 (Wave 11): three measure-first tracks — all pointed at one root
+
+Goal: attack the vtebench dense_cells deficit (15 ms vs Ghostty 9 /
+Alacritty 6), land off-thread image decode, and audit a parser thread.
+All three converged on the same root — kitty's threading model — and all
+three resolved as measure-first with the audit/finding as the
+deliverable rather than a lever landed this phase. Nothing was forced.
+
+### Track 1 — dense_cells is LOCK contention, not render (P11-0-FINDINGS.md)
+
+dense_cells main-thread render is 0.6%. Its busy CPU is **58.3% lock
+operations** (`pthread_mutex_lock` 14.2% + `__psynch_mutexwait` 12.1% +
+unlock 11.1% + `__psynch_mutexdrop` 7.4%, all-thread). Root cause: the
+vt-parser's single `self->lock` ping-pongs between the IO thread
+(`read_bytes` takes it twice per read — create + commit write buffer)
+and the main parse tick, and vtebench writes the SGR-per-cell payload in
+tiny per-char chunks → maximal lock-acquisition frequency. Verified
+workload-specific: the devlog cat-flood (large chunks) shows lock =
+0.1%. No bounded ≥10% small lever exists; the fix is a lock-free
+buffer handoff → folded into Track 3.
+
+### Track 2 — off-thread image decode: DEFER, reframed (P11-2-DECODE-DESIGN.md)
+
+`inflate_png_inner` is pure/thread-safe, but its graphics.c wrappers
+mutate shared LoadData + call `set_command_failed_response`, and
+`handle_add_command` couples decode with disk-cache + GPU upload + the
+APC response, runs in parse-worker context, and uses a SINGLE
+`currently_loading` slot. Design A (worker-decode, synchronous handoff)
+moves CPU not wall — worthless. Design B (deferred decode + deferred
+response) is a REAL win — and because icat sets quiet=1
+(`finish_command_response` returns NULL on success, graphics.c:880) it
+does NOT wait on a success ack, so the win plausibly includes the icat
+wall, not just the other-window hitch (an earlier "win ≈ 0" reading was
+retracted). But Design B needs an async image-load-QUEUE rewrite
+(in-flight queue, out-of-band error protocol, placement ordering,
+delete-during-decode races) whose blast radius rivals the parser-thread
+work and needs a heavy contention harness — its own phase. Deferred;
+what moves the icat WALL specifically is faster decode (libdeflate /
+SIMD unfilter), a separate optimization from decode LOCATION.
+
+### Track 3 — parser-thread feasibility audit: Design 2 GO, Design 1 NO-GO (P11-3-PARSER-AUDIT.md)
+
+The load-bearing fact: kitty's Screen is single-writer-BY-THREAD, not by
+lock — parse, render, and every Python Screen call are serialized on the
+main thread (`process_global_state`: resize→parse→render,
+child-monitor.c:1537-1549). No lock guards Screen; the 58% `self->lock`
+guards only the IO→main byte buffer. Render is not a pure reader
+(`screen_update_cell_data` clears is_dirty / marks lines clean,
+screen.c:3920-3957), and grman is read-modify-written by BOTH parse and
+render (screen.c:1826 vs 3835) — so any design that de-serializes
+inherits an unlocked dual-writer Screen whose torn/dropped-frame races
+are INVISIBLE to the converged-state harness (`scroll_semantics` via
+`as_text`).
+
+- **Design 1 (dedicated parser thread): NO-GO / DEFER.** Massive
+  multi-subsystem blast radius; behavior-identity UNPROVABLE (the
+  decisive races are golden-invisible; TSan proves race-freedom, not
+  frame-level identity); relocates the 58% onto the GIL (the parser
+  thread would `PyGILState_Ensure` around ~25 callback sites, contending
+  the main thread's Python) — may not even recover the win. Revisit only
+  after a deterministic intermediate-frame differential harness exists.
+- **Design 2 (lock-free SPSC IO→parser byte ring, parse stays
+  main-thread): GO — Phase 12.** ~200-400 lines in vt-parser.c +
+  read_bytes; zero change to Screen/render/Python/grman/GIL, so
+  parse/render/Python stay serialized and Screen ordering is byte-for-
+  byte identical → scroll_semantics + full suite PROVE identity. The one
+  new invariant (SPSC in-order, lossless, back-pressured) is local +
+  fuzz/TSan-testable. Directly deletes the measured dense_cells lock
+  fraction (the contended psynch waits alone = 19.5% of all-thread
+  busy); the gain is capped at the lock share since the real parse work
+  stays main-thread, but it is the largest PROVABLE lever. Architect
+  audit APPROVED.
+
+Phase 11 landed no product code (three numbers-backed measure-first
+verdicts); its deliverables are the three analyses + the Phase-12 plan
+(Design 2 SPSC handoff), which now carries a concrete, quantified
+motivation (58% of dense_cells busy) and a proven-safe shape.
+
 ## Final architecture (post-Phase-7 consolidation)
 
 The frame path is native end to end; the GL-name shim survives only where
@@ -1323,31 +1401,47 @@ condition. Updated as captures land.
 
 ## Future work (consolidated queue)
 
-1. ~~Ring-grid unification (O(1) scroll)~~ — **DONE in Phase 10** (the
-   slot-pool variant: scrolling 69 → 38 ms). Remaining scroll-side
-   follow-ups: the recycled-row memset (25% of the old profile,
-   semantically required — only a lazy-clear scheme could touch it) and
-   **vtebench dense_cells** (15 vs 6–9 ms, SGR-heavy, unattributed —
-   profile before acting; now the largest vtebench deficit).
-2. **Dedicated parser/reader thread** — the devlog residual fix,
-   quantified in Phase 9: kitty's pure pipeline (render off, delay 0)
-   drains at 45.4 ms/pass vs Alacritty's end-to-end 42.5 ms; the
-   io→main-tick handoff is the cost, not any per-stage CPU. (The
-   render-thread split variant is DEAD: ≤0.6% devlog / ≤0.4% scrolling,
-   Phase-9 gate.)
-3. **Off-thread image decode** — the real icat-hitch lever (decode = 91.6%
-   of the 24 MB wall; .omc/verify/g4/FINDINGS.md).
+1. **Phase 12 — lock-free SPSC IO→parser handoff** (Design 2, architect
+   audit-approved in Phase 11, P11-3-PARSER-AUDIT.md). Replaces the
+   vt-parser single-mutex byte handoff (58% of dense_cells busy — the
+   create/commit ping-pong under tiny writes) with a lock-free SPSC ring;
+   parse stays main-thread so Screen ordering is byte-for-byte identical
+   and scroll_semantics + the full suite PROVE identity. ~200-400 lines
+   in vt-parser.c + read_bytes; zero Screen/render/Python/GIL change.
+   Gate on: standalone ring fuzz/TSan harness, suites green, a
+   dense_cells re-profile showing the psynch waits gone, input_delay
+   latency unchanged. This is the identified next lever.
+2. ~~Dedicated parser/reader thread (Design 1)~~ — **NO-GO / DEFER**
+   (Phase-11 audit): behavior-identity is UNPROVABLE — the decisive
+   parse/render races (dirty-flag lost update, torn rows, grman
+   dual-writer) are invisible to the converged-state harness, and the
+   change relocates the 58% onto the GIL. Revisit only after a
+   deterministic intermediate-frame differential harness exists. (The
+   render-thread split variant is separately DEAD: ≤0.6% devlog / ≤0.4%
+   scrolling, Phase-9 gate.)
+3. **Off-thread image decode = async image-load QUEUE** (Phase-11 audit,
+   P11-2-DECODE-DESIGN.md) — removes the main-thread HITCH during a large
+   decode (and plausibly the icat wall, since icat is quiet=1 and does
+   not wait on a success ack). Requires an in-flight-load queue +
+   out-of-band error protocol + placement ordering + delete-during-decode
+   safety (a graphics-subsystem state-machine rewrite) — its own phase.
+   SEPARATELY, what moves the icat WALL specifically is a **faster decode**
+   (libdeflate / SIMD PNG unfilter) — decode speed, not decode location.
 4. **utf8 decoder NEON kernel** — 0.96 GB/s today on Japanese, ~2.5–3×
    headroom via ESC-prescan + dedicated UTF-8→UTF-32 kernel (US-402b
-   defer, numbers in P8-LEVERS.md). vtebench dense_cells (15 vs 7-8 ms)
-   remains unattributed — profile before acting.
-5. **Cross-backend composition difference** — §7 #6, tracked in
+   defer, numbers in P8-LEVERS.md).
+5. **~~vtebench dense_cells~~ ATTRIBUTED** (Phase 11): it is the
+   vt-parser lock contention above, not render or per-cell SGR cost —
+   fixed by item 1. The recycled-row memset from Phase 10 (scroll side,
+   ~25% of the old scroll profile, semantically required) remains a
+   lazy-clear-only follow-up.
+6. **Cross-backend composition difference** — §7 #6, tracked in
    .scratch/metal-gl-composition-diff/.
-6. **icat-GIF animation failure** — pre-existing, all configs; tracked in
+7. **icat-GIF animation failure** — pre-existing, all configs; tracked in
    .scratch/icat-gif-animation/.
-7. **Keypress→photon latency capture** — needs the Accessibility grant
+8. **Keypress→photon latency capture** — needs the Accessibility grant
    (§7 #4); PTY proxy stands in meanwhile.
-8. **Energy (powermetrics)** — operator sudo + a quiet machine (§7 #9;
+9. **Energy (powermetrics)** — operator sudo + a quiet machine (§7 #9;
    vtebench columns landed in Phase 8).
 
 ## Known deviations (tracked, intentional)
