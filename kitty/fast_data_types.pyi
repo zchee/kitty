@@ -1024,6 +1024,14 @@ def set_ascii_runfill_enabled(enabled: bool) -> bool:
     pass
 
 
+def set_wide_runfill_enabled(enabled: bool) -> bool:
+    pass
+
+
+def test_wide_runfill_fast_class() -> str | None:
+    pass
+
+
 def x11_window_id(os_window_id: int) -> int:
     pass
 
