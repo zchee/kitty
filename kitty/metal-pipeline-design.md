@@ -1596,7 +1596,14 @@ invariant enumeration).
    US-805 identity gates (both-backend suites, dump golden,
    MTL_DEBUG_LAYER) have raw logs committed under
    `.omc/verify/phase12/results/`; and the numbers above are re-measured
-   on the final FR-hardened binary.
+   on the final FR-hardened binary. `suite-metal-postfix.log` carries
+   one failure beyond the errors=2 zsh baseline
+   (`test_ssh_shell_integration`): proven environmental -- the machine's
+   PATH-first zsh is a zsh-master dev build that emits OSC 133
+   semantic-prompt marks natively (reproduced outside kitty in a
+   sandboxed probe; the assertion reads raw child bytes upstream of the
+   parser, and the branch touches nothing on that surface). Forensics:
+   `results/ssh-test-env-failure.md`.
 
 **Deterministic interleaving coverage** (kitty_tests/spsc_ring_check.c,
 demanded by both lanes): `VT_RING_TEST_HOOKS` step points in the header
