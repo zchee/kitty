@@ -1281,9 +1281,14 @@ deliverable rather than a lever landed this phase. Nothing was forced.
 
 ### Track 1 — dense_cells is LOCK contention, not render (P11-0-FINDINGS.md)
 
-dense_cells main-thread render is 0.6%. Its busy CPU is **58.3% lock
-operations** (`pthread_mutex_lock` 14.2% + `__psynch_mutexwait` 12.1% +
-unlock 11.1% + `__psynch_mutexdrop` 7.4%, all-thread). Root cause: the
+dense_cells main-thread render is 0.6%. Its busy CPU is **~55% lock
+operations** (all-thread, results/dense-symbol-histogram.json; the
+contended kernel waits within that — `__psynch_mutexwait`/`drop`, 9.3%
+of all samples — are load-sensitive, captured at loadavg 7.38, so the
+idle-machine figure is lower; the uncontended lock calls are load-robust
+CPU shares). A load-independent cross-check: io-thread busy is **19.9%
+on dense_cells vs 3.27% on the Phase-9 scrolling profile, ~6×**. Root
+cause: the
 vt-parser's single `self->lock` ping-pongs between the IO thread
 (`read_bytes` takes it twice per read — create + commit write buffer)
 and the main parse tick, and vtebench writes the SGR-per-cell payload in
@@ -1300,11 +1305,13 @@ mutate shared LoadData + call `set_command_failed_response`, and
 APC response, runs in parse-worker context, and uses a SINGLE
 `currently_loading` slot. Design A (worker-decode, synchronous handoff)
 moves CPU not wall — worthless. Design B (deferred decode + deferred
-response) is a REAL win — and because icat sets quiet=1
-(`finish_command_response` returns NULL on success, graphics.c:880) it
-does NOT wait on a success ack, so the win plausibly includes the icat
-wall, not just the other-window hitch (an earlier "win ≈ 0" reading was
-retracted). But Design B needs an async image-load-QUEUE rewrite
+response) is a REAL win — and because icat sets quiet=2
+(`GRT_quiet_silent`; `finish_command_response` returns NULL on BOTH
+success and error at quiet>1, graphics.c:880) it does NOT wait on any
+response, so the win plausibly includes the icat wall, not just the
+other-window hitch (an earlier "win ≈ 0" reading was retracted). The
+out-of-band error-response constraint applies to quiet≤1 clients, not
+icat. But Design B needs an async image-load-QUEUE rewrite
 (in-flight queue, out-of-band error protocol, placement ordering,
 delete-during-decode races) whose blast radius rivals the parser-thread
 work and needs a heavy contention harness — its own phase. Deferred;
@@ -1316,8 +1323,9 @@ SIMD unfilter), a separate optimization from decode LOCATION.
 The load-bearing fact: kitty's Screen is single-writer-BY-THREAD, not by
 lock — parse, render, and every Python Screen call are serialized on the
 main thread (`process_global_state`: resize→parse→render,
-child-monitor.c:1537-1549). No lock guards Screen; the 58% `self->lock`
-guards only the IO→main byte buffer. Render is not a pure reader
+child-monitor.c:1537-1549). No lock guards Screen; the ~55%-of-busy
+`self->lock` guards only the IO→main byte buffer. Render is not a pure
+reader
 (`screen_update_cell_data` clears is_dirty / marks lines clean,
 screen.c:3920-3957), and grman is read-modify-written by BOTH parse and
 render (screen.c:1826 vs 3835) — so any design that de-serializes
@@ -1328,7 +1336,7 @@ are INVISIBLE to the converged-state harness (`scroll_semantics` via
 - **Design 1 (dedicated parser thread): NO-GO / DEFER.** Massive
   multi-subsystem blast radius; behavior-identity UNPROVABLE (the
   decisive races are golden-invisible; TSan proves race-freedom, not
-  frame-level identity); relocates the 58% onto the GIL (the parser
+  frame-level identity); relocates the lock cost onto the GIL (the parser
   thread would `PyGILState_Ensure` around ~25 callback sites, contending
   the main thread's Python) — may not even recover the win. Revisit only
   after a deterministic intermediate-frame differential harness exists.
@@ -1347,7 +1355,8 @@ are INVISIBLE to the converged-state harness (`scroll_semantics` via
 Phase 11 landed no product code (three numbers-backed measure-first
 verdicts); its deliverables are the three analyses + the Phase-12 plan
 (Design 2 SPSC handoff), which now carries a concrete, quantified
-motivation (58% of dense_cells busy) and a proven-safe shape.
+motivation (~55% of dense_cells busy is the parser-lock ping-pong) and a
+proven-safe shape.
 
 ## Final architecture (post-Phase-7 consolidation)
 
@@ -1403,8 +1412,9 @@ condition. Updated as captures land.
 
 1. **Phase 12 — lock-free SPSC IO→parser handoff** (Design 2, architect
    audit-approved in Phase 11, P11-3-PARSER-AUDIT.md). Replaces the
-   vt-parser single-mutex byte handoff (58% of dense_cells busy — the
-   create/commit ping-pong under tiny writes) with a lock-free SPSC ring;
+   vt-parser single-mutex byte handoff (~55% of dense_cells busy — the
+   create/commit ping-pong under tiny writes; part is load-sensitive
+   contended waits) with a lock-free SPSC ring;
    parse stays main-thread so Screen ordering is byte-for-byte identical
    and scroll_semantics + the full suite PROVE identity. ~200-400 lines
    in vt-parser.c + read_bytes; zero Screen/render/Python/GIL change.
@@ -1415,14 +1425,14 @@ condition. Updated as captures land.
    (Phase-11 audit): behavior-identity is UNPROVABLE — the decisive
    parse/render races (dirty-flag lost update, torn rows, grman
    dual-writer) are invisible to the converged-state harness, and the
-   change relocates the 58% onto the GIL. Revisit only after a
+   change relocates the lock cost onto the GIL. Revisit only after a
    deterministic intermediate-frame differential harness exists. (The
    render-thread split variant is separately DEAD: ≤0.6% devlog / ≤0.4%
    scrolling, Phase-9 gate.)
 3. **Off-thread image decode = async image-load QUEUE** (Phase-11 audit,
    P11-2-DECODE-DESIGN.md) — removes the main-thread HITCH during a large
-   decode (and plausibly the icat wall, since icat is quiet=1 and does
-   not wait on a success ack). Requires an in-flight-load queue +
+   decode (and plausibly the icat wall, since icat is quiet=2 and does
+   not wait on any response). Requires an in-flight-load queue +
    out-of-band error protocol + placement ordering + delete-during-decode
    safety (a graphics-subsystem state-machine rewrite) — its own phase.
    SEPARATELY, what moves the icat WALL specifically is a **faster decode**
