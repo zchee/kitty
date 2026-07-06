@@ -188,8 +188,8 @@ kitty (Metal)    0.504 – 0.516 s         ≈ 52 MB/s
 kitty (OpenGL)   0.575 – 0.581 s         ≈ 47 MB/s
 ===============  ======================  ==========================
 
-The Metal backend beats the OpenGL backend by ~13% on both axes on the
-same commit. Alacritty currently leads the wide-character throughput
+The Metal backend beats the OpenGL backend on the same commit by ~13% on
+devlog-006 and ~11% on churn drain. Alacritty currently leads the wide-character throughput
 test; the gap is concentrated in kitty's parser/decode stage (profiled
 at ~30% of flood time), which is the identified follow-up lever.
 vtebench and energy (powermetrics) columns will be added when captured.

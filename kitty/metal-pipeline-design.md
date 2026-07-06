@@ -1037,6 +1037,22 @@ condition. Updated as captures land.
 | 9 | energy ≤ GL baseline | BLOCKED | powermetrics (operator sudo) + visibility |
 | 10 | 1-line edit ≤ 8 KB | PASS | D2: ≈ 2.2 KB/frame typing capture |
 
+## Future work (consolidated queue)
+
+1. **Off-thread image decode** — the real icat-hitch lever (decode = 91.6%
+   of the 24 MB wall; .omc/verify/g4/FINDINGS.md).
+2. **Parser/decode throughput** — the devlog-006 gap to Alacritty (~15%)
+   lives here (~30% of flood time profiled); candidate levers: SIMD-fused
+   decode→draw, render thread for encode+upload.
+3. **Cross-backend composition difference** — §7 #6, tracked in
+   .scratch/metal-gl-composition-diff/.
+4. **icat-GIF animation failure** — pre-existing, all configs; tracked in
+   .scratch/icat-gif-animation/.
+5. **Keypress→photon latency capture** — needs the Accessibility grant
+   (§7 #4); PTY proxy stands in meanwhile.
+6. **Energy (powermetrics) + vtebench columns** — operator sudo + a quiet
+   machine (§7 #9, performance.rst table).
+
 ## Known deviations (tracked, intentional)
 
 - Cell/graphics MSL shader *logic* is still the opus-era port; semantic drift
