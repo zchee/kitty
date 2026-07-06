@@ -1,0 +1,20 @@
+{
+ "plain_overflow": "VISIBLE+HISTORY(ansi):\n\u001b[mline0\n\u001b[mline1\n\u001b[mline2\n\u001b[mline3\n\u001b[mline4\n\u001b[mline5\n\u001b[mline6\n\u001b[mline7\n\u001b[m\u001b[mline8\n\u001b[mline9\n\u001b[mline10\n\u001b[mline11\n\nCURSOR: x=0 y=4\nPAGERHIST:\n",
+ "ring_wrap_eviction": "VISIBLE+HISTORY(ansi):\n\u001b[mevict0\n\u001b[mevict1\n\u001b[mevict2\n\u001b[mevict3\n\u001b[mevict4\n\u001b[mevict5\n\u001b[mevict6\n\u001b[mevict7\n\u001b[mevict8\n\u001b[mevict9\n\u001b[mevict10\n\u001b[mevict11\n\u001b[mevict12\n\u001b[m\u001b[mevict13\n\u001b[mevict14\n\nCURSOR: x=0 y=2\nPAGERHIST:\n\u001b[mevict0\r\n\u001b[mevict1\r\n\u001b[mevict2\r\n\u001b[mevict3\r\n\u001b[mevict4\r\n\u001b[mevict5\r\n\u001b[mevict6\r\n\u001b[mevict7\r\n\u001b[mevict8\r\n\u001b[mevict9\r\n",
+ "margins_small_region": "VISIBLE+HISTORY(ansi):\n\n\u001b[mreg6\n\u001b[mreg7\n\n\n\nCURSOR: x=0 y=0\nPAGERHIST:\n",
+ "margins_bottom_region": "VISIBLE+HISTORY(ansi):\n\n\n\u001b[mbot4\n\u001b[mbot5\n\n\nCURSOR: x=0 y=0\nPAGERHIST:\n",
+ "decawm_wrap_continued": "VISIBLE+HISTORY(ansi):\n\u001b[mAAAAAA\u001b[mAAAAAA\u001b[mAAAAAA\u001b[m\u001b[mAAAAA\n\u001b[mplain\n\u001b[mBBBBBB\u001b[mBBBBB\nCURSOR: x=5 y=3\nPAGERHIST:\n",
+ "wide_across_scroll": "VISIBLE+HISTORY(ansi):\n\u001b[m日本語x0\n\u001b[m日本語x1\n\u001b[m日本語x2\n\u001b[m\u001b[m日本語x3\n\u001b[m漢字漢字\u001b[m漢\n\u001b[mend日本\nCURSOR: x=7 y=3\nPAGERHIST:\n",
+ "wide_at_region_edge": "VISIBLE+HISTORY(ansi):\n\n\u001b[m字字字字字3\n\u001b[m字字字字字4\n\n\n\nCURSOR: x=0 y=0\nPAGERHIST:\n",
+ "reverse_index_margins": "VISIBLE+HISTORY(ansi):\n\u001b[mri0\n\u001b[m\u001b[mri1\n\u001b[mtop\n\n\u001b[mri2\n\u001b[mri5\n\nCURSOR: x=0 y=0\nPAGERHIST:\n",
+ "clear_screen_ed2": "VISIBLE+HISTORY(ansi):\n\u001b[med0\n\u001b[med1\n\u001b[med2\n\u001b[med3\n\u001b[m\u001b[mafter\n\n\n\n\nCURSOR: x=5 y=0\nPAGERHIST:\n",
+ "clear_scrollback_ed3": "VISIBLE+HISTORY(ansi):\n\n\n\n\n\u001b[mpost\nCURSOR: x=4 y=4\nPAGERHIST:\n",
+ "selection_across_scroll": "VISIBLE+HISTORY(ansi):\n\u001b[msel0\n\u001b[msel1\n\u001b[msel2\n\u001b[m\u001b[msel3\n\u001b[mmore1\n\u001b[mmore2\n\nCURSOR: x=0 y=3\nPAGERHIST:\n\nSELECTION: [\"sel2\\n\", \"sel3\"]",
+ "resize_grow_cols": "VISIBLE+HISTORY(ansi):\n\u001b[mgrow0 \u001b[mWWWWWW\n\u001b[mgrow1 \u001b[mWWWWWW\n\u001b[mgrow2 WWW\u001b[mWWW\n\u001b[mgrow3 WWW\u001b[mWWW\n\u001b[mgrow4 WWW\u001b[mWWW\n\u001b[mgrow5 WWW\u001b[mWWW\n\u001b[mgrow6 WWW\u001b[mWWW\n\u001b[m\u001b[mgrow7 WWW\u001b[mWWW\n\u001b[mgrow8 WWW\u001b[mWWW\n\nCURSOR: x=0 y=4\nPAGERHIST:\n\u001b[mgrow0 \u001b[mWWW\rWWW\n\u001b[mgrow1 \u001b[mWWW\rWWW\n",
+ "resize_shrink_cols": "VISIBLE+HISTORY(ansi):\n\u001b[mnk4x\u001b[myz\n\u001b[mshri\u001b[mnk5x\u001b[myz\n\u001b[mshri\u001b[mnk6x\u001b[myz\n\u001b[mshri\u001b[mnk7x\u001b[m\u001b[myz\n\u001b[mshri\u001b[mnk8x\u001b[myz\n\nCURSOR: x=0 y=4\nPAGERHIST:\n",
+ "resize_lines_both": "VISIBLE+HISTORY(ansi):\n\u001b[mrl0\n\u001b[mrl1\n\u001b[mrl2\n\u001b[mrl3\n\u001b[mrl4\n\u001b[mrl5\n\u001b[mrl6\n\u001b[mrl7\n\u001b[m\u001b[mrl8\n\u001b[mrl9\n\u001b[mmid\n\n\n\n\nCURSOR: x=3 y=2\nPAGERHIST:\n",
+ "resize_multicell_rewrap": "VISIBLE+HISTORY(ansi):\n\u001b[m広い文\u001b[m字の行\u001b[m\u001b[mです広\u001b[mい文字\u001b[mの行で\u001b[mす\n\u001b[mtail\nCURSOR: x=4 y=4\nPAGERHIST:\n",
+ "altscreen_roundtrip": "VISIBLE+HISTORY(ansi):\n\u001b[mmain0\n\u001b[mmain1\n\u001b[mmain2\n\u001b[mmain3\n\u001b[m\u001b[mmain4\n\u001b[mmain5\n\u001b[mmain6\n\u001b[mback\nCURSOR: x=4 y=3\nPAGERHIST:\n",
+ "insert_delete_lines": "VISIBLE+HISTORY(ansi):\n\u001b[mil0\n\u001b[m\u001b[mil1\n\u001b[mins\n\n\u001b[mdel\n\u001b[mil4\n\nCURSOR: x=3 y=3\nPAGERHIST:\n",
+ "sgr_colors_survive_history": "VISIBLE+HISTORY(ansi):\n\u001b[m\u001b[31mred\u001b[42mgreenbg\n\u001b[m\u001b[30mc0\n\u001b[m\u001b[31mc1\n\u001b[m\u001b[32mc2\n\u001b[m\u001b[33mc3\n\u001b[m\u001b[34mc4\n\u001b[m\u001b[m\u001b[35mc5\n\u001b[m\u001b[36mc6\n\u001b[m\u001b[37mc7\n\nCURSOR: x=0 y=3\nPAGERHIST:\n"
+}
