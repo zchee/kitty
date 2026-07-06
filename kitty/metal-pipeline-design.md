@@ -1362,35 +1362,54 @@ proven-safe shape.
 
 Status: LANDED (design gate: codex critic DESIGN-APPROVED with 4
 majors, all folded pre-implementation; ring + standalone proof harness
-at 2370c5899; swap at e856793ff).
+at 2370c5899; swap at e856793ff; final-review REJECTED verdicts fixed
+by the FR-1..FR-4 amendments below and re-measured).
 
-### Results (same-machine before/after interleave, 3 rounds, loadavg ≈ 4)
+### Results (same-machine before/after interleave, 3 full rounds on the final FR-hardened binary, loadavg 4.3–7.7 — elevated, flagged per protocol)
 
-- **dense_cells 15.0 → 10.0 ms (−33%)** — the phase target. The
+- **dense_cells 15.0 → 11.0 ms (−27%)** — the phase target (the
+  pre-hardening prototype measured 10.0 ms at loadavg ≈ 4; the
+  final protocol's fences cost ≤ 1 ms under elevated load). The
   re-profile confirms the mechanism, not just the number: contended
   psynch mutex waits **9.3% of all samples → 0.0%**, total lock ops
   **~55% → 0.1% of busy** (committed histograms:
   `.omc/verify/phase11/results/dense-symbol-histogram.json` before,
   `.omc/verify/phase12/results/dense-symbol-histogram-after.json`
   after). What remains on the profile is real parse work.
-- **`kitten __benchmark__` ascii 145 → 245 MB/s (+69%), unicode 131 →
-  202 MB/s (+54%)** — unexpected magnitude, same-window verified (the
-  before arm reproduces the published mutex-era numbers): the
-  create/commit/has_space mutex round-trips were throttling ingestion
-  on the flood path itself, not just dense_cells.
-- **vtebench scrolling 38 → 34 ms (−11%)** — the same lock overhead
+- **`kitten __benchmark__` ascii 141 → 238 MB/s (+69%), unicode 127 →
+  195 MB/s (+54%)** — unexpected magnitude, same-window verified in
+  every round (`.omc/verify/phase12/results/ab-*.json`; the earlier
+  quiet-machine capture read 145 → 245 / 131 → 202 — identical ratios,
+  ambient load shifted both arms): the create/commit/has_space mutex
+  round-trips were throttling ingestion on the flood path itself, not
+  just dense_cells.
+- **vtebench scrolling 39 → 35 ms (−10%)** — the same lock overhead
   removed from the scroll workload.
-- **devlog-006 0.458 → 0.465 s** — inside the round-to-round noise
-  band; the pipeline-bound model predicted neutrality.
-- **Input pacing unchanged**: under a 150 ms typing pattern both
-  binaries present exactly once per keystroke with identical p50 gap
-  (150.0 ms) — input_delay batching semantics preserved
-  (`.omc/verify/phase12/results/latency-proxy-*.json`).
-- Identity: both backends at suite baseline at the swap boundary;
-  scroll-semantics snapshots (goldens from the pre-ring binary)
-  byte-identical; Metal dump golden byte-identical; the standalone ring
-  harness (incl. the small-ring TSan variant with full-ring
-  transitions) race-free. Two tests that encoded the old linear
+- **devlog-006 neutral** — the 3-round A/B read after 0.586 vs before
+  0.515 s (+14%), but a devlog-only alternating-order recheck
+  (`results/devlog-recheck.json`) FLIPPED the direction (before 0.699
+  vs after 0.498 median at loadavg 12–14) and the matched-load rounds
+  are equal (0.466 vs 0.465 s): the apparent delta is load
+  confounding, exactly as the pipeline-bound model predicts
+  (suppressing the entire render path moves this wall 0.6%).
+- **Input pacing unchanged on the final binary**: under a 150 ms
+  typing pattern both binaries present exactly once per keystroke with
+  identical p50 gap (150.0 ms) — input_delay batching semantics
+  preserved. Zero-present (occluded) captures now fail the proxy run
+  and are quarantined under `results/failed/`, so the cited artifacts
+  are all valid (`.omc/verify/phase12/results/latency-proxy-*.json`).
+- Identity: both backends at suite baseline at the swap boundary AND
+  re-run on the final FR-hardened binary with raw logs committed
+  (`results/suite-{metal,gl}-postfix.log`: Ran 356, the only failures
+  are the documented environmental zsh/ssh ones; Go green;
+  scroll_semantics and ascii_runfill pass in-suite); scroll-semantics
+  snapshots (goldens from the pre-ring binary) byte-identical; Metal
+  dump golden byte-identical before-vs-after on the final binary with
+  the rendered content visually confirmed
+  (`results/dump-golden-postfix.log`, `-after.png`); MTL_DEBUG_LAYER
+  pure-render run clean (`results/mtl-debug-layer-postfix.log`); the
+  standalone ring harness (incl. the small-ring TSan variant with
+  full-ring transitions) race-free. Two tests that encoded the old linear
   buffer's transport granularity (full-write capacity single-window,
   OSC 52 pending split offsets) were updated to assert the actual
   contracts (exact byte accounting; flag pattern + reassembled
@@ -1428,6 +1447,8 @@ typedef struct VTInputRing {           // one per Parser, transport only
     alignas(64) _Atomic size_t head;   // producer-owned, monotonically increasing
     alignas(64) _Atomic size_t tail;   // consumer-owned, monotonically increasing
     alignas(64) _Atomic monotonic_t new_input_at;  // first-unabsorbed timestamp
+    alignas(64) _Atomic bool writer_parked;        // back-pressure waiter flag (FR-2)
+    alignas(64) size_t reserved_sz; bool reserve_active;  // producer-private
 } VTInputRing;                          // static_assert 64-byte separation
 ```
 
@@ -1435,12 +1456,11 @@ Indices are free-running (masked with `VT_RING_SZ-1` on access);
 `used = head - tail` is overflow-safe for size_t. Producer publishes
 with `store(head, release)` after the bytes are written; consumer reads
 `load(head, acquire)` before touching them (and symmetrically
-tail/release ↔ acquire for space). `new_input_at` is stored by the
-producer (only if currently 0) after the head publish and cleared by
-the consumer after a parse round — ordering rides the head/tail
-acquire-release edges, matching today's under-lock semantics. Precedent
-for the atomic style: the L5 `last_local_key_input_at`
-(child-monitor.c:29-30).
+tail/release ↔ acquire for space). `new_input_at` follows the FR-1
+covered-or-fail-open protocol below (the original "rides the
+acquire-release edges" formulation was rejected at the final review as
+unprovable). Precedent for the atomic style: the L5
+`last_local_key_input_at` (child-monitor.c:29-30).
 
 ### Protocol mapping (1:1 onto the enumerated invariants)
 
@@ -1530,6 +1550,66 @@ invariant enumeration).
    arena). The resident-memory envelope change (+1 MiB per parser) is
    deliberate and recorded.
 
+### Final-review amendments (two independent codex lanes, both REJECTED the first cut — converging findings, all fixed)
+
+1. **FR-1 — `new_input_at` was not linearized with byte publication.**
+   The first cut cleared with a used()==0 check followed by a blind
+   store(0): a publish landing between them left visible bytes with a
+   zero stamp, and the unconditional post-publish re-stamp could park a
+   stale value in an already-drained ring. Fix (vt-input-ring.h): the
+   consumer clears with a **CAS against the value it observed** while
+   the ring was observably empty, then **re-covers fail-open**
+   (stamp = now) if bytes became visible across the clear; the
+   producer's post-publish re-stamp is now behind a **seq_cst fence and
+   conditional on unconsumed bytes remaining** (fence-paired with the
+   clear, so exactly one side resolves each race: either the producer
+   sees the full drain and skips, or the consumer sees the re-stamp and
+   clears it). The contract is restated honestly: in every quiescent
+   state with pending bytes the stamp is non-zero and ≤ the oldest
+   byte's arrival; the only reachable transients are zero/older stamps,
+   which **open the input_delay gate early** — a missing stamp can
+   never delay parsing or lose bytes. The 150 ms pacing proxy re-run on
+   the fixed binary is unchanged (p50 150.0 both arms).
+2. **FR-2 — the full-ring POLLIN re-arm could lose its wakeup.** The
+   first cut set `write_space_created` from a pre-drain
+   `was_full` snapshot; a producer filling the ring after that snapshot
+   could park the IO thread (POLLIN off) while the consumer advanced
+   tail without waking it. Fix: a **`writer_parked` waiter flag with a
+   Dekker-style seq_cst fence pair** — the io thread parks via
+   `vt_ring_writer_arm_or_park` (publish flag → fence → re-check
+   space) before dropping POLLIN (child-monitor.c), and `run_worker`
+   unparks once per tick after all tail advances (fence → claim flag →
+   `write_space_created`). Either the parker's re-check sees the new
+   space, or the unpark sees the flag: a sleeping reader with freeable
+   space is unreachable. The unpark is per-tick, not per-drain, so no
+   fence lands in the per-escape consume loop.
+3. **FR-3 — release builds had lost the misuse guards.** The
+   double-reserve / over-commit checks were `assert()` (compiled out by
+   the macOS `-DNDEBUG` build); they are now unconditional
+   `VT_RING_MISUSE` (fprintf+abort), restoring the mutex-era fatal()
+   contract. The stale "thread safe, using an internal lock" comment on
+   the producer API (vt-parser.h) now states the SPSC contract.
+4. **FR-4 — evidence gaps.** `kitten __benchmark__` now runs in ALL
+   three A/B rounds (the first capture skipped round 2); zero-present
+   latency-proxy captures fail the run and are quarantined under
+   `results/failed/` instead of being written as normal data; the
+   US-805 identity gates (both-backend suites, dump golden,
+   MTL_DEBUG_LAYER) have raw logs committed under
+   `.omc/verify/phase12/results/`; and the numbers above are re-measured
+   on the final FR-hardened binary.
+
+**Deterministic interleaving coverage** (kitty_tests/spsc_ring_check.c,
+demanded by both lanes): `VT_RING_TEST_HOOKS` step points in the header
+let a single-threaded test run the peer role's steps at an exact
+protocol boundary. Five proofs run before the stress suite in every
+variant (plain/small/TSan×2): clear-races-publish (fail-open re-cover),
+clear-between-stamp-and-publish (fenced conditional re-stamp),
+no-stale-stamp-in-emptied-ring (re-stamp skip), park/unpark basics
+(claim-once, refuse-while-full), and fill-races-park (lost-wakeup
+impossibility, both resolutions). The stress consumer counts
+covered-or-fail-open transients instead of hard-asserting the
+(unprovable) absolute invariant — 0 observed across all variants.
+
 ### Staging and evidence plan
 
 1. Ring header + STANDALONE harness commit: real producer/consumer
@@ -1601,8 +1681,8 @@ condition. Updated as captures land.
 ## Future work (consolidated queue)
 
 1. ~~Lock-free SPSC IO→parser handoff~~ — **DONE in Phase 12**
-   (dense_cells 15 → 10 ms, `__benchmark__` ascii +69% / unicode +54%,
-   scrolling 38 → 34 ms, psynch waits 9.3% → 0.0%, pacing unchanged).
+   (dense_cells 15 → 11 ms, `__benchmark__` ascii +69% / unicode +54%,
+   scrolling 39 → 35 ms, psynch waits 9.3% → 0.0%, pacing unchanged).
 2. ~~Dedicated parser/reader thread (Design 1)~~ — **NO-GO / DEFER**
    (Phase-11 audit): behavior-identity is UNPROVABLE — the decisive
    parse/render races (dirty-flag lost update, torn rows, grman

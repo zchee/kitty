@@ -159,11 +159,12 @@ change under test is the only variable:
   presentation path, down from ≈ 26 ms with the synchronous present and
   ≈ 64–79 ms with the original display-link pacing — and the ~200 ms
   link-resume tail is gone entirely.
-- **Throughput** (``kitten __benchmark__ --render``): ASCII ≈ **245 MB/s**
-  and Unicode ≈ **202 MB/s** at 100×30 after the lock-free input handoff
+- **Throughput** (``kitten __benchmark__ --render``): ASCII ≈ **238 MB/s**
+  and Unicode ≈ **195 MB/s** at 100×30 after the lock-free input handoff
   (+69% / +54% over the mutex-handoff binary in a same-machine
   interleave — the io-thread↔parser mutex ping-pong was throttling
-  ingestion itself). Before that handoff the run-fill work had brought
+  ingestion itself; an earlier quiet-machine capture read ≈ 245/202 with
+  identical ratios). Before that handoff the run-fill work had brought
   ASCII to ≈ 147 MB/s (batched ASCII run-fill, 1.30× over fill-disabled)
   and Unicode to ≈ 130 MB/s (batched width-2 run fill, +6.8%).
 - **Flood behavior**: sustained full-screen updates encode at the display
@@ -222,10 +223,11 @@ Terminal         dense_cells   scrolling  unicode
 ===============  ============  =========  ========
 Alacritty        6             24         7
 Ghostty          9             20         7
-kitty (Metal)    **10**        **34**     9
+kitty (Metal)    **11**        **35**     9
 ===============  ============  =========  ========
 
-(kitty cells re-measured 2026-07-06 after the lock-free input handoff;
+(kitty cells re-measured 2026-07-06 on the final race-hardened
+lock-free handoff binary, loadavg 4.3–7.7 flagged per protocol;
 competitor cells are the earlier same-machine capture — nothing changed
 on their side.)
 
@@ -234,12 +236,12 @@ work: kitty's visible screen and scrollback share a slot pool and
 scrolling moves lines between them by slot id — a pointer-sized swap —
 instead of copying ~32 bytes/cell into the scrollback ring; that took
 the earlier 69 ms baseline to 38 ms (−40%), and the input-handoff work
-below took it to 34 ms. The dense_cells column is the **lock-free
+below took it to ≈ 35 ms. The dense_cells column is the **lock-free
 SPSC input handoff**: profiling showed ~55% of dense_cells busy CPU was
 a single io-thread↔parser mutex being acquired twice per tiny read;
 replacing that handoff with a lock-free ring (parse stays on the main
 thread, so screen-update ordering is provably unchanged) measured
-**15 → 10 ms (−33%)** in a same-machine interleave, with the contended
+**15 → 11 ms (−27%)** in a same-machine interleave, with the contended
 mutex kernel waits gone from the profile entirely (9.3% of all samples
 → 0.0%). The remaining scrolling gap to Ghostty/Alacritty is the
 recycled-row clear (memset, required in any design) plus the draw path.
