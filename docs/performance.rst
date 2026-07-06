@@ -162,7 +162,8 @@ change under test is the only variable:
 - **Throughput** (``kitten __benchmark__ --render``): ASCII ≈ 147 MB/s
   and ASCII+scrollback ≈ 111 MB/s at 100×30 after the batched ASCII
   run-fill (1.30×/1.20× over the same binary with the fill disabled);
-  Unicode ≈ 121 MB/s unchanged.
+  Unicode ≈ 130 MB/s after the batched width-2 run fill (+6.8% over the
+  fill-disabled arm; it was ≈ 121 MB/s before).
 - **Flood behavior**: sustained full-screen updates encode at the display
   refresh rate (cadence p50 = p99 = 16.67 ms at 60 Hz) instead of
   free-running, with zero transient buffer or texture allocations per
