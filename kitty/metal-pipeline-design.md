@@ -1158,6 +1158,85 @@ pagerhist, multicell interplay) queued at the top of Future work with
 these numbers. Landed artifact: the suppression lever (standing tool for
 render-cost upper bounds).
 
+## Phase 10 (Wave 10): O(1) scroll via a shared line-slot pool — design
+
+Status: DESIGN (implementation gated on architect design approval; this
+section gains results + adjudication when the phase closes). Target: the
+Phase-9-attributed scroll-copy machinery (~70% of vtebench-scrolling
+CPU: memmove 44.5% under `historybuf_add_line` + memset 25.4% under
+`screen_index`; also ~25% of cat-flood main-thread busy).
+
+### The audit finding that shapes the design
+
+`cpu_lineptr`/`gpu_lineptr` never escape line-buf.c / history.c (zero
+external references). The complete raw-member escape list (design-gate
+review closed it at exactly two): `remap_hyperlink_ids`
+(hyperlink.c:102-103) walks both linebufs' `cpu_cell_buf` as one flat
+array — the one true cross-line contiguity consumer, rewritten per-line
+in stage 1 (cold GC path) — and the same-dims resize fast path
+(resize.c:258-261) whose map/attrs/cell block memcpys become per-line
+copies into the dest's own slots (slot ids must not cross pools). Every
+other consumer goes through index-addressed view APIs (`*_init_line`
+and friends: screen.c ×39, resize.c ×14, shaders.c ×2, lineops.h ×3),
+Line views are short-lived, paused_rendering holds a deep clone,
+selection tracks coordinates. LineBuf already has per-line index
+indirection (`line_map[visual] = physical`). Storage addressing is
+therefore already encapsulated: the containers' internals can change
+without touching the 58 call sites.
+(Full enumeration: `.omc/verify/phase10/P10-0-AUDIT.md`.)
+
+### Selected design: shared line-slot pool ("a-prime")
+
+One pool per Screen: line slots (cpu[xnum]+gpu[xnum]) in 2048-line
+slabs with stable addresses (history's existing segment allocation
+pattern); slot id (u32) → (slab, offset). `LineBuf.line_map[y]` holds a
+pool slot id instead of a block-local index — same semantics, wider
+domain. HistoryBuf replaces its segments with a ring of slot ids (+
+attrs by value, as today). Scroll eviction becomes a **slot handover**
+(new internal API used by INDEX_UP; the copy-based `historybuf_add_line`
+remains for rewrap-style callers):
+
+- forward push where the ring position holds an allocated spare slot
+  (left by a prior reverse-scroll pop, or the recycled tail after
+  `pagerhist_push` when full): SWAP — 1:1 exchange, no free-list,
+  count-only shrink.
+- forward push onto a never-allocated position: the pool provides a
+  fresh slot for linebuf (slab growth, monotone up to lb.ynum + history
+  capacity — today's memory envelope).
+- reverse scroll keeps today's COPY semantics (verified: `_reverse_scroll`
+  pops a view, the slot stays owned by history as the spare, the content
+  is copied out) — cold path, zero ownership transfer, zero leaks.
+- Zero cell memmove on every scroll path. The recycled-row memset stays
+  in ANY design (a new row must read blank; Alacritty clears too) — the
+  honest floor is therefore ≈38–40 ms on vtebench scrolling (memset
+  ≈17.5 ms survives), below the PRD's ≤35 ms wording; the shortfall
+  will be recorded plainly. Cat-flood wall: −4–6% expected.
+
+Pool ownership: one pool per (main_linebuf, historybuf) group — the
+only pair exchanging slots. Alt linebuf, the paused_rendering clone,
+resize temporaries, and standalone Python containers use private pools;
+resize frees the old pool with the old containers; main↔alt toggle
+never crosses pools.
+
+Rejected alternative: full ring-grid unification (visible screen as a
+window over one ring) — identical payoff (the memset survives there
+too) at 3–4× the radius (scrollback y-semantics leak into as_text/
+pager/selection; rewrap loses container symmetry; the standalone
+Python LineBuf/HistoryBuf test surface breaks).
+
+### Identity strategy and staging
+
+A kill switch is infeasible (container layout is one-or-the-other), so
+behavior identity rests on (1) a differential scroll-semantics harness
+committed BEFORE any container change, with pre-change-binary behavior
+snapshots (scroll regions/margins, rewrap grow/shrink, pager +
+pagerhist, multicell across the scroll boundary, selection tracking,
+ring-wrap eviction, reverse scroll, ED2/ED3); (2) staged landing —
+pool module → LineBuf on pool → HistoryBuf on pool (still copying) →
+handover switch → resize fast-path adaptation — with the harness, full
+suites, and goldens green at every stage boundary; before/after binary
+A/B for the numbers.
+
 ## Final architecture (post-Phase-7 consolidation)
 
 The frame path is native end to end; the GL-name shim survives only where
