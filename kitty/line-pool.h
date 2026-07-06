@@ -17,6 +17,10 @@
 
 #include "line.h"
 
+// slab capacity for pools that grow with scrollback (the granularity the
+// history segments had); private single-container pools size exactly
+#define LINE_POOL_DEFAULT_SLAB 2048u
+
 typedef struct LineSlotSlab {
     CPUCell *cpu;
     GPUCell *gpu;

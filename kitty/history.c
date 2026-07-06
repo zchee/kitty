@@ -106,7 +106,7 @@ pagerhist_clear(HistoryBuf *self) {
 }
 
 static HistoryBuf*
-create_historybuf(PyTypeObject *type, unsigned int xnum, unsigned int ynum, unsigned int pagerhist_sz, TextCache *tc) {
+create_historybuf(PyTypeObject *type, unsigned int xnum, unsigned int ynum, unsigned int pagerhist_sz, TextCache *tc, LineSlotPool *pool) {
     if (xnum == 0 || ynum == 0) {
         PyErr_SetString(PyExc_ValueError, "Cannot create an empty history buffer");
         return NULL;
@@ -115,7 +115,8 @@ create_historybuf(PyTypeObject *type, unsigned int xnum, unsigned int ynum, unsi
     if (self != NULL) {
         self->xnum = xnum;
         self->ynum = ynum;
-        self->pool = line_slot_pool_alloc(xnum, SEGMENT_SIZE);
+        if (pool) { line_slot_pool_incref(pool); self->pool = pool; }
+        else self->pool = line_slot_pool_alloc(xnum, SEGMENT_SIZE);
         if (!self->pool) { Py_CLEAR(self); PyErr_NoMemory(); return NULL; }
         ensure_position(self, 0);  // first chunk upfront, as the first segment was
         self->text_cache = tc_incref(tc);
@@ -132,7 +133,7 @@ new_history_object(PyTypeObject *type, PyObject *args, PyObject UNUSED *kwds) {
     if (!PyArg_ParseTuple(args, "II|I", &ynum, &xnum, &pagerhist_sz)) return NULL;
     TextCache *tc = tc_alloc();
     if (!tc) return PyErr_NoMemory();
-    HistoryBuf *ans = create_historybuf(type, xnum, ynum, pagerhist_sz, tc);
+    HistoryBuf *ans = create_historybuf(type, xnum, ynum, pagerhist_sz, tc, NULL);
     tc_decref(tc);
     return (PyObject*)ans;
 }
@@ -189,6 +190,11 @@ historybuf_is_line_continued(HistoryBuf *self, index_type lnum) {
 
 bool
 history_buf_endswith_wrap(HistoryBuf *self) {
+    // count guard: an empty buffer has no newest line. The pre-pool
+    // layout returned false here by luck (cleared storage was always
+    // freshly zeroed); with pooled slots, clear keeps slot contents, so
+    // reading position 0 ungated would leak a stale wrap flag.
+    if (!self->count) return false;
     return cpu_lineptr(self, index_of(self, 0))[self->xnum-1].next_char_was_wrapped;
 }
 
@@ -640,7 +646,11 @@ PyTypeObject HistoryBuf_Type = {
 INIT_TYPE(HistoryBuf)
 
 HistoryBuf *alloc_historybuf(unsigned int lines, unsigned int columns, unsigned int pagerhist_sz, TextCache *tc) {
-    return create_historybuf(&HistoryBuf_Type, columns, lines, pagerhist_sz, tc);
+    return create_historybuf(&HistoryBuf_Type, columns, lines, pagerhist_sz, tc, NULL);
+}
+
+HistoryBuf *alloc_historybuf_with_pool(unsigned int lines, unsigned int columns, unsigned int pagerhist_sz, TextCache *tc, LineSlotPool *pool) {
+    return create_historybuf(&HistoryBuf_Type, columns, lines, pagerhist_sz, tc, pool);
 }
 
 // }}}
@@ -667,11 +677,31 @@ historybuf_next_dest_line(HistoryBuf *self, ANSIBuf *as_ansi_buf, Line *src_line
 }
 
 HistoryBuf*
-historybuf_alloc_for_rewrap(unsigned int columns, HistoryBuf *self) {
+historybuf_alloc_for_rewrap(unsigned int columns, HistoryBuf *self, LineSlotPool *pool) {
     if (!self) return NULL;
-    HistoryBuf *ans = alloc_historybuf(self->ynum, columns, 0, self->text_cache);
+    HistoryBuf *ans = pool ? alloc_historybuf_with_pool(self->ynum, columns, 0, self->text_cache, pool)
+                           : alloc_historybuf(self->ynum, columns, 0, self->text_cache);
     if (ans) { ans->count = 0; ans->start_of_data = 0; }  // positions grow on demand
     return ans;
+}
+
+void
+historybuf_take_line_from(HistoryBuf *self, LineBuf *lb, index_type lb_y, ANSIBuf *as_ansi_buf) {
+    // O(1) scroll eviction: swap slot ids instead of copying cells. Both
+    // containers must share one pool (wired at Screen creation/resize).
+    // historybuf_push handles the ring advance and renders the oldest
+    // line into pagerhist BEFORE its position is reused, exactly as the
+    // copying add_line did; the spare slot previously at the ring
+    // position moves to the linebuf row, whose stale content the
+    // caller's linebuf_clear_line memset erases (required in any design).
+    if (UNLIKELY(self->pool != lb->pool)) fatal("slot handover between containers with different pools");
+    bool needs_clear;
+    index_type idx = historybuf_push(self, as_ansi_buf, &needs_clear);
+    ensure_position(self, idx);
+    const index_type evicted = lb->line_map[lb_y];
+    lb->line_map[lb_y] = self->slot_ring[idx];
+    self->slot_ring[idx] = evicted;
+    self->attrs_ring[idx] = lb->line_attrs[lb_y];
 }
 
 void

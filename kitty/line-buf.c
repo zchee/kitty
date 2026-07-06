@@ -122,7 +122,7 @@ clear(LineBuf *self, PyObject *a UNUSED) {
 }
 
 LineBuf *
-alloc_linebuf_(PyTypeObject *cls, unsigned int lines, unsigned int columns, TextCache *text_cache) {
+alloc_linebuf_(PyTypeObject *cls, unsigned int lines, unsigned int columns, TextCache *text_cache, LineSlotPool *pool) {
     if (columns > 5000 || lines > 50000) {
         PyErr_SetString(PyExc_ValueError, "Number of rows or columns is too large.");
         return NULL;
@@ -138,10 +138,12 @@ alloc_linebuf_(PyTypeObject *cls, unsigned int lines, unsigned int columns, Text
     if (self != NULL) {
         self->xnum = columns;
         self->ynum = lines;
-        // Cell storage lives in the slot pool; the private pool's slab is
-        // sized exactly for this container (shared pools use
-        // history-segment-sized slabs and grow with scrollback).
-        self->pool = line_slot_pool_alloc(columns, lines);
+        // Cell storage lives in the slot pool; a private pool's slab is
+        // sized exactly for this container, while a shared pool (with the
+        // paired HistoryBuf, for the slot handover on scroll) uses
+        // history-segment-sized slabs and grows with scrollback.
+        if (pool) { line_slot_pool_incref(pool); self->pool = pool; }
+        else self->pool = line_slot_pool_alloc(columns, lines);
         self->line_map = self->pool ? PyMem_Calloc(1, lines * (sizeof(index_type) + sizeof(index_type) + sizeof(LineAttrs))) : NULL;
         if (!self->line_map) { line_slot_pool_decref(self->pool); self->pool = NULL; Py_CLEAR(self); return NULL; }
         self->scratch = self->line_map + lines;
@@ -164,7 +166,7 @@ new_linebuf_object(PyTypeObject *type, PyObject *args, PyObject UNUSED *kwds) {
     if (!PyArg_ParseTuple(args, "II", &ynum, &xnum)) return NULL;
     TextCache *tc = tc_alloc();
     if (!tc) return PyErr_NoMemory();
-    PyObject *ans = (PyObject*)alloc_linebuf_(type, ynum, xnum, tc);
+    PyObject *ans = (PyObject*)alloc_linebuf_(type, ynum, xnum, tc, NULL);
     tc_decref(tc);
     return ans;
 }
@@ -656,4 +658,7 @@ rewrap(LineBuf *self, PyObject *args) {
 
 
 LineBuf *
-alloc_linebuf(unsigned int lines, unsigned int columns, TextCache *tc) { return alloc_linebuf_(&LineBuf_Type, lines, columns, tc); }
+alloc_linebuf(unsigned int lines, unsigned int columns, TextCache *tc) { return alloc_linebuf_(&LineBuf_Type, lines, columns, tc, NULL); }
+
+LineBuf*
+alloc_linebuf_with_pool(unsigned int lines, unsigned int columns, TextCache *tc, LineSlotPool *pool) { return alloc_linebuf_(&LineBuf_Type, lines, columns, tc, pool); }

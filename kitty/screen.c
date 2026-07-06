@@ -138,9 +138,14 @@ new_screen_object(PyTypeObject *type, PyObject *args, PyObject UNUSED *kwds) {
         self->test_child = test_child; Py_INCREF(test_child);
         self->cursor = alloc_cursor();
         self->color_profile = alloc_color_profile();
-        self->main_linebuf = alloc_linebuf(lines, columns, self->text_cache); self->alt_linebuf = alloc_linebuf(lines, columns, self->text_cache);
+        // main linebuf and historybuf share one slot pool so scroll can
+        // move lines between them by slot id (O(1)) instead of copying
+        LineSlotPool *pool = line_slot_pool_alloc(columns, LINE_POOL_DEFAULT_SLAB);
+        self->main_linebuf = pool ? alloc_linebuf_with_pool(lines, columns, self->text_cache, pool) : NULL;
+        self->alt_linebuf = alloc_linebuf(lines, columns, self->text_cache);
         self->linebuf = self->main_linebuf;
-        self->historybuf = alloc_historybuf(MAX(scrollback, lines), columns, OPT(scrollback_pager_history_size), self->text_cache);
+        self->historybuf = pool ? alloc_historybuf_with_pool(MAX(scrollback, lines), columns, OPT(scrollback_pager_history_size), self->text_cache, pool) : NULL;
+        line_slot_pool_decref(pool);  // the containers hold their own refs
         self->main_grman = grman_alloc(false);
         self->alt_grman = grman_alloc(false);
         self->active_hyperlink_id = 0;
@@ -2422,8 +2427,7 @@ screen_cursor_to_column(Screen *self, unsigned int column) {
     INDEX_GRAPHICS(-1) \
     if (add_to_history) { \
         /* Only add to history when no top margin has been set */ \
-        linebuf_init_line(self->linebuf, bottom); \
-        historybuf_add_line(self->historybuf, self->linebuf->line, &self->as_ansi_buf); \
+        historybuf_take_line_from(self->historybuf, self->linebuf, bottom, &self->as_ansi_buf); \
         self->history_line_added_count++; \
         if (self->last_visited_prompt.is_set) { \
             if (self->last_visited_prompt.scrolled_by < self->historybuf->count) self->last_visited_prompt.scrolled_by++; \
