@@ -1118,11 +1118,15 @@ main-CPU-bound, unlike the cat-flood): memmove **44.5%** (93% under
 scroll-copy machinery is ~70%**; draw_text 6.9%; render-encode +
 render-shape **0.36%**.
 
-**Verdict: the render-thread split is dead on both axes** — a perfect
-split buys ≤0.6% on devlog and ≤0.4% on scrolling. Rejected with
-numbers, closing the Future-work #1 hypothesis. The de-multiplex framing
-was wrong: kitty's main thread is not render-starved; on floods it is
-41% idle (pipeline-bound) and on scrolling it is copy-bound.
+**Verdict: the render-thread split is dead on both measured throughput
+axes** — a perfect split buys ≤0.6% on devlog and ≤0.4% on scrolling,
+and the suppression lever OVER-estimates a real split (which still pays
+main-thread snapshot/handoff and drives the display link), so the true
+ceiling is lower still. Interactive-latency and animation-pacing effects
+were not measured (outside this phase's throughput charter). Rejected
+with numbers, closing the Future-work #1 hypothesis. The de-multiplex
+framing was wrong: kitty's main thread is not render-starved; on floods
+it is 41% idle (pipeline-bound) and on scrolling it is copy-bound.
 
 ### Every alternative lever, dispositioned
 

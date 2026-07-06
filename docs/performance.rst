@@ -202,7 +202,9 @@ render path entirely (a test lever that skips shaping, upload, encode
 and present) moves the default-config wall by only **0.6%**. Even with
 rendering fully off *and* ``input_delay 0``, kitty's pty→parse drain
 (45.4 ms per 5.4 MB pass) is slower than Alacritty's entire loop
-(42.5 ms, rendering included): the residual is the io-thread→main-tick
+(42.5 ms, rendering included; captured in an earlier same-machine
+interleave whose kitty anchors reproduce within 0.5% across the two
+measurement windows): the residual is the io-thread→main-tick
 handoff architecture itself, not any per-stage CPU. That is also why the
 Metal and OpenGL backends measure equal here. (An earlier revision of this table showed Metal ~13%
 ahead of OpenGL on devlog-006; that delta does not reproduce under
