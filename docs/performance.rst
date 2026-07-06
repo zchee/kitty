@@ -227,9 +227,10 @@ The scrolling column is the line-storage redesign landing: kitty's
 visible screen and scrollback now share a slot pool and scrolling moves
 lines between them by slot id — a pointer-sized swap — instead of
 copying ~32 bytes/cell into the scrollback ring. That removed the
-memmove that was 44.5% of scrolling CPU (median 69 → 38 ms, −45%, with
-1.7× more benchmark samples completing per run; the same-machine
-before/after interleave measured 63 → 38 ms). The remaining gap to
+memmove that was 44.5% of scrolling CPU: the same-machine before/after
+interleave measured **63 → 38 ms (−40%)** with 1.7× more benchmark
+samples completing per run (the earlier cross-session baseline was
+69 ms). The remaining gap to
 Ghostty/Alacritty is the recycled-row clear (memset, required in any
 design) plus the draw path, and dense_cells (SGR-heavy, unattributed)
 is now the largest vtebench deficit. devlog-006 is unchanged by this
