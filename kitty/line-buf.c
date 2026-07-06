@@ -21,7 +21,12 @@ LineSlotPool*
 line_slot_pool_alloc(index_type xnum, index_type slab_capacity) {
     LineSlotPool *pool = calloc(1, sizeof(LineSlotPool));
     if (!pool) return NULL;
-    pool->xnum = xnum; pool->slab_capacity = MAX(1u, slab_capacity); pool->refcnt = 1;
+    pool->xnum = xnum; pool->refcnt = 1;
+    // round up to a power of two: the hot lineptr math becomes
+    // shift+mask (a runtime division here cost ~2% draw throughput)
+    index_type cap = 1; uint8_t shift = 0;
+    while (cap < MAX(1u, slab_capacity)) { cap <<= 1; shift++; }
+    pool->slab_capacity = cap; pool->slab_shift = shift; pool->slab_mask = cap - 1;
     return pool;
 }
 

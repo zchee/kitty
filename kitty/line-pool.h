@@ -29,10 +29,13 @@ typedef struct LineSlotSlab {
 
 typedef struct LineSlotPool {
     index_type xnum;
-    // slab capacity in slots, fixed per pool: sized exactly for
-    // single-container private pools, history-segment-sized (2048) for
-    // pools that grow with scrollback
+    // slab capacity in slots, fixed per pool and rounded up to a power
+    // of two so the hot slot->address math is shift+mask, not division:
+    // sized for the container on single-container private pools,
+    // history-segment-sized (2048) for pools that grow with scrollback
     index_type slab_capacity;
+    uint8_t slab_shift;
+    index_type slab_mask;
     unsigned refcnt;
     size_t num_slabs, slots_used;
     LineSlotSlab *slabs;
@@ -47,10 +50,10 @@ index_type line_slot_pool_take(LineSlotPool *pool);
 
 static inline CPUCell*
 pool_cpu_lineptr(const LineSlotPool *pool, index_type slot) {
-    return pool->slabs[slot / pool->slab_capacity].cpu + (size_t)(slot % pool->slab_capacity) * pool->xnum;
+    return pool->slabs[slot >> pool->slab_shift].cpu + (size_t)(slot & pool->slab_mask) * pool->xnum;
 }
 
 static inline GPUCell*
 pool_gpu_lineptr(const LineSlotPool *pool, index_type slot) {
-    return pool->slabs[slot / pool->slab_capacity].gpu + (size_t)(slot % pool->slab_capacity) * pool->xnum;
+    return pool->slabs[slot >> pool->slab_shift].gpu + (size_t)(slot & pool->slab_mask) * pool->xnum;
 }
