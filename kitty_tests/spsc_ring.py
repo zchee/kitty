@@ -5,8 +5,11 @@
 # (kitty/vt-input-ring.h) with real producer/consumer threads: in-order
 # lossless delivery (seeded stream compare), back-pressure without loss
 # (max_used == capacity + producer zero-windows + deterministic consumer
-# stalls), wrap-around, partial writes, and the design-review MAJOR-1
-# timestamp invariant (bytes visible => new_input_at != 0). Two builds
+# stalls), wrap-around, partial writes, and the FR-1
+# covered-or-fail-open timestamp contract (quiescent pending bytes are
+# covered; reachable transients can only open the input_delay gate
+# early - each racy resolution path is pinned by the deterministic
+# interleaving proofs in spsc_ring_check.c). Two builds
 # run always: the default 1 MiB ring and a 4 KiB ring that maximizes
 # full-ring transitions. ThreadSanitizer builds of both run when
 # KITTY_RING_TSAN=1 (slow; used by the phase verification, not the

@@ -1531,6 +1531,10 @@ invariant enumeration).
    CAS-if-zero BEFORE the head release, and again AFTER it to cover the
    consumer's clear-on-empty landing between stamp and publish. The
    harness asserts `used > 0 ⇒ new_input_at ≠ 0` at every drain.
+   (Superseded by FR-1 below: the SHIPPED contract is
+   covered-or-fail-open - the absolute invariant described this draft
+   protocol only; the hardened harness proves each racy resolution path
+   deterministically instead of asserting it.)
 2. **Lost wakeup at the parse gate**: today `write_space_created` is
    only consumed when the tick actually parsed (`pd.input_read`,
    child-monitor.c:515). With the ring, a top-of-tick drain can free a
@@ -1603,7 +1607,10 @@ invariant enumeration).
    semantic-prompt marks natively (reproduced outside kitty in a
    sandboxed probe; the assertion reads raw child bytes upstream of the
    parser, and the branch touches nothing on that surface). Forensics:
-   `results/ssh-test-env-failure.md`.
+   `results/ssh-test-env-failure.md`. The dump golden is a
+   secondary indicator (its log flags the PNG as suspiciously small);
+   the suites, ring harness, and parser-level evidence carry the
+   identity gate.
 
 **Deterministic interleaving coverage** (kitty_tests/spsc_ring_check.c,
 demanded by both lanes): `VT_RING_TEST_HOOKS` step points in the header
