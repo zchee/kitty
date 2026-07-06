@@ -1517,13 +1517,11 @@ consume_input(PS *self, PyObject *dump_callback UNUSED, id_type window_id UNUSED
 
 // Drain the transport ring into the contiguous parse arena. Replaces the
 // old under-lock absorb of write.pending; runs only on the main thread.
-// Sets write_space_created when the drain frees space in a full ring so
-// do_parse re-arms POLLIN for the stalled reader.
+// Runs once per consume_input step, so it stays fence-free; waking a
+// reader parked on a full ring happens once per tick in run_worker.
 static void
-drain_ring(PS *self, ParseData *pd) {
+drain_ring(PS *self) {
     VTInputRing *ring = self->input_ring;
-    const bool was_full = !vt_ring_has_space(ring);
-    bool drained = false;
     while (self->read.sz < BUF_SZ) {
         size_t avail;
         const uint8_t *src = vt_ring_readable(ring, &avail);
@@ -1532,9 +1530,7 @@ drain_ring(PS *self, ParseData *pd) {
         memcpy(self->buf + self->read.sz, src, n);
         self->read.sz += n;
         vt_ring_advance(ring, n);
-        drained = true;
     }
-    if (was_full && drained) pd->write_space_created = true;
 }
 
 static void
@@ -1544,7 +1540,7 @@ run_worker(void *p, ParseData *pd, bool flush) {
     screen->parsing_at = pd->now;
     // drain before the parse gate, mirroring the old absorb placement so
     // the gate and the nearly-full override see the post-drain state
-    drain_ring(self, pd);
+    drain_ring(self);
     pd->has_pending_input = self->read.pos < self->read.sz;
     if (pd->has_pending_input) {
         pd->time_since_new_input = pd->now - vt_ring_new_input_at(self->input_ring);
@@ -1559,11 +1555,11 @@ run_worker(void *p, ParseData *pd, bool flush) {
             self->read.consumed = 0;
             do {
                 consume_input(self, pd->dump_callback, screen->window_id);
-                drain_ring(self, pd);  // pick up bytes that arrived mid-parse
+                drain_ring(self);  // pick up bytes that arrived mid-parse
             } while (self->read.pos < self->read.sz);
-            // clear only while the ring is observably empty; the
-            // producer's post-publish re-stamp covers the race
-            if (vt_ring_used(self->input_ring) == 0) vt_ring_clear_new_input_at(self->input_ring);
+            // CAS-clear with fail-open re-cover; the helper self-guards
+            // on ring emptiness (final-review FR-1)
+            vt_ring_clear_new_input_at(self->input_ring, pd->now);
             if (self->read.consumed) {
                 self->read.pos -= MIN(self->read.pos, self->read.consumed);
                 self->read.sz -= MIN(self->read.sz, self->read.consumed);
@@ -1571,6 +1567,11 @@ run_worker(void *p, ParseData *pd, bool flush) {
             }
         }
     }
+    // once per tick, after every tail advance this tick will make: wake a
+    // reader parked on a full ring (final-review FR-2). Fence-paired with
+    // the park in vt_ring_writer_arm_or_park, so the wakeup cannot be lost
+    // even when the fill raced past drain_ring's view.
+    if (vt_ring_unpark_writer(self->input_ring)) pd->write_space_created = true;
 }
 
 #ifndef DUMP_COMMANDS
@@ -1590,9 +1591,11 @@ vt_parser_commit_write(Parser *p, size_t sz) {
 }
 
 bool
-vt_parser_has_space_for_input(const Parser *p) {
+vt_parser_arm_pollin(const Parser *p) {
     PS *self = (PS*)p->state;
-    return vt_ring_has_space(self->input_ring);
+    // false parks the io thread on the full ring; the main thread's
+    // per-tick unpark wakes it when draining creates space (FR-2)
+    return vt_ring_writer_arm_or_park(self->input_ring);
 }
 #endif
 

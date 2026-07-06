@@ -30,9 +30,12 @@ void free_vt_parser(Parser*);
 void reset_vt_parser(Parser*);
 
 
-// The following are thread safe, using an internal lock
+// SPSC transport contract (no internal lock): the three producer calls
+// below are for the io thread only — a single producer feeding the
+// lock-free ring in vt-input-ring.h; parse_worker/parse_worker_dump run
+// on the main thread as the single consumer
 uint8_t* vt_parser_create_write_buffer(Parser*, size_t*);
 void vt_parser_commit_write(Parser*, size_t);
-bool vt_parser_has_space_for_input(const Parser*);
+bool vt_parser_arm_pollin(const Parser*);
 void parse_worker(void *p, ParseData *data, bool flush);
 void parse_worker_dump(void *p, ParseData *data, bool flush);

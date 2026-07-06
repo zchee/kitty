@@ -1813,7 +1813,11 @@ io_loop(void *data) {
         for (i = 0; i < self->count; i++) {
             screen = children[i].screen;
             /* printf("i:%lu id:%lu fd: %d read_buf_sz: %lu write_buf_used: %lu\n", i, children[i].id, children[i].fd, screen->read_buf_sz, screen->write_buf_used); */
-            children_fds[EXTRA_FDS + i].events = vt_parser_has_space_for_input(screen->vt_parser) ? POLLIN : 0;
+            // arm-or-park: on a full ring this parks the reader inside the
+            // ring's waiter protocol before dropping POLLIN, so the parse
+            // tick's unpark (write_space_created -> wakeup_io_loop) cannot
+            // be lost to a fill that races the fullness check
+            children_fds[EXTRA_FDS + i].events = vt_parser_arm_pollin(screen->vt_parser) ? POLLIN : 0;
             screen_mutex(lock, write);
             children_fds[EXTRA_FDS + i].events |= (screen->write_buf_used ? POLLOUT  : 0);
             screen_mutex(unlock, write);
