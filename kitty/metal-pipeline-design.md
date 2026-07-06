@@ -1158,13 +1158,41 @@ pagerhist, multicell interplay) queued at the top of Future work with
 these numbers. Landed artifact: the suppression lever (standing tool for
 render-cost upper bounds).
 
-## Phase 10 (Wave 10): O(1) scroll via a shared line-slot pool — design
+## Phase 10 (Wave 10): O(1) scroll via a shared line-slot pool
 
-Status: DESIGN (implementation gated on architect design approval; this
-section gains results + adjudication when the phase closes). Target: the
-Phase-9-attributed scroll-copy machinery (~70% of vtebench-scrolling
-CPU: memmove 44.5% under `historybuf_add_line` + memset 25.4% under
-`screen_index`; also ~25% of cat-flood main-thread busy).
+Status: LANDED (design-gate approved with 7 amendments, all applied;
+stages 1–3 at 4f8487cd0 / 811b7e5d3 / df474d5ca + the shift+mask fix
+b2ce4562f). Target was the Phase-9-attributed scroll-copy machinery
+(~70% of vtebench-scrolling CPU: memmove 44.5% under
+`historybuf_add_line` + memset 25.4% under `screen_index`).
+
+### Results (before/after interleaved binaries, LOAD-DEGRADED 7–8)
+
+- **vtebench scrolling: 63 → 38 ms median (−40%)**, with 1.7× more
+  samples completing per fixed-time run (52 → 90); the fresh
+  three-terminal capture puts kitty at **38 ms vs Ghostty 20 /
+  Alacritty 24**, down from 69 ms (2.9× behind → 1.6–1.9×). The
+  Phase-9 amended prediction — "the honest floor is ≈38–40 ms because
+  the recycled-row memset survives" — landed exactly: **the ≤35 ms PRD
+  wording was NOT met**, as forecast, and the residual is the memset +
+  draw path, with dense_cells (15 vs 6–9 ms, unattributed) now the
+  largest vtebench deficit.
+- devlog-006: neutral (0.494 vs 0.493 A/B; fresh competitive round
+  0.484 ≈ kitty-GL 0.485) — exactly as the Phase-8/9 pipeline-bound
+  model predicts for a parse-side CPU cut.
+- `kitten __benchmark__`: neutral after the shift+mask fix (ascii
+  143.5 vs 143.6, unicode 130.1 vs 130.4 across 3 interleaved rounds).
+  The first A/B caught a REAL ~2% draw-throughput regression from a
+  runtime division in the hot slot→address math — fixed by rounding
+  slab capacities to powers of two (shift+mask), re-measured neutral.
+- Two latent-behavior finds along the way, both caught by the
+  phase's own harnesses: `history_buf_endswith_wrap` read position 0
+  with no count guard (pre-pool it returned false only because cleared
+  storage was freshly zeroed; the stale wrap flag broke mouse
+  triple-click line continuation — count guard added), and the
+  division cost above. Suites at baseline on BOTH backends at every
+  stage boundary; scroll-semantics snapshots byte-identical throughout;
+  MTL_DEBUG_LAYER clean on a scroll flood.
 
 ### The audit finding that shapes the design
 
@@ -1289,13 +1317,12 @@ condition. Updated as captures land.
 
 ## Future work (consolidated queue)
 
-1. **Ring-grid unification (O(1) scroll)** — the vtebench-scrolling fix,
-   quantified in Phase 9: scroll-copy = ~70% of scrolling CPU (memmove
-   44.5% + memset 25.4%); make the visible screen a window over the
-   scrollback ring (or per-line pointer swaps between LineBuf and
-   HistoryBuf). Screen-level container redesign: resize/rewrap,
-   serialization, pagerhist, multicell interplay. Also removes the 25%
-   scroll share of flood busy (P8-0).
+1. ~~Ring-grid unification (O(1) scroll)~~ — **DONE in Phase 10** (the
+   slot-pool variant: scrolling 69 → 38 ms). Remaining scroll-side
+   follow-ups: the recycled-row memset (25% of the old profile,
+   semantically required — only a lazy-clear scheme could touch it) and
+   **vtebench dense_cells** (15 vs 6–9 ms, SGR-heavy, unattributed —
+   profile before acting; now the largest vtebench deficit).
 2. **Dedicated parser/reader thread** — the devlog residual fix,
    quantified in Phase 9: kitty's pure pipeline (render off, delay 0)
    drains at 45.4 ms/pass vs Alacritty's end-to-end 42.5 ms; the

@@ -184,10 +184,10 @@ replication):
 ===============  =========================  ==========================
 Terminal         devlog-006 (54 MB JP)      full-grid churn drain
 ===============  =========================  ==========================
-Alacritty        **0.435 s** (0.427–0.444)  **≈ 62 MB/s**
-Ghostty          0.484 s (0.446–0.767)      ≈ 47 MB/s
-kitty (Metal)    0.496 s (0.479–0.500)      ≈ 52 MB/s
-kitty (OpenGL)   0.500 s (0.499–0.512)      ≈ 51 MB/s
+Alacritty        **0.426 s** (0.404–0.434)  **≈ 62 MB/s**
+Ghostty          0.469 s (0.463–0.474)      ≈ 46 MB/s
+kitty (Metal)    0.484 s (0.482–0.489)      ≈ 53 MB/s
+kitty (OpenGL)   0.485 s (0.476–0.498)      ≈ 53 MB/s
 ===============  =========================  ==========================
 
 The devlog-006 gap decomposes cleanly (three-way interleave, medians):
@@ -218,22 +218,23 @@ ms per ~1 MiB sample, lower is better, same conditions):
 ===============  ============  =========  ========
 Terminal         dense_cells   scrolling  unicode
 ===============  ============  =========  ========
-Alacritty        7             26         6
-Ghostty          8             20         8
-kitty (Metal)    15            69         9
+Alacritty        6             24         7
+Ghostty          9             20         7
+kitty (Metal)    15            **38**     9
 ===============  ============  =========  ========
 
-kitty trails on vtebench's SGR-dense and scrolling patterns. The
-scrolling gap is now fully attributed: ~70% of kitty's scrolling CPU is
-the scroll-copy machinery — each scrolled line is copied into the
-scrollback ring (memmove, 44.5%) and the recycled row cleared (memset,
-25.4%), ~32 bytes/cell streaming through a ring too large for cache,
-while Alacritty rotates a ring grid in O(1) with zero copy. Rendering is
-0.4% of this workload, so no render offload can help; the fix is a
-grid-container redesign (visible screen as a window over the scrollback
-ring, or per-line pointer swaps between the screen and history buffers),
-tracked as the top follow-up. Energy (powermetrics) columns will be
-added when captured.
+The scrolling column is the line-storage redesign landing: kitty's
+visible screen and scrollback now share a slot pool and scrolling moves
+lines between them by slot id — a pointer-sized swap — instead of
+copying ~32 bytes/cell into the scrollback ring. That removed the
+memmove that was 44.5% of scrolling CPU (median 69 → 38 ms, −45%, with
+1.7× more benchmark samples completing per run; the same-machine
+before/after interleave measured 63 → 38 ms). The remaining gap to
+Ghostty/Alacritty is the recycled-row clear (memset, required in any
+design) plus the draw path, and dense_cells (SGR-heavy, unattributed)
+is now the largest vtebench deficit. devlog-006 is unchanged by this
+work, as predicted: that axis is pipeline-bound, not scroll-bound.
+Energy (powermetrics) columns will be added when captured.
 
 Instrumenting kitty
 -----------------------
