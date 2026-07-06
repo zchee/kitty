@@ -174,9 +174,25 @@ change under test is the only variable:
 - **1-line edit cost**: ≈ 2.2 KB uploaded per typed-character frame
   (dirty-row uploads), versus a full-grid upload previously.
 
-A same-machine comparison table against other terminals (Ghostty,
-Alacritty, the OpenGL kitty backend and others) is being captured under
-the same protocol and will be published here.
+Same-machine comparison (Apple M3 Max, 100×30 cells, default configs,
+interleaved arms; **all runs under elevated system load (loadavg 10–15),
+flagged per protocol** — treat as indicative until quiet-machine
+replication):
+
+===============  ======================  ==========================
+Terminal         devlog-006 (54 MB JP)   full-grid churn drain
+===============  ======================  ==========================
+Alacritty        **0.436 – 0.443 s**     **≈ 62 MB/s**
+Ghostty          0.445 – 0.463 s         ≈ 48 MB/s
+kitty (Metal)    0.504 – 0.516 s         ≈ 52 MB/s
+kitty (OpenGL)   0.575 – 0.581 s         ≈ 47 MB/s
+===============  ======================  ==========================
+
+The Metal backend beats the OpenGL backend by ~13% on both axes on the
+same commit. Alacritty currently leads the wide-character throughput
+test; the gap is concentrated in kitty's parser/decode stage (profiled
+at ~30% of flood time), which is the identified follow-up lever.
+vtebench and energy (powermetrics) columns will be added when captured.
 
 Instrumenting kitty
 -----------------------
