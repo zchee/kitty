@@ -38,7 +38,8 @@ typedef struct {
 
 
 HistoryBuf* alloc_historybuf(unsigned int, unsigned int, unsigned int, TextCache *tc);
-HistoryBuf *historybuf_alloc_for_rewrap(unsigned int columns, HistoryBuf *self);
+HistoryBuf* alloc_historybuf_with_pool(unsigned int, unsigned int, unsigned int, TextCache *tc, LineSlotPool*);
+HistoryBuf *historybuf_alloc_for_rewrap(unsigned int columns, HistoryBuf *self, LineSlotPool *pool);
 void historybuf_finish_rewrap(HistoryBuf *dest, HistoryBuf *src);
 void historybuf_fast_rewrap(HistoryBuf *dest, HistoryBuf *src);
 index_type historybuf_next_dest_line(HistoryBuf *self, ANSIBuf *as_ansi_buf, Line *src_line, index_type dest_y, Line *dest_line, bool continued);

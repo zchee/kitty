@@ -105,6 +105,7 @@ CPUCell* linebuf_cpu_cell_at(LineBuf *self, index_type x, index_type y);
 bool linebuf_line_ends_with_continuation(LineBuf *self, index_type y);
 void linebuf_refresh_sprite_positions(LineBuf *self);
 void historybuf_add_line(HistoryBuf *self, const Line *line, ANSIBuf*);
+void historybuf_take_line_from(HistoryBuf *self, LineBuf *lb, index_type lb_y, ANSIBuf *as_ansi_buf);
 bool historybuf_pop_line(HistoryBuf *, Line *);
 void historybuf_init_line(HistoryBuf *self, index_type num, Line *l);
 bool history_buf_endswith_wrap(HistoryBuf *self);

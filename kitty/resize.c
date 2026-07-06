@@ -292,11 +292,15 @@ rewrap(Rewrap *r) {
 ResizeResult
 resize_screen_buffers(LineBuf *lb, HistoryBuf *hb, index_type lines, index_type columns, ANSIBuf *as_ansi_buf, TrackCursor *cursors) {
     ResizeResult ans = {0};
-    ans.lb = alloc_linebuf(lines, columns, lb->text_cache);
-    if (!ans.lb) return ans;
+    // the resized main pair shares a fresh pool (slot handover on scroll);
+    // the old pool dies with the old containers after the swap
+    LineSlotPool *pool = hb ? line_slot_pool_alloc(columns, LINE_POOL_DEFAULT_SLAB) : NULL;
+    ans.lb = pool ? alloc_linebuf_with_pool(lines, columns, lb->text_cache, pool) : alloc_linebuf(lines, columns, lb->text_cache);
+    if (!ans.lb) { line_slot_pool_decref(pool); return ans; }
     RAII_PyObject(raii_nlb, (PyObject*)ans.lb); (void) raii_nlb;
     if (hb) {
-        ans.hb = historybuf_alloc_for_rewrap(columns, hb);
+        ans.hb = historybuf_alloc_for_rewrap(columns, hb, pool);
+        line_slot_pool_decref(pool);
         if (!ans.hb) return ans;
     }
     RAII_PyObject(raii_nhb, (PyObject*)ans.hb); (void) raii_nhb;

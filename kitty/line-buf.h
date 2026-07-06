@@ -23,3 +23,4 @@ typedef struct {
 
 
 LineBuf* alloc_linebuf(unsigned int, unsigned int, TextCache*);
+LineBuf* alloc_linebuf_with_pool(unsigned int, unsigned int, TextCache*, LineSlotPool*);
