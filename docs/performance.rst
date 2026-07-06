@@ -139,6 +139,45 @@ As you can see, |kitty| uses much less CPU than all terminals, except xterm, but
 its scrolling "smoothness" is much better than that of xterm (at least to my,
 admittedly biased, eyes).
 
+Apple Silicon / Metal backend
+--------------------------------
+
+The macOS Metal backend (``KITTY_USE_METAL=1`` builds) was optimized and
+measured in 2026 on an Apple M3 Max (macOS 27, 60 Hz laptop display,
+default config and font, 100×30 cell window unless stated). Methodology:
+same-machine interleaved A/B arms, medians over repeated runs, load
+average recorded per run and elevated-load captures flagged rather than
+dropped; the full fairness protocol (identical grids/fonts, visible
+unoccluded windows, byte-identical workloads, warmup/teardown discipline)
+is kept in the repository alongside the raw JSON artifacts.
+
+Highlights, each measured against a same-binary kill-switch arm so the
+change under test is the only variable:
+
+- **Input latency** (PTY-write→present, the harness-measurable proxy for
+  echo latency): median ≈ **15 ms** with the asynchronous IOSurface
+  presentation path, down from ≈ 26 ms with the synchronous present and
+  ≈ 64–79 ms with the original display-link pacing — and the ~200 ms
+  link-resume tail is gone entirely.
+- **Throughput** (``kitten __benchmark__ --render``): ASCII ≈ 147 MB/s
+  and ASCII+scrollback ≈ 111 MB/s at 100×30 after the batched ASCII
+  run-fill (1.30×/1.20× over the same binary with the fill disabled);
+  Unicode ≈ 121 MB/s unchanged.
+- **Flood behavior**: sustained full-screen updates encode at the display
+  refresh rate (cadence p50 = p99 = 16.67 ms at 60 Hz) instead of
+  free-running, with zero transient buffer or texture allocations per
+  steady-state frame, including during GIF animation.
+- **Memory**: the glyph atlas stores monochrome glyphs as single-channel
+  masks — 4× smaller than the previous RGBA atlas for the monochrome set
+  (−72% total atlas bytes on a text+emoji workload) with byte-identical
+  rendered output.
+- **1-line edit cost**: ≈ 2.2 KB uploaded per typed-character frame
+  (dirty-row uploads), versus a full-grid upload previously.
+
+A same-machine comparison table against other terminals (Ghostty,
+Alacritty, the OpenGL kitty backend and others) is being captured under
+the same protocol and will be published here.
+
 Instrumenting kitty
 -----------------------
 

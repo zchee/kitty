@@ -1019,6 +1019,24 @@ it is cheap and cold:
   TEST_FORCE_INFLIGHT, the neutered KITTY_METAL_IMMEDIATE logger) are
   policy, not dead code, and remain.
 
+## §7 acceptance criteria — adjudication (living table)
+
+Current verdicts with evidence; BLOCKED items name their unblocking
+condition. Updated as captures land.
+
+| # | criterion | verdict | evidence / blocker |
+|---|---|---|---|
+| 1 | baseline artifact, reruns <5% | PARTIAL | harness + artifacts exist (.omc/verify/*); a one-shot `make metal-baseline` JSON emission not re-validated on HEAD |
+| 2 | passes/frame == 1 all configs, tile-load ≈ 0 | PASS | M1 single-pass layered; passes=1 in every stats capture since Wave 3 |
+| 3 | zero steady-state allocs | PASS (counters) / PARTIAL (formal) | D1 allocs=0 + tex_allocs=0 across captures; the formal 5-min Instruments soak not run (sanitized-env Instruments session pending) |
+| 4 | keypress→present p50 ≤ 9 ms (120 Hz), p99 ≤ 17 ms; sync=no p50 ≤ 3 ms | BLOCKED | Accessibility grant (CGPreflightPostEventAccess=false); PTY proxy on 60 Hz: p50 ≈ 15 ms incl. input_delay+refresh — thresholds re-anchor at capture |
+| 5 | throughput ≥ 2× Phase-0 AND ≥ kitty-GL AND vtebench ≥ Ghostty −10% AND devlog-006 first | PARTIAL + BLOCKED | 2×: documented shortfall (lever A/B 1.30×/1.20×; Phase-0 binary unrunnable — SIGABRT); GL/competitive arms: screen visibility |
+| 6 | pixel goldens ≤ 1 LSB vs GL reference | PARTIAL | Metal-vs-Metal goldens byte-identical throughout; the cross-backend Metal-vs-GL diff is now capturable occluded (thumbnail path) — queued |
+| 7 | idle: blink-only presents, CPU < 0.3%, link paused | PASS (behavior) / PARTIAL (formal CPU%) | idle presents = 0 over 60 s in every probe since Wave 4; formal idle-CPU% capture queued |
+| 8 | stability: suites, DEBUG_LAYER, 10-min flood soak RSS < 5% | PARTIAL | suites + DEBUG_LAYER green throughout; the 10-min visible flood soak queued (visibility) |
+| 9 | energy ≤ GL baseline | BLOCKED | powermetrics (operator sudo) + visibility |
+| 10 | 1-line edit ≤ 8 KB | PASS | D2: ≈ 2.2 KB/frame typing capture |
+
 ## Known deviations (tracked, intentional)
 
 - Cell/graphics MSL shader *logic* is still the opus-era port; semantic drift
