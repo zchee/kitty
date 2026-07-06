@@ -135,12 +135,21 @@ class TestParser(BaseTest):
         self.assertFalse(self.write_bytes(s, self.create_write_buffer(s), '23mx'))
         self.parse_written_data(s, ('select_graphic_rendition', '23'), 'x')
 
-        # test full write
+        # test full write: the transport ring hands out CONTIGUOUS windows,
+        # so near-full capacity can be split across two windows at the wrap
+        # point (the old linear buffer exposed one window per fill); fill
+        # until the window comes back empty and account for every byte
         sz = VT_PARSER_BUFFER_SIZE // 3 + 7
         self.assertFalse(self.write_bytes(s, self.create_write_buffer(s), b'a' * sz))
         self.assertFalse(self.write_bytes(s, self.create_write_buffer(s), b'b' * sz))
-        left = self.write_bytes(s, self.create_write_buffer(s), b'c' * sz)
-        self.assertTrue(len(left), 3 * sz - VT_PARSER_BUFFER_SIZE)
+        data = b'c' * sz
+        while data:
+            b = self.create_write_buffer(s)
+            if not b:
+                break
+            data = self.write_bytes(s, b, data)
+        self.assertTrue(data, 'transport should be full before the data ran out')
+        self.ae(3 * sz - len(data), VT_PARSER_BUFFER_SIZE)
         self.assertFalse(self.create_write_buffer(s))
         s.test_parse_written_data()
         b = self.create_write_buffer(s)

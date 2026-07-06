@@ -512,8 +512,11 @@ static bool
 do_parse(ChildMonitor *self, Screen *screen, monotonic_t now, bool flush) {
     ParseData pd = {.dump_callback = self->dump_callback, .now = now};
     self->parse_func(screen, &pd, flush);
+    // independent of input_read: the top-of-tick ring drain can free a
+    // full transport ring even when the input_delay gate declines to
+    // parse, and the stalled reader needs its POLLIN re-armed either way
+    if (pd.write_space_created) wakeup_io_loop(self, false);
     if (pd.input_read) {
-        if (pd.write_space_created) wakeup_io_loop(self, false);
         if (screen->paused_rendering.expires_at) {
             set_maximum_wait(MAX(0, screen->paused_rendering.expires_at - now));
         } else set_maximum_wait(OPT(input_delay) - pd.time_since_new_input);
