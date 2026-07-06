@@ -99,8 +99,17 @@ remap_hyperlink_ids(Screen *self, bool preserve_hyperlinks_in_history, hyperlink
         }
     }
     LineBuf *second = self->linebuf, *first = second == self->main_linebuf ? self->alt_linebuf : self->main_linebuf;
-    for (index_type i = 0; i < self->lines * self->columns; i++) process_cell(pool, map, clone, first->cpu_cell_buf + i);
-    for (index_type i = 0; i < self->lines * self->columns; i++) process_cell(pool, map, clone, second->cpu_cell_buf + i);
+    // per-line: cell storage lives in pool slots, so lines are not one
+    // contiguous block (visual/physical order is irrelevant here — every
+    // cell of both buffers gets remapped either way)
+    for (index_type y = 0; y < self->lines; y++) {
+        CPUCell *cells = linebuf_cpu_cells_for_line(first, y);
+        for (index_type x = 0; x < self->columns; x++) process_cell(pool, map, clone, cells + x);
+    }
+    for (index_type y = 0; y < self->lines; y++) {
+        CPUCell *cells = linebuf_cpu_cells_for_line(second, y);
+        for (index_type x = 0; x < self->columns; x++) process_cell(pool, map, clone, cells + x);
+    }
 }
 
 static void
