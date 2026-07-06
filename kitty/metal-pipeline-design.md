@@ -1358,6 +1358,153 @@ verdicts); its deliverables are the three analyses + the Phase-12 plan
 motivation (~55% of dense_cells busy is the parser-lock ping-pong) and a
 proven-safe shape.
 
+## Phase 12 (Wave 12): lock-free SPSC IO→parser handoff — design
+
+Status: DESIGN (implementation gated on architect design approval; this
+section gains results + adjudication at phase close). Target: the
+vt-parser single-mutex byte handoff — ~55% of dense_cells busy, with
+the IO thread taking the lock 2×/read (create+commit) plus once per
+child per poll iteration (the POLLIN gate), ping-ponging against the
+main parse tick (P11-0-FINDINGS.md; full invariant enumeration in
+`.omc/verify/phase12/P12-0-INVARIANTS.md`).
+
+### The design in one sentence
+
+Insert a lock-free SPSC byte ring between the IO thread and the main
+thread, drain it into the EXISTING `PS.buf` parse arena at the top of
+each parse tick, and delete the mutex from the hot path — parse stays
+on the main thread, so Screen mutation ordering is byte-for-byte
+identical and `scroll_semantics` + the full suite remain a valid
+identity proof.
+
+### Ring layout and memory orders
+
+```c
+typedef struct VTInputRing {           // one per Parser, transport only
+    uint8_t buf[VT_RING_SZ];           // 1 MiB, power of two
+    alignas(64) _Atomic size_t head;   // producer-owned, monotonically increasing
+    alignas(64) _Atomic size_t tail;   // consumer-owned, monotonically increasing
+    alignas(64) _Atomic monotonic_t new_input_at;  // first-unabsorbed timestamp
+} VTInputRing;                          // static_assert 64-byte separation
+```
+
+Indices are free-running (masked with `VT_RING_SZ-1` on access);
+`used = head - tail` is overflow-safe for size_t. Producer publishes
+with `store(head, release)` after the bytes are written; consumer reads
+`load(head, acquire)` before touching them (and symmetrically
+tail/release ↔ acquire for space). `new_input_at` is stored by the
+producer (only if currently 0) after the head publish and cleared by
+the consumer after a parse round — ordering rides the head/tail
+acquire-release edges, matching today's under-lock semantics. Precedent
+for the atomic style: the L5 `last_local_key_input_at`
+(child-monitor.c:29-30).
+
+### Protocol mapping (1:1 onto the enumerated invariants)
+
+- `vt_parser_create_write_buffer` → RESERVE: contiguous span
+  `min(free, ring_end - (head & mask))`; hands the caller a pointer
+  into the ring. Zero space → same as today's zero-size window
+  (read_bytes returns without reading; POLLIN gate stalls the reader).
+  Wrap-around simply yields a shorter window; the next read continues
+  at the ring start — no memmove, ever. Double-reserve stays a fatal
+  assertion.
+- `read()` runs into the reserved span with no lock and no relocation
+  hazard: the consumer NEVER moves ring bytes (it only advances tail),
+  so the in-flight window cannot go stale — the entire
+  compaction/relocation machinery (the multi-word coupling that made
+  atomics-on-the-shared-arena unsafe) disappears rather than being
+  ported.
+- `vt_parser_commit_write(sz)` → PUBLISH: `head += sz` (release);
+  commit(0) publishes nothing. Sets `new_input_at` if 0.
+- `vt_parser_has_space_for_input` → `head - tail < VT_RING_SZ`,
+  acquire loads, lock-free — the per-poll-iteration lock acquisition
+  becomes two atomic loads.
+- `run_worker` absorb → DRAIN: while ring non-empty and
+  `read.sz < BUF_SZ`: memcpy the contiguous ring segment into
+  `PS.buf + read.sz`, advance `read.sz` and `tail` (release). Then the
+  existing parse loop runs on `PS.buf` exactly as today — and since the
+  producer no longer touches PS state, `read.*`/compaction become
+  MAIN-THREAD-PRIVATE: the parse side needs no lock at all. The
+  mid-parse absorb becomes a mid-parse re-drain (same loop shape as
+  today's re-absorb, preserving the consume-while-arriving behavior).
+  `write.offset/sz/pending` die; `self->lock` leaves the hot path
+  entirely (init/destroy only, or deleted outright).
+- `write_space_created` → space-created: true when the drain freed
+  ring space from a full ring — feeding the existing
+  `wakeup_io_loop` re-arm (child-monitor.c:516) unchanged.
+- input_delay batching, the nearly-full parse override
+  (`read.sz + 16 KiB > BUF_SZ` — now also `ring nearly full`), the
+  WAKEUP pacing, and the L5 echo path are untouched (all already
+  outside the parser lock).
+
+### Honest costs and bounds (stated up front)
+
+- **+1 memcpy/byte** (ring → PS.buf) where today's steady state does
+  0–1 copies (commit relocation + compaction). Bulk memcpy runs at
+  tens of GB/s: on the devlog corpus that is ~0.2 ms per 5.4 MB pass
+  (~0.4%) — gated by the devlog non-regression A/B.
+- **Worst-case buffered bytes double**: ring (1 MiB) + PS.buf backlog
+  (< 1 MiB) vs today's single 1 MiB arena. Steady state is similar
+  (the drain empties the ring into the arena each tick); the bound is
+  a transient. Recorded as a deliberate envelope change.
+- The dense_cells gain is capped at the lock share (~55% of busy, part
+  load-sensitive): the real parse work (~30%) stays on the main
+  thread by design.
+
+### Rejected alternative
+
+Atomics over the existing shared linear buffer: the producer window
+offset is derived from consumer state and relocated by the consumer's
+compaction — a multi-word protocol with cross-thread memmoves that has
+no safe lock-free formulation. The ring removes the coupling instead
+of synchronizing it (P11-3 audit conclusion, reconfirmed by the
+invariant enumeration).
+
+### Design-gate amendments (codex critic, DESIGN-APPROVED with 4 MAJORs — all folded)
+
+1. **Timestamp ordering**: the draft published `head` before stamping
+   `new_input_at`, admitting "bytes visible with zero timestamp" (early
+   parse) and a stale-stamp leak. Fixed with **stamp-publish-stamp**:
+   CAS-if-zero BEFORE the head release, and again AFTER it to cover the
+   consumer's clear-on-empty landing between stamp and publish. The
+   harness asserts `used > 0 ⇒ new_input_at ≠ 0` at every drain.
+2. **Lost wakeup at the parse gate**: today `write_space_created` is
+   only consumed when the tick actually parsed (`pd.input_read`,
+   child-monitor.c:515). With the ring, a top-of-tick drain can free a
+   full ring while the input_delay gate declines parsing → POLLIN would
+   stay off. THE SWAP MUST make the space-created wakeup fire
+   independent of `input_read` (a do_parse change) + a slow-parser test.
+3. **Reserve bookkeeping kept**: stateless reserve dropped the old
+   fatal-on-double-create guard; the ring now tracks
+   `reserved_sz/reserve_active` (producer-private) and asserts on
+   double-reserve and commit-larger-than-reserved (harness/debug
+   builds; NDEBUG compiles them out).
+4. **Placement**: the 1 MiB ring is heap-allocated as a
+   `VTInputRing *input_ring` next to PS (which is a separate
+   posix_memalign block behind a pointer in the Parser PyObject) —
+   never embedded by value (would double per-parser resident memory),
+   and PS.buf is NOT replaced (the scanners depend on the contiguous
+   arena). The resident-memory envelope change (+1 MiB per parser) is
+   deliberate and recorded.
+
+### Staging and evidence plan
+
+1. Ring header + STANDALONE harness commit: real producer/consumer
+   threads; in-order/lossless (checksums), back-pressure without loss,
+   wrap-around, partial writes, 256 KiB drains; seeded fuzz; **TSan
+   clean**, including a small-ring (`-DVT_RING_SZ=4096`) TSan variant
+   that forces full-ring transitions under TSan slowdown — before any
+   parser change lands. (DONE pre-commit: 4/4 variants pass, evidence
+   in `.omc/verify/phase12/P12-1-RING-VALIDATION.md`.)
+2. The swap commit (vt-parser.c + read_bytes + the amendment-2 wakeup
+   fix), suites green on BOTH backends at the boundary, goldens
+   byte-identical, plus a kitty-level TSan/synthetic-contention run
+   over the real IO-vs-main interleaving.
+3. Re-profile (psynch waits demonstrably gone, histogram committed) +
+   before/after interleaved A/B (dense_cells primary; devlog,
+   `__benchmark__`, scrolling non-regression) + input_delay-default
+   latency check + docs.
+
 ## Final architecture (post-Phase-7 consolidation)
 
 The frame path is native end to end; the GL-name shim survives only where
