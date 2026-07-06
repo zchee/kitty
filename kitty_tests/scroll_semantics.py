@@ -12,6 +12,7 @@
 # Regenerate goldens (ONLY on a binary whose behavior is the accepted
 # reference): KITTY_REGEN_SCROLL_GOLDENS=1 python3.14 test.py scroll_semantics
 
+import base64
 import json
 import os
 from pathlib import Path
@@ -32,6 +33,12 @@ def dump_state(s) -> str:
     ph = s.historybuf.pagerhist_as_text() if s.historybuf is not None else ''
     parts.append('PAGERHIST:')
     parts.append(ph)
+    if s.historybuf is not None:
+        # byte-exactness of the compressed pager history (design-review
+        # amendment: text-level compare could mask encoding drift)
+        phb = s.historybuf.pagerhist_as_bytes()
+        if phb:
+            parts.append('PAGERHIST_BYTES: ' + base64.b64encode(phb).decode())
     sel = s.text_for_selection()
     if any(sel):
         parts.append('SELECTION: ' + json.dumps(sel))
@@ -157,6 +164,44 @@ class TestScrollSemantics(BaseTest):
             for i in range(8):
                 feed(s, f'\x1b[3{i % 8}mc{i}\x1b[m\r\n')
 
+        def erase_last_command_multicell(s):
+            # exercises historybuf_delete_newest_lines incl. the
+            # multicell nuke at the new newest line (screen.c:4893)
+            feed(s, '\x1b]133;A\x1b\\$ cmd1\r\n')
+            feed(s, 'out1\r\nout2漢字漢\r\n')
+            feed(s, '\x1b]133;A\x1b\\$ cmd2\r\n')
+            for i in range(6):
+                feed(s, f'o{i}日本\r\n')
+            s.erase_last_command()
+
+        def resize_lines_only_same_cols(s):
+            # cols unchanged => historybuf_fast_rewrap path
+            for i in range(9):
+                feed(s, f'fr{i}\r\n')
+            s.resize(3, 6)
+            feed(s, 'a')
+            s.resize(6, 6)
+
+        def resize_same_dims(s):
+            for i in range(7):
+                feed(s, f'sd{i}\r\n')
+            s.resize(5, 6)  # identical dims: today a fast/no-op path
+
+        def hyperlink_gc_across_eviction(s):
+            # >256 distinct hyperlink ids force a hyperlink-pool GC whose
+            # remap walks history + BOTH linebufs (the flat-walk escape
+            # rewritten per-line in stage 1)
+            for i in range(300):
+                feed(s, f'\x1b]8;;http://e.com/{i}\x1b\\L{i}\x1b]8;;\x1b\\\r\n')
+
+        def paused_rendering_across_scroll(s):
+            for i in range(5):
+                feed(s, f'pr{i}\r\n')
+            s.pause_rendering(True, 5000)
+            feed(s, 'while-paused1\r\nwhile-paused2\r\n')
+            s.pause_rendering(False)
+            feed(s, 'after')
+
         return {
             'plain_overflow': (dict(cols=6, lines=5, scrollback=10), plain_overflow),
             'ring_wrap_eviction': (dict(cols=8, lines=3, scrollback=3, options=pager), ring_wrap_eviction),
@@ -176,6 +221,11 @@ class TestScrollSemantics(BaseTest):
             'altscreen_roundtrip': (dict(cols=8, lines=4, scrollback=8), altscreen_roundtrip),
             'insert_delete_lines': (dict(cols=6, lines=6, scrollback=8), insert_delete_lines),
             'sgr_colors_survive_history': (dict(cols=10, lines=4, scrollback=12), sgr_colors_survive_history),
+            'erase_last_command_multicell': (dict(cols=10, lines=5, scrollback=12), erase_last_command_multicell),
+            'resize_lines_only_same_cols': (dict(cols=6, lines=5, scrollback=10), resize_lines_only_same_cols),
+            'resize_same_dims': (dict(cols=6, lines=5, scrollback=8), resize_same_dims),
+            'hyperlink_gc_across_eviction': (dict(cols=12, lines=4, scrollback=20), hyperlink_gc_across_eviction),
+            'paused_rendering_across_scroll': (dict(cols=16, lines=4, scrollback=8), paused_rendering_across_scroll),
         }
 
     def test_scroll_semantics(self):
