@@ -2208,6 +2208,13 @@ def create_macos_bundle_gunk(dest: str, for_freeze: bool, args: Options) -> str:
             raise SystemExit('kitten not built cannot create macOS bundle')
         os.symlink(os.path.relpath(kitten_exe, os.path.dirname(in_src_launcher)),
                    os.path.join(os.path.dirname(in_src_launcher), os.path.basename(kitten_exe)))
+    # The Metal backend loads default.metallib from Contents/Resources; the
+    # source-tree copytree above filters it out (only py/glsl/so are kept),
+    # so install the metallib the build already produced. Without it the
+    # Metal renderer fails to initialize and the window stays blank.
+    metallib_src = os.path.join('kitty', 'default.metallib')
+    if os.path.exists(metallib_src):
+        shutil.copy2(metallib_src, os.path.join(ddir, 'Contents', 'Resources', 'default.metallib'))
     create_quick_access_bundle(dest)
     return str(kitty_exe)
 
