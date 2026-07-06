@@ -86,11 +86,13 @@ vertex BorderVertexOut border_vertex(
     float3 color3 = as_color_vector(uniforms.colors[rc], 16, uniforms.gamma_lut);
 
     float is_window_bg = is_integer_value(rc, 3); // WINDOW_BACKGROUND_PLACEHOLDER
-    float is_default_bg = is_integer_value(rc, 0); // DEFAULT_BG
     color3 = if_one_then(is_window_bg, window_bg, color3);
 
+    // border quads and tab bar edge strips draw opaque (GL parity:
+    // ACTIVE=1, INACTIVE=2, BELL=4, TAB_BAR_EDGE_LEFT=7, TAB_BAR_EDGE_RIGHT=8)
     float is_not_a_border = zero_or_one(abs(
-        (float(rc) - 1.0f) * (float(rc) - 2.0f) * (float(rc) - 4.0f)
+        (float(rc) - 1.0f) * (float(rc) - 2.0f) * (float(rc) - 4.0f) *
+        (float(rc) - 7.0f) * (float(rc) - 8.0f)
     ));
     float final_opacity = if_one_then(is_not_a_border, uniforms.background_opacity, 1.0f);
     out.color_premul = vec4_premul(color3, final_opacity);
