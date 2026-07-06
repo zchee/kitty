@@ -1358,10 +1358,53 @@ verdicts); its deliverables are the three analyses + the Phase-12 plan
 motivation (~55% of dense_cells busy is the parser-lock ping-pong) and a
 proven-safe shape.
 
-## Phase 12 (Wave 12): lock-free SPSC IO→parser handoff — design
+## Phase 12 (Wave 12): lock-free SPSC IO→parser handoff
 
-Status: DESIGN (implementation gated on architect design approval; this
-section gains results + adjudication at phase close). Target: the
+Status: LANDED (design gate: codex critic DESIGN-APPROVED with 4
+majors, all folded pre-implementation; ring + standalone proof harness
+at 2370c5899; swap at e856793ff).
+
+### Results (same-machine before/after interleave, 3 rounds, loadavg ≈ 4)
+
+- **dense_cells 15.0 → 10.0 ms (−33%)** — the phase target. The
+  re-profile confirms the mechanism, not just the number: contended
+  psynch mutex waits **9.3% of all samples → 0.0%**, total lock ops
+  **~55% → 0.1% of busy** (committed histograms:
+  `.omc/verify/phase11/results/dense-symbol-histogram.json` before,
+  `.omc/verify/phase12/results/dense-symbol-histogram-after.json`
+  after). What remains on the profile is real parse work.
+- **`kitten __benchmark__` ascii 145 → 245 MB/s (+69%), unicode 131 →
+  202 MB/s (+54%)** — unexpected magnitude, same-window verified (the
+  before arm reproduces the published mutex-era numbers): the
+  create/commit/has_space mutex round-trips were throttling ingestion
+  on the flood path itself, not just dense_cells.
+- **vtebench scrolling 38 → 34 ms (−11%)** — the same lock overhead
+  removed from the scroll workload.
+- **devlog-006 0.458 → 0.465 s** — inside the round-to-round noise
+  band; the pipeline-bound model predicted neutrality.
+- **Input pacing unchanged**: under a 150 ms typing pattern both
+  binaries present exactly once per keystroke with identical p50 gap
+  (150.0 ms) — input_delay batching semantics preserved
+  (`.omc/verify/phase12/results/latency-proxy-*.json`).
+- Identity: both backends at suite baseline at the swap boundary;
+  scroll-semantics snapshots (goldens from the pre-ring binary)
+  byte-identical; Metal dump golden byte-identical; the standalone ring
+  harness (incl. the small-ring TSan variant with full-ring
+  transitions) race-free. Two tests that encoded the old linear
+  buffer's transport granularity (full-write capacity single-window,
+  OSC 52 pending split offsets) were updated to assert the actual
+  contracts (exact byte accounting; flag pattern + reassembled
+  payload) — sanctioned at the design gate, since window granularity
+  was never child-observable behavior.
+- Functional contention evidence: the dense_cells re-profile hammers
+  the real IO-vs-main interleaving at maximal tiny-write frequency with
+  correct output (whole-kitty TSan is not supported by setup.py, whose
+  sanitize flags are ASan/UBSan; the PRD's synthetic-contention
+  alternative applies).
+
+### The design (as landed)
+
+Target: the
 vt-parser single-mutex byte handoff — ~55% of dense_cells busy, with
 the IO thread taking the lock 2×/read (create+commit) plus once per
 child per poll iteration (the POLLIN gate), ping-ponging against the
@@ -1557,17 +1600,9 @@ condition. Updated as captures land.
 
 ## Future work (consolidated queue)
 
-1. **Phase 12 — lock-free SPSC IO→parser handoff** (Design 2, architect
-   audit-approved in Phase 11, P11-3-PARSER-AUDIT.md). Replaces the
-   vt-parser single-mutex byte handoff (~55% of dense_cells busy — the
-   create/commit ping-pong under tiny writes; part is load-sensitive
-   contended waits) with a lock-free SPSC ring;
-   parse stays main-thread so Screen ordering is byte-for-byte identical
-   and scroll_semantics + the full suite PROVE identity. ~200-400 lines
-   in vt-parser.c + read_bytes; zero Screen/render/Python/GIL change.
-   Gate on: standalone ring fuzz/TSan harness, suites green, a
-   dense_cells re-profile showing the psynch waits gone, input_delay
-   latency unchanged. This is the identified next lever.
+1. ~~Lock-free SPSC IO→parser handoff~~ — **DONE in Phase 12**
+   (dense_cells 15 → 10 ms, `__benchmark__` ascii +69% / unicode +54%,
+   scrolling 38 → 34 ms, psynch waits 9.3% → 0.0%, pacing unchanged).
 2. ~~Dedicated parser/reader thread (Design 1)~~ — **NO-GO / DEFER**
    (Phase-11 audit): behavior-identity is UNPROVABLE — the decisive
    parse/render races (dirty-flag lost update, torn rows, grman

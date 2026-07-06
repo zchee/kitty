@@ -159,11 +159,13 @@ change under test is the only variable:
   presentation path, down from ≈ 26 ms with the synchronous present and
   ≈ 64–79 ms with the original display-link pacing — and the ~200 ms
   link-resume tail is gone entirely.
-- **Throughput** (``kitten __benchmark__ --render``): ASCII ≈ 147 MB/s
-  and ASCII+scrollback ≈ 111 MB/s at 100×30 after the batched ASCII
-  run-fill (1.30×/1.20× over the same binary with the fill disabled);
-  Unicode ≈ 130 MB/s after the batched width-2 run fill (+6.8% over the
-  fill-disabled arm; it was ≈ 121 MB/s before).
+- **Throughput** (``kitten __benchmark__ --render``): ASCII ≈ **245 MB/s**
+  and Unicode ≈ **202 MB/s** at 100×30 after the lock-free input handoff
+  (+69% / +54% over the mutex-handoff binary in a same-machine
+  interleave — the io-thread↔parser mutex ping-pong was throttling
+  ingestion itself). Before that handoff the run-fill work had brought
+  ASCII to ≈ 147 MB/s (batched ASCII run-fill, 1.30× over fill-disabled)
+  and Unicode to ≈ 130 MB/s (batched width-2 run fill, +6.8%).
 - **Flood behavior**: sustained full-screen updates encode at the display
   refresh rate (cadence p50 = p99 = 16.67 ms at 60 Hz) instead of
   free-running, with zero transient buffer or texture allocations per
@@ -220,22 +222,32 @@ Terminal         dense_cells   scrolling  unicode
 ===============  ============  =========  ========
 Alacritty        6             24         7
 Ghostty          9             20         7
-kitty (Metal)    15            **38**     9
+kitty (Metal)    **10**        **34**     9
 ===============  ============  =========  ========
 
-The scrolling column is the line-storage redesign landing: kitty's
-visible screen and scrollback now share a slot pool and scrolling moves
-lines between them by slot id — a pointer-sized swap — instead of
-copying ~32 bytes/cell into the scrollback ring. That removed the
-memmove that was 44.5% of scrolling CPU: the same-machine before/after
-interleave measured **63 → 38 ms (−40%)** with 1.7× more benchmark
-samples completing per run (the earlier cross-session baseline was
-69 ms). The remaining gap to
-Ghostty/Alacritty is the recycled-row clear (memset, required in any
-design) plus the draw path, and dense_cells (SGR-heavy, unattributed)
-is now the largest vtebench deficit. devlog-006 is unchanged by this
-work, as predicted: that axis is pipeline-bound, not scroll-bound.
-Energy (powermetrics) columns will be added when captured.
+(kitty cells re-measured 2026-07-06 after the lock-free input handoff;
+competitor cells are the earlier same-machine capture — nothing changed
+on their side.)
+
+Two redesigns landed here. The scrolling column is the line-storage
+work: kitty's visible screen and scrollback share a slot pool and
+scrolling moves lines between them by slot id — a pointer-sized swap —
+instead of copying ~32 bytes/cell into the scrollback ring; that took
+the earlier 69 ms baseline to 38 ms (−40%), and the input-handoff work
+below took it to 34 ms. The dense_cells column is the **lock-free
+SPSC input handoff**: profiling showed ~55% of dense_cells busy CPU was
+a single io-thread↔parser mutex being acquired twice per tiny read;
+replacing that handoff with a lock-free ring (parse stays on the main
+thread, so screen-update ordering is provably unchanged) measured
+**15 → 10 ms (−33%)** in a same-machine interleave, with the contended
+mutex kernel waits gone from the profile entirely (9.3% of all samples
+→ 0.0%). The remaining scrolling gap to Ghostty/Alacritty is the
+recycled-row clear (memset, required in any design) plus the draw path.
+devlog-006 is unchanged by both, as predicted: that axis is
+pipeline-bound. Interactive input pacing is untouched by the handoff
+change (present cadence under a 150 ms typing pattern is identical
+before/after). Energy (powermetrics) columns will be added when
+captured.
 
 Instrumenting kitty
 -----------------------
