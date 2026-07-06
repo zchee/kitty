@@ -39,6 +39,11 @@ def dump_state(s) -> str:
         phb = s.historybuf.pagerhist_as_bytes()
         if phb:
             parts.append('PAGERHIST_BYTES: ' + base64.b64encode(phb).decode())
+        # the wrap flag of the newest history line feeds line-0
+        # continuation; with pooled slots surviving a clear, an ungated
+        # read here is exactly how stale state would leak (final-review
+        # finding: the ed3_stale_wrap_reuse scenario exists for this)
+        parts.append(f'HB_ENDSWITH_WRAP: {s.historybuf.endswith_wrap()}')
     sel = s.text_for_selection()
     if any(sel):
         parts.append('SELECTION: ' + json.dumps(sel))
@@ -194,6 +199,19 @@ class TestScrollSemantics(BaseTest):
             for i in range(300):
                 feed(s, f'\x1b]8;;http://e.com/{i}\x1b\\L{i}\x1b]8;;\x1b\\\r\n')
 
+        def ed3_stale_wrap_reuse(s):
+            # wrap full-width lines into history (wrap flags set on the
+            # evicted cells), ED3-clear the shared pool (slots survive as
+            # spares holding stale wrap flags), then scroll plain lines so
+            # the stale slots are reused: HB_ENDSWITH_WRAP and the as_text
+            # continuation joins must reflect the NEW content only
+            feed(s, 'W' * 36)  # 6 wrapped rows on 6 cols, flags set
+            for i in range(4):
+                feed(s, f'\r\nw{i}')
+            feed(s, '\x1b[3J')
+            for i in range(8):
+                feed(s, f'p{i}\r\n')
+
         def paused_rendering_across_scroll(s):
             for i in range(5):
                 feed(s, f'pr{i}\r\n')
@@ -225,6 +243,7 @@ class TestScrollSemantics(BaseTest):
             'resize_lines_only_same_cols': (dict(cols=6, lines=5, scrollback=10), resize_lines_only_same_cols),
             'resize_same_dims': (dict(cols=6, lines=5, scrollback=8), resize_same_dims),
             'hyperlink_gc_across_eviction': (dict(cols=12, lines=4, scrollback=20), hyperlink_gc_across_eviction),
+            'ed3_stale_wrap_reuse': (dict(cols=6, lines=4, scrollback=6, options=pager), ed3_stale_wrap_reuse),
             'paused_rendering_across_scroll': (dict(cols=16, lines=4, scrollback=8), paused_rendering_across_scroll),
         }
 

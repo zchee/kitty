@@ -312,7 +312,7 @@ allocate_line_storage(Line *line, bool initialize) {
     if (initialize) {
         line->cpu_cells = PyMem_Calloc(line->xnum, sizeof(CPUCell));
         line->gpu_cells = PyMem_Calloc(line->xnum, sizeof(GPUCell));
-        if (line->cpu_cells == NULL || line->gpu_cells) { PyErr_NoMemory(); return false; }
+        if (line->cpu_cells == NULL || line->gpu_cells == NULL) { PyErr_NoMemory(); return false; }
         if (BLANK_CHAR != 0) clear_chars_in_line(line->cpu_cells, line->gpu_cells, line->xnum, BLANK_CHAR);
     } else {
         line->cpu_cells = PyMem_Malloc(line->xnum * sizeof(CPUCell));

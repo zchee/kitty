@@ -1193,6 +1193,12 @@ b2ce4562f). Target was the Phase-9-attributed scroll-copy machinery
   division cost above. Suites at baseline on BOTH backends at every
   stage boundary; scroll-semantics snapshots byte-identical throughout;
   MTL_DEBUG_LAYER clean on a scroll flood.
+- Deliberate behavior change (final-review note): ED3 / clear on the
+  SHARED pool retains cell memory as spares (count-only reset) instead
+  of releasing segments as the pre-pool clear did — bounded by the
+  design's memory envelope (lb.ynum + history capacity), and required
+  because the slots belong to the pool's lifetime, not the clear.
+  Private/standalone containers keep the release behavior.
 
 ### The audit finding that shapes the design
 
