@@ -13,6 +13,7 @@
 #include "control-codes.h"
 #include "state.h"
 #include "simd-string.h"
+#include "vt-input-ring.h"
 #include <stdalign.h>
 
 #define BUF_SZ (1024u*1024u)
@@ -220,12 +221,14 @@ typedef struct PS {
     // these are temporary variables set only for duration of a parse call
     PyObject *dump_callback;
     Screen *screen;
-    monotonic_t now, new_input_at;
-    pthread_mutex_t lock;
+    monotonic_t now;
 
-    // The buffer
+    // Transport from the IO thread (lock-free SPSC; heap-allocated, see
+    // vt-input-ring.h) and the main-thread-private parse arena state.
+    // buf/read are touched only by the main thread now, so the parse
+    // side needs no synchronization at all.
+    VTInputRing *input_ring;
     struct { size_t consumed, pos, sz; } read;
-    struct { size_t offset, sz, pending; } write;
 } PS;
 
 static void
@@ -1512,40 +1515,62 @@ consume_input(PS *self, PyObject *dump_callback UNUSED, id_type window_id UNUSED
 
 // API {{{
 
-#define with_lock pthread_mutex_lock(&self->lock);
-#define end_with_lock pthread_mutex_unlock(&self->lock);
+// Drain the transport ring into the contiguous parse arena. Replaces the
+// old under-lock absorb of write.pending; runs only on the main thread.
+// Sets write_space_created when the drain frees space in a full ring so
+// do_parse re-arms POLLIN for the stalled reader.
+static void
+drain_ring(PS *self, ParseData *pd) {
+    VTInputRing *ring = self->input_ring;
+    const bool was_full = !vt_ring_has_space(ring);
+    bool drained = false;
+    while (self->read.sz < BUF_SZ) {
+        size_t avail;
+        const uint8_t *src = vt_ring_readable(ring, &avail);
+        if (!avail) break;
+        const size_t n = MIN(avail, BUF_SZ - self->read.sz);
+        memcpy(self->buf + self->read.sz, src, n);
+        self->read.sz += n;
+        vt_ring_advance(ring, n);
+        drained = true;
+    }
+    if (was_full && drained) pd->write_space_created = true;
+}
 
 static void
 run_worker(void *p, ParseData *pd, bool flush) {
     Screen *screen = (Screen*)p;
     PS *self = (PS*)screen->vt_parser->state;
     screen->parsing_at = pd->now;
-    with_lock {
-        self->read.sz += self->write.pending; self->write.pending = 0;
-        pd->has_pending_input = self->read.pos < self->read.sz;
-        if (pd->has_pending_input) {
-            pd->time_since_new_input = pd->now - self->new_input_at;
-            if (flush || pd->time_since_new_input >= OPT(input_delay) || self->read.sz + 16 * 1024 > BUF_SZ) {
-                pd->input_read = true;
-                self->dump_callback = pd->dump_callback; self->now = pd->now;
-                self->screen = screen;
-                self->read.consumed = 0;
-                do {
-                    end_with_lock; {
-                        consume_input(self, pd->dump_callback, screen->window_id);
-                    } with_lock;
-                    self->read.sz += self->write.pending; self->write.pending = 0;
-                } while (self->read.pos < self->read.sz);
-                self->new_input_at = 0;
-                if (self->read.consumed) {
-                    pd->write_space_created = self->read.sz >= BUF_SZ;
-                    self->read.pos -= MIN(self->read.pos, self->read.consumed);
-                    self->read.sz -= MIN(self->read.sz, self->read.consumed);
-                    if (self->read.sz) memmove(self->buf, self->buf + self->read.consumed, self->read.sz);
-                }
+    // drain before the parse gate, mirroring the old absorb placement so
+    // the gate and the nearly-full override see the post-drain state
+    drain_ring(self, pd);
+    pd->has_pending_input = self->read.pos < self->read.sz;
+    if (pd->has_pending_input) {
+        pd->time_since_new_input = pd->now - vt_ring_new_input_at(self->input_ring);
+        // parse when the ring is full even inside the batching window:
+        // the reader is stalled and only parsing frees transport space
+        // (the analog of the old arena nearly-full override)
+        if (flush || pd->time_since_new_input >= OPT(input_delay) || self->read.sz + 16 * 1024 > BUF_SZ
+                || !vt_ring_has_space(self->input_ring)) {
+            pd->input_read = true;
+            self->dump_callback = pd->dump_callback; self->now = pd->now;
+            self->screen = screen;
+            self->read.consumed = 0;
+            do {
+                consume_input(self, pd->dump_callback, screen->window_id);
+                drain_ring(self, pd);  // pick up bytes that arrived mid-parse
+            } while (self->read.pos < self->read.sz);
+            // clear only while the ring is observably empty; the
+            // producer's post-publish re-stamp covers the race
+            if (vt_ring_used(self->input_ring) == 0) vt_ring_clear_new_input_at(self->input_ring);
+            if (self->read.consumed) {
+                self->read.pos -= MIN(self->read.pos, self->read.consumed);
+                self->read.sz -= MIN(self->read.sz, self->read.consumed);
+                if (self->read.sz) memmove(self->buf, self->buf + self->read.consumed, self->read.sz);
             }
         }
-    } end_with_lock;
+    }
 }
 
 #ifndef DUMP_COMMANDS
@@ -1553,37 +1578,21 @@ run_worker(void *p, ParseData *pd, bool flush) {
 uint8_t*
 vt_parser_create_write_buffer(Parser *p, size_t *sz) {
     PS *self = (PS*)p->state;
-    uint8_t *ans;
-    with_lock {
-        if (self->write.sz) fatal("vt_parser_create_write_buffer() called with an already existing write buffer");
-        self->write.offset = self->read.sz + self->write.pending;
-        *sz = BUF_SZ - self->write.offset;
-        self->write.sz = *sz;
-        ans = self->buf + self->write.offset;
-    } end_with_lock;
-    return ans;
+    // lock-free: a contiguous window in the transport ring (zero size
+    // iff the ring is full, which is the back-pressure stall)
+    return vt_ring_reserve(self->input_ring, sz);
 }
 
 void
 vt_parser_commit_write(Parser *p, size_t sz) {
     PS *self = (PS*)p->state;
-    with_lock {
-        size_t off = self->read.sz + self->write.pending;
-        if (self->new_input_at == 0) self->new_input_at = monotonic();
-        if (self->write.offset > off) memmove(self->buf + off, self->buf + self->write.offset, sz);
-        self->write.pending += sz;
-        self->write.sz = 0;
-    } end_with_lock;
+    vt_ring_commit(self->input_ring, sz, monotonic());
 }
 
 bool
 vt_parser_has_space_for_input(const Parser *p) {
     PS *self = (PS*)p->state;
-    bool ans;
-    with_lock {
-        ans = self->read.sz + self->write.pending < BUF_SZ;
-    } end_with_lock;
-    return ans;
+    return vt_ring_has_space(self->input_ring);
 }
 #endif
 
@@ -1612,7 +1621,7 @@ free_vt_parser(Parser* self) {
     if (self->state) {
         PS *s = (PS*)self->state;
         utf8_decoder_free(&s->utf8_decoder);
-        pthread_mutex_destroy(&s->lock);
+        free(s->input_ring);
         free(self->state); self->state = NULL;
     }
     Py_TYPE(self)->tp_free((PyObject*)self);
@@ -1676,10 +1685,14 @@ alloc_vt_parser(id_type window_id) {
             Py_CLEAR(self); PyErr_SetString(PyExc_TypeError, "PS->buf is not aligned");
             return NULL;
         }
-        if ((ret = pthread_mutex_init(&state->lock, NULL)) != 0) {
-            Py_CLEAR(self); PyErr_Format(PyExc_RuntimeError, "Failed to create Parser lock mutex: %s", strerror(ret));
+        // the transport ring lives behind a pointer: embedding its 1MiB
+        // by value would double the parser block (design-gate MAJOR-4)
+        if ((ret = posix_memalign((void**)&state->input_ring, 64, sizeof(VTInputRing))) != 0) {
+            Py_CLEAR(self);
+            PyErr_Format(PyExc_RuntimeError, "Failed to allocate parser input ring: %s", strerror(ret));
             return NULL;
         }
+        memset(state->input_ring, 0, sizeof(VTInputRing));
         state->window_id = window_id;
         utf8_decoder_reset(&state->utf8_decoder);
         reset_csi(&state->csi);

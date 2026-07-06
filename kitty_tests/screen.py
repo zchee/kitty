@@ -1294,7 +1294,20 @@ class TestScreen(BaseTest):
                 del t.ex
 
         t('XYZ', ('p;XYZ', False))
-        t('a' * VT_PARSER_BUFFER_SIZE, ('p;' + 'a' * (VT_PARSER_BUFFER_SIZE - 8), True), (';' + 'a' * 8, False))
+        # An over-capacity payload arrives via pending-mode chunks. WHERE
+        # the splits land depends on the transport's window sizes (the SPSC
+        # ring wraps, so the boundary shifts with prior traffic) — the
+        # stable contract is the flag pattern and the reassembled payload.
+        c.clear()
+        send('a' * VT_PARSER_BUFFER_SIZE)
+        self.assertGreaterEqual(len(c.cc_buf), 2)
+        self.assertTrue(all(pending for _, pending in c.cc_buf[:-1]))
+        self.assertFalse(c.cc_buf[-1][1])
+        self.ae(c.cc_buf[0][0][:2], 'p;')
+        for chunk, _ in c.cc_buf[1:]:
+            self.ae(chunk[0], ';')
+        payload = c.cc_buf[0][0][2:] + ''.join(chunk[1:] for chunk, _ in c.cc_buf[1:])
+        self.ae(payload, 'a' * VT_PARSER_BUFFER_SIZE)
         t('', ('p;', False))
         t('!', ('p;!', False))
 
