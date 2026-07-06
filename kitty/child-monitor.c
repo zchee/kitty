@@ -991,6 +991,16 @@ no_render_frame_received_recently(OSWindow *w, monotonic_t now, monotonic_t max_
 
 bool
 render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images, bool input_driven) {
+    // P9-0 test-only lever (like KITTY_METAL_TEST_FORCE_INFLIGHT): suppress
+    // all per-window rendering (shape + cell-data upload + encode + present)
+    // while parse/io/timers run identically, to measure how much flood wall
+    // time main-thread render interleave costs. Never set outside harnesses.
+    static int suppress_render = -1;
+    if (UNLIKELY(suppress_render < 0)) {
+        const char *v = getenv("KITTY_TEST_SUPPRESS_RENDER");
+        suppress_render = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    if (UNLIKELY(suppress_render == 1)) return false;
     if (!w->num_tabs) return false;
     if (!should_os_window_be_rendered(w) && global_state.thumbnail_callback.os_window != w->id) {
         update_os_window_title(w);

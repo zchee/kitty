@@ -1092,6 +1092,68 @@ scroll-machinery share and is queued in Future work. Harness:
 `.omc/verify/phase8/p8_vtebench.py` (payload to the tty, results via
 `--dat --silent`).
 
+## Phase 9 (Wave 9): render/parse de-multiplex — measured, and rejected
+
+Goal: the structural 10.6% devlog residual (US-402d) and the vtebench
+scrolling gap (69 ms vs Ghostty 20 / Alacritty 26). Method: before any
+threading work, a test-only suppression lever
+(`KITTY_TEST_SUPPRESS_RENDER=1`, early-return in `render_os_window()`)
+puts an upper bound on what ANY render offload could buy — parse, io and
+timers run identically, rendering costs exactly zero.
+
+### The gate numbers (`.omc/verify/phase9/P9-0-FINDINGS.md`)
+
+devlog-006, 4 interleaved arms (LOAD-DEGRADED 8.8): render share of the
+wall = **0.58%** at default config, **2.97%** at `input_delay 0`; the
+delay share (5.74%) reproduces the US-402d policy split. The
+pure-pipeline bound is the decisive number: render OFF + delay 0 drains
+at **45.4 ms/pass vs Alacritty's end-to-end 42.5 ms** — kitty's
+io-thread→main-tick handoff alone costs more than Alacritty's whole
+read+parse+render loop.
+
+vtebench `scrolling` (sample, main thread 96% busy — this workload IS
+main-CPU-bound, unlike the cat-flood): memmove **44.5%** (93% under
+`historybuf_add_line` — the evicted-line copy into the scrollback ring)
++ memset **25.4%** (`screen_index` recycled-row clear) = **the
+scroll-copy machinery is ~70%**; draw_text 6.9%; render-encode +
+render-shape **0.36%**.
+
+**Verdict: the render-thread split is dead on both axes** — a perfect
+split buys ≤0.6% on devlog and ≤0.4% on scrolling. Rejected with
+numbers, closing the Future-work #1 hypothesis. The de-multiplex framing
+was wrong: kitty's main thread is not render-starved; on floods it is
+41% idle (pipeline-bound) and on scrolling it is copy-bound.
+
+### Every alternative lever, dispositioned
+
+- **Drop GPUCells from history storage** (−62% copy width): impossible —
+  the SGR color spec lives only in GPUCell; losing it loses colors.
+- **Batch scrolled lines into one copy**: impossible — the recycled row
+  is cleared and rewritten immediately, so each line must be saved (or
+  pointer-swapped) at scroll time.
+- **Non-temporal/faster memcpy**: platform memmove already streams
+  optimally; the cost is byte volume (~32 B/cell × cols × every scrolled
+  line through a >L2 ring).
+- **Lazy clear of the recycled row** (the memset 25%): needs
+  cleared-state tracking checked by every line reader — too much radius
+  for one benchmark.
+- **io→main handoff micro-levers**: input_delay already coalesces
+  wakeups at defaults; BUF_SZ is already 1 MiB; the remaining 6.8-point
+  pure-pipeline residual is the reader/parser thread model itself.
+
+### What Phase 9 establishes
+
+The two remaining competitive gaps share one root each, both
+architectural: (1) the devlog residual is the **reader/parser thread
+model** (a dedicated parser thread à la Alacritty — not a render
+thread); (2) the scrolling gap is the **grid container** (Alacritty's
+visible screen is a window over the scrollback ring: O(1) scroll, zero
+copy; kitty copies every scrolled line into a separate history ring).
+Both are Screen-level redesigns (resize/rewrap, serialization,
+pagerhist, multicell interplay) queued at the top of Future work with
+these numbers. Landed artifact: the suppression lever (standing tool for
+render-cost upper bounds).
+
 ## Final architecture (post-Phase-7 consolidation)
 
 The frame path is native end to end; the GL-name shim survives only where
@@ -1144,18 +1206,25 @@ condition. Updated as captures land.
 
 ## Future work (consolidated queue)
 
-1. **Render-thread split (parse/render de-multiplexing)** — the Phase-8
-   headline lever: the structural 10.6% devlog residual vs Alacritty
-   (US-402d) plus the encode+upload offload named since Phase 5.
-2. **Off-thread image decode** — the real icat-hitch lever (decode = 91.6%
+1. **Ring-grid unification (O(1) scroll)** — the vtebench-scrolling fix,
+   quantified in Phase 9: scroll-copy = ~70% of scrolling CPU (memmove
+   44.5% + memset 25.4%); make the visible screen a window over the
+   scrollback ring (or per-line pointer swaps between LineBuf and
+   HistoryBuf). Screen-level container redesign: resize/rewrap,
+   serialization, pagerhist, multicell interplay. Also removes the 25%
+   scroll share of flood busy (P8-0).
+2. **Dedicated parser/reader thread** — the devlog residual fix,
+   quantified in Phase 9: kitty's pure pipeline (render off, delay 0)
+   drains at 45.4 ms/pass vs Alacritty's end-to-end 42.5 ms; the
+   io→main-tick handoff is the cost, not any per-stage CPU. (The
+   render-thread split variant is DEAD: ≤0.6% devlog / ≤0.4% scrolling,
+   Phase-9 gate.)
+3. **Off-thread image decode** — the real icat-hitch lever (decode = 91.6%
    of the 24 MB wall; .omc/verify/g4/FINDINGS.md).
-3. **vtebench dense_cells/scrolling gap analysis** — kitty 15/69 ms vs
-   Alacritty 7/26 (Phase-8 capture); scrolling aligns with the
-   scroll-machinery share (historybuf line copy — the steal/swap redesign
-   rejected in US-402c would be its container-level fix).
 4. **utf8 decoder NEON kernel** — 0.96 GB/s today on Japanese, ~2.5–3×
    headroom via ESC-prescan + dedicated UTF-8→UTF-32 kernel (US-402b
-   defer, numbers in P8-LEVERS.md).
+   defer, numbers in P8-LEVERS.md). vtebench dense_cells (15 vs 7-8 ms)
+   remains unattributed — profile before acting.
 5. **Cross-backend composition difference** — §7 #6, tracked in
    .scratch/metal-gl-composition-diff/.
 6. **icat-GIF animation failure** — pre-existing, all configs; tracked in
