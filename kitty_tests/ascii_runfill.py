@@ -1,17 +1,19 @@
 #!/usr/bin/env python
 # License: GPLv3 Copyright: 2026, Kovid Goyal <kovid at kovidgoyal.net>
 
-# Differential fuzz test for the batched ASCII run-fill path in
-# draw_ascii_run() (kitty/screen.c). It feeds the *same* byte stream to two
-# screens, one with the bulk path enabled and one with it forced off via
-# kitty.fast_data_types.set_ascii_runfill_enabled(), and asserts the
-# resulting screen state is byte-identical. The bulk path is an internal
-# fast-path optimization only: it must never be observable from the output.
+# Differential fuzz test for the batched run-fill paths in draw_ascii_run()
+# and draw_wide_run() (kitty/screen.c). It feeds the *same* byte stream to a
+# scalar-only reference screen (both bulk paths forced off via
+# kitty.fast_data_types.set_ascii_runfill_enabled() /
+# set_wide_runfill_enabled()) and to screens with each combination of the
+# bulk paths enabled, and asserts the resulting screen state is
+# byte-identical. The bulk paths are internal fast-path optimizations only:
+# they must never be observable from the output.
 
 import os
 import random
 
-from kitty.fast_data_types import set_ascii_runfill_enabled
+from kitty.fast_data_types import set_ascii_runfill_enabled, set_wide_runfill_enabled, test_wide_runfill_fast_class
 
 from . import BaseTest, parse_bytes
 
@@ -62,6 +64,17 @@ def _ascii_run(rng: random.Random, cols: int) -> bytes:
     return bytes(rng.randint(0x20, 0x7e) for _ in range(n))
 
 
+# Plain width-2 chars (kana/kanji/hangul/wide-emoji) for long runs that
+# exercise draw_wide_run()'s chunking against wrap boundaries, plus the
+# joining hazards (VS16, dakuten, ZWJ) as their own tail categories below.
+CJK_RUN_CHARS = '日本語あいうえおカキクケコ漢字化処理端末描画中文简体繁體한국어글\U0001f600\U0001f680'
+
+
+def _cjk_run(rng: random.Random, cols: int) -> bytes:
+    n = rng.randint(1, 2 * cols)
+    return ''.join(rng.choice(CJK_RUN_CHARS) for _ in range(n)).encode('utf-8')
+
+
 def _sgr(rng: random.Random) -> bytes:
     codes = [rng.choice(SGR_CODES) for _ in range(rng.randint(1, 3))]
     return ('\x1b[' + ';'.join(map(str, codes)) + 'm').encode('ascii')
@@ -72,10 +85,10 @@ def _cursor_move(rng: random.Random, cols: int, lines: int) -> bytes:
     return f'\x1b[{row};{col}H'.encode('ascii')
 
 
-# weighted per the fuzz spec: mostly ASCII runs, with a long tail of
-# controls/SGR/wide-chars/cursor-moves/mode-toggles/charset-shifts.
+# weighted per the fuzz spec: mostly ASCII and CJK runs, with a long tail
+# of controls/SGR/wide-units/cursor-moves/mode-toggles/charset-shifts.
 _FUZZ_CATEGORIES = (
-    ('ascii', 73), ('control', 10), ('sgr', 5), ('wide', 5),
+    ('ascii', 58), ('cjk_run', 15), ('control', 10), ('sgr', 5), ('wide', 5),
     ('cursor', 3), ('mode', 2), ('charset', 2),
 )
 _FUZZ_NAMES = [c for c, _ in _FUZZ_CATEGORIES]
@@ -85,6 +98,8 @@ _FUZZ_WEIGHTS = [w for _, w in _FUZZ_CATEGORIES]
 def _fuzz_token(rng: random.Random, category: str, cols: int, lines: int) -> bytes:
     if category == 'ascii':
         return _ascii_run(rng, cols)
+    if category == 'cjk_run':
+        return _cjk_run(rng, cols)
     if category == 'control':
         return rng.choice((b'\n', b'\t', b'\r'))
     if category == 'sgr':
@@ -134,6 +149,22 @@ def _deterministic_cases() -> list[tuple[str, bytes, int, int]]:
     add('sgr_mid_stream_then_runs', b'\x1b[31mred' + b'\x1b[4munderline' + b'\x1b[0mplain', cols=20, lines=4)
     add('hyperlinks_around_runs', hyperlink('http://example.com', '1') + b'linked' + hyperlink() + b'plain', cols=20, lines=4)
     add('cursor_move_mid_run_overwrite', b'0123456789' + b'\x1b[1;4H' + b'XYZ', cols=12, lines=4)
+
+    # draw_wide_run() adversarial cases: wrap parity (a width-2 run against
+    # even and odd column counts, so the run both fits exactly and leaves a
+    # dangling single cell for the scalar wrap), modes, joiners, overwrites.
+    add('cjk_long_lines', ('日本語の端末描画テスト' * 8).encode(), cols=20, lines=6)
+    add('cjk_wrap_even_cols', ('漢' * 15).encode(), cols=10, lines=5)
+    add('cjk_wrap_odd_cols', ('漢' * 15).encode(), cols=11, lines=5)
+    add('cjk_decawm_off', DECAWM_OFF + ('語' * 12).encode(), cols=10, lines=4)
+    add('cjk_irm_insert', IRM_ON + ('本' * 6).encode() + b'\x1b[1G' + '日'.encode(), cols=12, lines=4)
+    add('vs16_after_kanji_run', '株株株㊙️株株'.encode(), cols=20, lines=4)
+    add('dakuten_after_kana_run', ('かかか' + 'が' + 'かか').encode(), cols=20, lines=4)
+    add('zwj_between_wide_runs', ('日本' + '\U0001f468‍\U0001f469' + '語化').encode(), cols=20, lines=4)
+    add('cjk_overwrite_multicell', '日本語'.encode() + b'\x1b[1;2H' + '漢字'.encode(), cols=12, lines=4)
+    add('mixed_ascii_cjk_alternating', ('a日b本c語' * 4).encode(), cols=14, lines=6)
+    add('emoji_run', ('\U0001f600' * 6).encode(), cols=16, lines=4)
+    add('hangul_run', ('한국어글자한국어글자' * 3).encode(), cols=15, lines=6)
 
     return cases
 
@@ -202,21 +233,31 @@ class TestAsciiRunfill(BaseTest):
 
     def assert_paths_match(self, data: bytes, cols: int, lines: int, context: str) -> None:
         scrollback = max(3, lines)
-        prev = set_ascii_runfill_enabled(True)
-        try:
-            bulk = self.create_screen(cols=cols, lines=lines, scrollback=scrollback)
-            parse_bytes(bulk, data)
-        finally:
-            set_ascii_runfill_enabled(prev)
-        prev = set_ascii_runfill_enabled(False)
-        try:
-            scalar = self.create_screen(cols=cols, lines=lines, scrollback=scrollback)
-            parse_bytes(scalar, data)
-        finally:
-            set_ascii_runfill_enabled(prev)
-        self.assert_screens_match(bulk, scalar, context)
+
+        def run_with(ascii_on: bool, wide_on: bool):
+            prev_ascii = set_ascii_runfill_enabled(ascii_on)
+            prev_wide = set_wide_runfill_enabled(wide_on)
+            try:
+                screen = self.create_screen(cols=cols, lines=lines, scrollback=scrollback)
+                parse_bytes(screen, data)
+            finally:
+                set_ascii_runfill_enabled(prev_ascii)
+                set_wide_runfill_enabled(prev_wide)
+            return screen
+
+        scalar = run_with(False, False)
+        for ascii_on, wide_on in ((True, True), (True, False), (False, True)):
+            bulk = run_with(ascii_on, wide_on)
+            self.assert_screens_match(
+                bulk, scalar, f'{context} arms=ascii:{ascii_on},wide:{wide_on}',
+                label_a=f'bulk(ascii={ascii_on},wide={wide_on})')
 
     def test_ascii_runfill(self):
+        # -1) Exhaustive soundness proof of draw_wide_run()'s fast-class
+        # shortcut: every admitted codepoint x every raw segmentation state
+        # must step to the exact constant the C fill writes. Runs in C.
+        self.assertIsNone(test_wide_runfill_fast_class())
+
         # 0) Comparator self-check: prove assert_screens_match() actually
         # detects divergence, so a vacuously-passing comparator can't hide
         # real regressions in the cases below.

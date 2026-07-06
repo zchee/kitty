@@ -1189,6 +1189,21 @@ ascii_runfill_enabled(void) {
     return ascii_runfill_state == 1;
 }
 
+// P8 (Phase 8): same levers for the batched width-2 run fill:
+// KITTY_DISABLE_WIDE_RUNFILL=1 forces the scalar loop for a whole process;
+// set_wide_runfill_enabled() (fast_data_types) toggles it in-process for
+// the differential fuzz test.
+static int wide_runfill_state = -1;
+
+static bool
+wide_runfill_enabled(void) {
+    if (UNLIKELY(wide_runfill_state < 0)) {
+        const char *v = getenv("KITTY_DISABLE_WIDE_RUNFILL");
+        wide_runfill_state = (v && v[0] && strcmp(v, "0") != 0) ? 0 : 1;
+    }
+    return wide_runfill_state == 1;
+}
+
 // P1 (Phase 5): fill a run of printable-ASCII chars in bulk — one GPUCell
 // template broadcast per line chunk (memset_array, the linebuf_clear_lines
 // pattern) and a tight CPUCell scatter, with one cursor advance per chunk —
@@ -1240,6 +1255,118 @@ draw_ascii_run(Screen *self, const uint32_t *chars, size_t num, text_loop_state 
     return consumed;
 }
 
+// P8 (Phase 8): codepoints the width-2 run fill may pass WITHOUT consulting
+// char_props_for()/grapheme_segmentation_step() — the serial state-machine
+// dependency chain those form is the draw-loop bottleneck on CJK floods.
+// Membership promises: valid CharProps, width 2, and for every segmentation
+// state reachable after a stored width-2 char, stepping the state with this
+// char yields exactly {.grapheme_break=GBP_None} with add_to_current_cell
+// off. test_wide_runfill_fast_class() (fast_data_types) proves all of this
+// exhaustively over every admitted codepoint and every raw segmentation
+// state, so the ranges here can only under-approximate, never diverge.
+static inline bool
+plain_wide_fast_class(uint32_t ch) {
+    return (0x4E00 <= ch && ch <= 0x9FFF)   // CJK Unified Ideographs
+        || (0x3041 <= ch && ch <= 0x3096)   // hiragana (excludes combining 3099/309A)
+        || (0x309B <= ch && ch <= 0x30FF)   // spacing dakuten, katakana, ー, ・
+        || (0x3000 <= ch && ch <= 0x3029)   // ideographic space and punctuation 、。「」々
+        || (0x3031 <= ch && ch <= 0x303C)   // kana repeat marks etc. (302A-302F combining and 3030/303D Extended_Pictographic are excluded)
+        || (0x3400 <= ch && ch <= 0x4DBF)   // CJK Extension A
+        || (0xFF01 <= ch && ch <= 0xFF60)   // fullwidth forms
+        || (0xF900 <= ch && ch <= 0xFA6D);  // CJK Compatibility Ideographs
+}
+
+// P8 (Phase 8): fill a run of plain width-2 codepoints in bulk — one
+// two-cell multicell pair per char with a register-built CPUCell template
+// and a single GPUCell broadcast, skipping the per-char branchy tail
+// (multicell probes, wrap checks, IRM/placeholder tests, zero_cells RMW)
+// and, for the fast class above, the whole property/segmentation lookup
+// chain. The caller has fully validated chars[0]: charset-identity (>= 256
+// is never remapped by map_char), valid CharProps, grapheme step COMMITTED
+// to s->seg, width 2, not the image placeholder, IRM off. Later chars are
+// validated here — fast-class ones by construction (see above), the rest
+// with exactly the scalar sequence (props -> segmentation step -> width) —
+// and s->seg is committed per STORED char only, so on any early stop the
+// scalar loop resumes at the first unconsumed char with exactly the
+// segmentation state it would have had. The fill NEVER wraps: it is
+// confined to the current line and stops at anything it cannot replicate
+// exactly — the line edge (scalar owns the DECAWM wrap and its wrap-time
+// segmentation-state re-derivation and multicell-nuke semantics), a
+// multicell cell in the target span (scalar nuke/move-past), a
+// charset-range char, an invalid char, a grapheme join (combining/VS/ZWJ),
+// a non-2 width, or the image placeholder. The GBP_Prepend entry guard
+// keeps the fast-class exit-state theorem sound even if some future
+// Unicode version were to add a width-2 Prepend char.
+static size_t
+draw_wide_run(Screen *self, const uint32_t *chars, size_t num, text_loop_state *s) {
+    if (UNLIKELY(s->seg.grapheme_break == GBP_Prepend)) return 0;
+    size_t consumed = 0;
+    CPUCell c = {.is_multicell=true, .width=2, .scale=1, .natural_width=true, .hyperlink_id=s->cc.hyperlink_id};
+    const GraphemeSegmentationResult plain = {.grapheme_break=GBP_None};
+    const index_type limit = self->columns;
+    index_type x = self->cursor->x;
+    while (consumed < num) {
+        if (x + 2 > limit) break;  // line edge: scalar wrap/clamp semantics take over
+        // 1) multicell-clean span: how many whole cell pairs from x are free
+        // of multicell remnants (scalar nuke/move-past owns anything else).
+        size_t span_max = MIN((size_t)((limit - x) / 2), num - consumed);
+        size_t clean = 0;
+        while (clean < 2 * span_max && !s->cp[x + clean].is_multicell) clean++;
+        span_max = clean / 2;
+        if (!span_max) break;
+        // 2) validate chars into the clean span, committing s->seg per
+        // accepted char. Fast-class chars skip the whole property chain:
+        // once the state equals the plain constant, stepping any fast-class
+        // char returns that same constant (proven exhaustively by
+        // test_wide_runfill_fast_class), so the step is elided; until then
+        // (at most the first couple of chars after entry, while residual
+        // emoji/InCB context bits shift out) the real step runs. The
+        // checker also proves fast-class chars never join and never yield
+        // Prepend from any reachable state, so the generic add/width/
+        // Prepend checks are unnecessary for them.
+        size_t n = 0;
+        while (n < span_max) {
+            const uint32_t ch = chars[consumed + n];
+            if (consumed + n) {  // chars[0] was validated (and its seg step committed) by the caller
+                if (LIKELY(plain_wide_fast_class(ch))) {
+                    if (UNLIKELY(s->seg.val != plain.val))
+                        s->seg = grapheme_segmentation_step(s->seg, char_props_for(ch));
+                } else {
+                    if (ch < 256 || ch == IMAGE_PLACEHOLDER_CHAR) break;
+                    const CharProps cp = char_props_for(ch);
+                    if (cp.is_invalid) break;
+                    const GraphemeSegmentationResult seg = grapheme_segmentation_step(s->seg, cp);
+                    if (seg.add_to_current_cell) break;
+                    if (wcwidth_std(cp) != 2) break;
+                    if (UNLIKELY(seg.grapheme_break == GBP_Prepend)) break;  // keep the fast-class theorem's precondition
+                    s->seg = seg;
+                }
+            }
+            n++;
+        }
+        if (!n) break;
+        // 3) bulk store: one GPUCell template broadcast for the whole chunk
+        // (the memset_array pattern draw_ascii_run uses) and a tight
+        // CPUCell pair loop.
+        memset_array(s->gp + x, s->g, 2 * n);
+        for (size_t j = 0; j < n; j++) {
+            c.ch_or_idx = chars[consumed + j]; c.x = 0;
+            s->cp[x + 2 * j] = c;
+            c.x = 1;
+            s->cp[x + 2 * j + 1] = c;
+        }
+        x += 2 * n;
+        consumed += n;
+        if (n < span_max) break;  // validation stopped mid-span: scalar resumes there
+    }
+    if (consumed) {
+        self->cursor->x = x;
+        s->prev.y = self->cursor->y; s->prev.x = x - 2; s->prev.cc = s->cp + x - 2;
+        self->last_graphic_char = chars[consumed - 1];
+    }
+    return consumed;
+}
+
 static void
 draw_text_loop(Screen *self, const uint32_t *chars, size_t num_chars, text_loop_state *s) {
     init_text_loop_line(self, s);
@@ -1287,6 +1414,16 @@ draw_text_loop(Screen *self, const uint32_t *chars, size_t num_chars, text_loop_
                     continue;
                 }
                 char_width = 1;
+            } else if (char_width == 2 && ch == chars[i] && ch != IMAGE_PLACEHOLDER_CHAR
+                    && !self->modes.mIRM && i + 1 < num_chars && chars[i + 1] >= 256
+                    && wide_runfill_enabled()) {
+                // P8 (Phase 8): batched width-2 run fill, the draw_ascii_run
+                // analog for CJK/emoji floods. ch == chars[i] rules out
+                // charset remaps; whatever draw_wide_run cannot replicate
+                // exactly makes it stop early and this scalar path resumes
+                // at the first unconsumed char.
+                const size_t consumed = draw_wide_run(self, chars + i, num_chars - i, s);
+                if (consumed) { i += consumed - 1; continue; }
             }
         }
 
@@ -6610,9 +6747,59 @@ py_set_ascii_runfill_enabled(PyObject *self UNUSED, PyObject *val) {
     return PyBool_FromLong(old);
 }
 
+static PyObject*
+py_set_wide_runfill_enabled(PyObject *self UNUSED, PyObject *val) {
+    // P8 differential-test lever, the width-2 twin of the above.
+    const int t = PyObject_IsTrue(val);
+    if (t < 0) return NULL;
+    const bool old = wide_runfill_enabled();
+    wide_runfill_state = t ? 1 : 0;
+    return PyBool_FromLong(old);
+}
+
+static PyObject*
+py_test_wide_runfill_fast_class(PyObject *self UNUSED, PyObject *args UNUSED) {
+    // Exhaustively prove the properties draw_wide_run()'s fast-class
+    // shortcut relies on, for EVERY codepoint the class admits. Returns
+    // None on success, an error string naming the first violation.
+    //   1. valid CharProps, width 2
+    //   2. from EVERY raw segmentation state whose grapheme_break is not
+    //      AtStart (the synthetic pre-start value: every step exits with
+    //      the processed char's own break class, so it is unreachable
+    //      mid-run) and not Prepend (guarded at the fill's entry and per
+    //      generic-path char): step(S, ch) never joins
+    //      (add_to_current_cell off) and lands on grapheme_break ==
+    //      GBP_None — this is what lets the fill's fast branch skip the
+    //      generic add/width/Prepend checks
+    //   3. steady state: step(PLAIN, ch) == PLAIN exactly, where PLAIN is
+    //      {.grapheme_break=GBP_None} with every other bit clear — this is
+    //      what lets the fill skip the step call entirely once the state
+    //      has converged to PLAIN
+    const GraphemeSegmentationResult plain = {.grapheme_break=GBP_None};
+    for (uint32_t ch = 0; ch <= MAX_UNICODE; ch++) {
+        if (!plain_wide_fast_class(ch)) continue;
+        const CharProps cp = char_props_for(ch);
+        if (cp.is_invalid) return PyUnicode_FromFormat("U+%04X: is_invalid set", ch);
+        if (wcwidth_std(cp) != 2) return PyUnicode_FromFormat("U+%04X: width %d != 2", ch, wcwidth_std(cp));
+        const GraphemeSegmentationResult steady = grapheme_segmentation_step(plain, cp);
+        if (steady.val != plain.val)
+            return PyUnicode_FromFormat("U+%04X: not steady: PLAIN steps to %u", ch, (unsigned)steady.val);
+        for (uint32_t raw = 0; raw < 1024; raw++) {  // all (add_to_current_cell, state) bit combinations
+            const GraphemeSegmentationResult st = {.val=(uint16_t)(raw << 6)};
+            if (st.grapheme_break == GBP_AtStart || st.grapheme_break == GBP_Prepend) continue;
+            const GraphemeSegmentationResult r = grapheme_segmentation_step(st, cp);
+            if (r.add_to_current_cell || r.grapheme_break != GBP_None)
+                return PyUnicode_FromFormat("U+%04X: state %u steps to %u (join or non-None break)", ch, (unsigned)st.val, (unsigned)r.val);
+        }
+    }
+    Py_RETURN_NONE;
+}
+
 static PyMethodDef module_methods[] = {
     {"is_emoji_presentation_base", (PyCFunction)screen_is_emoji_presentation_base, METH_O, ""},
     {"set_ascii_runfill_enabled", (PyCFunction)py_set_ascii_runfill_enabled, METH_O, ""},
+    {"set_wide_runfill_enabled", (PyCFunction)py_set_wide_runfill_enabled, METH_O, ""},
+    {"test_wide_runfill_fast_class", (PyCFunction)py_test_wide_runfill_fast_class, METH_NOARGS, ""},
     {"truncate_point_for_length", (PyCFunction)screen_truncate_point_for_length, METH_VARARGS, ""},
     {"test_ch_and_idx", test_ch_and_idx, METH_O, ""},
     {NULL}  /* Sentinel */
