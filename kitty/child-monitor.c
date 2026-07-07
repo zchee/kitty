@@ -1057,6 +1057,95 @@ immediate_encode_floor(OSWindow *w, monotonic_t now) {
     }
     return w->immediate_present_floor;
 }
+
+// KITTY_PACING_DEBUG=1: Wave-14 Step-0 confirmation instrumentation for the
+// immediate-encode governor gate below. Debug-only and Metal-only: the env var
+// is resolved ONCE into a cached bool (zero cost when off -- a single
+// predictable branch), nothing is allocated in the hot path, and all counter
+// state lives on the render/main thread that owns the gate (no cross-thread
+// access). One parseable "pacing:" line is emitted via log_error every
+// PACING_DUMP_EVERY gate evaluations and again at teardown. Counters are
+// cumulative for the life of the process, so a run's totals are the
+// reason=teardown record (or the last reason=periodic line if the process is
+// killed before teardown).
+#define PACING_DUMP_EVERY 512u
+typedef struct PacingDebugCounters {
+    uint64_t ticks;               // render_os_window gate evaluations sampled
+    uint64_t input_driven_ticks;  // ...of which were input-driven (pending input damage)
+    uint64_t immediate_taken;     // immediate_encode == true  (low-latency fast path)
+    uint64_t immediate_disq;      // immediate_encode == false (deferred to the pace link)
+    uint64_t floor_blocked;       // disqualified ONLY by the immediate-encode floor: the
+                                  // Phase-13B "fast parse lands damage inside the floor" chain
+    uint64_t defer_not_requested; // defer branch: render_state NOT_REQUESTED -> request_frame_render
+    uint64_t defer_fallback250;   // defer branch: REQUESTED + 250ms no_render_frame fallback -> request
+    uint64_t defer_waiting;       // defer branch: REQUESTED and link fresh -> wait for the next link tick
+    uint64_t gap_bucket[7];       // now-last_gpu_present_at at the gate, ms: <4,4-8,8-16,16-40,40-80,80-250,>=250
+} PacingDebugCounters;
+static PacingDebugCounters pacing_dbg;
+static uint64_t pacing_dbg_since_dump, pacing_dbg_seq;
+
+static bool
+pacing_debug_enabled(void) {
+    static int cached = -1;
+    if (UNLIKELY(cached < 0)) {
+        const char *v = getenv("KITTY_PACING_DEBUG");
+        cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+// Coarse fixed buckets for now-last_gpu_present_at at the gate (indices map to
+// the gap_* keys emitted by pacing_debug_dump).
+static unsigned
+pacing_gap_bucket(monotonic_t gap) {
+    if (gap < ms_to_monotonic_t(4ll)) return 0;
+    if (gap < ms_to_monotonic_t(8ll)) return 1;
+    if (gap < ms_to_monotonic_t(16ll)) return 2;
+    if (gap < ms_to_monotonic_t(40ll)) return 3;
+    if (gap < ms_to_monotonic_t(80ll)) return 4;
+    if (gap < ms_to_monotonic_t(250ll)) return 5;
+    return 6;
+}
+
+static void
+pacing_debug_dump(const char *reason) {
+    const PacingDebugCounters *c = &pacing_dbg;
+    log_error("pacing: reason=%s seq=%llu ticks=%llu input_driven=%llu imm_taken=%llu imm_disq=%llu"
+              " floor_blocked=%llu defer_nreq=%llu defer_fallback250=%llu defer_waiting=%llu"
+              " gap_lt4=%llu gap_4_8=%llu gap_8_16=%llu gap_16_40=%llu gap_40_80=%llu gap_80_250=%llu gap_ge250=%llu",
+              reason, (unsigned long long)(++pacing_dbg_seq),
+              (unsigned long long)c->ticks, (unsigned long long)c->input_driven_ticks,
+              (unsigned long long)c->immediate_taken, (unsigned long long)c->immediate_disq,
+              (unsigned long long)c->floor_blocked,
+              (unsigned long long)c->defer_not_requested, (unsigned long long)c->defer_fallback250,
+              (unsigned long long)c->defer_waiting,
+              (unsigned long long)c->gap_bucket[0], (unsigned long long)c->gap_bucket[1],
+              (unsigned long long)c->gap_bucket[2], (unsigned long long)c->gap_bucket[3],
+              (unsigned long long)c->gap_bucket[4], (unsigned long long)c->gap_bucket[5],
+              (unsigned long long)c->gap_bucket[6]);
+}
+
+// Sampled once per gate evaluation on the render/main thread, only when the
+// cached debug bool is set. Reads w's gate inputs only; when nonfloor_ok holds
+// the gate already resolved immediate_encode_floor() this tick, so the re-call
+// hits the per-window cache without an extra refresh (no behavior change).
+static void
+pacing_debug_sample_gate(OSWindow *w, monotonic_t now, bool input_driven, bool immediate_encode) {
+    const monotonic_t gap = now - w->last_gpu_present_at;
+    pacing_dbg.ticks++;
+    if (input_driven) pacing_dbg.input_driven_ticks++;
+    pacing_dbg.gap_bucket[pacing_gap_bucket(gap)]++;
+    if (immediate_encode) pacing_dbg.immediate_taken++;
+    else {
+        pacing_dbg.immediate_disq++;
+        const bool nonfloor_ok = metal_immediate_encode_enabled()
+            && input_driven && !w->keep_rendering_till_swap && USE_RENDER_FRAMES
+            && w->render_state == RENDER_FRAME_NOT_REQUESTED && !w->live_resize.in_progress
+            && global_state.thumbnail_callback.os_window != w->id;
+        if (nonfloor_ok && gap < immediate_encode_floor(w, now)) pacing_dbg.floor_blocked++;
+    }
+    if (UNLIKELY(++pacing_dbg_since_dump >= PACING_DUMP_EVERY)) { pacing_dbg_since_dump = 0; pacing_debug_dump("periodic"); }
+}
 #endif
 
 bool
@@ -1106,12 +1195,28 @@ render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images, bo
 #else
     (void)input_driven;
 #endif
+#ifdef KITTY_BACKEND_METAL
+    if (UNLIKELY(pacing_debug_enabled())) pacing_debug_sample_gate(w, now, input_driven, immediate_encode);
+#endif
     if (immediate_encode) {
 #ifdef __APPLE__
         if (sp) os_signpost_event_emit(slog, render_gate_sid, "render_gate", "window=%llu state=%{public}s", w->id, "immediate");
 #endif
     } else if (!w->keep_rendering_till_swap && USE_RENDER_FRAMES && w->render_state != RENDER_FRAME_READY) {
-        if (w->render_state == RENDER_FRAME_NOT_REQUESTED || no_render_frame_received_recently(w, now, ms_to_monotonic_t(250ll))) request_frame_render(w);
+        // Preserve the original short-circuit exactly: no_render_frame_received_recently
+        // is evaluated iff render_state != NOT_REQUESTED, and request_frame_render is
+        // called iff either sub-condition holds. The two locals only let the pacing
+        // debug counters classify which sub-branch fired (see KITTY_PACING_DEBUG).
+        const bool nreq = w->render_state == RENDER_FRAME_NOT_REQUESTED;
+        const bool stale = !nreq && no_render_frame_received_recently(w, now, ms_to_monotonic_t(250ll));
+        if (nreq || stale) request_frame_render(w);
+#ifdef KITTY_BACKEND_METAL
+        if (UNLIKELY(pacing_debug_enabled())) {
+            if (nreq) pacing_dbg.defer_not_requested++;
+            else if (stale) pacing_dbg.defer_fallback250++;
+            else pacing_dbg.defer_waiting++;
+        }
+#endif
         if (w->id != global_state.thumbnail_callback.os_window) {
             // dont respect render frames soon after a resize on Wayland as they cause flicker because
             // we want to fill the newly resized buffer ASAP, not at compositors convenience
@@ -1647,6 +1752,9 @@ main_loop(ChildMonitor *self, PyObject *a UNUSED) {
 #define main_loop_doc "The main thread loop"
     state_check_timer = add_main_loop_timer(1000, true, do_state_check, self, NULL);
     run_main_loop(process_global_state, self);
+#ifdef KITTY_BACKEND_METAL
+    if (pacing_debug_enabled()) pacing_debug_dump("teardown");
+#endif
 #ifdef __APPLE__
     cocoa_free_actions_data();
 #endif
