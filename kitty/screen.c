@@ -405,8 +405,12 @@ nuke_multicell_char_at(Screen *self, index_type x_, index_type y_, bool replace_
     for (int y = (int)y_ - 1; y > y_min_limit && num_lines_above; y--, num_lines_above--) {
         Line *line = range_line_(self, y); cp = line->cpu_cells; gp = line->gpu_cells;
         nuke_in_line(cp, gp, x_, x_limit, ch);
-        if (y > -1) linebuf_mark_line_dirty(self->linebuf, y);
-        else historybuf_mark_line_dirty(self->historybuf, -(y + 1));
+        if (y > -1) {
+            linebuf_mark_line_dirty(self->linebuf, y);
+            // L1: this direct range_line_ write bypasses linebuf_init_cells' mark;
+            // replace_with_spaces can extend content past the cursor bound.
+            linebuf_mark_xlimit_untracked(self->linebuf, (index_type)y);
+        } else historybuf_mark_line_dirty(self->historybuf, -(y + 1));
     }
     self->is_dirty = true;
 }
@@ -777,7 +781,10 @@ init_segmentation_state(Screen *self, text_loop_state *s) {
 
 static void
 init_text_loop_line(Screen *self, text_loop_state *s) {
-    linebuf_init_cells(self->linebuf, self->cursor->y, &s->cp, &s->gp);
+    // L1: the append-draw path records the exact write extent via
+    // linebuf_note_write_extent, so use the non-marking cell fetch (keeps the
+    // deferred-row finalize O(1) for the scroll flood).
+    linebuf_init_cells_notrack(self->linebuf, self->cursor->y, &s->cp, &s->gp);
     clear_intersecting_selections(self, self->cursor->y);
     linebuf_mark_line_dirty(self->linebuf, self->cursor->y);
     s->image_placeholder_marked = false;
@@ -1258,6 +1265,7 @@ draw_ascii_run(Screen *self, const uint32_t *chars, size_t num, text_loop_state 
         s->prev.cc = s->cp + x + n - 1;
         self->last_graphic_char = rc[n - 1];
         self->cursor->x = x + n;
+        linebuf_note_write_extent(self->linebuf, self->cursor->y, x + n);  // L1: xhwm for this run chunk
         consumed += n;
     }
     if (consumed) s->seg = (GraphemeSegmentationResult){.grapheme_break=GBP_None};
@@ -1370,6 +1378,7 @@ draw_wide_run(Screen *self, const uint32_t *chars, size_t num, text_loop_state *
     }
     if (consumed) {
         self->cursor->x = x;
+        linebuf_mark_xlimit_untracked(self->linebuf, self->cursor->y);  // L1: wide run -> finalize rescans (not the flood)
         s->prev.y = self->cursor->y; s->prev.x = x - 2; s->prev.cc = s->cp + x - 2;
         self->last_graphic_char = chars[consumed - 1];
     }
@@ -1382,6 +1391,7 @@ draw_text_loop(Screen *self, const uint32_t *chars, size_t num_chars, text_loop_
     int char_width;
     for (size_t i = 0; i < num_chars; i++) {
         uint32_t ch = map_char(self, chars[i]);
+        bool simple_ascii = false;  // L1: set iff this iteration takes the plain-ASCII fast store
         if (ch < DEL && s->seg.grapheme_break <= GBP_None) {  // fast path for printable ASCII
             if (ch < ' ') {
                 draw_control_char(self, s, ch);
@@ -1402,6 +1412,7 @@ draw_text_loop(Screen *self, const uint32_t *chars, size_t num_chars, text_loop_
             }
             char_width = 1;
             s->seg = (GraphemeSegmentationResult){.grapheme_break=GBP_None};
+            simple_ascii = true;  // plain ASCII single cell (high-bit-clear); extent == cursor->x
         } else {
             CharProps cp = char_props_for(ch);
             if (cp.is_invalid) {
@@ -1484,6 +1495,12 @@ draw_text_loop(Screen *self, const uint32_t *chars, size_t num_chars, text_loop_
             self->cursor->x++;
             fc->is_multicell = false;
         }
+        // L1: the plain-ASCII fast store writes one high-bit-clear cell and
+        // advances the cursor exactly past it (the scroll flood) -> exact bound.
+        // Every other scalar store (graphemes/text-cache indices, width-2,
+        // charset-mapped) is marked UNTRACKED so finalize rescans -- off the flood.
+        if (simple_ascii) linebuf_note_write_extent(self->linebuf, self->cursor->y, self->cursor->x);
+        else linebuf_mark_xlimit_untracked(self->linebuf, self->cursor->y);
     }
 #undef init_line
 }
@@ -2310,6 +2327,10 @@ screen_tab(Screen *self) {
                 }
                 self->lc->count = 2; self->lc->chars[0] = '\t'; self->lc->chars[1] = diff;
                 cell_set_chars(cpu_cell, self->text_cache, self->lc);
+                // L1: TAB wrote a '\t' marker + spaces via a direct (non-init_cells)
+                // cell fetch and jumps the cursor to the stop without a note, so a
+                // deferred row's extent grew invisibly -> rescan it at finalize.
+                linebuf_mark_xlimit_untracked(self->linebuf, self->cursor->y);
             }
         }
         self->cursor->x = found;

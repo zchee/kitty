@@ -91,6 +91,10 @@ ScrollClearMode scroll_clear_mode(void);
 void linebuf_init_line(LineBuf *, index_type);
 void linebuf_init_line_at(LineBuf *, index_type, Line*);
 void linebuf_init_cells(LineBuf *lb, index_type ynum, CPUCell **c, GPUCell **g);
+// Wave-15 L1: draw-path cell fetch; like linebuf_init_cells but does NOT mark the
+// deferred row UNTRACKED (the caller records the exact extent via
+// linebuf_note_write_extent). See linebuf_init_cells in line-buf.c.
+void linebuf_init_cells_notrack(LineBuf *lb, index_type ynum, CPUCell **c, GPUCell **g);
 CPUCell* linebuf_cpu_cells_for_line(LineBuf *lb, index_type idx);
 void linebuf_clear(LineBuf *, char_type ch);
 void linebuf_clear_lines(LineBuf *self, const Cursor *cursor, index_type start, index_type end);

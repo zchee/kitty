@@ -150,10 +150,16 @@ alloc_linebuf_(PyTypeObject *cls, unsigned int lines, unsigned int columns, Text
         // history-segment-sized slabs and grows with scrollback.
         if (pool) { line_slot_pool_incref(pool); self->pool = pool; }
         else self->pool = line_slot_pool_alloc(columns, lines);
-        self->line_map = self->pool ? PyMem_Calloc(1, lines * (sizeof(index_type) + sizeof(index_type) + sizeof(LineAttrs))) : NULL;
+        // Combined allocation: index_type lanes first (4-byte aligned), the
+        // 1-byte LineAttrs last -> line_map | scratch | line_xlimit | line_attrs.
+        // line_xlimit (Wave-15 L1) precedes line_attrs so the index_type array
+        // stays 4-byte aligned for any `lines` (a trailing index_type after the
+        // 1-byte LineAttrs lane would misalign unless lines%4==0).
+        self->line_map = self->pool ? PyMem_Calloc(1, lines * (3 * sizeof(index_type) + sizeof(LineAttrs))) : NULL;
         if (!self->line_map) { line_slot_pool_decref(self->pool); self->pool = NULL; Py_CLEAR(self); return NULL; }
         self->scratch = self->line_map + lines;
-        self->line_attrs = (LineAttrs*)(self->scratch + lines);
+        self->line_xlimit = self->scratch + lines;
+        self->line_attrs = (LineAttrs*)(self->line_xlimit + lines);
         self->text_cache = tc_incref(text_cache);
         self->line = alloc_line(self->text_cache);
         self->line->xnum = columns;
@@ -190,6 +196,24 @@ void
 linebuf_init_cells(LineBuf *lb, index_type idx, CPUCell **c, GPUCell **g) {
     // S1 (Phase 13B): callers fetch these pointers to WRITE GPUCells (draw
     // run-fills, multicell, char shifts), so materialize any deferred clear.
+    linebuf_materialize_blank(lb, idx);
+    const index_type p = lb_phys(lb, idx);
+    // Wave-15 L1: this (tracking) variant is used by in-place mutators (IRM
+    // insert/delete shift, multicell nuke/halve, colored-blank) whose extent the
+    // append-draw notes do not describe. Mark a deferred row UNTRACKED so
+    // linebuf_finalize_hwm_line rescans it (rare; never the scroll flood, which
+    // uses linebuf_init_cells_notrack and records the exact extent).
+    if (lb->line_attrs[p].is_blank) lb->line_xlimit[p] = XLIMIT_UNTRACKED;
+    const index_type ynum = lb->line_map[p];
+    *c = cpu_lineptr(lb, ynum);
+    *g = gpu_lineptr(lb, ynum);
+}
+
+void
+linebuf_init_cells_notrack(LineBuf *lb, index_type idx, CPUCell **c, GPUCell **g) {
+    // Wave-15 L1: the append-draw path's cell fetch. Identical to
+    // linebuf_init_cells but WITHOUT the UNTRACKED mark -- the caller records the
+    // exact write extent via linebuf_note_write_extent, keeping finalize O(1).
     linebuf_materialize_blank(lb, idx);
     const index_type ynum = lb->line_map[lb_phys(lb, idx)];
     *c = cpu_lineptr(lb, ynum);
@@ -410,6 +434,27 @@ scroll_clear_mode(void) {
     return (ScrollClearMode)scroll_clear_mode_state;
 }
 
+// Wave-15 L1 escape hatches (see line-buf.h), resolved once like scroll_clear_mode.
+bool
+xlimit_track_disabled(void) {
+    static int cached = -1;
+    if (UNLIKELY(cached < 0)) {
+        const char *v = getenv("KITTY_DISABLE_XLIMIT_TRACK");
+        cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+bool
+xlimit_verify_enabled(void) {
+    static int cached = -1;
+    if (UNLIKELY(cached < 0)) {
+        const char *v = getenv("KITTY_XLIMIT_VERIFY");
+        cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
 void
 linebuf_clear_line(LineBuf *self, index_type y, bool clear_attrs, bool allow_lazy) {
 #if BLANK_CHAR != 0
@@ -430,6 +475,7 @@ linebuf_clear_line(LineBuf *self, index_type y, bool clear_attrs, bool allow_laz
     // (allow_lazy=false) zero it now.
     if (allow_lazy && scroll_clear_mode() != SCROLL_CLEAR_EAGER) {
         self->line_attrs[p].is_blank = 1;
+        self->line_xlimit[p] = 0;  // L1: begin a fresh deferred-row write high-water
     } else {
         zero_at_ptr_count(g, self->xnum);
     }
@@ -454,6 +500,18 @@ linebuf_materialize_blank_line(LineBuf *self, index_type y) {
     zero_at_ptr_count(gpu_lineptr(self, self->line_map[p]), self->xnum);
 }
 
+// L1: backward xlimit scan (last non-blank CPUCell + 1) starting from `start`.
+// Starting from the tracked upper bound makes this O(1) for the scroll flood;
+// starting from xnum reproduces the pre-L1 full scan (kill-switch / verify /
+// UNTRACKED). cpu_cells are eager 12B-cleared in every arm, so ch_and_idx is the
+// authoritative emptiness test.
+static index_type
+xlimit_scan(const CPUCell *c, index_type start) {
+    index_type x = start;
+    while (x && !c[x - 1].ch_and_idx) x--;
+    return x;
+}
+
 // S2 HWM finalize (also correct for a RELOCATE un-drawn row: xlimit==0 zeroes
 // the whole row): a deferred row keeps its drawn GPUCells [0, xlimit) and a
 // stale tail [xlimit, xnum); clear the tail (0 work for full-width lines) and
@@ -466,8 +524,23 @@ linebuf_finalize_hwm_line(LineBuf *self, index_type y) {
     self->line_attrs[p].is_blank = 0;
     const index_type ym = self->line_map[p];
     const CPUCell *c = cpu_lineptr(self, ym);
-    index_type xlimit = self->xnum;
-    while (xlimit && !c[xlimit - 1].ch_and_idx) xlimit--;
+    // L1: line_xlimit is an UPPER BOUND on the write extent -- the max cursor
+    // column any draw reached (a draw always advances the cursor past what it
+    // writes), or XLIMIT_UNTRACKED when a non-append mutator moved content past
+    // the cursor (IRM shift) or cleared it. Scanning backward from the bound
+    // yields the exact xlimit: O(1) for the flood (bound == 1), full scan for
+    // UNTRACKED / kill-switch. Never under-clears because bound >= true extent.
+    index_type bound = self->line_xlimit[p];
+    if (UNLIKELY(bound > self->xnum) || UNLIKELY(xlimit_track_disabled())) bound = self->xnum;
+    index_type xlimit = xlimit_scan(c, bound);
+    if (UNLIKELY(xlimit_verify_enabled())) {
+        const index_type full = xlimit_scan(c, self->xnum);
+        if (xlimit != full) {  // bound fell below the true extent -> would under-clear
+            log_error("xlimit-verify: MISMATCH finalize y=%u phys=%u bound=%u boundscan=%u fullscan=%u xnum=%u",
+                      y, p, self->line_xlimit[p], xlimit, full, self->xnum);
+            abort();
+        }
+    }
     if (xlimit < self->xnum) zero_at_ptr_count(gpu_lineptr(self, ym) + xlimit, self->xnum - xlimit);
 }
 
@@ -517,6 +590,11 @@ linebuf_normalize(LineBuf *self) {
         as[i] = self->line_attrs[p];
     }
     memcpy(self->line_attrs, as, n * sizeof(self->line_attrs[0]));
+    for (index_type i = 0; i < n; i++) {  // L1: rotate line_xlimit alongside line_attrs
+        index_type p = h + i; if (p >= n) p -= n;
+        self->scratch[i] = self->line_xlimit[p];
+    }
+    memcpy(self->line_xlimit, self->scratch, n * sizeof(self->line_xlimit[0]));
     self->head = 0;
 }
 
@@ -534,11 +612,14 @@ linebuf_index(LineBuf* self, index_type top, index_type bottom) {
     linebuf_normalize(self);
     index_type old_top = self->line_map[top];
     LineAttrs old_attrs = self->line_attrs[top];
+    index_type old_xlimit = self->line_xlimit[top];
     const index_type num = bottom - top;
     memmove(self->line_map + top, self->line_map + top + 1, sizeof(self->line_map[0]) * num);
     memmove(self->line_attrs + top, self->line_attrs + top + 1, sizeof(self->line_attrs[0]) * num);
+    memmove(self->line_xlimit + top, self->line_xlimit + top + 1, sizeof(self->line_xlimit[0]) * num);
     self->line_map[bottom] = old_top;
     self->line_attrs[bottom] = old_attrs;
+    self->line_xlimit[bottom] = old_xlimit;
 }
 
 static PyObject*
@@ -562,12 +643,15 @@ linebuf_reverse_index(LineBuf *self, index_type top, index_type bottom) {
     linebuf_normalize(self);
     index_type old_bottom = self->line_map[bottom];
     LineAttrs old_attrs = self->line_attrs[bottom];
+    index_type old_xlimit = self->line_xlimit[bottom];
     for (index_type i = bottom; i > top; i--) {
         self->line_map[i] = self->line_map[i - 1];
         self->line_attrs[i] = self->line_attrs[i - 1];
+        self->line_xlimit[i] = self->line_xlimit[i - 1];
     }
     self->line_map[top] = old_bottom;
     self->line_attrs[top] = old_attrs;
+    self->line_xlimit[top] = old_xlimit;
 }
 
 static PyObject*
@@ -601,6 +685,7 @@ linebuf_insert_lines(LineBuf *self, unsigned int num, unsigned int y, unsigned i
     for (i = ylimit - 1; i >= y + num; i--) {
         self->line_map[i] = self->line_map[i - num];
         self->line_attrs[i] = self->line_attrs[i - num];
+        self->line_xlimit[i] = self->line_xlimit[i - num];
     }
     memcpy(self->line_map + y, self->scratch, scratch_sz);
     Line l;
@@ -608,6 +693,7 @@ linebuf_insert_lines(LineBuf *self, unsigned int num, unsigned int y, unsigned i
         init_line(self, &l, self->line_map[i]);
         clear_line_(&l, self->xnum);
         self->line_attrs[i].val = 0;
+        self->line_xlimit[i] = 0;
     }
 }
 
@@ -632,6 +718,7 @@ linebuf_delete_lines(LineBuf *self, index_type num, index_type y, index_type bot
     for (i = y; i < ylimit && i + num < self->ynum; i++) {
         self->line_map[i] = self->line_map[i + num];
         self->line_attrs[i] = self->line_attrs[i + num];
+        self->line_xlimit[i] = self->line_xlimit[i + num];
     }
     memcpy(self->line_map + ylimit - num, self->scratch, scratch_sz);
     Line l;
@@ -639,6 +726,7 @@ linebuf_delete_lines(LineBuf *self, index_type num, index_type y, index_type bot
         init_line(self, &l, self->line_map[i]);
         clear_line_(&l, self->xnum);
         self->line_attrs[i].val = 0;
+        self->line_xlimit[i] = 0;
     }
 }
 
@@ -791,6 +879,7 @@ copy_old(LineBuf *self, PyObject *y) {
     for (index_type i = 0; i < MIN(self->ynum, other->ynum); i++) {
         index_type s = self->ynum - 1 - i, o = other->ynum - 1 - i;
         self->line_attrs[lb_phys(self, s)] = other->line_attrs[lb_phys(other, o)];
+        self->line_xlimit[lb_phys(self, s)] = other->line_xlimit[lb_phys(other, o)];  // L1: carry xhwm (same-width copy)
         s = self->line_map[lb_phys(self, s)]; o = other->line_map[lb_phys(other, o)];
         init_line(self, &sl, s); init_line(other, &ol, o);
         copy_line(&ol, &sl);
