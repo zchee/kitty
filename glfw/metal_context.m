@@ -467,6 +467,16 @@ void _glfwCocoaSetMetalLinkPaused(_GLFWwindow* window, bool paused)
     }
 }
 
+bool _glfwCocoaIsMetalLinkInRunloop(_GLFWwindow* window)
+{
+    // Wave-14 §5 confirm accessor: report the runloop-membership bookkeeping that
+    // _glfwCocoaSetMetalLinkPaused / addToRunLoop / removeFromRunLoop maintain
+    // above. Read on the same main/render thread that mutates it, so no lock is
+    // needed. false when the window has no link (nothing can be in the runloop).
+    if (!window || !window->context.metal.display_link) return false;
+    return window->context.metal.link_in_runloop;
+}
+
 void _glfwCocoaSetMetalLinkEnabled(_GLFWwindow* window, bool enabled)
 {
     // Phase 4 (L3): fully create or DESTROY the link. Removing it from the runloop

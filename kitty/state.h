@@ -475,6 +475,13 @@ typedef struct OSWindow {
     // fallback until then). See immediate_encode_floor() in child-monitor.c.
     monotonic_t immediate_present_floor;
     monotonic_t immediate_floor_computed_at;
+    // Wave-14 pacing stall-rescue: cached display refresh PERIOD (distinct from
+    // the 0.5x immediate floor above -- deliberately a separate field so the
+    // rescue never touches the immediate-encode path). Feeds resync_stall_bound()
+    // / resync_present_floor() in child-monitor.c; same lazy <=1/s refresh
+    // cadence. 0 until first computed.
+    monotonic_t resync_refresh_period;
+    monotonic_t resync_refresh_computed_at;
     uint64_t render_calls;
     id_type last_focused_counter;
     CloseRequest close_request;

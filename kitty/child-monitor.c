@@ -1058,6 +1058,65 @@ immediate_encode_floor(OSWindow *w, monotonic_t now) {
     return w->immediate_present_floor;
 }
 
+// Wave-14 pacing stall-rescue bounds. Refresh-derived from the same cached
+// os_window_refresh_hz() the immediate floor uses, but stored in a SEPARATE
+// OSWindow field (resync_refresh_period) -- the lead constraint is that the
+// rescue must NOT touch immediate_present_floor / immediate_encode_floor. The
+// period is recomputed at most ~1/s (a monitor hotplug / refresh switch
+// converges within a second) and falls back to 60 Hz when the refresh is unknown.
+#define RESYNC_STALL_MULT 3ll           // stall bound = 3x refresh period: above link
+                                        // jitter, so a healthy REQUESTED link (restamping
+                                        // last_render_frame_received_at every ~refresh)
+                                        // never trips it -- only >=3 missed ticks do.
+#define RESYNC_STALL_MIN_MS 24ll        // clamp floor (fast displays)
+#define RESYNC_STALL_MAX_MS 60ll        // clamp ceiling (slow/unknown displays)
+#define RESYNC_REFRESH_FALLBACK_HZ 60.0 // refresh unknown -> assume 60 Hz (16.67 ms period)
+
+static monotonic_t
+resync_refresh_period(OSWindow *w, monotonic_t now) {
+    if (w->resync_refresh_period <= 0 || now - w->resync_refresh_computed_at >= ms_to_monotonic_t(1000ll)) {
+        const int hz = os_window_refresh_hz(w);
+        const double period_ms = 1000.0 / (hz > 0 ? (double)hz : RESYNC_REFRESH_FALLBACK_HZ);
+        w->resync_refresh_period = ms_double_to_monotonic_t(period_ms);
+        w->resync_refresh_computed_at = now;
+    }
+    return w->resync_refresh_period;
+}
+
+// Staleness bound for the stall-rescue: a REQUESTED link whose last delivered
+// frame (last_render_frame_received_at) is older than this is treated as stalled.
+static monotonic_t
+resync_stall_bound(OSWindow *w, monotonic_t now) {
+    monotonic_t b = RESYNC_STALL_MULT * resync_refresh_period(w, now);
+    const monotonic_t lo = ms_to_monotonic_t(RESYNC_STALL_MIN_MS), hi = ms_to_monotonic_t(RESYNC_STALL_MAX_MS);
+    if (b < lo) b = lo;
+    if (b > hi) b = hi;
+    return b;
+}
+
+// Inline-rescue present floor (= 1x refresh period): caps stall-rescue renders at
+// <=1/refresh so a fully starved link cannot drive flood above the refresh rate
+// (preserves 13A L6). Also the deferred-with-pending-damage re-tick wait.
+static monotonic_t
+resync_present_floor(OSWindow *w, monotonic_t now) {
+    return resync_refresh_period(w, now);
+}
+
+// KITTY_DISABLE_PACING_RESYNC: kill-switch for the Wave-14 stall-rescue, resolved
+// ONCE into a cached bool (same pattern as pacing_debug_enabled). Precedence: set
+// and not "0" -> rescue OFF = HEAD-identical 250 ms-defer behavior (fixed 250 ms
+// stall bound, always defer, no inline render-through); unset or "0" -> rescue ON
+// (default). Orthogonal to KITTY_ENABLE_HWM_CLEAR.
+static bool
+pacing_resync_disabled(void) {
+    static int cached = -1;
+    if (UNLIKELY(cached < 0)) {
+        const char *v = getenv("KITTY_DISABLE_PACING_RESYNC");
+        cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
 // KITTY_PACING_DEBUG=1: Wave-14 Step-0 confirmation instrumentation for the
 // immediate-encode governor gate below. Debug-only and Metal-only: the env var
 // is resolved ONCE into a cached bool (zero cost when off -- a single
@@ -1079,6 +1138,8 @@ typedef struct PacingDebugCounters {
     uint64_t defer_not_requested; // defer branch: render_state NOT_REQUESTED -> request_frame_render
     uint64_t defer_fallback250;   // defer branch: REQUESTED + 250ms no_render_frame fallback -> request
     uint64_t defer_waiting;       // defer branch: REQUESTED and link fresh -> wait for the next link tick
+    uint64_t stall_link_in_runloop; // of the stale defers: link still in the runloop (H1: starved-in-place)
+    uint64_t stall_link_removed;    // of the stale defers: link removed from the runloop (H2: paused-desync)
     uint64_t gap_bucket[7];       // now-last_gpu_present_at at the gate, ms: <4,4-8,8-16,16-40,40-80,80-250,>=250
 } PacingDebugCounters;
 static PacingDebugCounters pacing_dbg;
@@ -1112,6 +1173,7 @@ pacing_debug_dump(const char *reason) {
     const PacingDebugCounters *c = &pacing_dbg;
     log_error("pacing: reason=%s seq=%llu ticks=%llu input_driven=%llu imm_taken=%llu imm_disq=%llu"
               " floor_blocked=%llu defer_nreq=%llu defer_fallback250=%llu defer_waiting=%llu"
+              " stall_in_runloop=%llu stall_removed=%llu"
               " gap_lt4=%llu gap_4_8=%llu gap_8_16=%llu gap_16_40=%llu gap_40_80=%llu gap_80_250=%llu gap_ge250=%llu",
               reason, (unsigned long long)(++pacing_dbg_seq),
               (unsigned long long)c->ticks, (unsigned long long)c->input_driven_ticks,
@@ -1119,6 +1181,7 @@ pacing_debug_dump(const char *reason) {
               (unsigned long long)c->floor_blocked,
               (unsigned long long)c->defer_not_requested, (unsigned long long)c->defer_fallback250,
               (unsigned long long)c->defer_waiting,
+              (unsigned long long)c->stall_link_in_runloop, (unsigned long long)c->stall_link_removed,
               (unsigned long long)c->gap_bucket[0], (unsigned long long)c->gap_bucket[1],
               (unsigned long long)c->gap_bucket[2], (unsigned long long)c->gap_bucket[3],
               (unsigned long long)c->gap_bucket[4], (unsigned long long)c->gap_bucket[5],
@@ -1205,28 +1268,62 @@ render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images, bo
     } else if (!w->keep_rendering_till_swap && USE_RENDER_FRAMES && w->render_state != RENDER_FRAME_READY) {
         // Preserve the original short-circuit exactly: no_render_frame_received_recently
         // is evaluated iff render_state != NOT_REQUESTED, and request_frame_render is
-        // called iff either sub-condition holds. The two locals only let the pacing
+        // called iff either sub-condition holds. The two locals also let the pacing
         // debug counters classify which sub-branch fired (see KITTY_PACING_DEBUG).
         const bool nreq = w->render_state == RENDER_FRAME_NOT_REQUESTED;
-        const bool stale = !nreq && no_render_frame_received_recently(w, now, ms_to_monotonic_t(250ll));
-        if (nreq || stale) request_frame_render(w);
+        bool stall_rescue = false;
 #ifdef KITTY_BACKEND_METAL
+        // Wave-14 stall-rescue (ADR 2026-07-07): under sustained scroll a
+        // RENDER_FRAME_REQUESTED frame whose pace link is starved (H1) ages past
+        // the staleness bound; HEAD then waits the full 250 ms fallback while the
+        // link sits in the runloop undelivered. Instead: shorten the bound to ~3x
+        // refresh AND render the pending damage inline THIS tick -- symmetric to
+        // the immediate-encode fast path, which also falls through to the render
+        // path below (stamping last_gpu_present_at and re-arming the link at :977).
+        // Refresh-capped by resync_present_floor so a fully starved link cannot
+        // drive flood above the refresh rate (preserves 13A L6). The kill-switch
+        // KITTY_DISABLE_PACING_RESYNC restores HEAD's fixed-250 ms defer behavior.
+        const bool resync_off = pacing_resync_disabled();
+        const monotonic_t stall_bound = resync_off ? ms_to_monotonic_t(250ll) : resync_stall_bound(w, now);
+        const bool stale = !nreq && no_render_frame_received_recently(w, now, stall_bound);
+        stall_rescue = !resync_off && stale && now - w->last_gpu_present_at >= resync_present_floor(w, now);
+        if (nreq || stale) request_frame_render(w);
         if (UNLIKELY(pacing_debug_enabled())) {
             if (nreq) pacing_dbg.defer_not_requested++;
-            else if (stale) pacing_dbg.defer_fallback250++;
+            else if (stale) {
+                pacing_dbg.defer_fallback250++;
+                // Confirm counter (ADR §5): at a stall, is the link still a runloop
+                // member (H1: starved-in-place) or removed (H2: paused-desync)?
+                if (glfwCocoaIsRenderLinkInRunloop(w->handle)) pacing_dbg.stall_link_in_runloop++;
+                else pacing_dbg.stall_link_removed++;
+            }
             else pacing_dbg.defer_waiting++;
         }
+#else
+        const bool stale = !nreq && no_render_frame_received_recently(w, now, ms_to_monotonic_t(250ll));
+        if (nreq || stale) request_frame_render(w);
 #endif
-        if (w->id != global_state.thumbnail_callback.os_window) {
+        if (!stall_rescue && w->id != global_state.thumbnail_callback.os_window) {
             // dont respect render frames soon after a resize on Wayland as they cause flicker because
             // we want to fill the newly resized buffer ASAP, not at compositors convenience
             if (!global_state.is_wayland || (monotonic() - w->viewport_resized_at) > s_double_to_monotonic_t(1)) {
 #ifdef __APPLE__
                 if (sp) os_signpost_event_emit(slog, render_gate_sid, "render_gate", "window=%llu state=%{public}s", w->id, "deferred");
 #endif
+#ifdef KITTY_BACKEND_METAL
+                // Deferred with pending damage but the refresh-cap gated the inline
+                // rescue off this tick: re-tick within one refresh so the damage
+                // renders promptly instead of waiting for the next input wakeup.
+                // set_maximum_wait is min-semantics -- only tightens a longer wait.
+                // Gated by !resync_off so the kill-switch path stays HEAD-identical
+                // (HEAD never sets a wait here; pre-mortem #7).
+                if (!resync_off && (nreq || stale)) set_maximum_wait(resync_present_floor(w, now));
+#endif
                 return false;
             }
         }
+        // stall_rescue (Metal) falls through here to the render path, exactly as
+        // immediate_encode does, rendering the pending damage inline this tick.
 #ifdef __APPLE__
         if (sp) os_signpost_event_emit(slog, render_gate_sid, "render_gate", "window=%llu state=%{public}s", w->id, "REQUESTED");
 #endif
