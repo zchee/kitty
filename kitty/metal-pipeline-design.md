@@ -1799,7 +1799,10 @@ link promptly instead of falling to the 250 ms fallback. Step-0
 confirmation instrumentation is spec'd in
 `.omc/verify/wave13b/VERIFY-REPORT.md` §4 (immediate_encode true/false
 counts, now−last_present distribution at the gate, fallback-branch rate,
-per-tick dirty fraction).
+per-tick dirty fraction). [Phase 14 ran that Step-0: the fallback-tail
+collapse was CONFIRMED and fixed (stall-rescue, default-ON), but the
+floor mechanism was REFUTED — floor_blocked ≈ 0 in both arms, and the
+immediate-encode path is off the flood critical path. See Phase 14.]
 
 Scroll-clear arm ledger (`scroll_clear_mode()`, line-buf.c — resolved
 once from the environment, precedence top-down):
@@ -1831,6 +1834,102 @@ byte-identical every arm; the 10-scenario pre-overwrite battery
 (reverse-scroll/ED2/ED3/ring-wrap) green every arm; dense_cells/unicode
 1.00 across arms and binaries; suites at baseline both backends; every
 lever kill-switched and A/B'd same-binary.
+
+## Phase 14 (Wave 14): the pacing decouple — governor fixed and exonerated
+
+Status: LANDED + MEASURE-FIRST CLOSE (charter
+`.omc/handoffs/wave14-pacing-decouple-KICKOFF.md`; ADR
+`.omc/plans/2026-07-07-wave14-pacing-decouple.md`; verify
+`.omc/verify/wave14/{STEP0-CONFIRMATION,VERIFY-REPORT,SWEEP-REPORT}.md`).
+Commit arc: 0a4d9b9c5 (Step-0 gate instrumentation) → 3d28473a6
+(stall-rescue, default-ON, kill-switched) → 029ae4310 (harness
+metal_present parse fix) → 8edd417db (stall-bound sweep knob). The wave
+fully adjudicates the Phase 13B pacing hypothesis: the floor mechanism
+is REFUTED, the 250 ms-tail pathology is REAL and FIXED, and the hwm
+scrolling regression is proven pacing-INDEPENDENT — the governor is
+exonerated and the ≤26 ms target re-chartered on a non-pacing root
+cause (Future work item 13). Suites Ran 359 both backends at baseline
+throughout; scroll_semantics goldens byte-identical in every arm.
+
+- **Step 0 — runtime confirmation (BLOCKING GATE, verdict REFRAMED).**
+  `KITTY_PACING_DEBUG=1` counters at the encode gate (zero-cost cached
+  bool; one "pacing:" record per 512 gate evals + at teardown;
+  cumulative, so the teardown line = run totals). REFUTED the 13B
+  trigger: floor_blocked = 0.36%/0.60% of ticks (eager/hwm) — the
+  immediate-encode path, floor included, is off the sustained-scroll
+  critical path entirely (its RENDER_FRAME_NOT_REQUESTED precondition
+  is ~never true while the link paces); the sub-floor gate-gap share
+  was LOWER under hwm (12.7% vs 18.0%), the opposite of "the faster
+  parse lands damage inside the floor". CONFIRMED the tail: hwm defers
+  hit the 250 ms fallback 6.7× more (38.4% vs 5.7% of defers), presents
+  2.6× fewer, and the 40–80 ms request-loop band went 65% → 0%.
+- **The real mechanism (code-grounded, runtime-arbitrated).** The pace
+  link is an NSWindow-vended CADisplayLink on the [NSApp run] main
+  runloop; requestRenderFrame always (idempotently) resumes it, and the
+  link callback stamps last_render_frame_received_at unconditionally —
+  so "stale" ⟺ an IN-RUNLOOP link unserviced for the bound: main-thread
+  starvation by the parse-hot tick loop (H1; stall_link_in_runloop
+  share = 1.0 in EVERY run, all arms and loads — H2 paused-desync and
+  H3 bookkeeping-loss are dead). The 250 ms fallback re-request is a
+  NO-OP for an in-runloop link (H4) — recovery waited on main-thread
+  yield, which is why hwm's present medians were a variable 88–252 ms
+  rather than a clean 250 ms spike.
+- **The fix (3d28473a6) — bounded-staleness stall-rescue, default-ON.**
+  In the stale defer sub-branch (Metal-only): staleness bound 250 ms →
+  clamp(3×refresh, 24–60 ms); on stall, render the pending damage
+  inline THIS tick (the same render-through the immediate-encode path
+  uses) and re-arm the link, refresh-capped by a separate 1×refresh
+  present floor (13A L6 intact — a fully starved link cannot exceed
+  refresh); when the cap defers the rescue, set_maximum_wait(1×refresh)
+  re-ticks the loop. immediate_encode_floor and the immediate path are
+  untouched. Result: gap_ge250 collapses 59.4 → 2.0 per run (**96.6%**),
+  the 16–40/40–80 ms bands return from 0%, goldens byte-identical, idle
+  = 1 present/20 s (== HEAD, no wakeup storm), flood cap held
+  structurally + empirically (min present gap 19.3 ms ≥ refresh,
+  sub-refresh count 0). Typing is guarded structurally (the rescue
+  requires render_state == REQUESTED; cold typing rides the untouched
+  NOT_REQUESTED edge) — a real p99 awaits an Accessibility-granted
+  session (CGEventPost is blocked for python3.14 on this machine).
+- **The decisive negative — pacing and scrolling are DECOUPLED.** The
+  cleanest A/B (same hwm memset): fix ON 47 ms vs OFF 48 ms — the fix
+  moves vtebench scrolling by ≈0 while collapsing the tail 96.6%. The
+  stall-bound sweep (8edd417db knob, KITTY_PACING_RESYNC_STALL_MS ∈
+  {17,24,33,50}) is FLAT: scrolling 47–49 ms at every bound, and the
+  cadence itself is bound-invariant (hwm gap_16_40 stays 1–2% vs
+  eager's 31% at EVERY bound — the rescue can only present when the
+  main loop runs render(), and that interval, not the bound, is the
+  quantum). Relocate corroborates: eager-like healthy cadence yet the
+  slowest arm (53 ms). hwm completes ~66 vtebench samples/5 s vs
+  eager's ~99, bound-invariant, at 13B-identical per-frame bytes and
+  passes — the residual is per-sample frame-readiness cost in the
+  deferred-clear scroll model, not the governor (item 13).
+- **Pacing lever ledger (all resolve-once, Metal-only):**
+  - `KITTY_PACING_DEBUG=1` → encode-gate counters, one-line "pacing:"
+    records (teardown totals; trailing `stall_bound_eff_ms` — integer
+    truncation makes the refresh-derived default report 49 @60 Hz).
+  - `KITTY_DISABLE_PACING_RESYNC` set & ≠0 → HEAD 250 ms-defer behavior
+    (kill switch, byte-identical; proven to reproduce the 13B
+    pathology: defer_fallback250 43.3% of defers).
+  - `KITTY_PACING_RESYNC_STALL_MS=<int>` → replaces the 3×refresh
+    bound, clamp [8,250] (diagnostic; inert while the kill switch is
+    on; the 1×refresh present floor is NOT overridable).
+- **Corrections to the record.** Phase 13B's root-cause paragraph
+  stands corrected (marked in place): right about the fallback-tail
+  signature and that the coupling deserved its own phase; wrong about
+  the floor — and its "the eager memset kept the fast path qualified"
+  story dies with it. Harness: the shared PRESENTED_RE had rotted
+  against the pace= suffix (silent 0-frame parses) — fixed at
+  029ae4310. Build: `make`'s devel path runs a destructive
+  `git rebase origin/master`; the dev build command is
+  `KITTY_USE_METAL=1 python3.14 setup.py build` (now a CLAUDE.md hard
+  rule).
+
+Exit: hwm/eager < 1.0 and scrolling ≤ 26 ms **NOT MET** (best 1.42–1.45×
+across all bounds; eager 33 ms under light load) — closed measure-first
+per the charter, with the residual root cause localized and chartered
+(item 13). The stall-rescue ships default-ON behind its kill switch: it
+fixes a real interactive-latency pathology (250 ms+ present tails under
+any main-thread stall) at zero measured cost to eager, idle, or flood.
 
 ## Final architecture (post-Phase-7 consolidation)
 
@@ -1909,12 +2008,12 @@ condition. Updated as captures land.
 5. **~~vtebench dense_cells~~ ATTRIBUTED** (Phase 11): it is the
    vt-parser lock contention above, not render or per-cell SGR cost —
    fixed by item 1. The recycled-row memset lazy-clear follow-up is
-   **implemented in Phase 13B but pacing-blocked**: the CPU reduction is
-   real and correct (S1 relocate + S2 hwm tail-clear, goldens
-   byte-identical), yet the governor coupling (item 12) inverts it into a
-   present-cadence regression, so both arms wait **opt-in**
+   implemented (Phase 13B) and its pacing blame is RESOLVED (Phase 14):
+   the governor was fixed AND exonerated — the hwm scrolling residual is
+   per-sample frame-readiness in the scroll model, NOT pacing (item 13)
+   — so both arms remain **opt-in**
    (`KITTY_DISABLE_LAZY_ROW_CLEAR=0` / `KITTY_ENABLE_HWM_CLEAR=1`) until
-   the pacing fix lands.
+   item 13 lands.
 6. **Cross-backend composition difference** — §7 #6, tracked in
    .scratch/metal-gl-composition-diff/.
 7. **icat-GIF animation failure** — pre-existing, all configs; tracked in
@@ -1939,18 +2038,31 @@ condition. Updated as captures land.
     `line_as_ansi` + UTF-8 re-encode on the scroll hot path
     (history.c:282-296); lazy/batched serialization is the lever if that
     configuration ever becomes a target.
-12. **Governor pacing decouple (Phase 13B root cause — the next-phase
-    charter)** — the immediate-encode floor (child-monitor.c:1099-1122)
-    disqualifies input-driven frames whose damage completes inside ~0.5×
-    refresh, and the deferred path's 250 ms
-    `no_render_frame_received_recently` fallback then collapses the
-    present cadence (~30× slower than the 40–80 ms request-loop band).
-    Fix candidate: a floor-disqualified frame with pending damage should
-    resync the link promptly instead of falling to the 250 ms fallback.
-    Step-0 confirmation instrumentation (encode-gate counters,
-    now−last_present distribution, fallback-branch rate) is spec'd in
-    `.omc/verify/wave13b/VERIFY-REPORT.md` §4. Unlocks item 5's S1/S2
-    arms and the scrolling ≤26 ms target.
+12. **~~Governor pacing decouple~~ DONE** (Phase 14): the 13B floor
+    framing did not survive runtime confirmation (floor_blocked ≈ 0 in
+    both arms; the immediate-encode path is off the flood critical
+    path). The real pathology — an in-runloop pace link starved by the
+    main thread, with the 250 ms fallback as the only (and no-op)
+    re-arm — was fixed by the bounded-staleness stall-rescue
+    (3d28473a6, default-ON, `KITTY_DISABLE_PACING_RESYNC` kill switch):
+    gap_ge250 −96.6%, flood cap + idle + goldens intact. The bound
+    sweep then proved the hwm scrolling regression pacing-INDEPENDENT →
+    item 13.
+13. **hwm frame-readiness residual (Phase 14 charter — the next
+    phase)** — why does hwm complete ~66 vtebench scrolling samples/5 s
+    vs eager's ~99 (1.42–1.45×) with identical per-frame bytes/passes,
+    a collapsed pacing tail, and bound-invariant cadence (gap_16_40
+    1–2% vs eager 31% at every stall bound)? The rescue presents only
+    when the main loop runs render(); that ~47 ms render() interval
+    under hwm flood — not pacing — is the quantum. Probe first
+    (measure-first): per-sample damage→render→READY→present timeline by
+    arm (eager / hwm / relocate), the main-loop tick-interval
+    distribution under flood, and where the hwm parse tick spends the
+    extra time. Candidate levers (untested): decouple the rescue
+    present from the full render() pass; chunk/throttle the parse drain
+    so the loop ticks at refresh cadence; audit vtebench's per-sample
+    sync interaction with the deferred-clear scroll model. Unlocks item
+    5's arms and the ≤26 ms target.
 
 ## Known deviations (tracked, intentional)
 
