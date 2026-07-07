@@ -455,6 +455,16 @@ xlimit_verify_enabled(void) {
     return cached == 1;
 }
 
+bool
+consumer_tail_clip_enabled(void) {
+    static int cached = -1;
+    if (UNLIKELY(cached < 0)) {
+        const char *v = getenv("KITTY_ENABLE_CONSUMER_TAIL_CLIP");
+        cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
 void
 linebuf_clear_line(LineBuf *self, index_type y, bool clear_attrs, bool allow_lazy) {
 #if BLANK_CHAR != 0
@@ -746,6 +756,16 @@ linebuf_copy_line_to(LineBuf *self, Line *line, index_type where) {
     copy_line(line, self->line);
     self->line_attrs[wp] = line->attrs;
     self->line_attrs[wp].has_dirty_text = true;
+    // L2: a deferred (is_blank) source carried a stale GPU tail across and this
+    // buffer's line_xlimit lane is not the source's extent; finalize-on-copy from
+    // the eager-clean CPUCells so copy_line_to always yields an authoritative row.
+    if (UNLIKELY(self->line_attrs[wp].is_blank)) {
+        const CPUCell *c = self->line->cpu_cells;
+        index_type xl = self->xnum;
+        while (xl && !c[xl - 1].ch_and_idx) xl--;
+        if (xl < self->xnum) zero_at_ptr_count(self->line->gpu_cells + xl, self->xnum - xl);
+        self->line_attrs[wp].is_blank = 0;
+    }
 }
 
 static PyObject*

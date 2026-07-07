@@ -2489,7 +2489,11 @@ screen_index(Screen *self) {
     // S2 HWM: finalize the row the cursor is leaving (zero its deferred GPU
     // tail, drop is_blank) before it scrolls up or the cursor descends. No-op
     // for eager/region rows (never is_blank) and 0 work for full-width lines.
-    if (scroll_clear_mode() == SCROLL_CLEAR_HWM) linebuf_finalize_hwm_line(self->linebuf, self->cursor->y);
+    // L2 (consumer tail clip): SKIP the finalize -- keep the row deferred so the
+    // visible/history render clip owns the GPUCell tail, moving the recycle-clear
+    // volume off the per-scrolled-line path onto ~30 visible rows/frame.
+    if (scroll_clear_mode() == SCROLL_CLEAR_HWM && !consumer_tail_clip_enabled())
+        linebuf_finalize_hwm_line(self->linebuf, self->cursor->y);
     if (self->cursor->y == bottom) {
         const bool add_to_history = self->linebuf == self->main_linebuf && self->margin_top == 0;
         INDEX_UP(add_to_history);
@@ -3721,9 +3725,23 @@ screen_pause_rendering(Screen *self, bool pause, int for_in_ms) {
     }
     for (index_type y = 0; y < self->lines; y++) {
         Line *src = visual_line_(self, y);
-        linebuf_init_line(self->paused_rendering.linebuf, y);
-        copy_line(src, self->paused_rendering.linebuf->line);
-        self->paused_rendering.linebuf->line_attrs[lb_phys(self->paused_rendering.linebuf, y)] = src->attrs;
+        LineBuf *pl = self->paused_rendering.linebuf;
+        linebuf_init_line(pl, y);
+        copy_line(src, pl->line);
+        const index_type pp = lb_phys(pl, y);
+        pl->line_attrs[pp] = src->attrs;
+        // L2: src may be a deferred (is_blank) row and copy_line brought its stale
+        // GPU tail across; the snapshot's fresh line_xlimit lane is 0, so a later
+        // finalize would zero live content. Finalize-on-copy from the eager-clean
+        // CPUCells so the paused buffer holds authoritative rows (no-op under L1,
+        // where visible rows are already finalized before the snapshot).
+        if (pl->line_attrs[pp].is_blank) {
+            const CPUCell *c = pl->line->cpu_cells;
+            index_type xl = pl->xnum;
+            while (xl && !c[xl - 1].ch_and_idx) xl--;
+            if (xl < pl->xnum) zero_at_ptr_count(pl->line->gpu_cells + xl, pl->xnum - xl);
+            pl->line_attrs[pp].is_blank = 0;
+        }
     }
     copy_selections(&self->paused_rendering.selections, &self->selections);
     copy_selections(&self->paused_rendering.url_ranges, &self->url_ranges);
@@ -4098,7 +4116,11 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
         // the clean (eager 12B-cleared) CPUCells; xlimit==0 is wholly blank.
         // Storage GPUCells are finalized parse-side, so this never races the
         // draw. Non-deferred rows take the normal diff/copy.
-        if (!is_history && linep->attrs.is_blank) {
+        // L2: history rows may now be deferred too (eviction keeps is_blank under
+        // consumer tail clip), so the clip covers both visible and scrollback
+        // is_blank rows; xlimit is derived from the eager-clean CPUCells either way.
+        // Pre-L2 history is always finalized at eviction, so this is a no-op there.
+        if (linep->attrs.is_blank) {
             const index_type xlimit = xlimit_for_line(linep);
             if (xlimit == 0) bytes += effective_full ? update_line_data_blank(self->columns, render_row, address)
                                                      : update_line_data_blank_diff(self->columns, render_row, address);

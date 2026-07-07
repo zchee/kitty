@@ -57,6 +57,10 @@ lb_phys(const LineBuf *lb, index_type y) {
 // (runtime-gated, NOT assert -- setup.py appends -DNDEBUG). Both default off/on-track.
 bool xlimit_track_disabled(void);
 bool xlimit_verify_enabled(void);
+// Wave-15 L2: KITTY_ENABLE_CONSUMER_TAIL_CLIP=1 (opt-in, meaningful only under HWM).
+// Defer the parse-side finalize tail-zero for scrolled/evicted rows -- carry
+// is_blank to the visible + history render clip, which owns the GPUCell tail.
+bool consumer_tail_clip_enabled(void);
 
 // Wave-15 L1: raise row y's write-extent UPPER BOUND to x_excl -- the cursor
 // column just past a draw store. A draw always advances the cursor past what it

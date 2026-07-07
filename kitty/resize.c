@@ -83,7 +83,12 @@ init_src_line(Rewrap *r) {
     return newline_needed;
 }
 
-#define set_dest_line_attrs(dest_y) r->dest.lb->line_attrs[lb_phys(r->dest.lb, dest_y)] = r->src.line.attrs; r->src.line.attrs.prompt_kind = UNKNOWN_PROMPT_KIND;
+// L2: the rewrap reconstructs each dest row from the source's content cells
+// [0, src_x_limit) into a fresh/eager-cleared dest slot (authoritative, blank
+// tail). Under consumer tail clip a deferred source carries is_blank=1, which
+// would spuriously mark the authoritative dest deferred (line_xlimit unset -> a
+// later finalize would zero live content); clear it. No-op under L1.
+#define set_dest_line_attrs(dest_y) { LineAttrs *_da = &r->dest.lb->line_attrs[lb_phys(r->dest.lb, dest_y)]; *_da = r->src.line.attrs; _da->is_blank = 0; r->src.line.attrs.prompt_kind = UNKNOWN_PROMPT_KIND; }
 
 static void
 first_dest_line(Rewrap *r) {
