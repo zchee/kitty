@@ -510,6 +510,23 @@ linebuf_materialize_blank_line(LineBuf *self, index_type y) {
     zero_at_ptr_count(gpu_lineptr(self, self->line_map[p]), self->xnum);
 }
 
+// Wave-15 S1-lite (ADR §10c): materialize a deferred (is_blank) row NOW -- zero the
+// WHOLE GPU row and drop is_blank; mark it dirty so render_line re-covers the drawn
+// CPU runs. Unlike finalize/clip (which zero only the tail [xlimit, xnum)), a full-
+// row zero leaves no stale cell anywhere -- correct for a DISCONTIGUOUS write whose
+// interior gaps line_xlimit (an upper bound) cannot locate. Called from the cursor-
+// positioning commands (never the append-only flood: draw + CR + LF), so zero flood
+// cost. Independent of the line_xlimit / UNTRACKED tracking. Any mode (self-gated on
+// is_blank; a no-op under EAGER, which never sets it).
+void
+linebuf_materialize_deferred_row(LineBuf *self, index_type y) {
+    const index_type p = lb_phys(self, y);
+    if (!self->line_attrs[p].is_blank) return;
+    self->line_attrs[p].is_blank = 0;
+    self->line_attrs[p].has_dirty_text = true;
+    zero_at_ptr_count(gpu_lineptr(self, self->line_map[p]), self->xnum);
+}
+
 // L1: backward xlimit scan (last non-blank CPUCell + 1) starting from `start`.
 // Starting from the tracked upper bound makes this O(1) for the scroll flood;
 // starting from xnum reproduces the pre-L1 full scan (kill-switch / verify /

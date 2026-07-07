@@ -2327,13 +2327,14 @@ screen_tab(Screen *self) {
                 }
                 self->lc->count = 2; self->lc->chars[0] = '\t'; self->lc->chars[1] = diff;
                 cell_set_chars(cpu_cell, self->text_cache, self->lc);
-                // L1: TAB wrote a '\t' marker + spaces via a direct (non-init_cells)
-                // cell fetch and jumps the cursor to the stop without a note, so a
-                // deferred row's extent grew invisibly -> rescan it at finalize.
-                linebuf_mark_xlimit_untracked(self->linebuf, self->cursor->y);
             }
         }
         self->cursor->x = found;
+        // S1-lite (§10c): TAB filled [old, found) with spaces via a direct
+        // (non-init_cells) fetch that left their GPUCells stale on a deferred row;
+        // materialize the whole row so render_line re-covers them. Supersedes the L1
+        // UNTRACKED mark -- the row is now authoritative, not deferred.
+        linebuf_materialize_deferred_row(self->linebuf, self->cursor->y);
     }
 }
 
@@ -2386,6 +2387,7 @@ screen_cursor_move(Screen *self, unsigned int count/*=1*/, int move_direction/*=
     if (move_direction > 0) {
         self->cursor->x += count;
         screen_ensure_bounds(self, false, in_margins);
+        linebuf_materialize_deferred_row(self->linebuf, self->cursor->y);  // S1-lite (§10c): CUF gap guard
     } else {
         index_type top = in_margins && self->modes.mDECOM ? self->margin_top : 0;
         while (count > 0) {
@@ -2421,6 +2423,7 @@ screen_cursor_up(Screen *self, unsigned int count/*=1*/, bool do_carriage_return
     else self->cursor->y += move_direction * count;
     if (do_carriage_return) self->cursor->x = 0;
     screen_ensure_bounds(self, true, in_margins);
+    linebuf_materialize_deferred_row(self->linebuf, self->cursor->y);  // S1-lite (§10c): CUU/CUD gap guard
 }
 
 void
@@ -2444,6 +2447,7 @@ screen_cursor_to_column(Screen *self, unsigned int column) {
     if (x != self->cursor->x) {
         self->cursor->x = x;
         screen_ensure_bounds(self, false, cursor_within_margins(self));
+        linebuf_materialize_deferred_row(self->linebuf, self->cursor->y);  // S1-lite (§10c): CHA/HPA gap guard
     }
 }
 
@@ -2699,6 +2703,7 @@ screen_cursor_position(Screen *self, unsigned int line, unsigned int column) {
     self->cursor->position_changed_by_client_at = self->parsing_at;
     self->cursor->x = column; self->cursor->y = line;
     screen_ensure_bounds(self, false, in_margins);
+    linebuf_materialize_deferred_row(self->linebuf, self->cursor->y);  // S1-lite (§10c): CUP gap guard
 }
 
 void
