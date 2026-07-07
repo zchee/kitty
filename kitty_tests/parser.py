@@ -839,6 +839,44 @@ class TestParser(BaseTest):
         s.reset()
         b']]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]'
 
+    def test_csi_param_accumulation(self):
+        # Wave-13a P1: the fast CSI-parameter path drops the per-parameter
+        # 64-bit divide but must stay bit-identical to the legacy path,
+        # including the >=16-digit overflow/clamp behaviour. Every value below
+        # is produced by BOTH arms; the verify stage re-runs this module with
+        # KITTY_VTP_LEGACY_CSI_PARSE=1 to confirm the same-binary A/B.
+        s = self.create_screen(8)
+        pb = partial(self.parse_bytes_dump, s)
+        # Leading zeros collapse to the significant value.
+        pb('\033[0000000000000002b', ('screen_repeat_character', 2))
+        pb('\033[0000000123b', ('screen_repeat_character', 123))
+        # 16 significant digits: the legacy multiplier table's last slot was
+        # 10^0 (not 10^1), so the 16th digit carries 100x weight. The fast path
+        # reproduces that exact (already int-overflowing) value.
+        pb('\033[9999999999999999b', ('screen_repeat_character', 1569324965))
+        pb('\033[1234567890123456b', ('screen_repeat_character', 1567312714))
+        # The 17th and later digits are dropped (16-digit accumulation cap): a
+        # 17-digit run equals its 16-digit prefix, and 16 zeros drop the last
+        # digit entirely.
+        pb('\033[12345678901234567b', ('screen_repeat_character', 1567312714))
+        pb('\033[00000000000000009b', ('screen_repeat_character', 0))
+        # A 20-digit run (past uint64 range if accumulated naively) still clamps
+        # to the same 16-digit value, with no divide.
+        pb('\033[99999999999999999999b', ('screen_repeat_character', 1569324965))
+        # Overflow that wraps to a negative int is caught by the non-negative
+        # parameter guard, exactly as the legacy path did.
+        pb('\033[999999999999999b', ('CSI code b is not allowed to have negative parameter (-1530494977)',))
+        # Two-parameter accumulation (CUP) with mixed leading zeros / widths.
+        pb('\033[0012;0000000000034H', ('screen_cursor_position', 12, 34))
+        s.reset()
+        # Truecolor SGR batteries: 38;2;r;g;b then 48;2;r;g;b, multi-digit chans.
+        pb('\033[38;2;255;128;0;48;2;12;34;56m',
+           ('select_graphic_rendition', '38:2:255:128:0'),
+           ('select_graphic_rendition', '48:2:12:34:56'))
+        # Colon-delimited sub-parameters (one param, colon-joined on dump).
+        pb('\033[38:2:255:128:0m', ('select_graphic_rendition', '38:2:255:128:0'))
+        pb('\033[48:5:236m', ('select_graphic_rendition', '48:5:236'))
+
     def test_osc_codes(self):
         s = self.create_screen()
         pb = partial(self.parse_bytes_dump, s)
