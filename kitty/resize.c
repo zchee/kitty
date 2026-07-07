@@ -109,7 +109,7 @@ linebuf_next_dest_line(Rewrap *r, bool continued) {
             dest->line->attrs.has_dirty_text = true;
             historybuf_add_line(r->dest.hb, dest->line, r->as_ansi_buf);
         }
-        linebuf_clear_line(dest, dest->ynum - 1, true);
+        linebuf_clear_line(dest, dest->ynum - 1, true, false);
     } else dest_y++;
     linebuf_init_line_at(dest, dest_y, &r->dest.line);
     set_dest_line_attrs(dest_y);
@@ -146,7 +146,7 @@ next_dest_line(Rewrap *r, bool continued) {
     }
     linebuf_index(r->sb, 0, r->sb->ynum - 1);
     if (r->sb->line_attrs[lb_phys(r->sb, r->sb->ynum - 1)].has_dirty_text) {
-        linebuf_clear_line(r->sb, r->sb->ynum - 1, true);
+        linebuf_clear_line(r->sb, r->sb->ynum - 1, true, false);
     }
 }
 

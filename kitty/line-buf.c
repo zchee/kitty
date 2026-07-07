@@ -190,7 +190,7 @@ void
 linebuf_init_cells(LineBuf *lb, index_type idx, CPUCell **c, GPUCell **g) {
     // S1 (Phase 13B): callers fetch these pointers to WRITE GPUCells (draw
     // run-fills, multicell, char shifts), so materialize any deferred clear.
-    linebuf_materialize_blank_line(lb, idx);
+    linebuf_materialize_blank(lb, idx);
     const index_type ynum = lb->line_map[lb_phys(lb, idx)];
     *c = cpu_lineptr(lb, ynum);
     *g = gpu_lineptr(lb, ynum);
@@ -223,7 +223,7 @@ linebuf_init_line(LineBuf *self, index_type idx) {
     // so materialize any deferred clear here. The explicit-Line variant
     // (linebuf_init_line_at) stays pure so the render path can peek is_blank and
     // emit blank_diff with the deferred GPUCells left untouched.
-    linebuf_materialize_blank_line(self, idx);
+    linebuf_make_authoritative(self, idx);
     linebuf_init_line_at(self, idx, self->line);
 }
 
@@ -380,46 +380,56 @@ clear_line_(Line *l, index_type xnum) {
     l->attrs.has_dirty_text = false;
 }
 
-// S1 (Phase 13B): the lazy (deferred-GPUCell) scroll clear, DEFAULT OFF.
-// The 13B mid-gate same-binary A/B found the lazy path a ~1.4-1.6x vtebench
-// scrolling regression (34->~54 ms, bimodal at exactly +1 frame @60Hz)
-// despite IDENTICAL byte- and upload-counts vs eager (KITTY_METAL_STATS:
-// uploads/frame 66156 both, passes 1:1, presents fewer): a pure
-// scheduling/sync-phase knife-edge, not work amplification, on a relocate
-// whose direct win is ~0. Per the bisectability rule no commit ships a known
-// scrolling regression, so the default is eager. The machinery is retained as
-// S2's is_blank substrate: KITTY_DISABLE_LAZY_ROW_CLEAR unset or =1 -> eager
-// 32B clear (default / the escape hatch); =0 opts into the lazy relocate for
-// A/B + the S2 diagnostic middle arm. Cached function-static, like the
-// draw-loop run-fill levers.
-static int lazy_row_clear_state = -1;
+// S1/S2 (Phase 13B): the recycled-row scroll clear has three arms, resolved
+// once from the environment (precedence below). DEFAULT is EAGER — the S2
+// mechanism ships gate-clean and the default->HWM flip is a separate commit
+// that lands only after the #14 acceptance gate. Arms:
+//   EAGER    (default; KITTY_DISABLE_LAZY_ROW_CLEAR set and != "0"): the
+//            original 32B clear (both CPUCells and GPUCells zeroed at scroll).
+//   RELOCATE (KITTY_DISABLE_LAZY_ROW_CLEAR=0): S1 - 12B CPU clear at scroll,
+//            defer the GPU clear, materialize (zero the whole GPU row) on
+//            write. The mid-gate diagnostic middle arm (~0 win + a sync-phase
+//            knife-edge; kept for A/B, not for shipping).
+//   HWM      (KITTY_ENABLE_HWM_CLEAR=1): S2 - 12B CPU clear at scroll, defer
+//            the GPU clear, and clear only the untouched GPU tail [xlimit,xnum)
+//            at line finalize (0 for full-width lines) with the render clipping
+//            the in-progress line. Eliminates the ~1315-sample GPU clear.
+// Cached function-static, like the draw-loop run-fill levers.
+static int scroll_clear_mode_state = -1;
 
-static bool
-lazy_row_clear_enabled(void) {
-    if (UNLIKELY(lazy_row_clear_state < 0)) {
-        const char *v = getenv("KITTY_DISABLE_LAZY_ROW_CLEAR");
-        lazy_row_clear_state = (v && v[0] && strcmp(v, "0") == 0) ? 1 : 0;
+ScrollClearMode
+scroll_clear_mode(void) {
+    if (UNLIKELY(scroll_clear_mode_state < 0)) {
+        const char *d = getenv("KITTY_DISABLE_LAZY_ROW_CLEAR");
+        const char *h = getenv("KITTY_ENABLE_HWM_CLEAR");
+        if (d && d[0] && strcmp(d, "0") != 0) scroll_clear_mode_state = SCROLL_CLEAR_EAGER;
+        else if (d && d[0]) scroll_clear_mode_state = SCROLL_CLEAR_RELOCATE;  // "0"
+        else if (h && h[0] && strcmp(h, "0") != 0) scroll_clear_mode_state = SCROLL_CLEAR_HWM;
+        else scroll_clear_mode_state = SCROLL_CLEAR_EAGER;
     }
-    return lazy_row_clear_state == 1;
+    return (ScrollClearMode)scroll_clear_mode_state;
 }
 
 void
-linebuf_clear_line(LineBuf *self, index_type y, bool clear_attrs) {
+linebuf_clear_line(LineBuf *self, index_type y, bool clear_attrs, bool allow_lazy) {
 #if BLANK_CHAR != 0
 #error This implementation is incorrect for BLANK_CHAR != 0
 #endif
-    index_type ym = self->line_map[lb_phys(self, y)];
+    const index_type p = lb_phys(self, y);
+    index_type ym = self->line_map[p];
     CPUCell *c = cpu_lineptr(self, ym); GPUCell *g = gpu_lineptr(self, ym);
-    // The 12B CPUCell clear stays eager: every text reader (xlimit_for_line/
-    // line_is_empty/line_length/unicode_in_range/line_as_ansi) keys off
-    // CPUCell fields, so a recycled row must read blank immediately (the
-    // pre-overwrite contract in kitty_tests/scroll_semantics.py).
+    // The 12B CPUCell clear stays eager in EVERY arm: every text reader
+    // (xlimit_for_line/line_is_empty/line_length/unicode_in_range/line_as_ansi)
+    // keys off CPUCell fields, so a recycled row must read blank immediately
+    // (the pre-overwrite contract in kitty_tests/scroll_semantics.py) and the
+    // HWM render clip derives its extent from these clean CPUCells.
     zero_at_ptr_count(c, self->xnum);
-    if (clear_attrs) self->line_attrs[lb_phys(self, y)].val = 0;
-    if (lazy_row_clear_enabled()) {
-        // Defer the 20B GPUCell clear: mark the row blank. Render emits zeros
-        // for it and any authoritative GPUCell access materializes first.
-        self->line_attrs[lb_phys(self, y)].is_blank = 1;
+    if (clear_attrs) self->line_attrs[p].val = 0;
+    // RELOCATE/HWM on a full-screen marginless scroll defer the 20B GPUCell
+    // clear behind is_blank; EAGER and every region/reverse/resize caller
+    // (allow_lazy=false) zero it now.
+    if (allow_lazy && scroll_clear_mode() != SCROLL_CLEAR_EAGER) {
+        self->line_attrs[p].is_blank = 1;
     } else {
         zero_at_ptr_count(g, self->xnum);
     }
@@ -432,11 +442,40 @@ linebuf_clear_line(LineBuf *self, index_type y, bool clear_attrs) {
 // defined — here that is the whole-row zero (a documented RELOCATE: the draw
 // path re-covers drawn cells, so the vtebench headline is ~0). S2 swaps this
 // body for a tail-only clear of [hwm, xnum) WITHOUT touching call sites.
+// S1 RELOCATE materialize: on the first write, zero the whole deferred GPU row
+// and drop is_blank. HWM keeps is_blank to line finalize and EAGER never sets
+// it, so this is a no-op in those arms; the is_blank guard is inlined at the
+// call sites via linebuf_materialize_blank (line-buf.h).
 void
 linebuf_materialize_blank_line(LineBuf *self, index_type y) {
-    if (!self->line_attrs[lb_phys(self, y)].is_blank) return;
-    self->line_attrs[lb_phys(self, y)].is_blank = 0;
-    zero_at_ptr_count(gpu_lineptr(self, self->line_map[lb_phys(self, y)]), self->xnum);
+    const index_type p = lb_phys(self, y);
+    if (!self->line_attrs[p].is_blank || scroll_clear_mode() != SCROLL_CLEAR_RELOCATE) return;
+    self->line_attrs[p].is_blank = 0;
+    zero_at_ptr_count(gpu_lineptr(self, self->line_map[p]), self->xnum);
+}
+
+// S2 HWM finalize (also correct for a RELOCATE un-drawn row: xlimit==0 zeroes
+// the whole row): a deferred row keeps its drawn GPUCells [0, xlimit) and a
+// stale tail [xlimit, xnum); clear the tail (0 work for full-width lines) and
+// drop is_blank when the cursor leaves the row or it is evicted to scrollback.
+// xlimit is derived from the clean (eager 12B-cleared) CPUCells.
+void
+linebuf_finalize_hwm_line(LineBuf *self, index_type y) {
+    const index_type p = lb_phys(self, y);
+    if (!self->line_attrs[p].is_blank) return;
+    self->line_attrs[p].is_blank = 0;
+    const index_type ym = self->line_map[p];
+    const CPUCell *c = cpu_lineptr(self, ym);
+    index_type xlimit = self->xnum;
+    while (xlimit && !c[xlimit - 1].ch_and_idx) xlimit--;
+    if (xlimit < self->xnum) zero_at_ptr_count(gpu_lineptr(self, ym) + xlimit, self->xnum - xlimit);
+}
+
+// init_line choke: is_blank guaranteed set by the inline caller.
+void
+linebuf_make_authoritative_cold(LineBuf *self, index_type y) {
+    if (scroll_clear_mode() == SCROLL_CLEAR_HWM) linebuf_finalize_hwm_line(self, y);
+    else linebuf_materialize_blank_line(self, y);  // RELOCATE (EAGER never sets is_blank)
 }
 
 static PyObject*
@@ -444,15 +483,25 @@ clear_line(LineBuf *self, PyObject *val) {
 #define clear_line_doc "clear_line(y) -> Clear the specified line"
     index_type y = (index_type)PyLong_AsUnsignedLong(val);
     if (y >= self->ynum) { PyErr_SetString(PyExc_ValueError, "Out of bounds"); return NULL; }
-    linebuf_clear_line(self, y, true);
+    linebuf_clear_line(self, y, true, false);
     Py_RETURN_NONE;
 }
 
-// S3 (Phase 13B): rotate line_map/line_attrs so logical row 0 sits at physical
-// 0 (head->0), letting the physical-index reorder ops below run unchanged. Cold
-// path only (region scroll, reverse-index, insert/delete lines); the hot
-// marginless scroll never calls this. scratch is ynum index_type (4*ynum
-// bytes), big enough to also stage the ynum-byte line_attrs pass.
+// ============================ PHYSICAL-INDEX ZONE ============================
+// S3 (Phase 13B) invariant: EVERY logical-row access to line_map/line_attrs
+// goes through lb_phys() EXCEPT (1) linebuf_normalize below (the head-rotation
+// primitive), (2) the four reorder functions it enables (linebuf_index /
+// _reverse_index / _insert_lines / _delete_lines), which run ONLY at head==0
+// (the marginless fast path returns early with an O(1) head bump; every other
+// entry calls linebuf_normalize first), and (3) order-agnostic full-row loops
+// (linebuf_clear/set_attribute) and the head==0 alloc rebuild. A raw line_map[
+// ]/line_attrs[] index anywhere else is a bug — use lb_phys.
+// ============================================================================
+// linebuf_normalize rotates line_map/line_attrs so logical row 0 sits at
+// physical 0 (head->0), letting the physical-index reorder ops below run
+// unchanged. Cold path only; the hot marginless scroll never calls this.
+// scratch is ynum index_type (4*ynum bytes), big enough to also stage the
+// ynum-byte line_attrs pass.
 static void
 linebuf_normalize(LineBuf *self) {
     if (self->head == 0) return;

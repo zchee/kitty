@@ -695,11 +695,12 @@ historybuf_take_line_from(HistoryBuf *self, LineBuf *lb, index_type lb_y, ANSIBu
     // position moves to the linebuf row, whose stale content the
     // caller's linebuf_clear_line memset erases (required in any design).
     if (UNLIKELY(self->pool != lb->pool)) fatal("slot handover between containers with different pools");
-    // S1 (Phase 13B): if the evicted row still carries a deferred (lazy) clear,
-    // materialize it now so the scrollback slot holds authoritative zeroed
-    // GPUCells — history has no is_blank/blank_diff render path. No-op (and off
-    // the vtebench hot path) for the usual case of evicting real content.
-    linebuf_materialize_blank_line(lb, lb_y);
+    // S1/S2 (Phase 13B): if the evicted row still carries a deferred clear,
+    // finalize it now so the scrollback slot holds authoritative GPUCells —
+    // history has no is_blank/clip render path. finalize_hwm zeroes the tail
+    // [xlimit, xnum) (whole row for an un-drawn RELOCATE row, xlimit==0). No-op
+    // (and off the vtebench hot path) when evicting real content.
+    linebuf_finalize_hwm_line(lb, lb_y);
     bool needs_clear;
     index_type idx = historybuf_push(self, as_ansi_buf, &needs_clear);
     ensure_position(self, idx);

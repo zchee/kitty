@@ -367,7 +367,7 @@ index_selection(const Screen *self, Selections *selections, bool up, index_type 
 
 #define INDEX_DOWN \
     linebuf_reverse_index(self->linebuf, top, bottom); \
-    linebuf_clear_line(self->linebuf, top, true); \
+    linebuf_clear_line(self->linebuf, top, true, false); \
     if (self->linebuf == self->main_linebuf && self->last_visited_prompt.is_set) { \
         if (self->last_visited_prompt.scrolled_by > 0) self->last_visited_prompt.scrolled_by--; \
         else if(self->last_visited_prompt.y < self->lines - 1) self->last_visited_prompt.y++; \
@@ -507,7 +507,7 @@ found:
     for (; y < (int)self->main_linebuf->ynum; y++) {
         linebuf_init_line(self->main_linebuf, y);
         linebuf_copy_line_to(prompt_copy, self->main_linebuf->line, num_of_prompt_lines++);
-        linebuf_clear_line(self->main_linebuf, y, false);
+        linebuf_clear_line(self->main_linebuf, y, false, false);
         if (y <= (int)self->cursor->y) {
             linebuf_init_line(self->main_linebuf, y);
             // this is needed because screen_resize() checks to see if the cursor is beyond the content,
@@ -2452,7 +2452,7 @@ screen_cursor_to_column(Screen *self, unsigned int column) {
             else self->last_visited_prompt.is_set = false; \
         } \
     } \
-    linebuf_clear_line(self->linebuf, bottom, true); \
+    linebuf_clear_line(self->linebuf, bottom, true, top == 0 && bottom == self->lines - 1 && self->linebuf == self->main_linebuf); \
     self->is_dirty = true; \
     index_selection(self, &self->selections, true, top, bottom); \
     clear_selection(&self->url_ranges);
@@ -2461,6 +2461,10 @@ void
 screen_index(Screen *self) {
     // Move cursor down one line, scrolling screen if needed
     unsigned int top = self->margin_top, bottom = self->margin_bottom;
+    // S2 HWM: finalize the row the cursor is leaving (zero its deferred GPU
+    // tail, drop is_blank) before it scrolls up or the cursor descends. No-op
+    // for eager/region rows (never is_blank) and 0 work for full-width lines.
+    if (scroll_clear_mode() == SCROLL_CLEAR_HWM) linebuf_finalize_hwm_line(self->linebuf, self->cursor->y);
     if (self->cursor->y == bottom) {
         const bool add_to_history = self->linebuf == self->main_linebuf && self->margin_top == 0;
         INDEX_UP(add_to_history);
@@ -3741,31 +3745,29 @@ get_line_edge_colors_at_row(Screen *self, index_type y, color_type *left, color_
     // Any of the output pointers may be NULL if that value is not needed.
     Line *line = range_line_(self, y);
     if (!line) return false;
-    // S1 (Phase 13B): a lazily-cleared (is_blank) row is semantically blank and
-    // its deferred GPUCells are unauthoritative — report default-background
-    // edges, matching the eager-clear result of all-zero cells. (History rows
-    // are materialized on eviction, so this only fires for live blank rows.)
-    if (line->attrs.is_blank) {
-        const color_type dbg = OPT(background);
-        if (left) *left = dbg;
-        if (right) *right = dbg;
-        if (left_is_default) *left_is_default = true;
-        if (right_is_default) *right_is_default = true;
-        return true;
-    }
+    // S1/S2 (Phase 13B): for a deferred (is_blank) row, an edge cell with no
+    // CPU content has an unauthoritative (stale/deferred) GPUCell -> report its
+    // edge as the default background; a drawn edge cell (HWM in-progress line
+    // whose content reaches the edge) reads its real GPUCell normally. When both
+    // edges are blank (every S1 row and the common HWM tail) both go default.
+    // History rows are finalized on eviction, so a live is_blank row is the only
+    // case reaching here.
+    const bool deferred = line->attrs.is_blank;
     color_type left_cell_fg = OPT(foreground), left_cell_bg = OPT(background), right_cell_bg = OPT(background), right_cell_fg = OPT(foreground);
     index_type cell_color_x = 0;
     char_type left_char = line_get_char(line, cell_color_x);
     bool reversed = false;
     colors_for_cell(line, self->color_profile, &cell_color_x, &left_cell_fg, &left_cell_bg, &reversed);
-    if (left_is_default) *left_is_default = (line->gpu_cells[cell_color_x].bg & 0xff) == 0;
-    if (left) *left = effective_cell_edge_color(left_char, left_cell_fg, left_cell_bg, true);
+    const bool left_blank = deferred && !cell_has_text(&line->cpu_cells[cell_color_x]);
+    if (left_is_default) *left_is_default = left_blank || (line->gpu_cells[cell_color_x].bg & 0xff) == 0;
+    if (left) *left = left_blank ? OPT(background) : effective_cell_edge_color(left_char, left_cell_fg, left_cell_bg, true);
     if (line->xnum > 0) cell_color_x = line->xnum - 1;
     char_type right_char = line_get_char(line, cell_color_x);
     reversed = false;  // reset: colors_for_cell only sets this flag, never clears it
     colors_for_cell(line, self->color_profile, &cell_color_x, &right_cell_fg, &right_cell_bg, &reversed);
-    if (right_is_default) *right_is_default = (line->gpu_cells[cell_color_x].bg & 0xff) == 0;
-    if (right) *right = effective_cell_edge_color(right_char, right_cell_fg, right_cell_bg, false);
+    const bool right_blank = deferred && !cell_has_text(&line->cpu_cells[cell_color_x]);
+    if (right_is_default) *right_is_default = right_blank || (line->gpu_cells[cell_color_x].bg & 0xff) == 0;
+    if (right) *right = right_blank ? OPT(background) : effective_cell_edge_color(right_char, right_cell_fg, right_cell_bg, false);
     return true;
 }
 
@@ -3809,6 +3811,24 @@ update_line_data_blank_diff(unsigned xnum, unsigned int dest_y, uint8_t *data) {
     uint8_t *dst = data + sz * dest_y;
     for (size_t i = 0; i < sz; i++) { if (dst[i]) { memset(dst, 0, sz); return sz; } }
     return 0;
+}
+
+// S2 (HWM): upload a deferred row's drawn head [0, xlimit) and blank the tail
+// in the ring slot (never the parse-side storage GPUCells). Diffed unless
+// force, so an unchanged row uploads nothing — matching the eager diff path.
+static size_t
+update_line_data_clipped(const Line *line, index_type xlimit, unsigned int dest_y, uint8_t *data, bool force) {
+    const size_t sz = line->xnum * sizeof(GPUCell);
+    const size_t head = xlimit * sizeof(GPUCell);
+    uint8_t *dst = data + sz * dest_y;
+    if (!force) {
+        bool changed = memcmp(dst, line->gpu_cells, head) != 0;
+        if (!changed) { for (size_t i = head; i < sz; i++) if (dst[i]) { changed = true; break; } }
+        if (!changed) return 0;
+    }
+    memcpy(dst, line->gpu_cells, head);
+    memset(dst + head, 0, sz - head);
+    return sz;
 }
 
 
@@ -4024,16 +4044,6 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
                                     : update_line_data_blank_diff(self->columns, render_row, address);
             continue;
         }
-        if (!is_history && linep->attrs.is_blank) {
-            // S1 (Phase 13B): a lazily-cleared row not yet written since the
-            // scroll renders blank with its deferred GPUCells left untouched
-            // (render_line_for_virtual_y uses the pure init_line_at, so the bit
-            // survives to here). Every GPUCell writer materializes — clears
-            // is_blank — first, so a surviving is_blank means genuinely blank.
-            bytes += effective_full ? update_line_data_blank(self->columns, render_row, address)
-                                    : update_line_data_blank_diff(self->columns, render_row, address);
-            continue;
-        }
         bool rerendered = false;
         if (is_history) {
             // we render line graphics even if the line is not dirty as graphics commands received after
@@ -4057,10 +4067,23 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
                 rerendered = true;
             }
         }
-        // Rows re-rendered this frame are known-changed -> copy directly (skip the
-        // memcmp); everything else diffs against the slot.
-        bytes += (effective_full || rerendered) ? update_line_data(linep, render_row, address)
-                                                : update_line_data_diff(linep, render_row, address);
+        // S1/S2: a deferred (is_blank) row went through render_line above (its
+        // drawn cells [0, xlimit) are fresh), but its GPUCell tail [xlimit, xnum)
+        // is still stale — clip it in the ring slot only. xlimit is derived from
+        // the clean (eager 12B-cleared) CPUCells; xlimit==0 is wholly blank.
+        // Storage GPUCells are finalized parse-side, so this never races the
+        // draw. Non-deferred rows take the normal diff/copy.
+        if (!is_history && linep->attrs.is_blank) {
+            const index_type xlimit = xlimit_for_line(linep);
+            if (xlimit == 0) bytes += effective_full ? update_line_data_blank(self->columns, render_row, address)
+                                                     : update_line_data_blank_diff(self->columns, render_row, address);
+            else bytes += update_line_data_clipped(linep, xlimit, render_row, address, effective_full || rerendered);
+        } else {
+            // Rows re-rendered this frame are known-changed -> copy directly
+            // (skip the memcmp); everything else diffs against the slot.
+            bytes += (effective_full || rerendered) ? update_line_data(linep, render_row, address)
+                                                    : update_line_data_diff(linep, render_row, address);
+        }
     }
     if (is_overlay_active && self->overlay_line.ynum + self->scrolled_by < self->lines) {
         if (self->overlay_line.is_dirty) {
