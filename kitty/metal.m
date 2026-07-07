@@ -1865,6 +1865,24 @@ metal_sync_present_forced(void) {
     return state == 1;
 }
 
+// L1 (Wave-13a) kill switch: input-immediate frames (pace=immediate — an
+// input-driven render that ran outside the pace link) present SYNCHRONOUSLY by
+// default. A lone keystroke frame has no second frame chasing it, so the
+// Wave-5c async double hop (completed handler -> dispatch_async(main) -> swap)
+// is pure latency for it; committing + waiting (<1 ms of terminal-frame GPU)
+// + swapping on this same main-thread turn skips both scheduler hops. Flood
+// frames are link-driven (pace=iosurface) and stay async — this lever never
+// touches them. KITTY_METAL_SYNC_IMMEDIATE=0 reverts to always-async (the
+// Wave-5c behavior). Default ON, mirroring metal_iosurface_enabled()'s polarity
+// (off only when explicitly "0"); KITTY_METAL_SYNC_PRESENT=1 still forces sync
+// everywhere and takes precedence.
+static bool
+metal_sync_immediate_enabled(void) {
+    static int state = -1;
+    if (state < 0) { const char *v = getenv("KITTY_METAL_SYNC_IMMEDIATE"); state = (v && v[0] && strcmp(v, "0") == 0) ? 0 : 1; }
+    return state == 1;
+}
+
 bool
 metal_iosurface_enabled(void) {
     // Wave-5 default: the IOSurface model IS the Metal presentation path.
@@ -2671,12 +2689,29 @@ metal_end_frame(void) {
             // Phase-5 profile). The explicit transaction + flush pushes the
             // swap to the render server immediately; CA composites it at the
             // next display refresh — vsync-clean without a drawable pool.
-            // Three cases still swap synchronously on this turn: live resize
-            // (the swap must land inside the resize transaction), a dirty ring
-            // slot (someone may still read the surface we rendered into), and
-            // the KITTY_METAL_SYNC_PRESENT=1 kill switch.
+            // Four cases swap synchronously on this turn: live resize (the swap
+            // must land inside the resize transaction), a dirty ring slot
+            // (someone may still read the surface we rendered into), the
+            // KITTY_METAL_SYNC_PRESENT=1 kill switch, and — since Wave-13a (L1)
+            // — an input-immediate frame (pace=immediate: an input-driven render
+            // that ran outside the pace link, so no follow-up frame amortizes
+            // the async hops). frame_is_immediate mirrors the pace ladder's
+            // "immediate" arm exactly (not link-driven, vsync-clean, not
+            // mid-resize), so the lever's scope is provably identical to the
+            // pace=immediate tag; KITTY_METAL_SYNC_IMMEDIATE=0 opts back out to
+            // always-async. Flood frames are link-driven and never satisfy this,
+            // so flood stays async (cadence p50=p99 unchanged). The sync swap
+            // routes through the SAME per-layer generation guard below, so
+            // overtaking an older still-queued async swap is reorder-safe: it
+            // records the newer fidx and the stale async block is dropped when
+            // it runs (identical to the dirty-slot/resize sync case the guard
+            // was built for in Wave-5c).
+            const bool frame_is_immediate = mtl_current_layer &&
+                mtl_current_layer.displaySyncEnabled &&
+                !mtl_current_layer.presentsWithTransaction && !metal_frame_link_driven;
             const bool sync_swap = metal_sync_present_forced() || mtl_iosurface_slot_dirty ||
-                                   (mtl_current_layer && mtl_current_layer.presentsWithTransaction);
+                                   (mtl_current_layer && mtl_current_layer.presentsWithTransaction) ||
+                                   (metal_sync_immediate_enabled() && frame_is_immediate);
             if (sync_swap) {
                 [mtl_current_command_buffer commit];
                 [mtl_current_command_buffer waitUntilCompleted];
