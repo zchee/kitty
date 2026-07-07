@@ -3717,6 +3717,18 @@ get_line_edge_colors_at_row(Screen *self, index_type y, color_type *left, color_
     // Any of the output pointers may be NULL if that value is not needed.
     Line *line = range_line_(self, y);
     if (!line) return false;
+    // S1 (Phase 13B): a lazily-cleared (is_blank) row is semantically blank and
+    // its deferred GPUCells are unauthoritative — report default-background
+    // edges, matching the eager-clear result of all-zero cells. (History rows
+    // are materialized on eviction, so this only fires for live blank rows.)
+    if (line->attrs.is_blank) {
+        const color_type dbg = OPT(background);
+        if (left) *left = dbg;
+        if (right) *right = dbg;
+        if (left_is_default) *left_is_default = true;
+        if (right_is_default) *right_is_default = true;
+        return true;
+    }
     color_type left_cell_fg = OPT(foreground), left_cell_bg = OPT(background), right_cell_bg = OPT(background), right_cell_fg = OPT(foreground);
     index_type cell_color_x = 0;
     char_type left_char = line_get_char(line, cell_color_x);
@@ -3984,6 +3996,16 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
         index_type lnum = 0;
         Line *linep = render_line_for_virtual_y(self, virtual_y, &line, &lnum, &is_history);
         if (linep == NULL) {
+            bytes += effective_full ? update_line_data_blank(self->columns, render_row, address)
+                                    : update_line_data_blank_diff(self->columns, render_row, address);
+            continue;
+        }
+        if (!is_history && linep->attrs.is_blank) {
+            // S1 (Phase 13B): a lazily-cleared row not yet written since the
+            // scroll renders blank with its deferred GPUCells left untouched
+            // (render_line_for_virtual_y uses the pure init_line_at, so the bit
+            // survives to here). Every GPUCell writer materializes — clears
+            // is_blank — first, so a surviving is_blank means genuinely blank.
             bytes += effective_full ? update_line_data_blank(self->columns, render_row, address)
                                     : update_line_data_blank_diff(self->columns, render_row, address);
             continue;
