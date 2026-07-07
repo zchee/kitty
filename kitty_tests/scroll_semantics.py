@@ -466,19 +466,6 @@ class TestScrollSemantics(BaseTest):
                 return '\t\t'             # col 1 -> 8 -> 16
             raise ValueError(kind)
 
-        # Arm is resolved once from the environment in C (scroll_clear_mode); mirror
-        # its precedence here so the GPU-gap check is a STRICT xfail under HWM only.
-        d = os.environ.get('KITTY_DISABLE_LAZY_ROW_CLEAR') or ''
-        h = os.environ.get('KITTY_ENABLE_HWM_CLEAR') or ''
-        if d and d != '0':
-            arm = 'eager'
-        elif d:
-            arm = 'relocate'
-        elif h and h != '0':
-            arm = 'hwm'
-        else:
-            arm = 'eager'
-
         for kind in ('CUP', 'CUF', 'TAB'):
             with self.subTest(jump=kind):
                 s = self.create_screen(cols=20, lines=3, scrollback=2)
@@ -496,31 +483,18 @@ class TestScrollSemantics(BaseTest):
                 ln = s.line(1)
                 # CPU (all arms): no recycled 'Z' leaks into the text.
                 self.assertNotIn('Z', str(ln), f'{kind}: stale text leaked')
-                gap = [x for x in range(1, 20) if x != col]
-                if arm == 'hwm':
-                    # STRICT XFAIL (hwm arm only): pre-existing S2 interior-gap GPU
-                    # staleness. linebuf_finalize_hwm_line tail-clears only
-                    # [xlimit, xnum), so the deferred slot's GPU survives in the
-                    # cursor-addressed gap [1, col). Pre-existing since 13B (fails
-                    # identically under KITTY_DISABLE_XLIMIT_TRACK, i.e. the pre-L1
-                    # scan) and off the vtebench flood path (xlimit==1 tail-clears
-                    # the whole "y\\n" row). Chartered Wave-15 as a MANDATORY gate for
-                    # any hwm default-flip; the fix is a new deferred-row first-write
-                    # gap-clear (~S1-lite), NOT part of L1/L2. Assert the gap is STILL
-                    # stale so this guard XPASSes LOUDLY the instant the fix lands --
-                    # then flip it to the eager assertion in the else branch.
-                    self.assertTrue(
-                        any(ln.cursor_from(x).bg != 0 for x in gap),
-                        f'{kind}: S2 interior-gap staleness is GONE under hwm -- the '
-                        f'chartered gap-clear fix appears to have landed; flip this '
-                        f'xfail to assertEqual(cursor_from(x).bg, 0) over the gap.')
-                else:
-                    # eager / RELOCATE: the whole row is cleared/materialized on the
-                    # recycle/first write, so every non-A/B cell reads default bg.
-                    for x in gap:
-                        self.assertEqual(
-                            ln.cursor_from(x).bg, 0,
-                            f'{arm}/{kind}: stale GPU bg {ln.cursor_from(x).bg} at col {x} (col={col})')
+                # GPU (raw gpu_cells via cursor_from), ALL arms: every non-A/B cell
+                # reads default bg. The §10c S1-lite materialize-on-cursor-jump zeros
+                # the whole deferred row before the discontiguous write, so no interior
+                # gap survives -- byte-identical to eager. (This was xfail-under-hwm
+                # while the gap was chartered-but-unfixed; the fix flips it to a plain
+                # assertion in every arm, and it XFAILs loudly if the fix regresses.)
+                for x in range(1, 20):
+                    if x == col:
+                        continue
+                    self.assertEqual(
+                        ln.cursor_from(x).bg, 0,
+                        f'{kind}: stale GPU bg {ln.cursor_from(x).bg} at col {x} (col={col})')
 
     def test_scroll_semantics(self):
         regen = bool(os.environ.get('KITTY_REGEN_SCROLL_GOLDENS'))

@@ -57,6 +57,12 @@ lb_phys(const LineBuf *lb, index_type y) {
 // (runtime-gated, NOT assert -- setup.py appends -DNDEBUG). Both default off/on-track.
 bool xlimit_track_disabled(void);
 bool xlimit_verify_enabled(void);
+// Wave-15 S1-lite (ADR §10c): full-row materialize of a deferred (is_blank) row --
+// zero all GPU + drop is_blank + mark dirty. Called from the cursor-positioning
+// commands so a following discontiguous write cannot leave stale interior-gap
+// GPUCells. Self-gated on is_blank; a no-op under EAGER; off the append flood.
+void linebuf_materialize_deferred_row(LineBuf *self, index_type y);
+
 // Wave-15 L2: KITTY_ENABLE_CONSUMER_TAIL_CLIP=1 (opt-in, meaningful only under HWM).
 // Defer the parse-side finalize tail-zero for scrolled/evicted rows -- carry
 // is_blank to the visible + history render clip, which owns the GPUCell tail.
