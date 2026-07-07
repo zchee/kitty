@@ -100,23 +100,23 @@ linebuf_clear(LineBuf *self, char_type ch) {
 
 void
 linebuf_mark_line_dirty(LineBuf *self, index_type y) {
-    self->line_attrs[y].has_dirty_text = true;
+    self->line_attrs[lb_phys(self, y)].has_dirty_text = true;
 }
 
 void
 linebuf_mark_line_clean(LineBuf *self, index_type y) {
-    self->line_attrs[y].has_dirty_text = false;
+    self->line_attrs[lb_phys(self, y)].has_dirty_text = false;
 }
 
 void
 linebuf_set_line_has_image_placeholders(LineBuf *self, index_type y, bool val) {
-    self->line_attrs[y].has_image_placeholders = val;
+    self->line_attrs[lb_phys(self, y)].has_image_placeholders = val;
 }
 
 void
 linebuf_clear_attrs_and_dirty(LineBuf *self, index_type y) {
-    self->line_attrs[y].val = 0;
-    self->line_attrs[y].has_dirty_text = true;
+    self->line_attrs[lb_phys(self, y)].val = 0;
+    self->line_attrs[lb_phys(self, y)].has_dirty_text = true;
 }
 
 static PyObject*
@@ -143,6 +143,7 @@ alloc_linebuf_(PyTypeObject *cls, unsigned int lines, unsigned int columns, Text
     if (self != NULL) {
         self->xnum = columns;
         self->ynum = lines;
+        self->head = 0;  // S3: line_map/line_attrs start un-rotated
         // Cell storage lives in the slot pool; a private pool's slab is
         // sized exactly for this container, while a shared pool (with the
         // paired HistoryBuf, for the slot handover on scroll) uses
@@ -190,14 +191,14 @@ linebuf_init_cells(LineBuf *lb, index_type idx, CPUCell **c, GPUCell **g) {
     // S1 (Phase 13B): callers fetch these pointers to WRITE GPUCells (draw
     // run-fills, multicell, char shifts), so materialize any deferred clear.
     linebuf_materialize_blank_line(lb, idx);
-    const index_type ynum = lb->line_map[idx];
+    const index_type ynum = lb->line_map[lb_phys(lb, idx)];
     *c = cpu_lineptr(lb, ynum);
     *g = gpu_lineptr(lb, ynum);
 }
 
 CPUCell*
 linebuf_cpu_cells_for_line(LineBuf *lb, index_type idx) {
-    const index_type ynum = lb->line_map[idx];
+    const index_type ynum = lb->line_map[lb_phys(lb, idx)];
     return cpu_lineptr(lb, ynum);
 }
 
@@ -211,8 +212,8 @@ void
 linebuf_init_line_at(LineBuf *self, index_type idx, Line *line) {
     line->ynum = idx;
     line->xnum = self->xnum;
-    line->attrs = self->line_attrs[idx];
-    init_line(self, line, self->line_map[idx]);
+    line->attrs = self->line_attrs[lb_phys(self, idx)];
+    init_line(self, line, self->line_map[lb_phys(self, idx)]);
 }
 
 void
@@ -231,7 +232,7 @@ linebuf_clear_lines(LineBuf *self, const Cursor *cursor, index_type start, index
 #if BLANK_CHAR != 0
 #error This implementation is incorrect for BLANK_CHAR != 0
 #endif
-#define lineptr(which, i) which##_lineptr(self, self->line_map[i])
+#define lineptr(which, i) which##_lineptr(self, self->line_map[lb_phys(self, i)])
     GPUCell *first_gpu_line = lineptr(gpu, start);
     const GPUCell gc = cursor_as_gpu_cell(cursor);
     memset_array(first_gpu_line, gc, self->xnum);
@@ -262,18 +263,18 @@ line(LineBuf *self, PyObject *y) {
 
 CPUCell*
 linebuf_cpu_cell_at(LineBuf *self, index_type x, index_type y) {
-    return &cpu_lineptr(self, self->line_map[y])[x];
+    return &cpu_lineptr(self, self->line_map[lb_phys(self, y)])[x];
 }
 
 bool
 linebuf_line_ends_with_continuation(LineBuf *self, index_type y) {
-    return y < self->ynum ? cpu_lineptr(self, self->line_map[y])[self->xnum - 1].next_char_was_wrapped : false;
+    return y < self->ynum ? cpu_lineptr(self, self->line_map[lb_phys(self, y)])[self->xnum - 1].next_char_was_wrapped : false;
 }
 
 void
 linebuf_set_last_char_as_continuation(LineBuf *self, index_type y, bool continued) {
     if (y < self->ynum) {
-        cpu_lineptr(self, self->line_map[y])[self->xnum - 1].next_char_was_wrapped = continued;
+        cpu_lineptr(self, self->line_map[lb_phys(self, y)])[self->xnum - 1].next_char_was_wrapped = continued;
     }
 }
 
@@ -309,7 +310,7 @@ dirty_lines(LineBuf *self, PyObject *a UNUSED) {
 #define dirty_lines_doc "dirty_lines() -> Line numbers of all lines that have dirty text."
     PyObject *ans = PyList_New(0);
     for (index_type i = 0; i < self->ynum; i++) {
-        if (self->line_attrs[i].has_dirty_text) {
+        if (self->line_attrs[lb_phys(self, i)].has_dirty_text) {
             PyList_Append(ans, PyLong_FromUnsignedLong(i));
         }
     }
@@ -340,8 +341,8 @@ create_line_copy_inner(LineBuf* self, index_type y) {
     src.xnum = self->xnum; line->xnum = self->xnum;
     if (!allocate_line_storage(line, 0)) { Py_CLEAR(line); return PyErr_NoMemory(); }
     line->ynum = y;
-    line->attrs = self->line_attrs[y];
-    init_line(self, &src, self->line_map[y]);
+    line->attrs = self->line_attrs[lb_phys(self, y)];
+    init_line(self, &src, self->line_map[lb_phys(self, y)]);
     copy_line(&src, line);
     return (PyObject*)line;
 }
@@ -363,8 +364,8 @@ copy_line_to(LineBuf *self, PyObject *args) {
     if (y >= self->ynum) { PyErr_SetString(PyExc_IndexError, "Out of bounds"); return NULL; }
     src.xnum = self->xnum; dest->xnum = self->xnum;
     dest->ynum = y;
-    dest->attrs = self->line_attrs[y];
-    init_line(self, &src, self->line_map[y]);
+    dest->attrs = self->line_attrs[lb_phys(self, y)];
+    init_line(self, &src, self->line_map[lb_phys(self, y)]);
     copy_line(&src, dest);
     Py_RETURN_NONE;
 }
@@ -399,18 +400,18 @@ linebuf_clear_line(LineBuf *self, index_type y, bool clear_attrs) {
 #if BLANK_CHAR != 0
 #error This implementation is incorrect for BLANK_CHAR != 0
 #endif
-    index_type ym = self->line_map[y];
+    index_type ym = self->line_map[lb_phys(self, y)];
     CPUCell *c = cpu_lineptr(self, ym); GPUCell *g = gpu_lineptr(self, ym);
     // The 12B CPUCell clear stays eager: every text reader (xlimit_for_line/
     // line_is_empty/line_length/unicode_in_range/line_as_ansi) keys off
     // CPUCell fields, so a recycled row must read blank immediately (the
     // pre-overwrite contract in kitty_tests/scroll_semantics.py).
     zero_at_ptr_count(c, self->xnum);
-    if (clear_attrs) self->line_attrs[y].val = 0;
+    if (clear_attrs) self->line_attrs[lb_phys(self, y)].val = 0;
     if (lazy_row_clear_enabled()) {
         // Defer the 20B GPUCell clear: mark the row blank. Render emits zeros
         // for it and any authoritative GPUCell access materializes first.
-        self->line_attrs[y].is_blank = 1;
+        self->line_attrs[lb_phys(self, y)].is_blank = 1;
     } else {
         zero_at_ptr_count(g, self->xnum);
     }
@@ -425,9 +426,9 @@ linebuf_clear_line(LineBuf *self, index_type y, bool clear_attrs) {
 // body for a tail-only clear of [hwm, xnum) WITHOUT touching call sites.
 void
 linebuf_materialize_blank_line(LineBuf *self, index_type y) {
-    if (!self->line_attrs[y].is_blank) return;
-    self->line_attrs[y].is_blank = 0;
-    zero_at_ptr_count(gpu_lineptr(self, self->line_map[y]), self->xnum);
+    if (!self->line_attrs[lb_phys(self, y)].is_blank) return;
+    self->line_attrs[lb_phys(self, y)].is_blank = 0;
+    zero_at_ptr_count(gpu_lineptr(self, self->line_map[lb_phys(self, y)]), self->xnum);
 }
 
 static PyObject*
@@ -439,9 +440,41 @@ clear_line(LineBuf *self, PyObject *val) {
     Py_RETURN_NONE;
 }
 
+// S3 (Phase 13B): rotate line_map/line_attrs so logical row 0 sits at physical
+// 0 (head->0), letting the physical-index reorder ops below run unchanged. Cold
+// path only (region scroll, reverse-index, insert/delete lines); the hot
+// marginless scroll never calls this. scratch is ynum index_type (4*ynum
+// bytes), big enough to also stage the ynum-byte line_attrs pass.
+static void
+linebuf_normalize(LineBuf *self) {
+    if (self->head == 0) return;
+    const index_type h = self->head, n = self->ynum;
+    for (index_type i = 0; i < n; i++) {
+        index_type p = h + i; if (p >= n) p -= n;
+        self->scratch[i] = self->line_map[p];
+    }
+    memcpy(self->line_map, self->scratch, n * sizeof(self->line_map[0]));
+    LineAttrs *as = (LineAttrs*)self->scratch;
+    for (index_type i = 0; i < n; i++) {
+        index_type p = h + i; if (p >= n) p -= n;
+        as[i] = self->line_attrs[p];
+    }
+    memcpy(self->line_attrs, as, n * sizeof(self->line_attrs[0]));
+    self->head = 0;
+}
+
 void
 linebuf_index(LineBuf* self, index_type top, index_type bottom) {
     if (top >= self->ynum - 1 || bottom >= self->ynum || bottom <= top) return;
+    // S3: marginless full-height scroll up is an O(1) head bump (logical row y
+    // becomes physical head+1+y; old logical 0 wraps to logical ynum-1). This is
+    // the vtebench/normal-scroll hot path; no memmove.
+    if (top == 0 && bottom == self->ynum - 1) {
+        self->head = self->head + 1 >= self->ynum ? 0 : self->head + 1;
+        return;
+    }
+    // Region scroll: normalize then run the original physical rotate.
+    linebuf_normalize(self);
     index_type old_top = self->line_map[top];
     LineAttrs old_attrs = self->line_attrs[top];
     const index_type num = bottom - top;
@@ -463,6 +496,13 @@ pyw_index(LineBuf *self, PyObject *args) {
 void
 linebuf_reverse_index(LineBuf *self, index_type top, index_type bottom) {
     if (top >= self->ynum - 1 || bottom >= self->ynum || bottom <= top) return;
+    // S3: marginless full-height reverse scroll (down) is an O(1) head bump back
+    // (old logical ynum-1 wraps to logical 0).
+    if (top == 0 && bottom == self->ynum - 1) {
+        self->head = self->head == 0 ? self->ynum - 1 : self->head - 1;
+        return;
+    }
+    linebuf_normalize(self);
     index_type old_bottom = self->line_map[bottom];
     LineAttrs old_attrs = self->line_attrs[bottom];
     for (index_type i = bottom; i > top; i--) {
@@ -498,6 +538,7 @@ linebuf_insert_lines(LineBuf *self, unsigned int num, unsigned int y, unsigned i
     if (y >= self->ynum || y > bottom || bottom >= self->ynum) return;
     index_type ylimit = bottom + 1;
     if (ylimit < y || (num = MIN(ylimit - y, num)) < 1) return;
+    linebuf_normalize(self);  // S3: physical rotate below assumes head==0
     const size_t scratch_sz = sizeof(self->scratch[0]) * num;
     memcpy(self->scratch, self->line_map + ylimit - num, scratch_sz);
     for (i = ylimit - 1; i >= y + num; i--) {
@@ -528,6 +569,7 @@ linebuf_delete_lines(LineBuf *self, index_type num, index_type y, index_type bot
     index_type ylimit = bottom + 1;
     num = MIN(bottom + 1 - y, num);
     if (y >= self->ynum || y > bottom || bottom >= self->ynum || num < 1) return;
+    linebuf_normalize(self);  // S3: physical rotate below assumes head==0
     const size_t scratch_sz = sizeof(self->scratch[0]) * num;
     memcpy(self->scratch, self->line_map + y, scratch_sz);
     for (i = y; i < ylimit && i + num < self->ynum; i++) {
@@ -554,10 +596,11 @@ delete_lines(LineBuf *self, PyObject *args) {
 
 void
 linebuf_copy_line_to(LineBuf *self, Line *line, index_type where) {
-    init_line(self, self->line, self->line_map[where]);
+    const index_type wp = lb_phys(self, where);  // S3: logical row -> physical
+    init_line(self, self->line, self->line_map[wp]);
     copy_line(line, self->line);
-    self->line_attrs[where] = line->attrs;
-    self->line_attrs[where].has_dirty_text = true;
+    self->line_attrs[wp] = line->attrs;
+    self->line_attrs[wp].has_dirty_text = true;
 }
 
 static PyObject*
@@ -568,7 +611,7 @@ as_ansi(LineBuf *self, PyObject *callback) {
     index_type ylimit = self->ynum - 1;
     ANSIBuf output = {0}; ANSILineState s = {.output_buf=&output};
     do {
-        init_line(self, &l, self->line_map[ylimit]);
+        init_line(self, &l, self->line_map[lb_phys(self, ylimit)]);
         output.len = 0;
         line_as_ansi(&l, &s, 0, l.xnum, 0, true);
         if (output.len) break;
@@ -578,7 +621,7 @@ as_ansi(LineBuf *self, PyObject *callback) {
     for(index_type i = 0; i <= ylimit; i++) {
         bool output_newline = !linebuf_line_ends_with_continuation(self, i);
         output.len = 0;
-        init_line(self, &l, self->line_map[i]);
+        init_line(self, &l, self->line_map[lb_phys(self, i)]);
         line_as_ansi(&l, &s, 0, l.xnum, 0, true);
         if (output_newline) {
             ensure_space_for(&output, buf, Py_UCS4, output.len + 1, capacity, 2048, false);
@@ -619,7 +662,7 @@ __str__(LineBuf *self) {
     RAII_ANSIBuf(buf);
     if (lines == NULL) return PyErr_NoMemory();
     for (index_type i = 0; i < self->ynum; i++) {
-        init_line(self, self->line, self->line_map[i]);
+        init_line(self, self->line, self->line_map[lb_phys(self, i)]);
         PyObject *t = line_as_unicode(self->line, false, &buf);
         if (t == NULL) return NULL;
         PyTuple_SET_ITEM(lines, i, t);
@@ -690,8 +733,8 @@ copy_old(LineBuf *self, PyObject *y) {
 
     for (index_type i = 0; i < MIN(self->ynum, other->ynum); i++) {
         index_type s = self->ynum - 1 - i, o = other->ynum - 1 - i;
-        self->line_attrs[s] = other->line_attrs[o];
-        s = self->line_map[s]; o = other->line_map[o];
+        self->line_attrs[lb_phys(self, s)] = other->line_attrs[lb_phys(other, o)];
+        s = self->line_map[lb_phys(self, s)]; o = other->line_map[lb_phys(other, o)];
         init_line(self, &sl, s); init_line(other, &ol, o);
         copy_line(&ol, &sl);
     }

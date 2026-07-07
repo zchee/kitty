@@ -83,7 +83,7 @@ init_src_line(Rewrap *r) {
     return newline_needed;
 }
 
-#define set_dest_line_attrs(dest_y) r->dest.lb->line_attrs[dest_y] = r->src.line.attrs; r->src.line.attrs.prompt_kind = UNKNOWN_PROMPT_KIND;
+#define set_dest_line_attrs(dest_y) r->dest.lb->line_attrs[lb_phys(r->dest.lb, dest_y)] = r->src.line.attrs; r->src.line.attrs.prompt_kind = UNKNOWN_PROMPT_KIND;
 
 static void
 first_dest_line(Rewrap *r) {
@@ -137,7 +137,7 @@ next_dest_line(Rewrap *r, bool continued) {
         r->dest.y = historybuf_next_dest_line(r->dest.hb, r->as_ansi_buf, &r->src.line, r->dest.y, &r->dest.line, continued);
         r->src.line.attrs.prompt_kind = UNKNOWN_PROMPT_KIND;
     }
-    if (r->sb->line_attrs[0].has_dirty_text) {
+    if (r->sb->line_attrs[lb_phys(r->sb, 0)].has_dirty_text) {
         CPUCell *cpu_cells; GPUCell *gpu_cells;
         linebuf_init_cells(r->sb, 0, &cpu_cells, &gpu_cells);
         memcpy(r->dest.line.cpu_cells, cpu_cells, dest_xnum * sizeof(cpu_cells[0]));
@@ -145,7 +145,7 @@ next_dest_line(Rewrap *r, bool continued) {
         r->current_dest_line_has_multiline_cells = true;
     }
     linebuf_index(r->sb, 0, r->sb->ynum - 1);
-    if (r->sb->line_attrs[r->sb->ynum - 1].has_dirty_text) {
+    if (r->sb->line_attrs[lb_phys(r->sb, r->sb->ynum - 1)].has_dirty_text) {
         linebuf_clear_line(r->sb, r->sb->ynum - 1, true);
     }
 }
@@ -363,7 +363,7 @@ resize_screen_buffer_without_rewrap(LineBuf *lb, index_type lines, index_type co
     index_type xcommon = MIN(lb->xnum, ans.lb->xnum);
     for (index_type y = 0; y < ans.num_content_lines_after; y++) {
         linebuf_init_line(lb, y); linebuf_init_line(ans.lb, y);
-        ans.lb->line_attrs[y] = lb->line_attrs[y]; ans.lb->line_attrs[y].has_dirty_text = true;
+        ans.lb->line_attrs[lb_phys(ans.lb, y)] = lb->line_attrs[lb_phys(lb, y)]; ans.lb->line_attrs[lb_phys(ans.lb, y)].has_dirty_text = true;
         memcpy(ans.lb->line->cpu_cells, lb->line->cpu_cells, xcommon * sizeof(lb->line->cpu_cells[0]));
         memcpy(ans.lb->line->gpu_cells, lb->line->gpu_cells, xcommon * sizeof(lb->line->gpu_cells[0]));
         if (xcommon > lb->line->xnum) {
