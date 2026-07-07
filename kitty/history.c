@@ -703,10 +703,11 @@ historybuf_take_line_from(HistoryBuf *self, LineBuf *lb, index_type lb_y, ANSIBu
     bool needs_clear;
     index_type idx = historybuf_push(self, as_ansi_buf, &needs_clear);
     ensure_position(self, idx);
-    const index_type evicted = lb->line_map[lb_y];
-    lb->line_map[lb_y] = self->slot_ring[idx];
+    const index_type lb_p = lb_phys(lb, lb_y);  // S3: logical row -> physical slot
+    const index_type evicted = lb->line_map[lb_p];
+    lb->line_map[lb_p] = self->slot_ring[idx];
     self->slot_ring[idx] = evicted;
-    self->attrs_ring[idx] = lb->line_attrs[lb_y];
+    self->attrs_ring[idx] = lb->line_attrs[lb_p];
 }
 
 void

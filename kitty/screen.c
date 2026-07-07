@@ -1801,7 +1801,7 @@ screen_dirty_line_graphics(Screen *self, const unsigned int top, const unsigned 
     const unsigned int limit = MIN(bottom+1, self->lines);
     LineBuf *linebuf = main_buf ? self->main_linebuf : self->alt_linebuf;
     for (unsigned int y = top; y < limit; y++) {
-        if (linebuf->line_attrs[y].has_image_placeholders) {
+        if (linebuf->line_attrs[lb_phys(linebuf, y)].has_image_placeholders) {
             need_to_remove = true;
             linebuf_mark_line_dirty(linebuf, y);
             self->is_dirty = true;
@@ -2697,7 +2697,7 @@ int
 screen_cursor_at_a_shell_prompt(const Screen *self) {
     if (self->cursor->y >= self->lines || self->linebuf != self->main_linebuf || !screen_is_cursor_visible(self)) return -1;
     for (index_type y=self->cursor->y + 1; y-- > 0; ) {
-        switch(self->linebuf->line_attrs[y].prompt_kind) {
+        switch(self->linebuf->line_attrs[lb_phys(self->linebuf, y)].prompt_kind) {
             case OUTPUT_START:
                 return -1;
             case PROMPT_START:
@@ -3483,11 +3483,11 @@ shell_prompt_marking(Screen *self, char *buf) {
                 self->prompt_settings.val = 0;
                 self->prompt_settings.redraws_prompts_at_all = 1;
                 parse_prompt_mark(self, buf+1, &pk);
-                self->linebuf->line_attrs[self->cursor->y].prompt_kind = pk;
+                self->linebuf->line_attrs[lb_phys(self->linebuf, self->cursor->y)].prompt_kind = pk;
                 if (pk == PROMPT_START) CALLBACK("cmd_output_marking", "O", Py_False);
             } break;
             case 'C': {
-                self->linebuf->line_attrs[self->cursor->y].prompt_kind = OUTPUT_START;
+                self->linebuf->line_attrs[lb_phys(self->linebuf, self->cursor->y)].prompt_kind = OUTPUT_START;
                 const char *cmdline = "";
                 if (strstr(buf + 1, ";cmdline") == buf + 1) {
                     cmdline = buf + 2;
@@ -3694,7 +3694,7 @@ screen_pause_rendering(Screen *self, bool pause, int for_in_ms) {
         Line *src = visual_line_(self, y);
         linebuf_init_line(self->paused_rendering.linebuf, y);
         copy_line(src, self->paused_rendering.linebuf->line);
-        self->paused_rendering.linebuf->line_attrs[y] = src->attrs;
+        self->paused_rendering.linebuf->line_attrs[lb_phys(self->paused_rendering.linebuf, y)] = src->attrs;
     }
     copy_selections(&self->paused_rendering.selections, &self->selections);
     copy_selections(&self->paused_rendering.url_ranges, &self->url_ranges);
