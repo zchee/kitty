@@ -700,7 +700,12 @@ historybuf_take_line_from(HistoryBuf *self, LineBuf *lb, index_type lb_y, ANSIBu
     // history has no is_blank/clip render path. finalize_hwm zeroes the tail
     // [xlimit, xnum) (whole row for an un-drawn RELOCATE row, xlimit==0). No-op
     // (and off the vtebench hot path) when evicting real content.
-    linebuf_finalize_hwm_line(lb, lb_y);
+    // L2 (consumer tail clip): SKIP the finalize -- keep is_blank in attrs_ring so
+    // the history render clip owns the tail. History now holds deferred rows (the
+    // 13B "History never holds is_blank" contract is intentionally inverted here);
+    // fast_rewrap finalizes-on-copy and every other history GPU reader clips or
+    // gates on is_blank (CPU readers are eager-clean).
+    if (!consumer_tail_clip_enabled()) linebuf_finalize_hwm_line(lb, lb_y);
     bool needs_clear;
     index_type idx = historybuf_push(self, as_ansi_buf, &needs_clear);
     ensure_position(self, idx);
@@ -722,10 +727,22 @@ void
 historybuf_fast_rewrap(HistoryBuf *dest, HistoryBuf *src) {
     // per-line: slot ids must not cross pools, so content is copied into
     // the dest's own slots (same total bytes as the old segment memcpys)
+    const bool clip = consumer_tail_clip_enabled();
     for (index_type i = 0; i < src->positions_allocated; i++) {
         memcpy(cpu_lineptr(dest, i), cpu_lineptr(src, i), (size_t)src->xnum * sizeof(CPUCell));
         memcpy(gpu_lineptr(dest, i), gpu_lineptr(src, i), (size_t)src->xnum * sizeof(GPUCell));
-        *attrptr(dest, i) = *attrptr(src, i);
+        LineAttrs *da = attrptr(dest, i);
+        *da = *attrptr(src, i);
+        // L2: finalize-on-copy -- the rewrapped history must not carry the deferred
+        // (is_blank) contract further. Zero the stale GPU tail [xlimit, xnum) from the
+        // eager-clean CPUCells and drop is_blank so the dest holds authoritative rows.
+        if (clip && da->is_blank) {
+            const CPUCell *c = cpu_lineptr(dest, i);
+            index_type xlimit = dest->xnum;
+            while (xlimit && !c[xlimit - 1].ch_and_idx) xlimit--;
+            if (xlimit < dest->xnum) zero_at_ptr_count(gpu_lineptr(dest, i) + xlimit, dest->xnum - xlimit);
+            da->is_blank = 0;
+        }
     }
     dest->count = src->count; dest->start_of_data = src->start_of_data;
 }
