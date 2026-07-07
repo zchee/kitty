@@ -1083,14 +1083,54 @@ resync_refresh_period(OSWindow *w, monotonic_t now) {
     return w->resync_refresh_period;
 }
 
+#define RESYNC_STALL_OVERRIDE_MIN_MS 8ll   // KITTY_PACING_RESYNC_STALL_MS clamp floor
+#define RESYNC_STALL_OVERRIDE_MAX_MS 250ll // ...and ceiling (the old fallback cap)
+
+// Last effective resync stall bound, cached for the KITTY_PACING_DEBUG dump
+// (stall_bound_eff_ms). Written by resync_stall_bound() at the gate, read by
+// pacing_debug_dump(); both on the render/main thread. 0 until first computed --
+// also the value reported while the rescue is kill-switched off, since
+// resync_stall_bound() is not called on that path.
+static monotonic_t pacing_stall_bound_eff;
+
+// KITTY_PACING_RESYNC_STALL_MS: Step-3 bound-sweep override. When set to a valid
+// positive integer it REPLACES the 3x-refresh resync_stall_bound() formula with a
+// fixed <n> ms clamped to [8, 250]; unset/invalid -> the refresh-derived bound
+// EXACTLY. Resolved ONCE (same cache pattern as immediate_encode_floor's env
+// override). resync_present_floor is deliberately NOT affected (stays 1x refresh
+// -- pre-mortem #2 flood-storm cap). Returns the clamped monotonic_t, or 0 = none.
+static monotonic_t
+resync_stall_override(void) {
+    static long cached_ms = -2;  // -2 unread, -1 no override, >=8 clamped ms
+    if (UNLIKELY(cached_ms == -2)) {
+        cached_ms = -1;
+        const char *v = getenv("KITTY_PACING_RESYNC_STALL_MS");
+        if (v && v[0]) {
+            char *end = NULL; long n = strtol(v, &end, 10);
+            if (end != v && *end == '\0' && n > 0) {
+                if (n < RESYNC_STALL_OVERRIDE_MIN_MS) n = RESYNC_STALL_OVERRIDE_MIN_MS;
+                if (n > RESYNC_STALL_OVERRIDE_MAX_MS) n = RESYNC_STALL_OVERRIDE_MAX_MS;
+                cached_ms = n;
+            }
+        }
+    }
+    return cached_ms > 0 ? ms_to_monotonic_t((monotonic_t)cached_ms) : 0;
+}
+
 // Staleness bound for the stall-rescue: a REQUESTED link whose last delivered
 // frame (last_render_frame_received_at) is older than this is treated as stalled.
 static monotonic_t
 resync_stall_bound(OSWindow *w, monotonic_t now) {
-    monotonic_t b = RESYNC_STALL_MULT * resync_refresh_period(w, now);
-    const monotonic_t lo = ms_to_monotonic_t(RESYNC_STALL_MIN_MS), hi = ms_to_monotonic_t(RESYNC_STALL_MAX_MS);
-    if (b < lo) b = lo;
-    if (b > hi) b = hi;
+    const monotonic_t ov = resync_stall_override();
+    monotonic_t b;
+    if (ov > 0) b = ov;  // fixed override: skip the 3x-refresh formula entirely
+    else {
+        b = RESYNC_STALL_MULT * resync_refresh_period(w, now);
+        const monotonic_t lo = ms_to_monotonic_t(RESYNC_STALL_MIN_MS), hi = ms_to_monotonic_t(RESYNC_STALL_MAX_MS);
+        if (b < lo) b = lo;
+        if (b > hi) b = hi;
+    }
+    pacing_stall_bound_eff = b;  // report the effective bound in the debug dump
     return b;
 }
 
@@ -1174,7 +1214,8 @@ pacing_debug_dump(const char *reason) {
     log_error("pacing: reason=%s seq=%llu ticks=%llu input_driven=%llu imm_taken=%llu imm_disq=%llu"
               " floor_blocked=%llu defer_nreq=%llu defer_fallback250=%llu defer_waiting=%llu"
               " stall_in_runloop=%llu stall_removed=%llu"
-              " gap_lt4=%llu gap_4_8=%llu gap_8_16=%llu gap_16_40=%llu gap_40_80=%llu gap_80_250=%llu gap_ge250=%llu",
+              " gap_lt4=%llu gap_4_8=%llu gap_8_16=%llu gap_16_40=%llu gap_40_80=%llu gap_80_250=%llu gap_ge250=%llu"
+              " stall_bound_eff_ms=%d",
               reason, (unsigned long long)(++pacing_dbg_seq),
               (unsigned long long)c->ticks, (unsigned long long)c->input_driven_ticks,
               (unsigned long long)c->immediate_taken, (unsigned long long)c->immediate_disq,
@@ -1185,7 +1226,8 @@ pacing_debug_dump(const char *reason) {
               (unsigned long long)c->gap_bucket[0], (unsigned long long)c->gap_bucket[1],
               (unsigned long long)c->gap_bucket[2], (unsigned long long)c->gap_bucket[3],
               (unsigned long long)c->gap_bucket[4], (unsigned long long)c->gap_bucket[5],
-              (unsigned long long)c->gap_bucket[6]);
+              (unsigned long long)c->gap_bucket[6],
+              monotonic_t_to_ms(pacing_stall_bound_eff));
 }
 
 // Sampled once per gate evaluation on the render/main thread, only when the
