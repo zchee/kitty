@@ -1822,7 +1822,12 @@ must leave the GPUCells fully defined — that is the
 `linebuf_materialize_blank_line` / `linebuf_finalize_hwm_line` /
 `linebuf_make_authoritative_cold` chokes (init_cells stays a no-op under
 HWM so the render clip keeps covering plain draws). History never holds
-is_blank (rows are made authoritative before the slot swap). Under S3,
+is_blank (rows are made authoritative before the slot swap). [Phase 15
+L2 INVERTS this clause: with `KITTY_ENABLE_CONSUMER_TAIL_CLIP=1`,
+history MAY hold deferred is_blank rows — the render clip covers them
+and every cross-buffer copy is made authoritative on copy. Interior
+gaps are materialized on cursor-jump (S1-lite, 6304909f5). See
+Phase 15.] Under S3,
 all line_map/line_attrs indexing goes through `lb_phys`; the banner-marked
 normalize + reorder functions are the only sanctioned physical-index zone
 (they run at head==0).
@@ -1931,6 +1936,118 @@ per the charter, with the residual root cause localized and chartered
 fixes a real interactive-latency pathology (250 ms+ present tails under
 any main-thread stall) at zero measured cost to eager, idle, or flood.
 
+## Phase 15 (Wave 15): frame-readiness — the metric was parse, and hwm now wins it
+
+Status: LANDED, GATE PASSED (charter
+`.omc/handoffs/wave15-frame-readiness-KICKOFF.md`; ADR
+`.omc/plans/2026-07-07-wave15-frame-readiness.md`; verify
+`.omc/verify/wave15/{STEP0-TIMELINE,VERIFY-REPORT}.md` + `s1lite/`).
+Commit arc: a06489c57 (KITTY_FRAME_TRACE per-tick probe) → f9e89de46
+(sparse-cursor guard, strict xfail) → 035f80117 (L1 O(1) finalize) →
+77b6033be (L2 render-clip defer) → 6304909f5 (S1-lite interior-gap fix;
+guard flipped to a plain PASS). Headline: **hwm+L2 scrolling parse
+18.45 ms/MiB = 0.66× eager's 27.85, sample ≈24 ms ≤ the 26 ms target**
+(load-flagged absolute; ratios rule); fullscreen 0.66×; dense 0.99×
+no-harm; D2 upload ≤ eager on every axis; pacing telemetry and idle
+unregressed; pixel goldens byte-identical. The hwm+L2 default-flip
+packet is ASSEMBLED and unblocked — the flip itself is a user decision
+(typing evidence remains structural-proxy-grade).
+
+- **Step 0 — the metric reframe (source + trace, two-way).** A vtebench
+  scrolling sample times `write_all(1 MiB "y\n")+flush` — PTY write
+  backpressure = kitty's parse drain rate; there is NO present-sync
+  anywhere (bench.rs:181-186). The per-tick trace concurs: each sample
+  drains in ~one main-loop tick; parse_ms ≈ the sample; render_ms
+  0.01–0.03; wakeup/present gaps ≈0. 13B's "the sample waits on a
+  present" premise is dead, and Wave-14's bound anomaly closed: bounds
+  move rescue cadence, never the parse wall. The benchmark never
+  measured presentation at all.
+- **Step 0b — the delta named to a source line.** hwm−eager = +13.96 ms
+  of parse wall per MiB (96% of the sample delta), localized by
+  sample(1) to the O(xnum) backward xlimit scan in
+  `linebuf_finalize_hwm_line` (line-buf.c:470, inlined into
+  screen_index): +13.81 ms of screen_index self-time, with the memset
+  primitive FLAT between arms. Geometry: on "y\n" (xlimit=1) the
+  finalize scanned ~99 cells and zeroed ~99 per line — S2's "0 work for
+  full-width lines" premise INVERTS on sparse lines. On full-width
+  lines the scan is O(1) and the tail-zero skips entirely — hwm's
+  structural win case (scrolling_fullscreen); dense_cells never scrolls
+  (alt-screen in-place rewrite) and is a no-harm axis only.
+- **L1 (035f80117) — O(1) finalize.** `line_xlimit` = per-row
+  write-extent UPPER BOUND (exact on the plain-ASCII fast store;
+  non-append writers — IRM shift, multicell nuke, wide/grapheme cache
+  stores, TAB — mark XLIMIT_UNTRACKED → full rescan). A fuzz + the live
+  verify killed the ADR's exact-tracking sketch with 5 concrete holes;
+  the bound design is never worse than the old scan and O(1) on the
+  flood. Escape hatch `KITTY_DISABLE_XLIMIT_TRACK`. hwm parse 42.1 →
+  32.4 ms/MiB — still 1.16× eager: **L1 alone does not win**; the
+  residual is deferred-model bookkeeping.
+- **L2 (77b6033be) — the actual win: clear per visible row, not per
+  scrolled line.** The consumer-side clip already existed for visible
+  rows (screen.c:3999 clips is_blank rows to xlimit IN THE RING); L2
+  deletes the parse-side tail-zero at scroll/eviction and extends the
+  clip to history rows — per-scrolled-line work (~5000 rows/MiB)
+  becomes per-visible-row-per-frame work (~30). History now holds
+  deferred rows — the 13B "history never holds is_blank" contract is
+  INVERTED (marked at the 13B section) — and every cross-buffer copy of
+  a deferred row is made authoritative on copy (fast_rewrap,
+  copy_line_to, paused-render snapshot, resize). Opt-in
+  `KITTY_ENABLE_CONSUMER_TAIL_CLIP=1` (HWM-only), backend-agnostic
+  shared C. Result: scrolling 18.45 (0.66×), fullscreen 23.43 (0.66×),
+  dense 4.58≈4.61 (0.99×), samples/5 s 145 vs eager's 99; D2
+  bytes/frame ≤ eager everywhere (fullscreen 3.6× FEWER, pixel-proven).
+- **S1-lite (6304909f5) — the interior-gap fix the guard caught.** The
+  mandated sparse-cursor-address-then-scroll golden (f9e89de46, judged
+  vs EAGER ground truth) exposed a PRE-EXISTING S2 defect: the tail
+  clear covers [xlimit,xnum) only, so interior gaps between
+  cursor-addressed writes displayed stale GPU cells (identical with L1
+  off; eager/relocate unaffected; off the flood path; L2's clip is also
+  tail-only). Fix per ADR §10c: a cursor-positioning command
+  (CUP/CUU/CUD/CUF/CHA/HPA/TAB — 5 entry points) into a deferred row
+  materializes the WHOLE row (RELOCATE-zero + drop is_blank) — correct
+  independent of the tracking (never consults line_xlimit), and the
+  append flood never jumps → ZERO flood cost (post-fix smoke 19.11 /
+  24.61, unchanged). The guard is now a plain assertion, green in every
+  arm on both backends; pixel goldens byte-identical on both scenes
+  (fullscreen_scroll, sparse_jump).
+- **Verification discipline that paid.** `KITTY_XLIMIT_VERIFY=1` — a
+  runtime env-gated bound-vs-scan cross-check with abort() (NOT
+  assert(): setup.py appends -DNDEBUG) — ran live through full suites
+  and caught **8 real would-be corruptions** during development (5 L1
+  tracking holes + 3 L2 copy-path holes), ending clean in every arm on
+  both backends. Suites Ran 360 baseline-green throughout;
+  scroll_semantics goldens byte-identical across
+  eager/hwm/hwm+L2/kill-switch arms at every commit.
+- **Scroll-clear lever ledger (updated).**
+  `KITTY_DISABLE_LAZY_ROW_CLEAR` (set≠0 → EAGER hatch, wins; =0 →
+  RELOCATE diagnostic) · `KITTY_ENABLE_HWM_CLEAR=1` → HWM (now with the
+  L1 O(1) finalize + S1-lite gap materialize) ·
+  `KITTY_ENABLE_CONSUMER_TAIL_CLIP=1` → L2 (HWM-only) ·
+  `KITTY_DISABLE_XLIMIT_TRACK≠0` → L1 escape (old scan) ·
+  `KITTY_XLIMIT_VERIFY=1` → debug cross-check. Measurement policy (user
+  directive, standing): test kitties spawn NO-ACTIVATE
+  (KITTY_NO_INITIAL_ACTIVATE=1, the harness default) — take_focus only
+  for a render-telemetry run, at most one per battery; parse metrics
+  are focus-independent (calibration ratio 0.989).
+- **The flip packet (assembled; decision = user's).** FOR: 0.66× on
+  both scroll axes, ≤26 ms met (24 ms, load-flagged; edges the
+  alacritty 26 ms reference under light load), dense no-harm, D2 clean,
+  pacing/idle clean, the interior-gap defect found AND fixed with a
+  permanent guard, pixel-identical rendering, every lever
+  kill-switched with the eager hatch retained. CAVEATS: typing p99 is
+  structural-proxy-grade (the deferred paths never touch the
+  cold-typing NOT_REQUESTED edge; a real p99 needs Accessibility for
+  python3.14); the L2 ring clip is suite + CPU-golden + 2-scene
+  pixel-golden validated, not exhaustively GPU-ring asserted. Flip
+  mechanics when approved: scroll_clear_mode unset → HWM + consumer
+  clip default-ON (eager hatch stays; relocate stays diagnostic).
+
+Exit: the ≤26 ms scrolling target is MET on this wave's evidence (the
+first arm to beat eager on every scroll axis). Remaining charter: item
+14 — the eager/shared draw-path re-segmentation cost
+(init_segmentation_state, 9.1 ms/MiB) — orthogonal, and it would stack
+with hwm+L2.
+
 ## Final architecture (post-Phase-7 consolidation)
 
 The frame path is native end to end; the GL-name shim survives only where
@@ -2008,12 +2125,13 @@ condition. Updated as captures land.
 5. **~~vtebench dense_cells~~ ATTRIBUTED** (Phase 11): it is the
    vt-parser lock contention above, not render or per-cell SGR cost —
    fixed by item 1. The recycled-row memset lazy-clear follow-up is
-   implemented (Phase 13B) and its pacing blame is RESOLVED (Phase 14):
-   the governor was fixed AND exonerated — the hwm scrolling residual is
-   per-sample frame-readiness in the scroll model, NOT pacing (item 13)
-   — so both arms remain **opt-in**
-   (`KITTY_DISABLE_LAZY_ROW_CLEAR=0` / `KITTY_ENABLE_HWM_CLEAR=1`) until
-   item 13 lands.
+   COMPLETE as of Phase 15: hwm+L2 (O(1) finalize + consumer tail clip
+   + S1-lite gap materialize) beats eager 0.66× on both scroll axes
+   with dense no-harm and the interior-gap defect fixed. The arms
+   remain **opt-in** (`KITTY_ENABLE_HWM_CLEAR=1` +
+   `KITTY_ENABLE_CONSUMER_TAIL_CLIP=1`; relocate diagnostic via
+   `KITTY_DISABLE_LAZY_ROW_CLEAR=0`) pending the USER's default-flip
+   decision — the packet is assembled in the Phase 15 section.
 6. **Cross-backend composition difference** — §7 #6, tracked in
    .scratch/metal-gl-composition-diff/.
 7. **icat-GIF animation failure** — pre-existing, all configs; tracked in
@@ -2048,21 +2166,22 @@ condition. Updated as captures land.
     gap_ge250 −96.6%, flood cap + idle + goldens intact. The bound
     sweep then proved the hwm scrolling regression pacing-INDEPENDENT →
     item 13.
-13. **hwm frame-readiness residual (Phase 14 charter — the next
-    phase)** — why does hwm complete ~66 vtebench scrolling samples/5 s
-    vs eager's ~99 (1.42–1.45×) with identical per-frame bytes/passes,
-    a collapsed pacing tail, and bound-invariant cadence (gap_16_40
-    1–2% vs eager 31% at every stall bound)? The rescue presents only
-    when the main loop runs render(); that ~47 ms render() interval
-    under hwm flood — not pacing — is the quantum. Probe first
-    (measure-first): per-sample damage→render→READY→present timeline by
-    arm (eager / hwm / relocate), the main-loop tick-interval
-    distribution under flood, and where the hwm parse tick spends the
-    extra time. Candidate levers (untested): decouple the rescue
-    present from the full render() pass; chunk/throttle the parse drain
-    so the loop ticks at refresh cadence; audit vtebench's per-sample
-    sync interaction with the deferred-clear scroll model. Unlocks item
-    5's arms and the ≤26 ms target.
+13. **~~hwm frame-readiness residual~~ DONE** (Phase 15): the "47 ms
+    render() quantum" framing dissolved on contact with the source —
+    vtebench samples time PTY drain (no present-sync), so the residual
+    was pure parse wall, named to the line-buf.c:470 finalize scan and
+    removed (L1), then beaten outright by moving the clear to the
+    render clip (L2, 0.66× eager) with the interior-gap defect found
+    and fixed (S1-lite). The ≤26 ms target is met; the default flip
+    awaits the user (item 5).
+14. **Draw-path re-segmentation cost (Phase 15 charter)** — eager and
+    hwm alike pay ~9.1 ms/MiB of the scrolling parse wall in the draw
+    path, dominated by init_segmentation_state re-segmenting each line
+    ("y" per line on the bench). Backend-agnostic C, orthogonal to the
+    scroll-clear model, and it stacks with hwm+L2 (18.45 − ~9 ≈ single
+    digits if fully recovered — likely partial). No small safe cut was
+    found in Wave 15 (ADR §L3); needs its own measure-first pass over
+    the segmentation state machine.
 
 ## Known deviations (tracked, intentional)
 
