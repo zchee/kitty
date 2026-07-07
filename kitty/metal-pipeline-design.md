@@ -2048,6 +2048,55 @@ first arm to beat eager on every scroll axis). Remaining charter: item
 (init_segmentation_state, 9.1 ms/MiB) — orthogonal, and it would stack
 with hwm+L2.
 
+## Phase 16 (Wave 16): the draw bucket — measured, diffuse, demoted
+
+Status: MEASURE-FIRST CLOSE at Step 0 (charter
+`.omc/handoffs/wave16-draw-segmentation-KICKOFF.md`; evidence
+`.omc/verify/wave16/{STEP0a-SYMBOLS,STEP0-ATTRIBUTION}.md` +
+`STEP19-PREP-NOTES.md`). No product code was changed — the Step-0 gate
+fired exactly as designed: no lever was picked because no coherent
+target survived measurement.
+
+- **Attribution** (sample(1) on post-LTO symbols — init_segmentation
+  survived as a distinct symbol, no instrument needed; 3 rounds/arm,
+  share spreads ≤2%, eager AND hwm+L2): the ~9.1–9.6 ms/MiB draw
+  bucket splits draw_text 43% / init_segmentation_state 31% /
+  draw_control_char 26% (+ selection ~0.9 ms/MiB) — DIFFUSE, no ≥40%
+  content-general term.
+- **The family hypothesis INVERTED** by the fullscreen discriminator:
+  seg/lf/sel RISE per MiB on full-width content (×1.3–1.4 —
+  per-OCCUPIED-CELL, ∝ written width) while draw_text COLLAPSES
+  (×0.33 — the per-line CALL dispatch term). On "y\n" (xlimit=1)
+  per-cell ≡ per-line, which is what made the bucket read as fixed
+  overhead. Item 14's premise — "init_segmentation_state
+  re-segmentation dominates" — is REFUTED: on the bench it is a bare
+  RESET (stepping skipped), and where stepping actually runs
+  (wide/unicode content) it is REQUIRED for correctness.
+- **The honest best lever (recorded, NOT chartered):** a provable
+  probe elision — `next_char_was_wrapped` is set ONLY by
+  continue_to_next_line (DECAWM auto-wrap, screen.c:719), never by a
+  bare LF, so the explicit-LF path's prev-cell probe (a scattered read
+  of the previous line's last CPUCell) and the second
+  init_text_loop_line re-init per line are pure waste there. Bounded
+  at ~1.5–3 ms/MiB on EAGER scrolling only (5–10% of parse), less on
+  hwm+L2, ~zero on wide content. Below the campaign's action
+  threshold; mechanism + call sites preserved in
+  `.omc/verify/wave16/STEP19-PREP-NOTES.md` if ever wanted.
+- **The true remaining heavy hitters are OUTSIDE the draw bucket**:
+  the memset row-clear 11.4 ms/MiB (~40% of eager's parse wall) +
+  scroll bookkeeping 5.7 — the clear/scroll path Phase 15 already
+  halved via hwm+L2 (0.66×). The economic answer to eager's memset is
+  the PENDING hwm+L2 default flip (Phase 15 packet), not a new eager
+  lever.
+- **Reference baselines recorded** (parse ms/MiB, eager / hwm+L2):
+  scrolling 28.2 / 18.85 · fullscreen 37.1 / 24.25 · unicode
+  3.37 / 3.34 (draw_text 93% with inlined steppers); kitten
+  __benchmark__ ascii 240.6 / unicode 199.1 MB/s.
+
+Exit: item 14 resolved as MEASURED-AND-REFUTED; no new charter opened.
+The scrolling campaign's remaining lever is the user's default-flip
+decision (Phase 15 packet).
+
 ## Final architecture (post-Phase-7 consolidation)
 
 The frame path is native end to end; the GL-name shim survives only where
@@ -2174,14 +2223,18 @@ condition. Updated as captures land.
     render clip (L2, 0.66× eager) with the interior-gap defect found
     and fixed (S1-lite). The ≤26 ms target is met; the default flip
     awaits the user (item 5).
-14. **Draw-path re-segmentation cost (Phase 15 charter)** — eager and
-    hwm alike pay ~9.1 ms/MiB of the scrolling parse wall in the draw
-    path, dominated by init_segmentation_state re-segmenting each line
-    ("y" per line on the bench). Backend-agnostic C, orthogonal to the
-    scroll-clear model, and it stacks with hwm+L2 (18.45 − ~9 ≈ single
-    digits if fully recovered — likely partial). No small safe cut was
-    found in Wave 15 (ADR §L3); needs its own measure-first pass over
-    the segmentation state machine.
+14. **~~Draw-path re-segmentation cost~~ MEASURED & REFUTED**
+    (Phase 16): the bucket is diffuse (draw_text 43% /
+    init_segmentation_state 31% / draw_control_char 26%, spreads ≤2%)
+    and its components are per-OCCUPIED-CELL, not per-line — the
+    re-segmentation premise inverted (the bench cost is a bare reset;
+    real stepping only runs on wide/unicode content where it is
+    correctness-required). Best available lever (the explicit-LF
+    probe elision, provable via the next_char_was_wrapped invariant)
+    bounds at ~1.5–3 ms/MiB eager-only — below action threshold,
+    recorded in Phase 16 / STEP19-PREP-NOTES.md. The remaining
+    scrolling cost lives in the clear/scroll path already solved by
+    hwm+L2 — see item 5's pending flip.
 
 ## Known deviations (tracked, intentional)
 
