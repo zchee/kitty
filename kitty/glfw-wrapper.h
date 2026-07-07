@@ -2472,6 +2472,10 @@ typedef void (*glfwCocoaSetRenderLinkEnabled_func)(GLFWwindow*, bool);
 GFW_EXTERN glfwCocoaSetRenderLinkEnabled_func glfwCocoaSetRenderLinkEnabled_impl;
 #define glfwCocoaSetRenderLinkEnabled glfwCocoaSetRenderLinkEnabled_impl
 
+typedef bool (*glfwCocoaIsRenderLinkInRunloop_func)(GLFWwindow*);
+GFW_EXTERN glfwCocoaIsRenderLinkInRunloop_func glfwCocoaIsRenderLinkInRunloop_impl;
+#define glfwCocoaIsRenderLinkInRunloop glfwCocoaIsRenderLinkInRunloop_impl
+
 typedef bool (*glfwCocoaResetLiveResizeGuards_func)(GLFWwindow*);
 GFW_EXTERN glfwCocoaResetLiveResizeGuards_func glfwCocoaResetLiveResizeGuards_impl;
 #define glfwCocoaResetLiveResizeGuards glfwCocoaResetLiveResizeGuards_impl

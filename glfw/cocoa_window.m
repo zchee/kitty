@@ -4155,6 +4155,17 @@ GLFWAPI void glfwCocoaSetRenderLinkEnabled(GLFWwindow *handle, bool enabled) {
 #endif
 }
 
+// Wave-14 §5 confirm accessor: is this window's render link currently in the main
+// runloop? Used only by the KITTY_PACING_DEBUG counters to split H1 (starved
+// in-runloop) from H2 (removed) at a stall. Returns false on non-Metal.
+GLFWAPI bool glfwCocoaIsRenderLinkInRunloop(GLFWwindow *handle) {
+#ifdef KITTY_USE_METAL
+    return _glfwCocoaIsMetalLinkInRunloop((_GLFWwindow*)handle);
+#else
+    (void)handle; return false;
+#endif
+}
+
 // Wave-4 stuck-live-resize recovery: clear the GLFW/Metal state that
 // viewWillStartLiveResize latched — the GLFW-side ns.live_resize_in_progress and the
 // layer's presentsWithTransaction — so a subsequent change_live_resize_state(false)

@@ -66,4 +66,9 @@ void _glfwCocoaSetMetalLinkPaused(_GLFWwindow* window, bool paused);
 // added when =yes. Defined in metal_context.m; called via glfwCocoaSetRenderLinkEnabled.
 void _glfwCocoaSetMetalLinkEnabled(_GLFWwindow* window, bool enabled);
 
+// Wave-14 confirm accessor: is this window's pace link currently a member of the
+// main runloop? Arbitrates H1 (link in-runloop but starved) vs H2 (link removed)
+// at a stall. Main/render-thread only, no lock; false when the window has no link.
+bool _glfwCocoaIsMetalLinkInRunloop(_GLFWwindow* window);
+
 #endif // KITTY_USE_METAL

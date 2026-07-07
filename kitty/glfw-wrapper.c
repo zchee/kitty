@@ -491,6 +491,9 @@ load_glfw(const char* path) {
     *(void **) (&glfwCocoaSetRenderLinkEnabled_impl) = dlsym(handle, "glfwCocoaSetRenderLinkEnabled");
     if (glfwCocoaSetRenderLinkEnabled_impl == NULL) dlerror(); // clear error indicator
 
+    *(void **) (&glfwCocoaIsRenderLinkInRunloop_impl) = dlsym(handle, "glfwCocoaIsRenderLinkInRunloop");
+    if (glfwCocoaIsRenderLinkInRunloop_impl == NULL) dlerror(); // clear error indicator
+
     *(void **) (&glfwCocoaResetLiveResizeGuards_impl) = dlsym(handle, "glfwCocoaResetLiveResizeGuards");
     if (glfwCocoaResetLiveResizeGuards_impl == NULL) dlerror(); // clear error indicator
 

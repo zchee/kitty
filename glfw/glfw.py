@@ -91,6 +91,7 @@ def generate_wrappers(glfw_header: str) -> None:
     void* glfwGetCocoaPendingMetalDrawable(GLFWwindow *w)
     void glfwCocoaSetRenderLinkPaused(GLFWwindow *w, bool paused)
     void glfwCocoaSetRenderLinkEnabled(GLFWwindow *w, bool enabled)
+    bool glfwCocoaIsRenderLinkInRunloop(GLFWwindow *w)
     bool glfwCocoaResetLiveResizeGuards(GLFWwindow *w)
     bool glfwCocoaRecreateGLDrawable(GLFWwindow *w)
     GLFWcocoarenderframefun glfwCocoaSetWindowResizeCallback(GLFWwindow *w, GLFWcocoarenderframefun callback)
@@ -98,6 +99,7 @@ def generate_wrappers(glfw_header: str) -> None:
     unsigned long glfwGetX11Window(GLFWwindow* window)
     void glfwSetPrimarySelectionString(GLFWwindow* window, const char* string)
     void glfwCocoaCycleThroughOSWindows(bool backwards)
+    void glfwCocoaSetWindowLevel(GLFWwindow *w, const char *level_spec)
     void glfwCocoaSetWindowChrome(GLFWwindow* window, unsigned int color, bool use_system_color, unsigned int system_color,\
     int background_blur, unsigned int hide_window_decorations, bool show_text_in_titlebar, int color_space, float background_opacity, bool resizable)
     void glfwCocoaRegisterMIMETypes(GLFWwindow *window, const char **mimes, size_t count)
