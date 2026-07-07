@@ -405,19 +405,23 @@ clear_line_(Line *l, index_type xnum) {
 }
 
 // S1/S2 (Phase 13B): the recycled-row scroll clear has three arms, resolved
-// once from the environment (precedence below). DEFAULT is EAGER — the S2
-// mechanism ships gate-clean and the default->HWM flip is a separate commit
-// that lands only after the #14 acceptance gate. Arms:
-//   EAGER    (default; KITTY_DISABLE_LAZY_ROW_CLEAR set and != "0"): the
-//            original 32B clear (both CPUCells and GPUCells zeroed at scroll).
+// once from the environment (precedence below). DEFAULT is HWM — flipped
+// 2026-07-07 after the Wave-15 acceptance gate (hwm+L2 0.66x eager on both
+// scroll axes, dense no-harm, goldens + pixel goldens byte-identical, the
+// interior-gap defect fixed by the S1-lite jump materialize). Arms:
+//   EAGER    (KITTY_DISABLE_LAZY_ROW_CLEAR set and != "0" — the escape
+//            hatch, wins over everything; or KITTY_ENABLE_HWM_CLEAR=0 — the
+//            explicit HWM opt-out): the original 32B clear (both CPUCells
+//            and GPUCells zeroed at scroll).
 //   RELOCATE (KITTY_DISABLE_LAZY_ROW_CLEAR=0): S1 - 12B CPU clear at scroll,
 //            defer the GPU clear, materialize (zero the whole GPU row) on
-//            write. The mid-gate diagnostic middle arm (~0 win + a sync-phase
-//            knife-edge; kept for A/B, not for shipping).
-//   HWM      (KITTY_ENABLE_HWM_CLEAR=1): S2 - 12B CPU clear at scroll, defer
-//            the GPU clear, and clear only the untouched GPU tail [xlimit,xnum)
-//            at line finalize (0 for full-width lines) with the render clipping
-//            the in-progress line. Eliminates the ~1315-sample GPU clear.
+//            write. Diagnostic A/B arm only.
+//   HWM      (DEFAULT; also KITTY_ENABLE_HWM_CLEAR=1): S2+L1 - 12B CPU clear
+//            at scroll, defer the GPU clear, and clear only the untouched GPU
+//            tail [xlimit,xnum) at line finalize (O(1) via the tracked write
+//            extent; 0 bytes for full-width lines), the render clipping the
+//            in-progress line. With the L2 consumer clip (default-ON, below)
+//            the finalize tail-zero is deferred to the render/history clip.
 // Cached function-static, like the draw-loop run-fill levers.
 static int scroll_clear_mode_state = -1;
 
@@ -428,8 +432,8 @@ scroll_clear_mode(void) {
         const char *h = getenv("KITTY_ENABLE_HWM_CLEAR");
         if (d && d[0] && strcmp(d, "0") != 0) scroll_clear_mode_state = SCROLL_CLEAR_EAGER;
         else if (d && d[0]) scroll_clear_mode_state = SCROLL_CLEAR_RELOCATE;  // "0"
-        else if (h && h[0] && strcmp(h, "0") != 0) scroll_clear_mode_state = SCROLL_CLEAR_HWM;
-        else scroll_clear_mode_state = SCROLL_CLEAR_EAGER;
+        else if (h && h[0] && strcmp(h, "0") == 0) scroll_clear_mode_state = SCROLL_CLEAR_EAGER;  // explicit opt-out
+        else scroll_clear_mode_state = SCROLL_CLEAR_HWM;  // DEFAULT (flipped 2026-07-07; also explicit "1")
     }
     return (ScrollClearMode)scroll_clear_mode_state;
 }
@@ -459,8 +463,10 @@ bool
 consumer_tail_clip_enabled(void) {
     static int cached = -1;
     if (UNLIKELY(cached < 0)) {
+        // DEFAULT ON since the 2026-07-07 flip; KITTY_ENABLE_CONSUMER_TAIL_CLIP=0
+        // is the opt-out (drops back to the L1 finalize tail-zero).
         const char *v = getenv("KITTY_ENABLE_CONSUMER_TAIL_CLIP");
-        cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+        cached = (v && v[0] == '0') ? 0 : 1;
     }
     return cached == 1;
 }

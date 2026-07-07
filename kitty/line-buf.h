@@ -63,7 +63,8 @@ bool xlimit_verify_enabled(void);
 // GPUCells. Self-gated on is_blank; a no-op under EAGER; off the append flood.
 void linebuf_materialize_deferred_row(LineBuf *self, index_type y);
 
-// Wave-15 L2: KITTY_ENABLE_CONSUMER_TAIL_CLIP=1 (opt-in, meaningful only under HWM).
+// Wave-15 L2 (DEFAULT ON since the 2026-07-07 flip; meaningful only under HWM;
+// KITTY_ENABLE_CONSUMER_TAIL_CLIP=0 opts out back to the L1 finalize tail-zero).
 // Defer the parse-side finalize tail-zero for scrolled/evicted rows -- carry
 // is_blank to the visible + history render clip, which owns the GPUCell tail.
 bool consumer_tail_clip_enabled(void);
