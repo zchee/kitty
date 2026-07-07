@@ -1642,6 +1642,70 @@ covered-or-fail-open transients instead of hard-asserting the
    `__benchmark__`, scrolling non-regression) + input_delay-default
    latency check + docs.
 
+## Phase 13A (Wave 13): arithmetic & gating quick wins
+
+Status: LANDED (plan `.omc/plans/2026-07-07-wave13-residual-optimization.md`;
+verify `.omc/verify/wave13a/VERIFY-REPORT.md` — gate PASS, no regressions,
+goldens byte-identical, Metal+GL suites baseline-equivalent). Four S-effort
+levers in one env-switched binary; all A/Bs same-binary interleaved under
+LOAD-DEGRADED conditions (load 4.6–12.6/16, launchservicesd ~1 core;
+ratios valid, absolutes flagged).
+
+- **P1 — CSI parse: no divide per parameter** (31ef4d3e0).
+  `csi_add_digit` accumulated high-end-first through a 10^n table and
+  `commit_csi_param` paid a 64-bit divide per committed parameter; now
+  plain `acc*10+d` with a multiply-by-sign commit. Bit-identical output
+  proven — an 8160-case dual-scheme model (including the legacy table's
+  16th-digit ×100 quirk) plus parser/screen suites identical in both
+  arms. End-to-end throughput within ±2% noise (expected: ~20–40
+  cyc/param is sub-noise on MB/s benches); the win is strictly-less CPU
+  per parameter at zero risk. Kill-switch `KITTY_VTP_LEGACY_CSI_PARSE=1`.
+- **FN1 — ligature-name memo** (f61b01478). `group_normal` called
+  `hb_font_glyph_to_string` (sfnt name lookup + strcmp) for every glyph
+  of every dirty run; LigatureType is now memoized in 3 spare
+  GlyphProperties bits, riding the per-font glyph_properties_hash_table
+  lifecycle (rebuilt on size/DPI/config change — no new invalidation
+  paths). Iosevka path untouched. Shaping groups byte-identical cached
+  vs uncached (test_shaping differential on Cascadia/Fira). Value is
+  per-glyph main-thread shaping CPU — deliberately off the async-render
+  bench axis. Kill-switch `KITTY_DISABLE_LIGNAME_CACHE=1` (+ in-process
+  `set_ligature_name_cache_enabled`).
+- **L1 — sync-present on input-immediate frames** (3b2dd70b3; default
+  flipped OFF at a388cd461). Mechanism: an input-immediate frame
+  (`!link_driven && displaySyncEnabled && !presentsWithTransaction`) may
+  skip the async completed-handler→main-queue double hop and swap
+  synchronously through the same per-layer generation guard
+  (reorder-safe). The 60 Hz A/B found no reliable ≥0.5 ms p99 typing win
+  (p50 24.99 vs 24.25 ms slightly favoring async; p99 swings 33–64 ms
+  symmetric in both arms; only 3–12/40 keystrokes take pace=immediate)
+  with zero flood-cadence change — so per the pre-agreed gate rule the
+  lever is opt-in: `KITTY_METAL_SYNC_IMMEDIATE=1`. ProMotion/quiet-box
+  re-eval queued in Future work. Measurement honesty: the first L1
+  capture was superseded — the v1 driver mixed clock domains (system
+  python `monotonic()` vs `presentedTime`'s mach timebase) and used an
+  intermittent-cat flood whose cat-boundary link idles admitted
+  immediate frames, faking an A-only p99 spike; the corrected
+  sustained-flood v2 shows symmetric p99 (`results/superseded/`).
+- **L6 — refresh-derived immediate floor** (de0d1e662). The
+  immediate-encode gate's hard-coded 8 ms floor is now ~0.5× the
+  window's monitor refresh period (min 3 ms, 8 ms fallback when
+  unknown), cached on OSWindow and recomputed only on cold input when
+  >1 s stale — never per-frame, never during flood; `#ifdef
+  KITTY_BACKEND_METAL`. At 60 Hz the derived 8.33 ms ≈ the old 8 ms:
+  measured byte-unchanged (typing + flood identical within noise). The
+  ProMotion payoff (~4.2 ms floor @120 Hz) is unmeasurable on this
+  60 Hz LCD and reserved for a high-refresh check. Kill-switch
+  `KITTY_METAL_IMMEDIATE_FLOOR_MS=<n>`.
+
+Exit gate: typing p99 unchanged; flood presents refresh-capped with
+cadence p50=p90=16.6667 ms in every arm (p99=33.33 ms symmetric
+load-induced drops in both arms); Metal+GL suites Ran 357 with only the
+documented environmental zsh errors; golden all-default vs
+all-levers-off byte-identical and content-verified. dense_cells read
+10.0 ms in both P1 arms (= the pre-13A baseline on this machine under
+load): the ≤9 ms absolute is LOAD-BLOCKED here and owned by Phase 13B
+(scroll-memset), not by any 13A lever.
+
 ## Final architecture (post-Phase-7 consolidation)
 
 The frame path is native end to end; the GL-name shim survives only where
@@ -1729,6 +1793,22 @@ condition. Updated as captures land.
    (§7 #4); PTY proxy stands in meanwhile.
 9. **Energy (powermetrics)** — operator sudo + a quiet machine (§7 #9;
    vtebench columns landed in Phase 8).
+
+10. **L1 sync-on-immediate re-eval** — the mechanism is landed, proven
+    reorder-safe, and opt-in (`KITTY_METAL_SYNC_IMMEDIATE=1`, Phase 13A);
+    re-measure on a ProMotion/quiet machine, where the two async present
+    hops are a larger fraction of the shorter frame budget (the 60 Hz
+    verdict was "no reliable p99 win"). Also re-run the LOAD-BLOCKED
+    absolutes (dense_cells ≤9 ms, flood p99=16.67 ms) on a quiesced box
+    via `.omc/verify/wave13a/w13_vtebench_ab.py` / `w13_latency_ab.py`.
+11. **pagerhist serialization cost (S5, documented)** —
+    `scrollback_pager_history_size` defaults to 0: `alloc_pagerhist`
+    returns NULL (history.c:64) and `pagerhist_push` early-returns
+    (history.c:284), so the pager history is ZERO-cost on the default
+    scroll path. When a user enables it, every ring eviction pays
+    `line_as_ansi` + UTF-8 re-encode on the scroll hot path
+    (history.c:282-296); lazy/batched serialization is the lever if that
+    configuration ever becomes a target.
 
 ## Known deviations (tracked, intentional)
 
