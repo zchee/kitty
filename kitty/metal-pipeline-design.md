@@ -601,6 +601,29 @@ up at the next display refresh. The drawable pool does not exist on this path,
 which dissolves the L2 blocker by construction: every input-driven frame IS an
 immediate render+present.
 
+**CALayer host (2026-07-08).** The layer receiving these contents swaps is no
+longer a `CAMetalLayer`: in IOSurface mode `_glfwCreateContextMetal`
+(glfw/metal_context.m) creates `KittyIOSurfaceLayer`, a plain-`CALayer`
+subclass. Manually setting `contents` on a CAMetalLayer bypasses its
+drawable-pool contract, and Core Animation logged an error-level ``changing
+`contents' on CAMetalLayer may result in undefined behavior`` on EVERY present
+(measured 1:1 — a 45 s flood produced 91 presents and 91 log lines); on a
+plain CALayer the assignment is a supported operation (the shape of Ghostty's
+`IOSurfaceLayer`), and the same run logs zero. The CAMetalLayer-typed state
+flags shared code reads/writes — `presentsWithTransaction` (resize signal),
+`displaySyncEnabled` (vsync flag), `drawableSize` (ring sizing) — survive as
+same-named MIRROR properties on the subclass: pure stored flags (no drawable
+presents exist on this path, so they carry no CA-side behavior), resolved at
+runtime by selector dispatch, so every `(CAMetalLayer*)` site in glfw and
+kitty/metal.m works unchanged. `metal_set_current_layer` fatals if the layer
+class ever disagrees with `metal_iosurface_enabled()` (the env check lives in
+two copies). Verified: warnings 0 (from 1:1 with presents), `KITTY_METAL_DUMP_FRAME`
+goldens byte-identical pre/post in BOTH arms, on-glass `screencapture` md5-identical
+(composite/colorspace parity — closes item 2 below), pace attribution unchanged,
+test suite at the known pre-existing baseline. The legacy path
+(`KITTY_METAL_IOSURFACE=0`) still creates a real CAMetalLayer (its flood
+SIGSEGV predates this change — `.scratch/legacy-drawable-flood-crash/`).
+
 Measurement semantics: `presentedTime` does not exist for a contents
 assignment, so `metal_present … pace=iosurface` lines are stamped by a
 CADisplayLink (macOS 14+, `NSScreen.mainScreen`, paused whenever no present is
@@ -644,11 +667,14 @@ the link as the default:
 1. **Flood pacing governor** — DONE (Wave-5b below): flood encodes at the
    refresh cadence (measured 59.3 fps, cadence p50=p99 16.6667 ms), settling
    the 186→58 fps waste and the energy criterion (§7 #9).
-2. **Colorspace decision** — the spike attaches no colorspace to the surfaces;
-   composite parity with the CAMetalLayer nil-colorspace policy is plausible
-   but UNVERIFIED (the golden harness reads the pre-composite offscreen, and
-   `screencapture` needs a Screen Recording grant — user checklist: eyeball a
-   KITTY_METAL_IOSURFACE=1 window against a normal one).
+2. **Colorspace decision** — DONE (2026-07-08, with the CALayer host change
+   above): no colorspace is attached to the surfaces, and composite parity is
+   now VERIFIED rather than plausible — `screencapture -l` of identical golden
+   content is md5-IDENTICAL between the CAMetalLayer host (pre-change) and the
+   plain-CALayer host (`KittyIOSurfaceLayer`), so Core Animation applies the
+   same (absent) color matching to manually assigned IOSurface contents on
+   both layer classes. Never attach a colorspace to the ring surfaces (same
+   rationale as the legacy layer's intentionally-nil `colorspace`).
 3. **Resize / multi-display / occlusion soak** — live resize takes the same
    contents-swap path inside the resize transaction (structurally sound, only
    smoke-tested); the measurement stamper is `NSScreen.mainScreen`-bound.
