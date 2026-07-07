@@ -468,6 +468,13 @@ typedef struct OSWindow {
     // immediate-encode floor compares against THIS window, so one window's
     // flood cannot starve another window's input fast path.
     monotonic_t last_gpu_present_at;
+    // L6 (Wave-13a): immediate-encode floor derived from the window display's
+    // refresh period (~0.5x it). Cached here and refreshed lazily (<=1/s) so a
+    // monitor hotplug / refresh-rate switch converges within a second with no
+    // per-frame AppKit query. 0 until first computed (gate uses the 8 ms
+    // fallback until then). See immediate_encode_floor() in child-monitor.c.
+    monotonic_t immediate_present_floor;
+    monotonic_t immediate_floor_computed_at;
     uint64_t render_calls;
     id_type last_focused_counter;
     CloseRequest close_request;
