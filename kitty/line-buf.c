@@ -380,17 +380,25 @@ clear_line_(Line *l, index_type xnum) {
     l->attrs.has_dirty_text = false;
 }
 
-// S1 (Phase 13B): KITTY_DISABLE_LAZY_ROW_CLEAR=1 reverts to the eager 32B
-// scroll clear (both CPUCells and GPUCells zeroed at scroll time) for a whole
-// process, so the lazy path can be A/B'd against the eager path without a
-// rebuild. Cached function-static, like the draw-loop run-fill levers.
+// S1 (Phase 13B): the lazy (deferred-GPUCell) scroll clear, DEFAULT OFF.
+// The 13B mid-gate same-binary A/B found the lazy path a ~1.4-1.6x vtebench
+// scrolling regression (34->~54 ms, bimodal at exactly +1 frame @60Hz)
+// despite IDENTICAL byte- and upload-counts vs eager (KITTY_METAL_STATS:
+// uploads/frame 66156 both, passes 1:1, presents fewer): a pure
+// scheduling/sync-phase knife-edge, not work amplification, on a relocate
+// whose direct win is ~0. Per the bisectability rule no commit ships a known
+// scrolling regression, so the default is eager. The machinery is retained as
+// S2's is_blank substrate: KITTY_DISABLE_LAZY_ROW_CLEAR unset or =1 -> eager
+// 32B clear (default / the escape hatch); =0 opts into the lazy relocate for
+// A/B + the S2 diagnostic middle arm. Cached function-static, like the
+// draw-loop run-fill levers.
 static int lazy_row_clear_state = -1;
 
 static bool
 lazy_row_clear_enabled(void) {
     if (UNLIKELY(lazy_row_clear_state < 0)) {
         const char *v = getenv("KITTY_DISABLE_LAZY_ROW_CLEAR");
-        lazy_row_clear_state = (v && v[0] && strcmp(v, "0") != 0) ? 0 : 1;
+        lazy_row_clear_state = (v && v[0] && strcmp(v, "0") == 0) ? 1 : 0;
     }
     return lazy_row_clear_state == 1;
 }
