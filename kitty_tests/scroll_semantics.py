@@ -399,6 +399,43 @@ class TestScrollSemantics(BaseTest):
                 if gone:
                     self.assert_tokens_absent_from_visible(s, gone)
 
+    def test_s1_lazy_clear_gpu_correctness(self):
+        # S1 (Phase 13B) lazy GPUCell clear: the deferred (is_blank) GPUCells
+        # must be indistinguishable from an eager 32B clear through every
+        # GPUCell consumer. Assertions encode the correct (eager) values and
+        # must hold with the lever ON (default) and OFF
+        # (KITTY_DISABLE_LAZY_ROW_CLEAR=1) — run both arms.
+
+        # (a) get_line_edge_colors_at_row on a just-scrolled blank cursor row:
+        # a prior non-default (red) bg must NOT leak; edges read default.
+        s = self.create_screen(cols=6, lines=4, scrollback=10)
+        feed(s, '\x1b[41m')                 # red bg
+        for i in range(4):
+            feed(s, f'R{i}xxx')
+            if i < 3:
+                feed(s, '\r\n')
+        feed(s, '\x1b[m\r\n\x1b[4;1H')       # reset, scroll, cursor on new blank row
+        self.assertEqual(s.line_edge_colors(), (0, 0), 'blank row leaked stale edge colors')
+
+        # (b) colored-blank preservation: a GPUCell writer (erase-to-yellow-bg)
+        # on the fresh blank row must materialize, keeping its bg.
+        feed(s, '\x1b[43m\x1b[K\x1b[m')      # yellow bg, erase to EOL
+        self.assertEqual(s.line(3).cursor_from(0).bg, 769, 'erase-to-color blank was wiped')
+
+        # (c) drawn colors after a scroll: the draw path materializes; the
+        # recycled row shows the drawn glyph in the drawn color, not stale bytes.
+        s2 = self.create_screen(cols=6, lines=3, scrollback=10)
+        for i in range(3):
+            feed(s2, f'C{i}yyy')
+            if i < 2:
+                feed(s2, '\r\n')
+        feed(s2, '\r\n\x1b[31mZ\x1b[m')      # scroll, draw red Z on the recycled row
+        drawn = s2.line(2).cursor_from(0)
+        self.assertEqual((str(s2.line(2)), drawn.fg, drawn.bg), ('Z', 257, 0), 'drawn cell wrong')
+
+        # (d) a fresh (never-scrolled) blank screen still reads default edges.
+        self.assertEqual(self.create_screen(cols=6, lines=3).line_edge_colors(), (0, 0))
+
     def test_scroll_semantics(self):
         regen = bool(os.environ.get('KITTY_REGEN_SCROLL_GOLDENS'))
         results = {}

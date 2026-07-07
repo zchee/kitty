@@ -86,7 +86,13 @@ typedef union LineAttrs {
         uint8_t has_dirty_text : 1;
         uint8_t has_image_placeholders : 1;
         uint8_t prompt_kind : 2;
-        uint8_t : 4;
+        // S1 (Phase 13B): the row's GPUCells were left stale by a deferred
+        // (lazy) scroll clear — only the 12B CPUCells were zeroed. The row
+        // renders blank and any authoritative GPUCell use must materialize
+        // (zero the GPUCells + clear this bit) first. Cleared eagerly when
+        // KITTY_DISABLE_LAZY_ROW_CLEAR=1.
+        uint8_t is_blank : 1;
+        uint8_t : 3;
     };
     uint8_t val;
 } LineAttrs ;

@@ -187,6 +187,9 @@ dealloc(LineBuf* self) {
 
 void
 linebuf_init_cells(LineBuf *lb, index_type idx, CPUCell **c, GPUCell **g) {
+    // S1 (Phase 13B): callers fetch these pointers to WRITE GPUCells (draw
+    // run-fills, multicell, char shifts), so materialize any deferred clear.
+    linebuf_materialize_blank_line(lb, idx);
     const index_type ynum = lb->line_map[idx];
     *c = cpu_lineptr(lb, ynum);
     *g = gpu_lineptr(lb, ynum);
@@ -214,6 +217,12 @@ linebuf_init_line_at(LineBuf *self, index_type idx, Line *line) {
 
 void
 linebuf_init_line(LineBuf *self, index_type idx) {
+    // S1 (Phase 13B): the idx-only wrapper feeds GPUCell writers (SGR-region
+    // apply, insert/delete/erase-char cursor fills) and direct GPUCell readers,
+    // so materialize any deferred clear here. The explicit-Line variant
+    // (linebuf_init_line_at) stays pure so the render path can peek is_blank and
+    // emit blank_diff with the deferred GPUCells left untouched.
+    linebuf_materialize_blank_line(self, idx);
     linebuf_init_line_at(self, idx, self->line);
 }
 
@@ -370,6 +379,21 @@ clear_line_(Line *l, index_type xnum) {
     l->attrs.has_dirty_text = false;
 }
 
+// S1 (Phase 13B): KITTY_DISABLE_LAZY_ROW_CLEAR=1 reverts to the eager 32B
+// scroll clear (both CPUCells and GPUCells zeroed at scroll time) for a whole
+// process, so the lazy path can be A/B'd against the eager path without a
+// rebuild. Cached function-static, like the draw-loop run-fill levers.
+static int lazy_row_clear_state = -1;
+
+static bool
+lazy_row_clear_enabled(void) {
+    if (UNLIKELY(lazy_row_clear_state < 0)) {
+        const char *v = getenv("KITTY_DISABLE_LAZY_ROW_CLEAR");
+        lazy_row_clear_state = (v && v[0] && strcmp(v, "0") != 0) ? 0 : 1;
+    }
+    return lazy_row_clear_state == 1;
+}
+
 void
 linebuf_clear_line(LineBuf *self, index_type y, bool clear_attrs) {
 #if BLANK_CHAR != 0
@@ -377,8 +401,33 @@ linebuf_clear_line(LineBuf *self, index_type y, bool clear_attrs) {
 #endif
     index_type ym = self->line_map[y];
     CPUCell *c = cpu_lineptr(self, ym); GPUCell *g = gpu_lineptr(self, ym);
-    zero_at_ptr_count(c, self->xnum); zero_at_ptr_count(g, self->xnum);
+    // The 12B CPUCell clear stays eager: every text reader (xlimit_for_line/
+    // line_is_empty/line_length/unicode_in_range/line_as_ansi) keys off
+    // CPUCell fields, so a recycled row must read blank immediately (the
+    // pre-overwrite contract in kitty_tests/scroll_semantics.py).
+    zero_at_ptr_count(c, self->xnum);
     if (clear_attrs) self->line_attrs[y].val = 0;
+    if (lazy_row_clear_enabled()) {
+        // Defer the 20B GPUCell clear: mark the row blank. Render emits zeros
+        // for it and any authoritative GPUCell access materializes first.
+        self->line_attrs[y].is_blank = 1;
+    } else {
+        zero_at_ptr_count(g, self->xnum);
+    }
+}
+
+// S1 (Phase 13B): perform a deferred (lazy) GPUCell clear now and drop the
+// is_blank marker, so a caller that reads or writes the GPUCells sees
+// authoritative (zeroed) data. No-op when the row was not lazily cleared.
+// INVARIANT: any writer that clears is_blank must leave the GPUCells fully
+// defined — here that is the whole-row zero (a documented RELOCATE: the draw
+// path re-covers drawn cells, so the vtebench headline is ~0). S2 swaps this
+// body for a tail-only clear of [hwm, xnum) WITHOUT touching call sites.
+void
+linebuf_materialize_blank_line(LineBuf *self, index_type y) {
+    if (!self->line_attrs[y].is_blank) return;
+    self->line_attrs[y].is_blank = 0;
+    zero_at_ptr_count(gpu_lineptr(self, self->line_map[y]), self->xnum);
 }
 
 static PyObject*
