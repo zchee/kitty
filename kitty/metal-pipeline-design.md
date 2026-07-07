@@ -2107,6 +2107,70 @@ decision (Phase 15 packet). [Executed 2026-07-07 at 8545ca3d7 — see
 item 5; the scrolling campaign is CLOSED with hwm+L2 as the shipping
 default.]
 
+## Phase 17 (Wave 17): the post-flip survey — plateau on-turf, one new gap
+
+Status: SURVEY CLOSE (charter
+`.omc/handoffs/wave17-rebaseline-survey-KICKOFF.md`; report
+`.omc/verify/wave17/SURVEY-REPORT.md`; measurement-only — no product
+code). The first full-matrix baseline under the shipped hwm+L2
+default: ALL 12 vtebench benchmarks × (default / eager hatch /
+alacritty reference) × 3 interleaved rounds, plus kitten __benchmark__
+and idle/cold spot checks. Coverage 30/36 cells with 2 arm-uniform
+generator skips listed (cursor_motion and light_cells emit empty
+payloads under every arm including alacritty — their generators, not
+kitty). The alacritty arm ran sanitized-env and was probe-verified
+NOT to steal focus (direct-binary launch does not activate).
+
+- **P0 flip-regression check: REFUTED.** default ≤ eager hatch on
+  every measured bench. The one candidate (scrolling_top_region,
+  median ratio 1.083) is integer/load noise — rounds [39,39,37] vs
+  [36,36,39] overlap, parse_ms/MiB identical (~21.6 both), and the
+  other three region benches are default == hatch exactly. The flip
+  is safe to soak.
+- **Flip wins held at survey scale**: scrolling 24|34|23 ms
+  (default|hatch|alacritty — parity with the reference);
+  scrolling_fullscreen 52|74|31 (the 0.70× flip win holds;
+  parse-bound residual 1.68× vs alacritty on the already-optimized
+  axis).
+- **Ranked residual gaps (all on previously-unmeasured axes):**
+  ① alt-screen/DECSTBM region scroll **3.7×** (37 vs 10 ms across
+  scrolling_bottom_region + both small_regions) — attribution:
+  frame-pacing / PTY-drain coupling, NOT parse (20 ≈ plain's
+  19 ms/MiB), NOT render (~0.03 ms/MiB), NOT present count (LOWER
+  than plain, 0.19–0.23 vs 0.57/sample); the discriminator is the
+  waiting-for-pace-tick gate share 0.74–0.76 vs plain's 0.50. hwm+L2
+  is inert on this path (alt screen, no scrollback; default == hatch
+  exactly). ② sync_medium_cells (escape-heavy vim replay) **2.73×**
+  (30 vs 11), same pacing signature (waiting 0.66). ③ dense_cells
+  1.67× (draw-bound) · unicode 1.5× (glyph raster) · medium_cells
+  1.13× · plain scrolling 1.04× — recorded below threshold.
+- **Drift check clean**: all four campaign axes within noise of the
+  wave-15/16 references (scrolling 19.2/18.85, fullscreen 24.8/24.25,
+  unicode 3.35/3.34 parse ms/MiB; dense no-harm); kitten ascii
+  235.9 / unicode 200.1 MB/s ≈ ref; idle 2 presents/20 s.
+  Accessibility remains ungranted → typing evidence stays
+  structural-proxy.
+- **Verdict: CONDITIONAL CHARTER, not a bare plateau.** Wave 18 is a
+  scoped INVESTIGATION of the region/vim pacing-drain coupling,
+  Step-0-gated on a drain-vs-present decouple A/B — the Phase-9
+  suppression lever (`KITTY_TEST_SUPPRESS_RENDER`,
+  child-monitor.c:1327) still exists, so the discriminating probe is
+  nearly free: if region sample_ms collapses toward its ~20 ms/MiB
+  parse wall with rendering suppressed, the lever family is confirmed
+  and the prize sized (suppression over-estimates a real fix — the
+  Phase-9 caveat rides along); if not, the gap is
+  structural/benchmark-artifact and the wave closes measure-first.
+  Wave-14's governor exoneration is NOT contradicted: it covered
+  main-screen scrolling where parse ≈ sample; on these axes parse ≠
+  sample, so pacing is back on the table for THIS path only. Honest
+  caveats carried into the charter: synthetic-flood risk (the vim
+  2.7× argues real apps see some of it), hypothesis-not-root-cause,
+  load-degraded absolutes (ratios ruled throughout).
+
+Exit: the scroll-clear campaign is confirmed plateaued-and-winning on
+its own axes with zero regressions; Future work item 15 charters
+Wave 18 (`.omc/handoffs/wave18-region-pacing-KICKOFF.md`).
+
 ## Final architecture (post-Phase-7 consolidation)
 
 The frame path is native end to end; the GL-name shim survives only where
@@ -2248,7 +2312,18 @@ condition. Updated as captures land.
     bounds at ~1.5–3 ms/MiB eager-only — below action threshold,
     recorded in Phase 16 / STEP19-PREP-NOTES.md. The remaining
     scrolling cost lives in the clear/scroll path already solved by
-    hwm+L2 — see item 5's pending flip.
+    hwm+L2 — see item 5 (flipped 2026-07-07).
+15. **Alt-screen/region-scroll pacing gap (Phase 17 charter →
+    Wave 18)** — kitty trails alacritty 3.7× on DECSTBM region
+    scrolls (37 vs 10 ms) and 2.73× on vim-session replay
+    (sync_medium_cells), at parity on plain scrolling. The Phase-17
+    survey attributes both to frame-pacing/PTY-drain coupling
+    (waiting-gate share 0.74 vs 0.50; parse, render, and present
+    count all exonerated; hwm+L2 inert on the alt screen). Step-0
+    kill test: the `KITTY_TEST_SUPPRESS_RENDER` decouple A/B sizes
+    the prize before any lever is designed. Charter:
+    `.omc/handoffs/wave18-region-pacing-KICKOFF.md`. Guardrail: never
+    trade main-screen parity for region gains.
 
 ## Known deviations (tracked, intentional)
 
