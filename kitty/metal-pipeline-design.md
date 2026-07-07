@@ -2018,11 +2018,14 @@ packet is ASSEMBLED and unblocked — the flip itself is a user decision
   both backends. Suites Ran 360 baseline-green throughout;
   scroll_semantics goldens byte-identical across
   eager/hwm/hwm+L2/kill-switch arms at every commit.
-- **Scroll-clear lever ledger (updated).**
+- **Scroll-clear lever ledger (updated; defaults as of the 2026-07-07
+  flip, commit 8545ca3d7).**
   `KITTY_DISABLE_LAZY_ROW_CLEAR` (set≠0 → EAGER hatch, wins; =0 →
-  RELOCATE diagnostic) · `KITTY_ENABLE_HWM_CLEAR=1` → HWM (now with the
-  L1 O(1) finalize + S1-lite gap materialize) ·
-  `KITTY_ENABLE_CONSUMER_TAIL_CLIP=1` → L2 (HWM-only) ·
+  RELOCATE diagnostic) · HWM is the DEFAULT (unset; also
+  `KITTY_ENABLE_HWM_CLEAR=1`; `=0` → EAGER opt-out) — with the L1 O(1)
+  finalize + S1-lite gap materialize · the L2 consumer clip is
+  DEFAULT-ON under HWM (`KITTY_ENABLE_CONSUMER_TAIL_CLIP=0` → back to
+  the L1 finalize tail-zero) ·
   `KITTY_DISABLE_XLIMIT_TRACK≠0` → L1 escape (old scan) ·
   `KITTY_XLIMIT_VERIFY=1` → debug cross-check. Measurement policy (user
   directive, standing): test kitties spawn NO-ACTIVATE
@@ -2041,6 +2044,11 @@ packet is ASSEMBLED and unblocked — the flip itself is a user decision
   pixel-golden validated, not exhaustively GPU-ring asserted. Flip
   mechanics when approved: scroll_clear_mode unset → HWM + consumer
   clip default-ON (eager hatch stays; relocate stays diagnostic).
+  **[EXECUTED 2026-07-07 at commit 8545ca3d7 — user-approved with the
+  proxy-grade-typing caveat. Post-flip verification: Metal + GL suites
+  Ran 360 baseline-green with KITTY_XLIMIT_VERIFY live; scroll golden
+  battery green in all four arms; no-activate smoke default 19.2
+  ms/MiB ≡ explicit hwm+L2, eager hatch 28.0.]**
 
 Exit: the ≤26 ms scrolling target is MET on this wave's evidence (the
 first arm to beat eager on every scroll axis). Remaining charter: item
@@ -2095,7 +2103,9 @@ target survived measurement.
 
 Exit: item 14 resolved as MEASURED-AND-REFUTED; no new charter opened.
 The scrolling campaign's remaining lever is the user's default-flip
-decision (Phase 15 packet).
+decision (Phase 15 packet). [Executed 2026-07-07 at 8545ca3d7 — see
+item 5; the scrolling campaign is CLOSED with hwm+L2 as the shipping
+default.]
 
 ## Final architecture (post-Phase-7 consolidation)
 
@@ -2176,11 +2186,15 @@ condition. Updated as captures land.
    fixed by item 1. The recycled-row memset lazy-clear follow-up is
    COMPLETE as of Phase 15: hwm+L2 (O(1) finalize + consumer tail clip
    + S1-lite gap materialize) beats eager 0.66× on both scroll axes
-   with dense no-harm and the interior-gap defect fixed. The arms
-   remain **opt-in** (`KITTY_ENABLE_HWM_CLEAR=1` +
-   `KITTY_ENABLE_CONSUMER_TAIL_CLIP=1`; relocate diagnostic via
-   `KITTY_DISABLE_LAZY_ROW_CLEAR=0`) pending the USER's default-flip
-   decision — the packet is assembled in the Phase 15 section.
+   with dense no-harm and the interior-gap defect fixed. **DEFAULT
+   FLIPPED 2026-07-07 (user-approved, commit 8545ca3d7)**: unset env →
+   HWM + consumer clip; opt-outs `KITTY_ENABLE_HWM_CLEAR=0` /
+   `KITTY_ENABLE_CONSUMER_TAIL_CLIP=0`; the
+   `KITTY_DISABLE_LAZY_ROW_CLEAR` eager hatch still wins (=0 →
+   relocate diagnostic). Verified at flip: both suites Ran 360
+   baseline-green with the verify cross-check live, golden battery
+   green in all four arms, default ≡ explicit hwm+L2 (19.2 ms/MiB) and
+   the hatch reproduces eager's 28.0 exactly.
 6. **Cross-backend composition difference** — §7 #6, tracked in
    .scratch/metal-gl-composition-diff/.
 7. **icat-GIF animation failure** — pre-existing, all configs; tracked in
