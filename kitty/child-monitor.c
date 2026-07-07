@@ -992,6 +992,73 @@ no_render_frame_received_recently(OSWindow *w, monotonic_t now, monotonic_t max_
     return ans;
 }
 
+#ifdef KITTY_BACKEND_METAL
+// L6 (Wave-13a): the immediate-encode floor is derived from the refresh period
+// of the display the window is actually on, instead of a hard-coded 8 ms.
+#define IMMEDIATE_FLOOR_MIN_MS 3.0     // positive minimum: a key-repeat storm can never unpace flood
+#define IMMEDIATE_FLOOR_FALLBACK_MS 8.0 // refresh unknown -> the historical constant
+
+// Refresh rate (Hz) of the display the OS window is currently on, or 0 if
+// unknown. Reads the GLFW monitor cache (refreshed on the monitor-config
+// callback, not a live per-call CGDisplay query). glfwGetWindowMonitor is
+// non-NULL only in fullscreen, so windowed mode finds the monitor whose bounds
+// contain the window centre; primary monitor is the last resort.
+static int
+os_window_refresh_hz(OSWindow *w) {
+    if (!w->handle || global_state.is_wayland) return 0;  // Wayland has no absolute positions; Metal is macOS-only anyway
+    GLFWmonitor *mon = glfwGetWindowMonitor(w->handle);
+    if (!mon) {
+        int wx = 0, wy = 0, ww = 0, wh = 0;
+        glfwGetWindowPos(w->handle, &wx, &wy);
+        glfwGetWindowSize(w->handle, &ww, &wh);
+        const int cx = wx + ww / 2, cy = wy + wh / 2;
+        int count = 0;
+        GLFWmonitor **mons = glfwGetMonitors(&count);
+        for (int i = 0; mons && i < count; i++) {
+            int mx = 0, my = 0;
+            glfwGetMonitorPos(mons[i], &mx, &my);
+            const GLFWvidmode *vm = glfwGetVideoMode(mons[i]);
+            if (vm && cx >= mx && cx < mx + vm->width && cy >= my && cy < my + vm->height) { mon = mons[i]; break; }
+        }
+    }
+    if (!mon) mon = glfwGetPrimaryMonitor();
+    if (!mon) return 0;
+    const GLFWvidmode *vm = glfwGetVideoMode(mon);
+    return (vm && vm->refreshRate > 0) ? vm->refreshRate : 0;
+}
+
+// Per-window immediate-encode floor. Default: ~0.5x the display refresh period
+// (8 ms @60 Hz, ~4.2 ms @120 Hz ProMotion — the win the hard-coded 8 ms left on
+// the table for fast typing on ProMotion) with a positive minimum, falling back
+// to the historical 8 ms when the refresh is unknown. Cached on the OS window
+// and recomputed at most ~1/s, which absorbs a monitor hotplug or refresh-rate
+// switch within a second without a per-frame query. This helper is only reached
+// on cold input (the caller's && chain short-circuits on render_state before
+// here), never on the flood hot path. KITTY_METAL_IMMEDIATE_FLOOR_MS=<n> forces
+// a fixed n-ms floor (n>0); 0/unset derives from the refresh.
+static monotonic_t
+immediate_encode_floor(OSWindow *w, monotonic_t now) {
+    static int env_floor_ms = -2;  // -2 unread, -1 derive, >=0 fixed override
+    if (UNLIKELY(env_floor_ms == -2)) {
+        const char *v = getenv("KITTY_METAL_IMMEDIATE_FLOOR_MS");
+        env_floor_ms = -1;
+        if (v && v[0]) { char *end = NULL; long n = strtol(v, &end, 10); if (end != v && n > 0 && n < 100000) env_floor_ms = (int)n; }
+    }
+    if (env_floor_ms >= 0) return ms_to_monotonic_t(env_floor_ms);
+    if (w->immediate_present_floor <= 0 || now - w->immediate_floor_computed_at >= ms_to_monotonic_t(1000ll)) {
+        const int hz = os_window_refresh_hz(w);
+        double floor_ms = IMMEDIATE_FLOOR_FALLBACK_MS;
+        if (hz > 0) {
+            floor_ms = 0.5 * (1000.0 / (double)hz);
+            if (floor_ms < IMMEDIATE_FLOOR_MIN_MS) floor_ms = IMMEDIATE_FLOOR_MIN_MS;
+        }
+        w->immediate_present_floor = ms_double_to_monotonic_t(floor_ms);
+        w->immediate_floor_computed_at = now;
+    }
+    return w->immediate_present_floor;
+}
+#endif
+
 bool
 render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images, bool input_driven) {
     // P9-0 test-only lever (like KITTY_METAL_TEST_FORCE_INFLIGHT): suppress
@@ -1017,24 +1084,25 @@ render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images, bo
 #endif
     // L2 immediate-encode-on-input — the low-latency half of the IOSurface
     // flood governor. When damage is input-driven and the pace link is idle
-    // (render_state NOT_REQUESTED) and >= ~1 refresh (8 ms) has passed since
-    // THIS window last presented, render the frame now instead of deferring to
-    // the next link tick (which costs ~1 frame of latency). On the IOSurface
-    // path the present is a layer.contents swap — no drawable pool exists, so
-    // rendering at an arbitrary instant is safe (pace=immediate).
+    // (render_state NOT_REQUESTED) and at least the immediate-encode floor
+    // (L6: ~0.5x the display refresh period; see immediate_encode_floor) has
+    // passed since THIS window last presented, render the frame now instead of
+    // deferring to the next link tick (which costs ~1 frame of latency). On the
+    // IOSurface path the present is a layer.contents swap — no drawable pool
+    // exists, so rendering at an arbitrary instant is safe (pace=immediate).
     // render_prepared_os_window's request_frame_render resyncs the link
     // afterward, so continuous output (flood) transitions to link pacing on
     // its next frame — that resync IS the governor's throughput half: flood
-    // encodes at the refresh rate, not the parse rate. The 8 ms floor is
-    // per-window (one window's flood must not starve another's fast path) and
-    // caps a key-repeat storm within a refresh.
+    // encodes at the refresh rate, not the parse rate. The floor is per-window
+    // (one window's flood must not starve another's fast path) and stays
+    // positive so it caps a key-repeat storm within a refresh.
     bool immediate_encode = false;
 #ifdef KITTY_BACKEND_METAL
     if (metal_immediate_encode_enabled()
         && input_driven && !w->keep_rendering_till_swap && USE_RENDER_FRAMES
         && w->render_state == RENDER_FRAME_NOT_REQUESTED && !w->live_resize.in_progress
         && global_state.thumbnail_callback.os_window != w->id
-        && now - w->last_gpu_present_at >= ms_to_monotonic_t(8ll)) immediate_encode = true;
+        && now - w->last_gpu_present_at >= immediate_encode_floor(w, now)) immediate_encode = true;
 #else
     (void)input_driven;
 #endif
