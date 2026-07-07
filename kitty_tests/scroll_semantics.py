@@ -247,6 +247,158 @@ class TestScrollSemantics(BaseTest):
             'paused_rendering_across_scroll': (dict(cols=16, lines=4, scrollback=8), paused_rendering_across_scroll),
         }
 
+    # -- Pre-overwrite blank-row contract (test-first for the lazy-clear
+    # -- levers S1 is_blank / S2 high-water-mark) ------------------------
+    #
+    # The golden snapshots above converge on the FINAL, post-overwrite
+    # state. The lazy-clear bug class hides in the window BEFORE a
+    # just-scrolled-in row is overwritten: a reader (as_text, selection,
+    # search, line length) observes the recycled slot while it still
+    # holds the stale bytes of the evicted line (P10 stale-wrap precedent,
+    # history.c:192-198). vtebench overwrites every recycled row
+    # immediately, so a golden that only compares end-state cannot see
+    # this — hence explicit, lever-agnostic assertions on the observable
+    # emptiness of a fresh blank row, checked the instant it is created.
+    #
+    # These pass on HEAD's eager clear (every INDEX_UP/INDEX_DOWN/ED path
+    # zeroes the recycled row) and define the contract S1/S2 must keep:
+    # narrowing or eliminating the memset must not let ANY CPU-cell reader
+    # surface stale content. Assertions are phrased on semantics only (no
+    # is_blank / hwm / kill-switch references) so they hold with every
+    # lever ON and OFF.
+
+    def assert_blank_row(self, s, y):
+        # Each assertion exercises one of the ~6 CPU-cell readers the
+        # P10-0 audit enumerated (lineops.h:42,61; line.c:151,434,561).
+        ln = s.line(y)
+        # line_as_unicode -> xlimit_for_line / line_length
+        self.assertEqual(str(ln), '', f'row {y}: str() surfaced stale bytes')
+        # line_as_ansi -> xlimit_for_line (+ SGR run reconstruction)
+        self.assertEqual(ln.as_ansi(), '', f'row {y}: as_ansi() surfaced stale bytes')
+        # trailing wrap-continuation cell read (the exact P10 stale-wrap leak)
+        self.assertFalse(
+            ln.last_char_has_wrapped_flag(), f'row {y}: stale soft-wrap flag survived the clear')
+        # unicode_in_range via a full-row selection (search/copy data path)
+        s.start_selection(0, y)
+        s.update_selection(s.columns - 1, y, True)
+        self.assertEqual(
+            s.text_for_selection(), (), f'row {y}: selection surfaced stale bytes')
+        # as_text -> unicode_in_range + line_is_empty over the visible grid
+        visible = as_text(s).split('\n')
+        got = visible[y] if y < len(visible) else ''
+        self.assertEqual(got, '', f'row {y}: as_text surfaced stale bytes')
+
+    def assert_tokens_absent_from_visible(self, s, tokens):
+        # search/unicode_in_range contract: content that was evicted to
+        # scrollback or erased must not remain readable on the visible
+        # screen through any recycled slot.
+        visible = as_text(s)
+        for tok in tokens:
+            self.assertNotIn(
+                tok, visible, f'evicted/erased token {tok!r} still visible after scroll')
+
+    def test_pre_overwrite_blank_reads(self):
+        # name -> driver(s) -> (blank_row_indices, tokens_fully_gone).
+        # The driver leaves the cursor at a fresh blank row that has NOT
+        # been overwritten; every listed row must read empty.
+        def plain_index_up(s):  # (a)
+            for i in range(4):
+                feed(s, f'AA{i}xx')
+                if i < 3:
+                    feed(s, '\r\n')
+            feed(s, '\r\n')  # LF at bottom -> scroll up; row 3 fresh blank
+            return [3], ()
+
+        def reverse_index(s):  # (b)
+            for i in range(4):
+                feed(s, f'RR{i}yy')
+                if i < 3:
+                    feed(s, '\r\n')
+            feed(s, '\x1b[H\x1bM')  # RI at top -> scroll down; row 0 fresh blank
+            return [0], ()
+
+        def clear_screen_ed2(s):  # (c) ED2
+            for i in range(3):
+                feed(s, f'DD{i}ee')
+                if i < 2:
+                    feed(s, '\r\n')
+            feed(s, '\x1b[2J')
+            return [0, 1, 2], ('DD0ee', 'DD1ee', 'DD2ee')
+
+        def clear_scrollback_ed3(s):  # (c) ED3
+            for i in range(6):
+                feed(s, f'GG{i}ff\r\n')
+            feed(s, 'live99')
+            feed(s, '\x1b[3J')  # erase display + scrollback
+            return [0, 1, 2], ('GG0ff', 'GG5ff', 'live99')
+
+        def ring_wrap_eviction(s):  # (d) recycled slot = OLDEST history line
+            for i in range(6):  # lines(3)+scrollback(3): ring becomes full
+                feed(s, f'EV{i:02d}z\r\n')
+            feed(s, '\r\n')  # one more scroll recycles the oldest hist slot
+            # 'EV00z' is the oldest evicted line: its slot is now the fresh
+            # blank bottom row -> genuinely stale bytes must not surface.
+            return [2], ('EV00z',)
+
+        def margins_region_forward(s):  # (e) scroll region, blank at region bottom
+            for i in range(5):
+                feed(s, f'MG{i}ab')
+                if i < 4:
+                    feed(s, '\r\n')
+            feed(s, '\x1b[2;4r\x1b[4;1H\n')  # region rows 1..3; LF at region bottom
+            return [3], ()
+
+        def margins_region_reverse(s):  # (e) scroll region, blank at region top
+            for i in range(5):
+                feed(s, f'MR{i}cd')
+                if i < 4:
+                    feed(s, '\r\n')
+            feed(s, '\x1b[2;4r\x1b[2;1H\x1bM')  # RI at region top -> row 1 blank
+            return [1], ()
+
+        def multicell_across_boundary(s):  # (f) wide char spanning the boundary
+            feed(s, '日本語')  # 3 full-width cells fill row 0
+            feed(s, '\r\nAB\r\nCD')
+            feed(s, '\r\n')  # scroll the multicell row out; row 2 fresh blank
+            # a leaked is_multicell/char would re-materialize the wide glyph
+            return [2], ('日本語',)
+
+        def wrapped_line_recycled(s):  # P10 stale-wrap class
+            feed(s, 'W' * 24)  # 4 soft-wrapped rows of 6 -> wrap flags set
+            for _ in range(6):
+                feed(s, '\r\n')  # scroll every wrapped row out; bottom recycles them
+            return [0, 1, 2, 3], ()
+
+        def insert_lines_blank(s):  # IL opens fresh blank rows mid-screen
+            for i in range(4):
+                feed(s, f'IL{i}qq')
+                if i < 3:
+                    feed(s, '\r\n')
+            feed(s, '\x1b[2;1H\x1b[2L')  # cursor row 2, insert 2 -> rows 1,2 blank
+            return [1, 2], ()
+
+        pager = {'scrollback_pager_history_size': 4096}
+        scenarios = {
+            'plain_index_up': (dict(cols=6, lines=4, scrollback=10), plain_index_up),
+            'reverse_index': (dict(cols=6, lines=4, scrollback=10), reverse_index),
+            'clear_screen_ed2': (dict(cols=6, lines=3, scrollback=8), clear_screen_ed2),
+            'clear_scrollback_ed3': (dict(cols=6, lines=3, scrollback=8, options=pager), clear_scrollback_ed3),
+            'ring_wrap_eviction': (dict(cols=6, lines=3, scrollback=3, options=pager), ring_wrap_eviction),
+            'margins_region_forward': (dict(cols=6, lines=5, scrollback=10), margins_region_forward),
+            'margins_region_reverse': (dict(cols=6, lines=5, scrollback=10), margins_region_reverse),
+            'multicell_across_boundary': (dict(cols=6, lines=3, scrollback=10), multicell_across_boundary),
+            'wrapped_line_recycled': (dict(cols=6, lines=4, scrollback=10), wrapped_line_recycled),
+            'insert_lines_blank': (dict(cols=6, lines=4, scrollback=10), insert_lines_blank),
+        }
+        for name, (kwargs, driver) in scenarios.items():
+            with self.subTest(scenario=name):
+                s = self.create_screen(**kwargs)
+                blank_rows, gone = driver(s)
+                for y in blank_rows:
+                    self.assert_blank_row(s, y)
+                if gone:
+                    self.assert_tokens_absent_from_visible(s, gone)
+
     def test_scroll_semantics(self):
         regen = bool(os.environ.get('KITTY_REGEN_SCROLL_GOLDENS'))
         results = {}
