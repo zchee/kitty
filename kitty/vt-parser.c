@@ -1553,9 +1553,10 @@ consume_input(PS *self, PyObject *dump_callback UNUSED, id_type window_id UNUSED
 // old under-lock absorb of write.pending; runs only on the main thread.
 // Runs once per consume_input step, so it stays fence-free; waking a
 // reader parked on a full ring happens once per tick in run_worker.
-static void
+static size_t
 drain_ring(PS *self) {
     VTInputRing *ring = self->input_ring;
+    size_t total = 0;
     while (self->read.sz < BUF_SZ) {
         size_t avail;
         const uint8_t *src = vt_ring_readable(ring, &avail);
@@ -1564,7 +1565,9 @@ drain_ring(PS *self) {
         memcpy(self->buf + self->read.sz, src, n);
         self->read.sz += n;
         vt_ring_advance(ring, n);
+        total += n;
     }
+    return total;
 }
 
 static void
@@ -1574,7 +1577,7 @@ run_worker(void *p, ParseData *pd, bool flush) {
     screen->parsing_at = pd->now;
     // drain before the parse gate, mirroring the old absorb placement so
     // the gate and the nearly-full override see the post-drain state
-    drain_ring(self);
+    pd->bytes_read += drain_ring(self);
     pd->has_pending_input = self->read.pos < self->read.sz;
     if (pd->has_pending_input) {
         pd->time_since_new_input = pd->now - vt_ring_new_input_at(self->input_ring);
@@ -1589,7 +1592,7 @@ run_worker(void *p, ParseData *pd, bool flush) {
             self->read.consumed = 0;
             do {
                 consume_input(self, pd->dump_callback, screen->window_id);
-                drain_ring(self);  // pick up bytes that arrived mid-parse
+                pd->bytes_read += drain_ring(self);  // pick up bytes that arrived mid-parse
             } while (self->read.pos < self->read.sz);
             // CAS-clear with fail-open re-cover; the helper self-guards
             // on ring emptiness (final-review FR-1)

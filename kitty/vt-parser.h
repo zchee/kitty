@@ -22,6 +22,7 @@ typedef struct ParseData {
 
     bool input_read, write_space_created, has_pending_input;
     monotonic_t time_since_new_input;
+    size_t bytes_read;  // bytes advanced out of the transport ring into the parse arena this parse (throughput probe)
 } ParseData;
 
 // The must only be called on the main thread

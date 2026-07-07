@@ -508,10 +508,73 @@ shutdown_monitor(ChildMonitor *self, PyObject *a UNUSED) {
     Py_RETURN_NONE;
 }
 
+#ifdef KITTY_BACKEND_METAL
+// KITTY_FRAME_TRACE=1: Wave-15 Step-0 per-tick frame-readiness probe. Sibling of
+// KITTY_PACING_DEBUG -- the env var is resolved ONCE into a cached bool (zero
+// cost when off, a single predictable branch), Metal-only, main-thread only,
+// allocation-free. Emits one parseable "ftrace:" line per main-loop tick
+// (process_global_state) via log_error, capturing that tick's timeline: a
+// monotonic timestamp, the inter-tick gap, bytes drained from the transport
+// ring, parse wall, render wall, and the focused (bench) window's render-gate
+// outcome + whether a present was committed. Fully composable with
+// KITTY_PACING_DEBUG (independent state; both may be on at once, no arm changes).
+// Step-0b reconstructs per-sample timelines from these lines correlated with
+// vtebench sample boundaries (a vtebench "sample" times write_all(bench)+flush of
+// the benchmark buffer, i.e. PTY write back-pressure, so bytes-drained/tick is
+// the throughput axis -- there is no present-sync in the sample loop).
+typedef enum FtGateOutcome {
+    FT_GATE_NONE = 0,   // focused window not gated this tick (render() skipped it, or none focused)
+    FT_GATE_IMMEDIATE,  // immediate-encode fast path (rendered inline)
+    FT_GATE_READY,      // render_state READY / keep_rendering_till_swap fallthrough (rendered)
+    FT_GATE_RESCUE,     // Wave-14 stall-rescue fired (rendered inline)
+    FT_GATE_NREQ,       // deferred: NOT_REQUESTED -> requested a frame, no render this tick
+    FT_GATE_FALLBACK,   // deferred: REQUESTED past the stall bound but refresh-capped, no render
+    FT_GATE_WAITING,    // deferred: REQUESTED and link fresh, waiting for the pace tick, no render
+} FtGateOutcome;
+// All written on the render/main thread (gate + parse) and read by the emitter
+// on the same thread, so plain statics suffice (mirrors pacing_stall_bound_eff).
+static uint64_t ft_seq;                // emitted-line counter
+static monotonic_t ft_prev_ts;         // previous emitted tick timestamp, for gap_ms
+static uint64_t ft_bytes_drained;      // bytes drained from transport rings this tick
+static FtGateOutcome ft_gate_outcome;  // focused window's gate branch this tick
+static bool ft_present_committed;      // focused window presented (swap) this tick
+static const char* const ft_gate_names[] = {
+    "none", "immediate", "ready", "rescue", "nreq", "fallback", "waiting"
+};
+
+static bool
+frame_trace_enabled(void) {
+    static int cached = -1;
+    if (UNLIKELY(cached < 0)) {
+        const char *v = getenv("KITTY_FRAME_TRACE");
+        cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+static inline double
+ft_ms(monotonic_t t) { return (double)t / (double)MONOTONIC_T_1e6; }
+
+static void
+frame_trace_emit(monotonic_t ts, bool input_read, monotonic_t parse_dt, monotonic_t render_dt) {
+    const monotonic_t gap = ft_prev_ts ? ts - ft_prev_ts : 0;
+    ft_prev_ts = ts;
+    log_error("ftrace: seq=%llu ts_ms=%.3f gap_ms=%.3f bytes=%llu parse_ms=%.3f render_ms=%.3f"
+              " input_read=%d gate=%s present=%d",
+              (unsigned long long)(++ft_seq), ft_ms(ts), ft_ms(gap),
+              (unsigned long long)ft_bytes_drained, ft_ms(parse_dt), ft_ms(render_dt),
+              input_read ? 1 : 0, ft_gate_names[ft_gate_outcome], ft_present_committed ? 1 : 0);
+}
+#endif
+
 static bool
 do_parse(ChildMonitor *self, Screen *screen, monotonic_t now, bool flush) {
     ParseData pd = {.dump_callback = self->dump_callback, .now = now};
     self->parse_func(screen, &pd, flush);
+#ifdef KITTY_BACKEND_METAL
+    // Sum ring bytes drained this tick across every screen parsed (frame-trace).
+    if (UNLIKELY(frame_trace_enabled())) ft_bytes_drained += pd.bytes_read;
+#endif
     // independent of input_read: the top-of-tick ring drain can free a
     // full transport ring even when the input_delay gate declines to
     // parse, and the stalled reader needs its POLLIN re-armed either way
@@ -1290,6 +1353,10 @@ render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images, bo
     // encodes at the refresh rate, not the parse rate. The floor is per-window
     // (one window's flood must not starve another's fast path) and stays
     // positive so it caps a key-repeat storm within a refresh.
+#ifdef KITTY_BACKEND_METAL
+    // Frame-trace: resolve the focused-window gate probe once for this window.
+    const bool ft = UNLIKELY(frame_trace_enabled()) && w->is_focused;
+#endif
     bool immediate_encode = false;
 #ifdef KITTY_BACKEND_METAL
     if (metal_immediate_encode_enabled()
@@ -1304,6 +1371,9 @@ render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images, bo
     if (UNLIKELY(pacing_debug_enabled())) pacing_debug_sample_gate(w, now, input_driven, immediate_encode);
 #endif
     if (immediate_encode) {
+#ifdef KITTY_BACKEND_METAL
+        if (ft) ft_gate_outcome = FT_GATE_IMMEDIATE;
+#endif
 #ifdef __APPLE__
         if (sp) os_signpost_event_emit(slog, render_gate_sid, "render_gate", "window=%llu state=%{public}s", w->id, "immediate");
 #endif
@@ -1341,6 +1411,15 @@ render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images, bo
             }
             else pacing_dbg.defer_waiting++;
         }
+        // Frame-trace: classify the focused window's deferred-gate branch. Order
+        // matters -- stall_rescue implies stale, so it is tested first (pacing's
+        // defer_fallback250 lumps rescue in with capped fallbacks; here they split).
+        if (ft) {
+            if (stall_rescue) ft_gate_outcome = FT_GATE_RESCUE;
+            else if (nreq) ft_gate_outcome = FT_GATE_NREQ;
+            else if (stale) ft_gate_outcome = FT_GATE_FALLBACK;
+            else ft_gate_outcome = FT_GATE_WAITING;
+        }
 #else
         const bool stale = !nreq && no_render_frame_received_recently(w, now, ms_to_monotonic_t(250ll));
         if (nreq || stale) request_frame_render(w);
@@ -1373,6 +1452,11 @@ render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images, bo
 #ifdef __APPLE__
     else if (sp) os_signpost_event_emit(slog, render_gate_sid, "render_gate", "window=%llu state=%{public}s", w->id, "READY");
 #endif
+#ifdef KITTY_BACKEND_METAL
+    // Neither immediate nor the deferred branch classified this tick: the gate
+    // fell through on render_state READY / keep_rendering_till_swap.
+    if (ft && ft_gate_outcome == FT_GATE_NONE) ft_gate_outcome = FT_GATE_READY;
+#endif
     w->render_calls++;
     make_os_window_context_current(w);
     bool needs_render = w->redraw_count > 0 || w->live_resize.in_progress || global_state.thumbnail_callback.os_window == w->id;
@@ -1388,7 +1472,12 @@ render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images, bo
     if (prepare_to_render_os_window(w, now, &active_window_id, &active_window_bg, &num_visible_windows, &all_windows_have_same_bg, scan_for_animated_images)) needs_render = true;
     if (w->last_active_window_id != active_window_id || w->last_active_tab != w->active_tab || w->focused_at_last_render != w->is_focused) needs_render = true;
     if (w->render_calls < 3 && background_image_for_os_window(w) != NULL) needs_render = true;
-    if (needs_render) render_prepared_os_window(w, active_window_id, active_window_bg, num_visible_windows, all_windows_have_same_bg);
+    if (needs_render) {
+        render_prepared_os_window(w, active_window_id, active_window_bg, num_visible_windows, all_windows_have_same_bg);
+#ifdef KITTY_BACKEND_METAL
+        if (ft) ft_present_committed = true;  // swap_window_buffers presented this tick
+#endif
+    }
     if (w->is_focused) change_menubar_title(w->window_title);
     return needs_render;
 }
@@ -1856,16 +1945,34 @@ process_global_state(void *data) {
         process_pending_resizes(now);
         input_read = true;
     }
+#ifdef KITTY_BACKEND_METAL
+    // Frame-trace: reset this tick's per-tick accumulators before parse/render.
+    const bool ft_on = UNLIKELY(frame_trace_enabled());
+    if (ft_on) { ft_bytes_drained = 0; ft_gate_outcome = FT_GATE_NONE; ft_present_committed = false; }
+#endif
 #ifdef __APPLE__
     const bool sp = child_monitor_signpost_enabled();
     os_log_t slog = sp ? child_monitor_signpost_log() : NULL;
     if (sp) os_signpost_interval_begin(slog, OS_SIGNPOST_ID_EXCLUSIVE, "parse", "");
 #endif
+#ifdef KITTY_BACKEND_METAL
+    const monotonic_t ft_parse_t0 = ft_on ? monotonic() : 0;
+#endif
     if (parse_input(self)) input_read = true;
+#ifdef KITTY_BACKEND_METAL
+    const monotonic_t ft_parse_t1 = ft_on ? monotonic() : 0;
+#endif
 #ifdef __APPLE__
     if (sp) os_signpost_interval_end(slog, OS_SIGNPOST_ID_EXCLUSIVE, "parse", "");
 #endif
     render(now, input_read);
+#ifdef KITTY_BACKEND_METAL
+    // One ftrace line per tick, after render so the gate outcome + present are set.
+    if (ft_on) {
+        const monotonic_t ft_render_t1 = monotonic();
+        frame_trace_emit(now, input_read, ft_parse_t1 - ft_parse_t0, ft_render_t1 - ft_parse_t1);
+    }
+#endif
 #ifdef __APPLE__
     if (has_cocoa_pending_actions) {
         process_cocoa_pending_actions();
