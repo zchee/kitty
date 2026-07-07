@@ -55,15 +55,19 @@ def _sanitized_env() -> dict[str, str]:
     ambient secrets. Extra needs are added explicitly by the caller."""
     return {k: os.environ[k] for k in _ENV_ALLOWLIST if k in os.environ}
 
-# metal_present line format, fixed by task #1's metal.m instrumentation
-# (final, kitty/metal.m ~1657-1663):
-#   metal_present frame=<uint64> presented_time=<float seconds, 9 decimals>
-# presented_time is MTLDrawable.presentedTime -- host time in seconds, the
-# same timebase as CACurrentMediaTime()/mach_absolute_time (see
-# current_media_time() in metal-latency.py). Shared here because both
-# metal-baseline.py (frame-count/availability check) and metal-latency.py
-# (injection-to-present pairing) parse this same line.
-PRESENTED_RE = re.compile(r"^metal_present\s+frame=(\d+)\s+presented_time=([\d.]+)\s*$", re.MULTILINE)
+# metal_present line format (kitty/metal.m:2097 IOSurface path + :2676 drawable
+# path). Both shapes share the frame=/presented_time= prefix and are matched:
+#   metal_present frame=<uint64> presented_time=<float, 9 decimals> pace=<mode>[ commit_time=<float>]
+#   metal_present frame=<uint64> presented_time=<float, 9 decimals>
+# presented_time is MTLDrawable.presentedTime (drawable path) / the display-link
+# timestamp (IOSurface path) -- host time in seconds, the same timebase as
+# CACurrentMediaTime()/mach_absolute_time (see current_media_time() in
+# metal-latency.py). Shared here because both metal-baseline.py (frame-count/
+# availability check) and metal-latency.py (injection-to-present pairing) parse
+# this same line. The trailing pace=/commit_time= fields were added after the
+# original format; they are tolerated (non-capturing) so the harnesses keep
+# matching, and capture groups 1/2 (frame, presented_time) are unchanged.
+PRESENTED_RE = re.compile(r"^metal_present\s+frame=(\d+)\s+presented_time=([\d.]+)(?:\s.*)?$", re.MULTILINE)
 
 
 def percentile(values: list[float], pct: float) -> float | None:
