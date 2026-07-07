@@ -11,14 +11,18 @@
 
 #if defined(__OBJC__)
 // Full CAMetalLayer type for the .m files that toggle presentation
-// properties on window->ns.layer (live resize, backing changes).
+// properties on window->ns.layer (live resize, backing changes). In
+// IOSurface mode the object is actually a KittyIOSurfaceLayer (a plain
+// CALayer subclass defined in metal_context.m with mirror properties for
+// presentsWithTransaction/displaySyncEnabled/drawableSize), so the
+// CAMetalLayer* casts still resolve correctly at runtime.
 #import <QuartzCore/CAMetalLayer.h>
 #endif
 
 // Metal-specific per-context data (replaces _GLFWcontextNSGL)
 typedef struct _GLFWcontextMetal
 {
-    id              layer;            // CAMetalLayer*
+    id              layer;            // CAMetalLayer* (legacy) or KittyIOSurfaceLayer* (IOSurface mode)
     id              device;           // id<MTLDevice>
     // Phase 4 (L1): CAMetalDisplayLink render driver. One link per window
     // (per CAMetalLayer) — it follows the layer's display automatically, so no

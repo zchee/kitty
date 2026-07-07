@@ -319,60 +319,121 @@ static GLFWglproc getProcAddressMetal(const char* procname UNUSED)
     return NULL;
 }
 
-// Create a Metal rendering context (CAMetalLayer) for a window.
+// IOSurface presentation mode's backing layer: a plain CALayer, not a
+// CAMetalLayer. Manually assigning IOSurfaces to `contents` is a fully
+// supported CALayer operation, which silences Core Animation's per-present
+// "changing `contents' on CAMetalLayer may result in undefined behavior"
+// error log and removes the standing UB exposure of bypassing the drawable
+// pool (same shape as Ghostty's IOSurfaceLayer). presentsWithTransaction /
+// displaySyncEnabled / drawableSize are MIRROR properties: plain stored
+// state with CAMetalLayer's exact selector names and types, because every
+// shared read/write site (the glfw resize signals here and in
+// cocoa_window.m, kitty/metal.m's present decisions and ring sizing)
+// accesses them through a CAMetalLayer* static type and resolves at runtime
+// via selector dispatch. In IOSurface mode there are no drawable presents,
+// so the flags carry no CA-side behavior — the sync swap already happens
+// inside an explicit CATransaction (iosurface_swap_contents, kitty/metal.m).
+// Selector names and types MUST stay exactly aligned with CAMetalLayer's;
+// metal_set_current_layer (kitty/metal.m) fatals if the layer class ever
+// disagrees with metal_iosurface_enabled().
+@interface KittyIOSurfaceLayer : CALayer
+@property (nonatomic) BOOL presentsWithTransaction;
+@property (nonatomic) BOOL displaySyncEnabled;
+@property (nonatomic) CGSize drawableSize;
+@end
+
+@implementation KittyIOSurfaceLayer
+// Kill ALL implicit animations (the 0.25 s contents crossfade, bounds moves
+// during AppKit-driven live resize). The contents swap itself already runs
+// under setDisableActions:YES, but AppKit's geometry changes land outside
+// that transaction.
+- (id<CAAction>)actionForKey:(NSString *)event { (void)event; return (id<CAAction>)[NSNull null]; }
+@end
+
+// Create a Metal rendering context for a window: the view's backing layer —
+// a plain KittyIOSurfaceLayer in IOSurface presentation mode (the default),
+// a CAMetalLayer on the legacy drawable path (KITTY_METAL_IOSURFACE=0).
 // Modeled on the Vulkan surface creation code in cocoa_window.m
 bool _glfwCreateContextMetal(_GLFWwindow* window)
 {
-    // Create the CAMetalLayer
-    CAMetalLayer *layer = [CAMetalLayer layer];
-    if (!layer)
-    {
-        _glfwInputError(GLFW_PLATFORM_ERROR,
-                        "Metal: Failed to create CAMetalLayer");
-        return false;
-    }
+    CAMetalLayer *layer;
+    if (iosurface_present_mode()) {
+        // The static type stays CAMetalLayer* so the shared property sites
+        // below and across kitty compile unchanged; only the mirror
+        // selectors and the inherited CALayer surface are ever used on it.
+        // None of the legacy branch's drawable-pool configuration applies
+        // (device/pixelFormat/framebufferOnly/maximumDrawableCount/
+        // allowsNextDrawableTimeout): this layer has no drawable pool. The
+        // frame format lives in the IOSurface ring (kitty/metal.m), and no
+        // colorspace is attached anywhere (nil-colorspace parity, see the
+        // legacy branch's colorspace comment below).
+        layer = (CAMetalLayer*)[KittyIOSurfaceLayer layer];
+        if (!layer)
+        {
+            _glfwInputError(GLFW_PLATFORM_ERROR,
+                            "Metal: Failed to create KittyIOSurfaceLayer");
+            return false;
+        }
+        // Mirror-flag seeds, matching the legacy branch: no resize
+        // transaction in progress; vsync on (CAMetalLayer's default —
+        // swapIntervalMetal overwrites this from the swap interval).
+        // drawableSize starts zero = "unset"; set_gpu_viewport
+        // (kitty/metal.m) drives it, and the ring sizing falls back to
+        // mtl_viewport while it is zero.
+        layer.presentsWithTransaction = NO;
+        layer.displaySyncEnabled = YES;
+    } else {
+        // Legacy drawable path: a real CAMetalLayer.
+        layer = [CAMetalLayer layer];
+        if (!layer)
+        {
+            _glfwInputError(GLFW_PLATFORM_ERROR,
+                            "Metal: Failed to create CAMetalLayer");
+            return false;
+        }
 
-    // Configure the layer
-    layer.device = (id<MTLDevice>)_glfw.metal.device;
-    // Plain (non-sRGB) BGRA8Unorm base. C1: sRGB is now encoded in-shader — the
-    // opaque cell/border fragments via the SRGB_ENCODE_OUTPUT function constant,
-    // and layered content in the single-pass resolve draw (kitty/metal.m) — so
-    // no per-frame sRGB texture view of the drawable is created any more.
-    layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
-    // C4a: framebufferOnly=YES lets Core Animation optimize the drawable for
-    // display (lossless framebuffer compression). Safe now that nothing creates a
-    // texture view of the drawable (that per-frame view creation was the Wave-1
-    // blocker that forced this to NO). Read-back paths — the KITTY_METAL_DUMP_FRAME
-    // golden harness and take_screenshot_of_rectangular_region — render to a
-    // readable offscreen instead (metal_capture_to_offscreen in metal.m), never
-    // the drawable.
-    layer.framebufferOnly = YES;
-    layer.presentsWithTransaction = NO;
-    // CAMetalLayer.maximumDrawableCount accepts only 2 or 3 (any other value
-    // raises an exception, Apple docs); default is 3. Wave-4 measured 2 vs 3
-    // under the CAMetalDisplayLink driver (flood + typing): the link delivers a
-    // vsync-timed drawable to each delegate callback, so there is no CPU-side
-    // nextDrawable race and a 2-deep pool already yields a perfectly steady
-    // present cadence (16.667 ms p50==p99==max at 60 Hz) with drawable_wait_ms
-    // structurally 0. Count 3 gave BYTE-IDENTICAL cadence and zero tail stalls
-    // (no smoothness gain) while adding ~2 ms of PTY-write->present latency (one
-    // more frame of queue depth). The old 2-pass-era "60 ms tail stall at 2" is
-    // gone. So 2 is optimal: shallowest presentation queue == lowest latency.
-    layer.maximumDrawableCount = 2;
-    // layer.colorspace is intentionally left at its default, nil. Per Apple
-    // docs a nil colorspace means the drawable's content "isn't
-    // color-matched" -- Core Animation performs no colorspace transform at
-    // composite time, which is the fast, GL-parity path. kitty already does
-    // its own sRGB handling in the render pipeline (texture views selected
-    // per pass in metal.m), so a CA-side conversion would be redundant work
-    // at best and a double-conversion bug at worst. Never set a colorspace
-    // here.
-    // Allow nextDrawable to return nil instead of blocking indefinitely
-    // when all drawables are in-flight. This prevents deadlock when
-    // the main thread blocks in nextDrawable while the GPU needs the
-    // run loop to process drawable release callbacks.
-    if (@available(macOS 12.3, *)) {
-        layer.allowsNextDrawableTimeout = YES;
+        // Configure the layer
+        layer.device = (id<MTLDevice>)_glfw.metal.device;
+        // Plain (non-sRGB) BGRA8Unorm base. C1: sRGB is now encoded in-shader — the
+        // opaque cell/border fragments via the SRGB_ENCODE_OUTPUT function constant,
+        // and layered content in the single-pass resolve draw (kitty/metal.m) — so
+        // no per-frame sRGB texture view of the drawable is created any more.
+        layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        // C4a: framebufferOnly=YES lets Core Animation optimize the drawable for
+        // display (lossless framebuffer compression). Safe now that nothing creates a
+        // texture view of the drawable (that per-frame view creation was the Wave-1
+        // blocker that forced this to NO). Read-back paths — the KITTY_METAL_DUMP_FRAME
+        // golden harness and take_screenshot_of_rectangular_region — render to a
+        // readable offscreen instead (metal_capture_to_offscreen in metal.m), never
+        // the drawable.
+        layer.framebufferOnly = YES;
+        layer.presentsWithTransaction = NO;
+        // CAMetalLayer.maximumDrawableCount accepts only 2 or 3 (any other value
+        // raises an exception, Apple docs); default is 3. Wave-4 measured 2 vs 3
+        // under the CAMetalDisplayLink driver (flood + typing): the link delivers a
+        // vsync-timed drawable to each delegate callback, so there is no CPU-side
+        // nextDrawable race and a 2-deep pool already yields a perfectly steady
+        // present cadence (16.667 ms p50==p99==max at 60 Hz) with drawable_wait_ms
+        // structurally 0. Count 3 gave BYTE-IDENTICAL cadence and zero tail stalls
+        // (no smoothness gain) while adding ~2 ms of PTY-write->present latency (one
+        // more frame of queue depth). The old 2-pass-era "60 ms tail stall at 2" is
+        // gone. So 2 is optimal: shallowest presentation queue == lowest latency.
+        layer.maximumDrawableCount = 2;
+        // layer.colorspace is intentionally left at its default, nil. Per Apple
+        // docs a nil colorspace means the drawable's content "isn't
+        // color-matched" -- Core Animation performs no colorspace transform at
+        // composite time, which is the fast, GL-parity path. kitty already does
+        // its own sRGB handling in the render pipeline (texture views selected
+        // per pass in metal.m), so a CA-side conversion would be redundant work
+        // at best and a double-conversion bug at worst. Never set a colorspace
+        // here.
+        // Allow nextDrawable to return nil instead of blocking indefinitely
+        // when all drawables are in-flight. This prevents deadlock when
+        // the main thread blocks in nextDrawable while the GPU needs the
+        // run loop to process drawable release callbacks.
+        if (@available(macOS 12.3, *)) {
+            layer.allowsNextDrawableTimeout = YES;
+        }
     }
 
     // Match the layer's scale to the backing store. The drawable size is
