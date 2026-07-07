@@ -2171,6 +2171,57 @@ Exit: the scroll-clear campaign is confirmed plateaued-and-winning on
 its own axes with zero regressions; Future work item 15 charters
 Wave 18 (`.omc/handoffs/wave18-region-pacing-KICKOFF.md`).
 
+## Phase 18 (Wave 18): the region-pacing kill test — lever family refuted
+
+Status: MEASURE-FIRST CLOSE at Step 0 (charter
+`.omc/handoffs/wave18-region-pacing-KICKOFF.md`; evidence
+`.omc/verify/wave18/STEP0-DECOUPLE.md`, 24 clean runs). No product
+code — the kill test did its job before a line was written, the
+second time this campaign's Step-0 discipline has retired a
+plausible-but-wrong lever (the first: the Phase-16 draw bucket).
+
+- **The test.** KITTY_TEST_SUPPRESS_RENDER=1 (the Phase-9 lever,
+  semantics verified: the early-return sits at the very top of
+  render_os_window — it deletes the gate, defer, request, AND present
+  entirely, while parse/io/timers run byte-identical; parse fidelity
+  ON/OFF 0.999–1.007) vs OFF, same-binary, ≥3 interleaved rounds each
+  on scrolling_bottom_region, sync_medium_cells, and plain scrolling.
+- **The verdict.** Deleting 100% of the render half moved the drain
+  by 0.0 ms: region 37.0 → 37.0, vim 30.0 → 30.0, control 23.25 →
+  24.0 (ON marginally slower); total bytes drained in the fixed 5 s
+  window equal OFF↔ON (~235/245 MiB). **The prize for the
+  drain-vs-present decouple family is ~0 — there is no coupling to
+  break.** Main-screen parity untouched.
+- **Why the Wave-17 discriminator misled.** The waiting-gate share
+  (0.74 vs 0.50) is a SYMPTOM, not a cost: WAITING ticks are cheap
+  no-ops (return at the defer without set_maximum_wait) that never
+  block the next tick's parse_input, which runs BEFORE render in
+  process_global_state. Driving the gate share to 0.0 changed
+  nothing; render itself had only 0.03–0.06 ms/MiB to reclaim against
+  a ~20 ms/MiB parse wall.
+- **The residual, honestly re-attributed (recorded, NOT chartered).**
+  Region drains ~4 ms/MiB and vim ~9 ms/MiB above their parse walls
+  and this SURVIVES suppression — non-render. Leading candidates: the
+  I/O-thread input_delay coalescing policy (io_loop batches main-loop
+  wakeups for bulk output — cross-reference Phase 8's finding that
+  6.0% of the devlog gap is input_delay POLICY, a deliberate
+  latency/efficiency tradeoff) and the vtebench back-pressure
+  measurement model itself (drain totals are ~axis-invariant, so
+  per-sample ms partly reflects payload shape — survey §10.1's
+  caveat). Policy tradeoffs and artifacts, below the action
+  threshold.
+- **Program verdict: PLATEAU — maintenance mode.** Every coherent
+  lever family the surveys produced has now been landed (hwm+L2
+  shipping at 0.66×, plain scrolling at alacritty parity),
+  measured-and-refuted (the Phase-16 draw bucket), or killed at
+  Step 0 (this phase). The guard tests (sparse-cursor, pre-overwrite,
+  the xlimit verify mode) watch the shipped model; the record
+  contains everything a future input_delay probe would need.
+
+Exit: item 15 resolved REFUTED-AS-LEVER; no new charter opened.
+Standing user items: the ff-merge of metal-fable-5-fast and the
+optional Accessibility grant for a measured typing p99.
+
 ## Final architecture (post-Phase-7 consolidation)
 
 The frame path is native end to end; the GL-name shim survives only where
@@ -2313,17 +2364,18 @@ condition. Updated as captures land.
     recorded in Phase 16 / STEP19-PREP-NOTES.md. The remaining
     scrolling cost lives in the clear/scroll path already solved by
     hwm+L2 — see item 5 (flipped 2026-07-07).
-15. **Alt-screen/region-scroll pacing gap (Phase 17 charter →
-    Wave 18)** — kitty trails alacritty 3.7× on DECSTBM region
-    scrolls (37 vs 10 ms) and 2.73× on vim-session replay
-    (sync_medium_cells), at parity on plain scrolling. The Phase-17
-    survey attributes both to frame-pacing/PTY-drain coupling
-    (waiting-gate share 0.74 vs 0.50; parse, render, and present
-    count all exonerated; hwm+L2 inert on the alt screen). Step-0
-    kill test: the `KITTY_TEST_SUPPRESS_RENDER` decouple A/B sizes
-    the prize before any lever is designed. Charter:
-    `.omc/handoffs/wave18-region-pacing-KICKOFF.md`. Guardrail: never
-    trade main-screen parity for region gains.
+15. **~~Alt-screen/region-scroll pacing gap~~ REFUTED AS A LEVER
+    FAMILY** (Phase 18): the decouple kill test deleted 100% of
+    render/present/gate and moved the drain 0.0 ms on both target
+    axes — the waiting-gate discriminator was a symptom (cheap no-op
+    ticks; parse runs before render), not a cost; render had
+    0.03–0.06 ms/MiB to reclaim against a ~20 ms/MiB wall. Prize ~0;
+    main-screen parity untouched. The non-render residual (region
+    +4 / vim +9 ms/MiB above the parse wall, surviving suppression)
+    is re-attributed to the input_delay coalescing POLICY (Phase-8
+    cross-ref: 6.0% of devlog = policy) and/or vtebench
+    back-pressure measurement shape — recorded in Phase 18, NOT
+    chartered (policy tradeoff / artifact, below threshold).
 
 ## Known deviations (tracked, intentional)
 
