@@ -36,6 +36,28 @@ lb_phys(const LineBuf *lb, index_type y) {
     return p >= lb->ynum ? p - lb->ynum : p;
 }
 
+// S1/S2: the write-choke materialize (init_cells/init_line). The is_blank guard
+// is inlined so the common EAGER path (is_blank never set) is a no-op with no
+// call; the cold body (line-buf.c) is RELOCATE-only. HWM keeps is_blank until
+// finalize, so its work is deferred, not done here.
+void linebuf_materialize_blank_line(LineBuf *self, index_type y);
+static inline void
+linebuf_materialize_blank(LineBuf *self, index_type y) {
+    if (self->line_attrs[lb_phys(self, y)].is_blank) linebuf_materialize_blank_line(self, y);
+}
+
+// The init_line choke (readers + colored-blank writers: erase/SGR/insert-char
+// write cpu-blank + colored GPUCells). Make a deferred row authoritative first
+// so its content is not later mistaken for a deferred tail: RELOCATE zeros the
+// whole row, HWM finalizes (tail only) and drops is_blank. init_cells (the
+// plain draw) uses linebuf_materialize_blank instead, keeping is_blank so HWM
+// can clip the un-drawn tail at render.
+void linebuf_make_authoritative_cold(LineBuf *self, index_type y);
+static inline void
+linebuf_make_authoritative(LineBuf *self, index_type y) {
+    if (self->line_attrs[lb_phys(self, y)].is_blank) linebuf_make_authoritative_cold(self, y);
+}
+
 
 LineBuf* alloc_linebuf(unsigned int, unsigned int, TextCache*);
 LineBuf* alloc_linebuf_with_pool(unsigned int, unsigned int, TextCache*, LineSlotPool*);

@@ -84,6 +84,10 @@ size_t cell_as_utf8_for_fallback(const ListOfChars *lc, char *buf, size_t sz);
 bool unicode_in_range(const Line *self, const index_type start, const index_type limit, const bool include_cc, const bool add_trailing_newline, const bool skip_zero_cells, bool skip_multiline_non_zero_lines, ANSIBuf*);
 PyObject* line_as_unicode(Line *, bool, ANSIBuf*);
 
+// S1/S2 (Phase 13B): the three-arm recycled-row scroll clear (see line-buf.c).
+typedef enum { SCROLL_CLEAR_EAGER, SCROLL_CLEAR_RELOCATE, SCROLL_CLEAR_HWM } ScrollClearMode;
+ScrollClearMode scroll_clear_mode(void);
+
 void linebuf_init_line(LineBuf *, index_type);
 void linebuf_init_line_at(LineBuf *, index_type, Line*);
 void linebuf_init_cells(LineBuf *lb, index_type ynum, CPUCell **c, GPUCell **g);
@@ -92,8 +96,14 @@ void linebuf_clear(LineBuf *, char_type ch);
 void linebuf_clear_lines(LineBuf *self, const Cursor *cursor, index_type start, index_type end);
 void linebuf_index(LineBuf* self, index_type top, index_type bottom);
 void linebuf_reverse_index(LineBuf *self, index_type top, index_type bottom);
-void linebuf_clear_line(LineBuf *self, index_type y, bool clear_attrs);
+// allow_lazy: the caller is a full-screen marginless scroll that may defer the
+// GPU clear (RELOCATE/HWM); region/reverse/insert-delete/resize pass false to
+// force the eager 32B clear (correct by construction).
+void linebuf_clear_line(LineBuf *self, index_type y, bool clear_attrs, bool allow_lazy);
 void linebuf_materialize_blank_line(LineBuf *self, index_type y);
+// S2 (HWM): clear only the untouched GPU tail [xlimit, xnum) of a deferred row
+// and drop is_blank, at line finalize. No-op unless the row is is_blank.
+void linebuf_finalize_hwm_line(LineBuf *self, index_type y);
 void linebuf_insert_lines(LineBuf *self, unsigned int num, unsigned int y, unsigned int bottom);
 void linebuf_delete_lines(LineBuf *self, index_type num, index_type y, index_type bottom);
 void linebuf_copy_line_to(LineBuf *, Line *, index_type);

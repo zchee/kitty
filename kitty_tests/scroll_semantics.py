@@ -436,6 +436,20 @@ class TestScrollSemantics(BaseTest):
         # (d) a fresh (never-scrolled) blank screen still reads default edges.
         self.assertEqual(self.create_screen(cols=6, lines=3).line_edge_colors(), (0, 0))
 
+        # (e) a colored-blank (erase-to-bg) must SURVIVE line finalize: the cells
+        # are cpu-blank but intentionally colored, so the S2 tail-clear (keyed on
+        # the cpu write-extent) must not wipe them. Erase a scrolled row to
+        # yellow, then LF so it is finalized and scrolls up one.
+        s3 = self.create_screen(cols=6, lines=3, scrollback=10)
+        for i in range(3):
+            feed(s3, f'K{i}pp')
+            if i < 2:
+                feed(s3, '\r\n')
+        feed(s3, '\r\n')                  # scroll: fresh blank bottom row, cursor there
+        feed(s3, '\x1b[43m\x1b[K\x1b[m')  # erase the row to yellow bg
+        feed(s3, '\r\n')                  # LF finalizes it; the yellow row -> row 1
+        self.assertEqual(s3.line(1).cursor_from(0).bg, 769, 'erase-to-color wiped at finalize')
+
     def test_scroll_semantics(self):
         regen = bool(os.environ.get('KITTY_REGEN_SCROLL_GOLDENS'))
         results = {}
