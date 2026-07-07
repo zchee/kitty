@@ -1548,6 +1548,41 @@ ligature_type_for_glyph(hb_font_t *hbf, glyph_index glyph_id, SpacerStrategy str
     return ligature_type_from_glyph_name(glyph_name, strategy);
 }
 
+// FN1 (Wave-13A): memoize the per-glyph ligature-name lookup in the font's
+// GlyphProperties cache. ligature_type_for_glyph() does an sfnt glyph-name
+// lookup (hb_font_glyph_to_string) + strcmp for every glyph of every dirty run,
+// but the result only matters for infinite-ligature fonts and never changes for
+// a given (font, glyph_id). Caching it means the string lookup runs at most once
+// per glyph per font. KITTY_DISABLE_LIGNAME_CACHE=1 forces the uncached lookup
+// process-wide; set_ligature_name_cache_enabled() toggles it in-process so tests
+// can compare the cached and uncached paths byte-for-byte. Only group_normal
+// uses this; the Iosevka path keeps its own precomputed array untouched.
+static int ligature_name_cache_state = -1;
+
+static bool
+ligature_name_cache_enabled(void) {
+    if (UNLIKELY(ligature_name_cache_state < 0)) {
+        const char *v = getenv("KITTY_DISABLE_LIGNAME_CACHE");
+        ligature_name_cache_state = (v && v[0] && strcmp(v, "0") != 0) ? 0 : 1;
+    }
+    return ligature_name_cache_state == 1;
+}
+
+static LigatureType
+cached_ligature_type_for_glyph(hb_font_t *hbf, glyph_index glyph_id, Font *font) {
+    // group_normal only ever runs for non-Iosevka fonts (see shape_run), and a
+    // font's spacer_strategy is fixed once detected, so the ligature type for a
+    // glyph is invariant for the font's lifetime and safe to cache.
+    if (!ligature_name_cache_enabled()) return ligature_type_for_glyph(hbf, glyph_id, font->spacer_strategy);
+    GlyphProperties s = find_glyph_properties(font->glyph_properties_hash_table, glyph_id);
+    if (!s.ligature_set) {
+        s.ligature_val = ligature_type_for_glyph(hbf, glyph_id, font->spacer_strategy);
+        s.ligature_set = 1;
+        set_glyph_properties(font->glyph_properties_hash_table, glyph_id, s);
+    }
+    return s.ligature_val;
+}
+
 #define L INFINITE_LIGATURE_START
 #define M INFINITE_LIGATURE_MIDDLE
 #define R INFINITE_LIGATURE_END
@@ -1665,7 +1700,7 @@ group_normal(Font *font, hb_font_t *hbf, const TextCache *tc, ListOfChars *lc) {
     bool prev_glyph_was_inifinte_ligature_end = false;
     while (G(glyph_idx) < G(num_glyphs) && G(cell_idx) < G(num_cells)) {
         glyph_index glyph_id = G(info)[G(glyph_idx)].codepoint;
-        LigatureType ligature_type = ligature_type_for_glyph(hbf, glyph_id, font->spacer_strategy);
+        LigatureType ligature_type = cached_ligature_type_for_glyph(hbf, glyph_id, font);
         cluster = G(info)[G(glyph_idx)].cluster;
         bool is_special = is_special_glyph(glyph_id, font, &G(current_cell_data));
         bool is_empty = is_special && is_empty_glyph(glyph_id, font);
@@ -2551,6 +2586,17 @@ pyrender_box_char(PyObject *self UNUSED, PyObject *args) {
     return Py_NewRef(ans);
 }
 
+static PyObject*
+set_ligature_name_cache_enabled(PyObject *self UNUSED, PyObject *val) {
+    // FN1 differential-test lever: toggle the ligature-name memoization
+    // in-process; returns the previous state so tests can restore it.
+    const int t = PyObject_IsTrue(val);
+    if (t < 0) return NULL;
+    const bool old = ligature_name_cache_enabled();
+    ligature_name_cache_state = t ? 1 : 0;
+    return PyBool_FromLong(old);
+}
+
 static PyMethodDef module_methods[] = {
     METHODB(set_font_data, METH_VARARGS),
     METHODB(sprite_idx_to_pos, METH_VARARGS),
@@ -2562,6 +2608,7 @@ static PyMethodDef module_methods[] = {
     METHODB(render_decoration, METH_VARARGS),
     METHODB(set_send_sprite_to_gpu, METH_O),
     METHODB(set_allow_use_of_box_fonts, METH_O),
+    METHODB(set_ligature_name_cache_enabled, METH_O),
     METHODB(test_shape, METH_VARARGS),
     METHODB(current_fonts, METH_VARARGS),
     METHODB(test_render_line, METH_VARARGS),
