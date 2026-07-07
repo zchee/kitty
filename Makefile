@@ -21,7 +21,6 @@ default: devel
 
 devel: CC=$(shell brew --prefix)/opt/ccache-head/libexec/clang
 devel: VVAL=--verbose
-devel: rebase
 devel: clean
 	PKG_CONFIG_PATH=/opt/homebrew/opt/libpng/lib/pkgconfig:/opt/homebrew/opt/freetype2/lib/pkgconfig:${PKG_CONFIG_PATH} KITTY_USE_METAL=1 ${PYTHON3} setup.py kitty.app -v --full --update-check-interval=0 --shell-integration=enabled $(VVAL)
 	# ${MAKE} docs SPHINXBUILD=/usr/local/share/pipx/sphinx-build
