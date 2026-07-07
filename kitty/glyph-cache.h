@@ -35,6 +35,8 @@ typedef union GlyphProperties {
         uint8_t special_val : 1;
         uint8_t empty_set : 1;
         uint8_t empty_val : 1;
+        uint8_t ligature_set : 1;  // FN1: whether ligature_val has been computed for this glyph
+        uint8_t ligature_val : 2;  // FN1: cached LigatureType (0-3) for the group_normal path
     };
     uint8_t val;
 } GlyphProperties;

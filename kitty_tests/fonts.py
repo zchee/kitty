@@ -16,6 +16,7 @@ from kitty.fast_data_types import (
     ParsedFontFeature,
     get_fallback_font,
     set_allow_use_of_box_fonts,
+    set_ligature_name_cache_enabled,
     sprite_idx_to_pos,
     sprite_map_set_layout,
     sprite_map_set_limits,
@@ -481,6 +482,25 @@ class Rendering(FontBaseTest):
 
         self.ae(groups('i\u0332\u0308', font='LiberationMono-Regular.ttf'), [(1, 2)])
         self.ae(groups('u\u0332 u\u0332\u0301', font='LiberationMono-Regular.ttf'), [(1, 2), (1, 1), (1, 2)])
+
+        # FN1: the ligature-name memoization must not change shaping. Assert the
+        # cached (default) and uncached paths produce byte-identical shaping for
+        # an infinite-ligature font (Cascadia: _start.seq/_end.seq glyph names)
+        # and a calt-ligature font (Fira Code), covering cache miss, hit, and the
+        # KITTY_DISABLE_LIGNAME_CACHE fallback path.
+        lig_probe = (
+            'abcd', 'A===B!=C', 'A=>>B!=C', '->', '<-', '==>', '<==', 'a->b',
+            'a==>b', '----', 'F--a--', '===--<>==', '<==>', '<!--', 'a<!--b',
+            '#_(', 'a#_(b', '<*>>', '9:30',
+        )
+        for font in ('CascadiaCode-Regular.otf', 'FiraCode-Medium.otf'):
+            cached = [ss(t, font=font) for t in lig_probe]
+            prev = set_ligature_name_cache_enabled(False)
+            try:
+                uncached = [ss(t, font=font) for t in lig_probe]
+            finally:
+                set_ligature_name_cache_enabled(prev)
+            self.ae(cached, uncached, f'ligature-name cache changed shaping for {font}')
 
     def test_emoji_presentation(self):
         s = self.create_screen()

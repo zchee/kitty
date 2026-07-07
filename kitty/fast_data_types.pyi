@@ -886,6 +886,10 @@ def set_wide_runfill_enabled(enabled: bool) -> bool:
     pass
 
 
+def set_ligature_name_cache_enabled(enabled: bool) -> bool:
+    pass
+
+
 def test_wide_runfill_fast_class() -> str | None:
     pass
 
