@@ -109,6 +109,14 @@ static id<MTLCommandBuffer> mtl_current_command_buffer = nil;
 static id<MTLRenderCommandEncoder> mtl_current_encoder = nil;
 static id<CAMetalDrawable> mtl_current_drawable = nil;
 static MTLRenderPassDescriptor *mtl_current_render_pass = nil;
+// Static type is CAMetalLayer*, but in IOSurface mode (the default) the
+// object is glfw's KittyIOSurfaceLayer — a plain-CALayer subclass with
+// mirror properties for presentsWithTransaction/displaySyncEnabled/
+// drawableSize (glfw/metal_context.m), resolved at runtime via selector
+// dispatch. Shared code may only touch those mirror selectors and the
+// inherited CALayer surface; CAMetalLayer-only API (nextDrawable,
+// maximumDrawableCount, ...) must stay behind !metal_iosurface_enabled().
+// metal_set_current_layer fatals on a layer-class/mode mismatch.
 static CAMetalLayer *mtl_current_layer = nil;
 // Phase 4 (L1): the drawable delivered by the CAMetalDisplayLink for this frame,
 // set via metal_set_link_drawable() before the link-driven render and cleared
@@ -1251,7 +1259,9 @@ gl_version_string(void) {
 void
 set_gpu_viewport(unsigned w, unsigned h) {
     mtl_viewport = (MTLViewport){0, 0, (double)w, (double)h, 0, 1};
-    // Update the CAMetalLayer drawable size to match the viewport
+    // Update the layer's drawableSize to match the viewport (the real
+    // drawable size on the legacy CAMetalLayer; the stored mirror property —
+    // read back by the IOSurface ring sizing — on KittyIOSurfaceLayer)
     if (mtl_current_layer) {
         CGSize desired = CGSizeMake(w, h);
         if (!CGSizeEqualToSize(mtl_current_layer.drawableSize, desired)) {
@@ -1786,7 +1796,8 @@ load_window_state(const MetalWindowSlot *s) {
     mtl_iosurface_slot_dirty = s->iosurface_slot_dirty;
 }
 
-// Set the current CAMetalLayer for rendering. Called when the OS window is
+// Set the current layer for rendering (CAMetalLayer on the legacy path,
+// KittyIOSurfaceLayer in IOSurface mode). Called when the OS window is
 // made current.
 void
 metal_set_current_layer(void *layer) {
@@ -1804,6 +1815,18 @@ metal_set_current_layer(void *layer) {
         }
         if (!slot) {
             if (!free_slot) { log_error("Metal: too many OS windows for per-window state table"); return; }
+            // Layer class and presentation mode must agree: the env check
+            // lives in two copies (iosurface_present_mode in
+            // glfw/metal_context.m picks the layer class;
+            // metal_iosurface_enabled here picks the code path). A
+            // divergence would send nextDrawable to a plain CALayer
+            // (unrecognized selector) or manual contents assignments to a
+            // layer with a live drawable pool — fail loudly instead.
+            const bool is_metal_layer = [(__bridge CALayer*)layer isKindOfClass:[CAMetalLayer class]];
+            if (metal_iosurface_enabled() == is_metal_layer)
+                fatal("Metal: layer class/mode mismatch (iosurface=%d, CAMetalLayer=%d): "
+                      "glfw iosurface_present_mode() and metal_iosurface_enabled() diverged",
+                      (int)metal_iosurface_enabled(), (int)is_metal_layer);
             slot = free_slot;
             memset(slot, 0, sizeof(*slot));
             slot->in_use = true;
@@ -1840,9 +1863,14 @@ metal_get_device(void) {
 }
 
 // ----- IOSurface presentation model (the default; Phase-4 step 7 graduated) -----
-// Frames render into IOSurface-backed BGRA8 textures (a 3-deep per-window
-// ring) and present by assigning the surface to layer.contents inside an
-// explicit CATransaction once the GPU completes — asynchronously since
+// Frames render into IOSurface-backed BGRA8 textures (a per-window ring)
+// and present by assigning the surface to layer.contents inside an
+// explicit CATransaction once the GPU completes. The backing layer in this
+// mode is glfw's KittyIOSurfaceLayer (plain CALayer subclass,
+// glfw/metal_context.m): manual contents assignment is a supported CALayer
+// operation there, so Core Animation logs no "changing `contents' on
+// CAMetalLayer" error and no drawable-pool state can interfere. The swap
+// happens — asynchronously since
 // Wave-5c: the completed handler dispatches the swap to the main queue, so
 // the main thread never stalls in waitUntilCompleted (live resize, dirty ring
 // slots and KITTY_METAL_SYNC_PRESENT=1 still swap synchronously). Core
@@ -2165,7 +2193,10 @@ metal_forget_layer(void *layer) {
 // The one true contents swap, shared by the sync and async present paths so
 // their transaction discipline cannot drift: explicit transaction (so an
 // enclosing implicit AppKit transaction cannot defer it), no animation, and
-// a flush that pushes the swap to the render server immediately.
+// a flush that pushes the swap to the render server immediately. The param
+// type is CAMetalLayer* only because that is the shared static type; in
+// IOSurface mode the object is a KittyIOSurfaceLayer (plain CALayer), for
+// which this assignment is a fully supported operation.
 static void
 iosurface_swap_contents(CAMetalLayer *layer, IOSurfaceRef surf) {
     [CATransaction begin];
