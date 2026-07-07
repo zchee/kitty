@@ -1706,6 +1706,132 @@ all-levers-off byte-identical and content-verified. dense_cells read
 load): the ≤9 ms absolute is LOAD-BLOCKED here and owned by Phase 13B
 (scroll-memset), not by any 13A lever.
 
+## Phase 13B (Wave 13): the scroll-memset campaign — pacing-blocked
+
+Status: LANDED as a MEASURE-FIRST VERDICT (plan
+`.omc/plans/2026-07-07-wave13-residual-optimization.md` §4.1/§Phase 13B;
+verify `.omc/verify/wave13b/VERIFY-REPORT.md` — scrolling exit gate NOT
+MET, correctness PASS everywhere; the root-cause finding below IS the
+deliverable). Commit arc: 21c12a07a (pre-overwrite semantics tests,
+red-able first) → 38984db8d (S1) → ca7a334c6 (S3) → 2de5b2647 (S1
+default-OFF) → ec8448ed5 (S2, opt-in). Defaults ship EAGER = phase-total
+neutral: final cross-binary trio scrolling before 34 / head 33 ms
+(**0.97**), dense_cells/unicode ratios 1.00 everywhere; Metal + GL suites
+both Ran 359 with only the two documented dev-zsh errors; scroll_semantics
+goldens byte-identical in every arm. All timing LOAD-DEGRADED (loadavg
+5.5–16.3, launchservicesd ~1 core; interleaved same-window arms, ratios
+valid, absolutes flagged).
+
+- **Profile gate (P13B-0, plan pre-mortem #1) — PASS.** Fresh sample(1) of
+  vtebench scrolling on the pre-lever build: the recycled-row clear is
+  **37.9% of main-thread busy** (2283/6027 samples; 39.7% incl. bzero
+  variants; ≥35% under all four denominator readings), split ~1315 GPUCell
+  (20 B) : ~967 CPUCell (12 B) samples. Below the plan's renormalized ~49%
+  estimate — exactly why the fresh capture was gated — but clearing the
+  bar (`.omc/verify/wave13b/P13B-0-PROFILE.md`).
+- **S1 — `is_blank` lazy GPUCell clear** (38984db8d; default flipped OFF
+  at 2de5b2647). `linebuf_clear_line` keeps the 12 B CPUCell clear eager
+  in every arm (every text reader keys off CPUCells) and defers the 20 B
+  GPUCell clear behind a new `is_blank` LineAttrs bit; render routes blank
+  rows via `update_line_data_blank[_diff]`; the one direct GPU reader
+  (`get_line_edge_colors_at_row`) gates to default bg; writers clear
+  is_blank only through materialize chokes that leave GPUCells fully
+  defined. Direct headline win ~0 BY DESIGN (draw_ascii_run re-covers
+  drawn GPUCells, so a whole-row materialize is a relocate — the plan's
+  recorded counter-finding); the deliverable is the S2-ready substrate.
+  Mid-gate verdict: same-binary env A/B eager 33 vs lazy 47 ms
+  (**1.42×**), bimodal (low mode ~35–36 ≈ eager, high mode ~55–57 = +1
+  60 Hz frame exactly; cross-binary trio concurred at 1.59–1.62) with NO
+  work amplification anywhere (D2 bytes/frame 66156=66156, passes 1=1,
+  presents 0.87× — FEWER): a pure pacing-phase effect, the intermittent
+  knife-edge version of the S2 coupling below. → opt-in diagnostic arm.
+- **S3 — circular line_map/line_attrs** (ca7a334c6) — **KEEP, neutral.**
+  The marginless `linebuf_index`/`reverse_index` memmove pair (393
+  samples, 6.5% of busy) becomes an O(1) head bump; every access goes
+  through the branchless `lb_phys` accessor (head + conditional subtract,
+  ~1 predictable cycle); regions/insert/delete normalize to head==0
+  first, so the tested physical memmove internals are unchanged (that
+  normalize + reorder zone is banner-marked as the only sanctioned
+  physical-index path). No runtime lever (structural): identity proven by
+  byte-identical goldens + datatypes/screen/layout/multicell suites both
+  arms of S1. Verdict: head/s1only 1.02 mid-gate, head/before 0.97 final
+  — the per-access cmov ≈ cancels the deleted per-scroll memmove; the
+  O(1) structure is retained for free.
+- **S2 — high-water-mark tail-clear** (ec8448ed5) — the real lever,
+  **OPT-IN pending the pacing fix**. GPU-only-first cut: the CPU 12 B
+  clear stays eager in every arm (CPU readers never see stale, no reader
+  gate), the scroll-time GPU clear is skipped entirely, and the stale
+  tail `[xlimit, xnum)` — xlimit derived from the clean CPUCells — is
+  zeroed parse-side at line finalize (screen_index / eviction / the
+  init_line choke), 0 work for full-width lines; render clips the
+  in-progress cursor line in the ring slot only (render-owned, no
+  cross-thread state). Regions/reverse/insert/delete/resize pass
+  allow_lazy=false → eager, correct by construction. A latent
+  colored-blank bug was caught during implementation (erase-to-bg writes
+  a cpu-blank row whose xlimit==0 finalize would zero the erase color)
+  and fixed by making init_line authoritative BEFORE the writer runs;
+  regression test landed. Correctness: hwm-vs-eager golden frames **4/4
+  byte-identical** incl. partial_scroll/partial_cursor; suites green in
+  all three arms. Perf gate FAIL: eager 34 / hwm 48 (**1.41×**) /
+  relocate 36 ms — the governor coupling below, not the mechanism.
+- **S2b (further/aggressive tail-clear variants): CONTRAINDICATED.** S2
+  already proves the memset approach is capped by the governor coupling;
+  S2b amplifies the same cadence regression without touching the root.
+
+Root cause (code-confirmed; the phase's chief deliverable): the S1/S2
+regressions are neither CPU nor upload — they are a **parse↔render pacing
+coupling in the iosurface flood governor's immediate-encode floor**
+(child-monitor.c:1099-1122). The input-driven immediate-encode fast path
+requires `now − last_gpu_present_at ≥ immediate_encode_floor` (L6: ~0.5×
+refresh ≈ 8 ms @60 Hz). Removing the recycled-row clear speeds the parse
+so each scroll frame's damage completes **inside** the floor → the fast
+path is disqualified → the frame defers → the request path falls to the
+250 ms `no_render_frame_received_recently` fallback → presents collapse
+(hwm 6.6× fewer presents; median present gap 377 vs 57 ms; 0% of gaps in
+the normal 40–80 ms request-loop band vs eager's 70%; per-frame
+bytes/passes/encode identical) → main-loop wakeups slow → PTY
+backpressure. The eager memset had been slowing the parse just enough to
+keep the fast path qualified. vtebench's per-sample sync waits on a
+present, and the rival captures use the same vsync-synced method, so the
+cadence legitimately counts against the headline. Fix candidate (next
+phase): a floor-disqualified frame with pending damage must resync the
+link promptly instead of falling to the 250 ms fallback. Step-0
+confirmation instrumentation is spec'd in
+`.omc/verify/wave13b/VERIFY-REPORT.md` §4 (immediate_encode true/false
+counts, now−last_present distribution at the gate, fallback-branch rate,
+per-tick dirty fraction).
+
+Scroll-clear arm ledger (`scroll_clear_mode()`, line-buf.c — resolved
+once from the environment, precedence top-down):
+- `KITTY_DISABLE_LAZY_ROW_CLEAR` set & ≠0 → **EAGER** (escape hatch, wins).
+- `KITTY_DISABLE_LAZY_ROW_CLEAR=0` → **RELOCATE** (S1 diagnostic arm).
+- `KITTY_ENABLE_HWM_CLEAR=1` → **HWM** (S2; re-test after the pacing fix).
+- unset → **EAGER**, the shipping default until the S2 acceptance gate
+  (stable hwm/eager < 1.0, no bimodal mode, scrolling ≤ 26 ms) passes.
+
+Reader/writer contract (binding on future scroll-model edits): a row with
+`is_blank` set has **zeroed CPUCells** (the 12 B clear is eager in every
+arm) — every text reader (xlimit_for_line, line_is_empty, line_length,
+unicode_in_range, line_as_ansi, selection/as_text) is safe ungated — but
+**stale GPUCells**: GPU readers must gate (edge colors → default bg;
+render → blank[_diff] or the hwm tail clip). Any writer clearing is_blank
+must leave the GPUCells fully defined — that is the
+`linebuf_materialize_blank_line` / `linebuf_finalize_hwm_line` /
+`linebuf_make_authoritative_cold` chokes (init_cells stays a no-op under
+HWM so the render clip keeps covering plain draws). History never holds
+is_blank (rows are made authoritative before the slot swap). Under S3,
+all line_map/line_attrs indexing goes through `lb_phys`; the banner-marked
+normalize + reorder functions are the only sanctioned physical-index zone
+(they run at head==0).
+
+Exit gate: scrolling ≤ 26 ms **NOT MET** (default eager = 34 ms = the
+pre-13B baseline; the block is the governor coupling, chartered as the
+next phase — Future work item 12). All other gates MET: goldens
+byte-identical every arm; the 10-scenario pre-overwrite battery
+(reverse-scroll/ED2/ED3/ring-wrap) green every arm; dense_cells/unicode
+1.00 across arms and binaries; suites at baseline both backends; every
+lever kill-switched and A/B'd same-binary.
+
 ## Final architecture (post-Phase-7 consolidation)
 
 The frame path is native end to end; the GL-name shim survives only where
@@ -1782,9 +1908,13 @@ condition. Updated as captures land.
    defer, numbers in P8-LEVERS.md).
 5. **~~vtebench dense_cells~~ ATTRIBUTED** (Phase 11): it is the
    vt-parser lock contention above, not render or per-cell SGR cost —
-   fixed by item 1. The recycled-row memset from Phase 10 (scroll side,
-   ~25% of the old scroll profile, semantically required) remains a
-   lazy-clear-only follow-up.
+   fixed by item 1. The recycled-row memset lazy-clear follow-up is
+   **implemented in Phase 13B but pacing-blocked**: the CPU reduction is
+   real and correct (S1 relocate + S2 hwm tail-clear, goldens
+   byte-identical), yet the governor coupling (item 12) inverts it into a
+   present-cadence regression, so both arms wait **opt-in**
+   (`KITTY_DISABLE_LAZY_ROW_CLEAR=0` / `KITTY_ENABLE_HWM_CLEAR=1`) until
+   the pacing fix lands.
 6. **Cross-backend composition difference** — §7 #6, tracked in
    .scratch/metal-gl-composition-diff/.
 7. **icat-GIF animation failure** — pre-existing, all configs; tracked in
@@ -1809,6 +1939,18 @@ condition. Updated as captures land.
     `line_as_ansi` + UTF-8 re-encode on the scroll hot path
     (history.c:282-296); lazy/batched serialization is the lever if that
     configuration ever becomes a target.
+12. **Governor pacing decouple (Phase 13B root cause — the next-phase
+    charter)** — the immediate-encode floor (child-monitor.c:1099-1122)
+    disqualifies input-driven frames whose damage completes inside ~0.5×
+    refresh, and the deferred path's 250 ms
+    `no_render_frame_received_recently` fallback then collapses the
+    present cadence (~30× slower than the 40–80 ms request-loop band).
+    Fix candidate: a floor-disqualified frame with pending damage should
+    resync the link promptly instead of falling to the 250 ms fallback.
+    Step-0 confirmation instrumentation (encode-gate counters,
+    now−last_present distribution, fallback-branch rate) is spec'd in
+    `.omc/verify/wave13b/VERIFY-REPORT.md` §4. Unlocks item 5's S1/S2
+    arms and the scrolling ≤26 ms target.
 
 ## Known deviations (tracked, intentional)
 
