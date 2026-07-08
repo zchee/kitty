@@ -1580,6 +1580,7 @@ run_worker(void *p, ParseData *pd, bool flush) {
     pd->ring_fill_start = vt_ring_used(self->input_ring);
     pd->arena_fill_start = self->read.sz - self->read.pos;
     const uint64_t pause_starts0 = screen->pause_starts, pause_stops0 = screen->pause_stops;
+    const uint64_t cow_copied0 = screen->cow_copied, cow_skip0 = screen->cow_skip_eligible;  // Wave-21 L4
     // drain before the parse gate, mirroring the old absorb placement so
     // the gate and the nearly-full override see the post-drain state
     pd->bytes_read += drain_ring(self);
@@ -1621,6 +1622,8 @@ run_worker(void *p, ParseData *pd, bool flush) {
     pd->ring_fill_end = vt_ring_used(self->input_ring);
     pd->pause_starts = (unsigned)(screen->pause_starts - pause_starts0);
     pd->pause_stops = (unsigned)(screen->pause_stops - pause_stops0);
+    pd->cow_copied = (unsigned)(screen->cow_copied - cow_copied0);  // Wave-21 L4
+    pd->cow_skip_eligible = (unsigned)(screen->cow_skip_eligible - cow_skip0);
 }
 
 #ifndef DUMP_COMMANDS

@@ -23,6 +23,23 @@ typedef struct {
     // deferred HWM row); linebuf_finalize_hwm_line reads it to skip the O(xnum)
     // backward xlimit scan. Lives in the same combined allocation as line_map.
     index_type *line_xlimit;
+    // Wave-21 L4: per-physical-row monotonic mutation generation, indexed by
+    // lb_phys() like line_attrs/line_xlimit and living in the same combined
+    // allocation. Bumped (ONLY when pause_snapshot_cow_enabled()) at the
+    // dirty-marking mutation sites, the non-marking line-buf.c mutators, and
+    // every line_map[p] write/permute. For THAT family a (serial, phys, slot,
+    // gen) key recorded by the BSU pause snapshot can only falsely match
+    // after a full uint32 wrap (gen — or of the allocation serial counter)
+    // between two snapshots of the same window. Known exceptions that mutate
+    // content with NO bump (L4-REVIEW.md F1; trace-only impact — they inflate
+    // cow_skip_eligible, so the measured R-hat is an over-estimate and the
+    // L4.2 NO-LAND stands a fortiori; each must gain a bump if the skip is
+    // ever wired): eager-arm linebuf_clear_line on the head-bump scroll path,
+    // remap_hyperlink_ids' cell rewrites, and screen_tab's space-fill.
+    // NEVER moved by linebuf_normalize/reorder ops: permutes bump the
+    // affected physical range instead, keeping each lane entry monotonic
+    // per-phys (fail-toward-copying).
+    uint32_t *line_gen;
     Line *line;
     TextCache *text_cache;
     // S3 (Phase 13B): head-offset circular indexing of line_map/line_attrs so a
@@ -32,7 +49,41 @@ typedef struct {
     // normalize (head->0) first and keep their physical code. head is 0 for a
     // freshly allocated/resized buffer.
     index_type head;
+    // Wave-21 L4: process-unique allocation serial (1-based; 0 is the
+    // never-matches sentinel the pause snapshot writes for history-backed
+    // rows). A resized/rewrapped/alt-screen LineBuf gets a fresh serial, so
+    // snapshot keys recorded against a previous allocation are structurally
+    // unable to match (slot/phys ABA guard). Assigned unconditionally at
+    // alloc: one increment per LineBuf allocation, never on a hot path.
+    uint32_t serial;
 } LineBuf;
+
+// Wave-21 L4 (KITTY_PAUSE_SNAPSHOT_COW): one-shot process-lifetime switch,
+// resolved at first use exactly like scroll_clear_mode() and NEVER re-read,
+// so a mid-session env flip is structurally impossible. OFF (unset/"0") keeps
+// the true legacy path: no generation bumps, no snapshot key bookkeeping.
+extern int pause_snapshot_cow_state;  // -1 unresolved, else 0/1 (line-buf.c)
+bool pause_snapshot_cow_resolve(void);
+static inline bool
+pause_snapshot_cow_enabled(void) {
+    const int s = pause_snapshot_cow_state;
+    return UNLIKELY(s < 0) ? pause_snapshot_cow_resolve() : s != 0;
+}
+
+// Wave-21 L4: bump the mutation generation of physical row p. Callers pass
+// lb_phys(y), or a raw physical index inside the head==0 reorder ops and the
+// order-agnostic full-row loops (the lane is permutation-order-agnostic
+// because permutes bump every row they touch).
+static inline void
+linebuf_gen_bump(LineBuf *self, index_type p) {
+    if (UNLIKELY(pause_snapshot_cow_enabled())) self->line_gen[p]++;
+}
+static inline void
+linebuf_gen_bump_range(LineBuf *self, index_type p_start, index_type p_end_incl) {
+    if (UNLIKELY(pause_snapshot_cow_enabled())) {
+        for (index_type p = p_start; p <= p_end_incl; p++) self->line_gen[p]++;
+    }
+}
 
 // S3: map a logical row index to its physical slot in line_map/line_attrs.
 // One add + predicated subtract (head+y < 2*ynum always), no divide.

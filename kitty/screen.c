@@ -702,6 +702,7 @@ dealloc(Screen* self) {
     PyMem_Free(self->overlay_line.original_line.gpu_cells);
     Py_CLEAR(self->overlay_line.overlay_text);
     PyMem_Free(self->main_tabstops);
+    free(self->paused_rendering.cow_keys); self->paused_rendering.cow_keys = NULL;  // Wave-21 L4
     Py_CLEAR(self->paused_rendering.linebuf);
     Py_CLEAR(self->paused_rendering.grman);
     free(self->selections.items);
@@ -3704,12 +3705,43 @@ screen_pause_rendering(Screen *self, bool pause, int for_in_ms) {
         if (self->paused_rendering.linebuf) Py_CLEAR(self->paused_rendering.linebuf);
         self->paused_rendering.linebuf = alloc_linebuf(self->lines, self->columns, self->text_cache);
         if (!self->paused_rendering.linebuf) { PyErr_Clear(); self->paused_rendering.expires_at = 0; return false; }
+        // Wave-21 L4: the key array's lifetime is tied to the snapshot linebuf —
+        // realloc resets every key, forcing a full copy on the next pause.
+        free(self->paused_rendering.cow_keys); self->paused_rendering.cow_keys = NULL;
+        self->paused_rendering.cow_keys_valid = false;
+        if (pause_snapshot_cow_enabled()) {
+            self->paused_rendering.cow_keys = calloc(self->lines, sizeof(self->paused_rendering.cow_keys[0]));
+        }
     }
+    // Wave-21 L4 (KITTY_PAUSE_SNAPSHOT_COW): per-row identity keys. At L4.1 this
+    // is trace-only — eligibility is counted but every row still copies; the
+    // behavioral skip is wired at L4.3 after the pre-registered cheap-kill check.
+    const bool cow = pause_snapshot_cow_enabled() && self->paused_rendering.cow_keys != NULL;
     for (index_type y = 0; y < self->lines; y++) {
+        struct SnapshotRowKey k = {0};  // lb_serial 0 = never matches (history-backed rows keep it)
+        if (cow) {
+            if (self->scrolled_by == 0) {
+                // Grid-backed row: identity = (allocation serial, physical
+                // position, pool slot) + the monotonic mutation generation.
+                LineBuf *lb = self->linebuf;
+                const index_type p = lb_phys(lb, y);
+                k.lb_serial = lb->serial; k.phys = p; k.slot = lb->line_map[p]; k.gen = lb->line_gen[p];
+                const struct SnapshotRowKey *prev = &self->paused_rendering.cow_keys[y];
+                if (self->paused_rendering.cow_keys_valid && k.lb_serial == prev->lb_serial
+                        && k.phys == prev->phys && k.slot == prev->slot && k.gen == prev->gen)
+                    self->cow_skip_eligible++;
+            }
+            // else: history rows (y < scrolled_by) alias the shared
+            // historybuf->line scratch and have no stable identity — and any
+            // scrolled_by != 0 visual mapping shifts every row — so the whole
+            // snapshot copies unconditionally (pinned Wave-21 rule).
+            self->paused_rendering.cow_keys[y] = k;
+        }
         Line *src = visual_line_(self, y);
         LineBuf *pl = self->paused_rendering.linebuf;
         linebuf_init_line(pl, y);
         copy_line(src, pl->line);
+        if (cow) self->cow_copied++;
         const index_type pp = lb_phys(pl, y);
         pl->line_attrs[pp] = src->attrs;
         // L2: src may be a deferred (is_blank) row and copy_line brought its stale
@@ -3725,6 +3757,7 @@ screen_pause_rendering(Screen *self, bool pause, int for_in_ms) {
             pl->line_attrs[pp].is_blank = 0;
         }
     }
+    if (cow) self->paused_rendering.cow_keys_valid = true;
     copy_selections(&self->paused_rendering.selections, &self->selections);
     copy_selections(&self->paused_rendering.url_ranges, &self->url_ranges);
     if (self->extra_cursors.count) {

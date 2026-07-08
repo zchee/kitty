@@ -549,6 +549,8 @@ static const char* const ft_gate_names[] = {
 // gauges overwrite-per-screen since the bench harness runs one window).
 static uint64_t ft_parsed_bytes;
 static uint64_t ft_pause_starts, ft_pause_stops;
+// Wave-21 L4: pause-snapshot COW probe counters (KITTY_PAUSE_SNAPSHOT_COW).
+static uint64_t ft_cow_copied, ft_cow_skip_eligible;
 static size_t ft_arena_fill_start, ft_arena_fill_end;
 static size_t ft_ring_fill_start, ft_ring_fill_end;
 static bool ft_paused_at_end;
@@ -620,6 +622,7 @@ frame_trace_emit(monotonic_t ts, bool input_read, monotonic_t parse_dt, monotoni
     log_error("ftrace: seq=%llu ts_ms=%.3f gap_ms=%.3f bytes=%llu parse_ms=%.3f render_ms=%.3f"
               " input_read=%d gate=%s present=%d parsed=%llu pause_on=%llu pause_off=%llu"
               " paused_end=%d arena0=%llu arena1=%llu ring0=%llu ring1=%llu"
+              " cow_copied=%llu cow_skip_eligible=%llu"
               " io_iters=%llu io_polls=%llu io_poll_ms=%.3f io_reads=%llu io_read_bytes=%llu"
               " io_read_ms=%.3f io_avail_bytes=%llu io_wrap_capped=%llu io_pollin_off=%llu",
               (unsigned long long)(++ft_seq), ft_ms(ts), ft_ms(gap),
@@ -629,6 +632,7 @@ frame_trace_emit(monotonic_t ts, bool input_read, monotonic_t parse_dt, monotoni
               ft_paused_at_end ? 1 : 0,
               (unsigned long long)ft_arena_fill_start, (unsigned long long)ft_arena_fill_end,
               (unsigned long long)ft_ring_fill_start, (unsigned long long)ft_ring_fill_end,
+              (unsigned long long)ft_cow_copied, (unsigned long long)ft_cow_skip_eligible,
               (unsigned long long)io_iters, (unsigned long long)io_polls, ft_ms((monotonic_t)io_pns),
               (unsigned long long)io_reads, (unsigned long long)io_rbytes, ft_ms((monotonic_t)io_rns),
               (unsigned long long)io_avail, (unsigned long long)io_wrapcap, (unsigned long long)io_pdis);
@@ -651,6 +655,8 @@ do_parse(ChildMonitor *self, Screen *screen, monotonic_t now, bool flush) {
         ft_parsed_bytes += pd.parsed_bytes;
         ft_pause_starts += pd.pause_starts;
         ft_pause_stops += pd.pause_stops;
+        ft_cow_copied += pd.cow_copied;  // Wave-21 L4
+        ft_cow_skip_eligible += pd.cow_skip_eligible;
         ft_arena_fill_start = pd.arena_fill_start;
         ft_arena_fill_end = pd.arena_fill_end;
         ft_ring_fill_start = pd.ring_fill_start;
@@ -2082,6 +2088,7 @@ process_global_state(void *data) {
     if (ft_on) {
         ft_bytes_drained = 0; ft_gate_outcome = FT_GATE_NONE; ft_present_committed = false;
         ft_parsed_bytes = 0; ft_pause_starts = 0; ft_pause_stops = 0; ft_paused_at_end = false;
+        ft_cow_copied = 0; ft_cow_skip_eligible = 0;  // Wave-21 L4
     }
 #endif
 #ifdef __APPLE__
