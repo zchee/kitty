@@ -1928,7 +1928,18 @@ def create_minimal_macos_bundle(args: Options, launcher_dir: str, relocate: bool
             os.remove(kitty_exe)
         os.symlink(os.path.join(os.path.relpath(bin_dir, launcher_dir), appname), kitty_exe)
     create_macos_app_icon(resources_dir)
-    create_quick_access_bundle(kapp, 'Quick access to kitty built from source')
+    # The Metal backend must find default.metallib at runtime. This function
+    # rmtree's kitty.app AFTER compile_metal_shaders() already installed the
+    # metallib (build() ordering), silently producing a GL-fallback dev build
+    # (Wave-20 P0 incident: every KITTY_METAL_* harness hook goes quiet).
+    # Install to BOTH runtime-searchable locations: the loose file next to
+    # the launcher symlink (the path the runtime actually hits — NSBundle
+    # cannot resolve Contents/Resources through the kitty/launcher/kitty
+    # symlink) and the bundle Resources dir (correct for direct .app runs).
+    metallib_src = os.path.join('kitty', 'default.metallib')
+    if is_macos and os.path.exists(metallib_src):
+        for dest_dir in (launcher_dir, resources_dir):
+            shutil.copy2(metallib_src, os.path.join(dest_dir, 'default.metallib'))
 
 
 def create_macos_bundle_gunk(dest: str, for_freeze: bool, args: Options) -> str:

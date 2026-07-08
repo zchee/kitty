@@ -45,6 +45,7 @@ void note_local_key_input(void) { atomic_store_explicit(&last_local_key_input_at
 
 #ifdef __APPLE__
 #include <os/signpost.h>
+#include <mach/mach_time.h>  // Wave-20 T1.1: ktrace_epoch mono↔mach clock anchor
 
 // Phase 0 instrumentation: env-gated os_signpost spans for the main loop's
 // parse/render/render-gate stages. Uses the same log subsystem/category as
@@ -565,6 +566,24 @@ static _Atomic(uint64_t) io_avail_bytes;       // sum of available_buffer_space 
 static _Atomic(uint64_t) io_wrap_capped_calls; // reads whose request was capped by the ring's
                                                 // physical wrap point rather than by true free space
 static _Atomic(uint64_t) io_pollin_disarmed;   // vt_parser_arm_pollin() false (ring genuinely full)
+// Wave-20 T1.1: per-keypress-echo stage stamps (S1..S4 of the typing
+// input→present decomposition; S5 pairs offline with the metal_present
+// stats line). S1 is last_local_key_input_at itself. Io-thread fields are
+// relaxed atomics (io_loop is their single writer); kt_parse_at/
+// kt_emitted_key_at are main-thread-only plain statics. One in-flight
+// journey is enough: the typing harness paces injections >= 80 ms apart,
+// far beyond a single echo's lifetime; a fresh key simply supersedes an
+// unemitted predecessor (visible as a missing seq in the artifact).
+static _Atomic(monotonic_t) kt_echo_read_at;   // S2: io thread read this key's echo
+static _Atomic(uint64_t) kt_echo_bytes;        // bytes in that echo read pass
+static _Atomic(bool) kt_l5_miss;               // echo missed the L5 fast-path window (still stamped)
+static monotonic_t kt_parse_at;                // S3: first do_parse at/after the echo
+static monotonic_t kt_emitted_key_at;          // dedupe: newest key stamp already emitted
+static uint64_t kt_seq;                        // emitted ktrace line counter
+static bool kt_epoch_emitted;                  // one-time mono↔mach anchor line
+// Instrumentation-only recency bound for stamping an echo that missed the
+// L5 window (plan T1.1 l5_miss rule: stamp + flag, never drop).
+#define KT_ECHO_STAMP_WINDOW (ms_to_monotonic_t(500ll))
 
 static bool
 frame_trace_enabled(void) {
@@ -621,6 +640,11 @@ do_parse(ChildMonitor *self, Screen *screen, monotonic_t now, bool flush) {
 #ifdef KITTY_BACKEND_METAL
     // Sum ring bytes drained this tick across every screen parsed (frame-trace).
     if (UNLIKELY(frame_trace_enabled())) {
+        // Wave-20 T1.1 (S3): first parse tick at/after the stamped echo.
+        if (pd.input_read) {
+            const monotonic_t kt_echo = atomic_load_explicit(&kt_echo_read_at, memory_order_relaxed);
+            if (kt_echo > kt_parse_at) kt_parse_at = now;
+        }
         ft_bytes_drained += pd.bytes_read;
         ft_parsed_bytes += pd.parsed_bytes;
         ft_pause_starts += pd.pause_starts;
@@ -2033,6 +2057,34 @@ process_global_state(void *data) {
     if (ft_on) {
         const monotonic_t ft_render_t1 = monotonic();
         frame_trace_emit(now, input_read, ft_parse_t1 - ft_parse_t0, ft_render_t1 - ft_parse_t1);
+        // Wave-20 T1.1: emit one ktrace line per completed keypress-echo
+        // journey — this tick both parsed the echo (S3 stamped) and
+        // classified the render gate (S4 = this tick's ts). S5 (present)
+        // pairs offline against the metal_present line; present= records
+        // whether THIS tick already committed a swap.
+        // One-time clock anchor: kitty's monotonic() is PROCESS-relative
+        // (monotonic_() - monotonic_start_time, monotonic.h) while the
+        // harness's injection stamps and metal_present's presented_time are
+        // mach_absolute_time-derived since boot (CACurrentMediaTime
+        // equivalent). Emitting both clocks in one instant lets the analyzer
+        // shift every ktrace stamp into the mach timebase.
+        if (UNLIKELY(!kt_epoch_emitted)) {
+            kt_epoch_emitted = true;
+            mach_timebase_info_data_t kt_tb; mach_timebase_info(&kt_tb);
+            const double kt_mach_ms = (double)mach_absolute_time() * kt_tb.numer / kt_tb.denom / 1e6;
+            log_error("ktrace_epoch: mono_ms=%.3f mach_ms=%.3f", ft_ms(monotonic()), kt_mach_ms);
+        }
+        const monotonic_t kt_key = atomic_load_explicit(&last_local_key_input_at, memory_order_relaxed);
+        const monotonic_t kt_echo = atomic_load_explicit(&kt_echo_read_at, memory_order_relaxed);
+        if (kt_key > kt_emitted_key_at && kt_echo >= kt_key && kt_parse_at >= kt_echo) {
+            log_error("ktrace: seq=%llu key_ms=%.3f echo_ms=%.3f echo_bytes=%llu parse_ms=%.3f gate_ms=%.3f gate=%s present=%d l5_miss=%d",
+                      (unsigned long long)(++kt_seq), ft_ms(kt_key), ft_ms(kt_echo),
+                      (unsigned long long)atomic_load_explicit(&kt_echo_bytes, memory_order_relaxed),
+                      ft_ms(kt_parse_at), ft_ms(now),
+                      ft_gate_names[ft_gate_outcome], ft_present_committed ? 1 : 0,
+                      atomic_load_explicit(&kt_l5_miss, memory_order_relaxed) ? 1 : 0);
+            kt_emitted_key_at = kt_key;
+        }
     }
 #endif
 #ifdef __APPLE__
@@ -2430,6 +2482,19 @@ io_loop(void *data) {
             // avoiding full-redraw flicker.
             const bool key_echo = total_read_bytes > 0 && total_read_bytes <= L5_SMALL_READ_MAX
                 && (now - atomic_load_explicit(&last_local_key_input_at, memory_order_relaxed)) <= L5_KEY_RECENCY_WINDOW;
+            // Wave-20 T1.1 (S2): stamp the FIRST read after each key press as
+            // that key's echo. An echo outside the L5 window (> 128 B or
+            // > 50 ms, up to the instrumentation bound) is stamped too and
+            // flagged l5_miss — reported as a sub-population, never dropped.
+            if (io_ft && total_read_bytes > 0) {
+                const monotonic_t kt_key = atomic_load_explicit(&last_local_key_input_at, memory_order_relaxed);
+                if (kt_key > 0 && atomic_load_explicit(&kt_echo_read_at, memory_order_relaxed) < kt_key
+                        && now - kt_key <= KT_ECHO_STAMP_WINDOW) {
+                    atomic_store_explicit(&kt_echo_bytes, (uint64_t)total_read_bytes, memory_order_relaxed);
+                    atomic_store_explicit(&kt_l5_miss, !key_echo, memory_order_relaxed);
+                    atomic_store_explicit(&kt_echo_read_at, now, memory_order_relaxed);
+                }
+            }
             if (key_echo || now - last_main_loop_wakeup_at > OPT(input_delay)) WAKEUP
             else has_pending_wakeups = true;
         } else {
