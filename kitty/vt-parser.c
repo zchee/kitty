@@ -1575,6 +1575,11 @@ run_worker(void *p, ParseData *pd, bool flush) {
     Screen *screen = (Screen*)p;
     PS *self = (PS*)screen->vt_parser->state;
     screen->parsing_at = pd->now;
+    // Wave-19 L4 probe: snapshot tick-entry state before the top-of-tick
+    // drain so KITTY_FRAME_TRACE can report absorb-vs-parse shape.
+    pd->ring_fill_start = vt_ring_used(self->input_ring);
+    pd->arena_fill_start = self->read.sz - self->read.pos;
+    const uint64_t pause_starts0 = screen->pause_starts, pause_stops0 = screen->pause_stops;
     // drain before the parse gate, mirroring the old absorb placement so
     // the gate and the nearly-full override see the post-drain state
     pd->bytes_read += drain_ring(self);
@@ -1590,10 +1595,12 @@ run_worker(void *p, ParseData *pd, bool flush) {
             self->dump_callback = pd->dump_callback; self->now = pd->now;
             self->screen = screen;
             self->read.consumed = 0;
+            const size_t pos_before = self->read.pos;
             do {
                 consume_input(self, pd->dump_callback, screen->window_id);
                 pd->bytes_read += drain_ring(self);  // pick up bytes that arrived mid-parse
             } while (self->read.pos < self->read.sz);
+            pd->parsed_bytes = self->read.pos - pos_before;
             // CAS-clear with fail-open re-cover; the helper self-guards
             // on ring emptiness (final-review FR-1)
             vt_ring_clear_new_input_at(self->input_ring, pd->now);
@@ -1609,6 +1616,11 @@ run_worker(void *p, ParseData *pd, bool flush) {
     // the park in vt_ring_writer_arm_or_park, so the wakeup cannot be lost
     // even when the fill raced past drain_ring's view.
     if (vt_ring_unpark_writer(self->input_ring)) pd->write_space_created = true;
+    // Wave-19 L4 probe: tick-exit state (post-admission shift, if any).
+    pd->arena_fill_end = self->read.sz - self->read.pos;
+    pd->ring_fill_end = vt_ring_used(self->input_ring);
+    pd->pause_starts = (unsigned)(screen->pause_starts - pause_starts0);
+    pd->pause_stops = (unsigned)(screen->pause_stops - pause_stops0);
 }
 
 #ifndef DUMP_COMMANDS
@@ -1633,6 +1645,15 @@ vt_parser_arm_pollin(const Parser *p) {
     // false parks the io thread on the full ring; the main thread's
     // per-tick unpark wakes it when draining creates space (FR-2)
     return vt_ring_writer_arm_or_park(self->input_ring);
+}
+
+// Wave-19 L3 probe: total free space in the ring (not just the largest
+// contiguous window vt_parser_create_write_buffer hands out). io thread
+// only; read-only, so safe alongside the SPSC producer/consumer contract.
+size_t
+vt_parser_ring_free_total(const Parser *p) {
+    PS *self = (PS*)p->state;
+    return VT_RING_SZ - vt_ring_used(self->input_ring);
 }
 #endif
 

@@ -541,6 +541,30 @@ static bool ft_present_committed;      // focused window presented (swap) this t
 static const char* const ft_gate_names[] = {
     "none", "immediate", "ready", "rescue", "nreq", "fallback", "waiting"
 };
+// Wave-19 L4: DECSET-2026 pause/drain decomposition fields (summed across
+// every screen parsed this tick, mirroring ft_bytes_drained; the fill
+// gauges overwrite-per-screen since the bench harness runs one window).
+static uint64_t ft_parsed_bytes;
+static uint64_t ft_pause_starts, ft_pause_stops;
+static size_t ft_arena_fill_start, ft_arena_fill_end;
+static size_t ft_ring_fill_start, ft_ring_fill_end;
+static bool ft_paused_at_end;
+// Wave-19 L3: io-thread-side PTY read/poll probe. Written by the io thread
+// (io_loop/read_bytes, single writer), read by the main thread when it
+// piggybacks these cumulative (never-reset) counters onto the ftrace line;
+// relaxed atomics are sufficient since these are diagnostic-only and no
+// other state is synchronized off them (mirrors last_local_key_input_at's
+// existing cross-thread convention in this file).
+static _Atomic(uint64_t) io_loop_iters;        // io_loop while()-top passes
+static _Atomic(uint64_t) io_poll_calls;        // poll() syscalls issued
+static _Atomic(uint64_t) io_poll_ns;           // wall time inside poll()
+static _Atomic(uint64_t) io_read_calls;        // read_bytes() successful read() syscalls
+static _Atomic(uint64_t) io_read_bytes;        // bytes returned by those read() calls
+static _Atomic(uint64_t) io_read_ns;           // wall time inside the read() syscall
+static _Atomic(uint64_t) io_avail_bytes;       // sum of available_buffer_space offered to read()
+static _Atomic(uint64_t) io_wrap_capped_calls; // reads whose request was capped by the ring's
+                                                // physical wrap point rather than by true free space
+static _Atomic(uint64_t) io_pollin_disarmed;   // vt_parser_arm_pollin() false (ring genuinely full)
 
 static bool
 frame_trace_enabled(void) {
@@ -559,11 +583,34 @@ static void
 frame_trace_emit(monotonic_t ts, bool input_read, monotonic_t parse_dt, monotonic_t render_dt) {
     const monotonic_t gap = ft_prev_ts ? ts - ft_prev_ts : 0;
     ft_prev_ts = ts;
+    // Wave-19 L3: cumulative (never-reset) io-thread counters, loaded with
+    // relaxed atomics since this is diagnostic-only cross-thread reporting
+    // piggybacked on the main-thread ftrace line (post-process by diffing
+    // consecutive lines; avoids any read-then-reset race with the writer).
+    const uint64_t io_iters = atomic_load_explicit(&io_loop_iters, memory_order_relaxed);
+    const uint64_t io_polls = atomic_load_explicit(&io_poll_calls, memory_order_relaxed);
+    const uint64_t io_pns = atomic_load_explicit(&io_poll_ns, memory_order_relaxed);
+    const uint64_t io_reads = atomic_load_explicit(&io_read_calls, memory_order_relaxed);
+    const uint64_t io_rbytes = atomic_load_explicit(&io_read_bytes, memory_order_relaxed);
+    const uint64_t io_rns = atomic_load_explicit(&io_read_ns, memory_order_relaxed);
+    const uint64_t io_avail = atomic_load_explicit(&io_avail_bytes, memory_order_relaxed);
+    const uint64_t io_wrapcap = atomic_load_explicit(&io_wrap_capped_calls, memory_order_relaxed);
+    const uint64_t io_pdis = atomic_load_explicit(&io_pollin_disarmed, memory_order_relaxed);
     log_error("ftrace: seq=%llu ts_ms=%.3f gap_ms=%.3f bytes=%llu parse_ms=%.3f render_ms=%.3f"
-              " input_read=%d gate=%s present=%d",
+              " input_read=%d gate=%s present=%d parsed=%llu pause_on=%llu pause_off=%llu"
+              " paused_end=%d arena0=%llu arena1=%llu ring0=%llu ring1=%llu"
+              " io_iters=%llu io_polls=%llu io_poll_ms=%.3f io_reads=%llu io_read_bytes=%llu"
+              " io_read_ms=%.3f io_avail_bytes=%llu io_wrap_capped=%llu io_pollin_off=%llu",
               (unsigned long long)(++ft_seq), ft_ms(ts), ft_ms(gap),
               (unsigned long long)ft_bytes_drained, ft_ms(parse_dt), ft_ms(render_dt),
-              input_read ? 1 : 0, ft_gate_names[ft_gate_outcome], ft_present_committed ? 1 : 0);
+              input_read ? 1 : 0, ft_gate_names[ft_gate_outcome], ft_present_committed ? 1 : 0,
+              (unsigned long long)ft_parsed_bytes, (unsigned long long)ft_pause_starts, (unsigned long long)ft_pause_stops,
+              ft_paused_at_end ? 1 : 0,
+              (unsigned long long)ft_arena_fill_start, (unsigned long long)ft_arena_fill_end,
+              (unsigned long long)ft_ring_fill_start, (unsigned long long)ft_ring_fill_end,
+              (unsigned long long)io_iters, (unsigned long long)io_polls, ft_ms((monotonic_t)io_pns),
+              (unsigned long long)io_reads, (unsigned long long)io_rbytes, ft_ms((monotonic_t)io_rns),
+              (unsigned long long)io_avail, (unsigned long long)io_wrapcap, (unsigned long long)io_pdis);
 }
 #endif
 
@@ -573,7 +620,17 @@ do_parse(ChildMonitor *self, Screen *screen, monotonic_t now, bool flush) {
     self->parse_func(screen, &pd, flush);
 #ifdef KITTY_BACKEND_METAL
     // Sum ring bytes drained this tick across every screen parsed (frame-trace).
-    if (UNLIKELY(frame_trace_enabled())) ft_bytes_drained += pd.bytes_read;
+    if (UNLIKELY(frame_trace_enabled())) {
+        ft_bytes_drained += pd.bytes_read;
+        ft_parsed_bytes += pd.parsed_bytes;
+        ft_pause_starts += pd.pause_starts;
+        ft_pause_stops += pd.pause_stops;
+        ft_arena_fill_start = pd.arena_fill_start;
+        ft_arena_fill_end = pd.arena_fill_end;
+        ft_ring_fill_start = pd.ring_fill_start;
+        ft_ring_fill_end = pd.ring_fill_end;
+        ft_paused_at_end = ft_paused_at_end || (screen->paused_rendering.expires_at != 0);
+    }
 #endif
     // independent of input_read: the top-of-tick ring drain can free a
     // full transport ring even when the input_delay gate declines to
@@ -582,6 +639,12 @@ do_parse(ChildMonitor *self, Screen *screen, monotonic_t now, bool flush) {
     if (pd.input_read) {
         if (screen->paused_rendering.expires_at) {
             set_maximum_wait(MAX(0, screen->paused_rendering.expires_at - now));
+            // DECSET-2026 pause gates rendering, not ring drain: without the
+            // input-cadence bound below, ticks that end inside a BSU..ESU
+            // window arm only the pause-expiry timeout (up to 2s) and drain
+            // cadence collapses to io-wakeup starvation (~3x slower drain on
+            // sync-heavy streams; Wave-19 Probe C).
+            set_maximum_wait(OPT(input_delay) - pd.time_since_new_input);
         } else set_maximum_wait(OPT(input_delay) - pd.time_since_new_input);
     } else if (pd.has_pending_input) set_maximum_wait(OPT(input_delay) - pd.time_since_new_input);
     return pd.input_read;
@@ -1944,7 +2007,10 @@ process_global_state(void *data) {
 #ifdef KITTY_BACKEND_METAL
     // Frame-trace: reset this tick's per-tick accumulators before parse/render.
     const bool ft_on = UNLIKELY(frame_trace_enabled());
-    if (ft_on) { ft_bytes_drained = 0; ft_gate_outcome = FT_GATE_NONE; ft_present_committed = false; }
+    if (ft_on) {
+        ft_bytes_drained = 0; ft_gate_outcome = FT_GATE_NONE; ft_present_committed = false;
+        ft_parsed_bytes = 0; ft_pause_starts = 0; ft_pause_stops = 0; ft_paused_at_end = false;
+    }
 #endif
 #ifdef __APPLE__
     const bool sp = child_monitor_signpost_enabled();
@@ -2072,6 +2138,15 @@ read_bytes(int fd, Screen *screen, size_t *nread) {
     *nread = 0;  // L5: bytes read this call (for the keystroke-echo fast-path)
     uint8_t *buf = vt_parser_create_write_buffer(screen->vt_parser, &available_buffer_space);
     if (!available_buffer_space) return true;
+#ifdef KITTY_BACKEND_METAL
+    // Wave-19 L3 probe: io-thread side of the ftrace instrumentation.
+    // free_total must be snapshotted now, alongside available_buffer_space
+    // and before commit_write moves the ring's head, or the wrap-capped
+    // comparison below would compare pre- and post-commit ring states.
+    const bool io_ft = UNLIKELY(frame_trace_enabled());
+    const monotonic_t io_t0 = io_ft ? monotonic() : 0;
+    const size_t io_free_total = io_ft ? vt_parser_ring_free_total(screen->vt_parser) : 0;
+#endif
 
     while(true) {
         len = read(fd, buf, available_buffer_space);
@@ -2085,6 +2160,20 @@ read_bytes(int fd, Screen *screen, size_t *nread) {
     }
     vt_parser_commit_write(screen->vt_parser, len);
     if (len > 0) *nread = (size_t)len;
+#ifdef KITTY_BACKEND_METAL
+    if (io_ft) {
+        atomic_fetch_add_explicit(&io_read_calls, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&io_read_bytes, (uint64_t)len, memory_order_relaxed);
+        atomic_fetch_add_explicit(&io_read_ns, (uint64_t)(monotonic() - io_t0), memory_order_relaxed);
+        atomic_fetch_add_explicit(&io_avail_bytes, (uint64_t)available_buffer_space, memory_order_relaxed);
+        // Distinguish "capped by the ring's flat-array wrap point" (a read
+        // sizing artifact) from "capped by genuine ring occupancy" (real
+        // backpressure): the former is smaller than the ring's true total
+        // free space, the latter equals it.
+        if (available_buffer_space < io_free_total)
+            atomic_fetch_add_explicit(&io_wrap_capped_calls, 1, memory_order_relaxed);
+    }
+#endif
     return len != 0;
 }
 
@@ -2231,6 +2320,13 @@ io_loop(void *data) {
         children_mutex(unlock);
         data_received = false;
         total_read_bytes = 0;
+#ifdef KITTY_BACKEND_METAL
+        // Wave-19 L3 probe: one io_loop pass. frame_trace_enabled() is a
+        // cached static-bool check (getenv() runs once), cheap to call
+        // every iteration even when off.
+        const bool io_ft = UNLIKELY(frame_trace_enabled());
+        if (io_ft) atomic_fetch_add_explicit(&io_loop_iters, 1, memory_order_relaxed);
+#endif
         for (i = 0; i < self->count + EXTRA_FDS; i++) children_fds[i].revents = 0;
         for (i = 0; i < self->count; i++) {
             screen = children[i].screen;
@@ -2239,19 +2335,39 @@ io_loop(void *data) {
             // ring's waiter protocol before dropping POLLIN, so the parse
             // tick's unpark (write_space_created -> wakeup_io_loop) cannot
             // be lost to a fill that races the fullness check
-            children_fds[EXTRA_FDS + i].events = vt_parser_arm_pollin(screen->vt_parser) ? POLLIN : 0;
+            const bool pollin_armed = vt_parser_arm_pollin(screen->vt_parser);
+#ifdef KITTY_BACKEND_METAL
+            if (io_ft && !pollin_armed) atomic_fetch_add_explicit(&io_pollin_disarmed, 1, memory_order_relaxed);
+#endif
+            children_fds[EXTRA_FDS + i].events = pollin_armed ? POLLIN : 0;
             screen_mutex(lock, write);
             children_fds[EXTRA_FDS + i].events |= (screen->write_buf_used ? POLLOUT  : 0);
             screen_mutex(unlock, write);
         }
+#ifdef KITTY_BACKEND_METAL
+        // count/time only the branches that actually issue poll(2); the
+        // has_pending_wakeups && time_delta<0 case sets ret=0 without
+        // polling and must not be counted as a syscall.
+#define TIMED_POLL(...) do { \
+    const monotonic_t io_poll_t0 = io_ft ? monotonic() : 0; \
+    ret = poll(__VA_ARGS__); \
+    if (io_ft) { \
+        atomic_fetch_add_explicit(&io_poll_calls, 1, memory_order_relaxed); \
+        atomic_fetch_add_explicit(&io_poll_ns, (uint64_t)(monotonic() - io_poll_t0), memory_order_relaxed); \
+    } \
+} while (0)
+#else
+#define TIMED_POLL(...) do { ret = poll(__VA_ARGS__); } while (0)
+#endif
         if (has_pending_wakeups) {
             now = monotonic();
             monotonic_t time_delta = OPT(input_delay) - (now - last_main_loop_wakeup_at);
-            if (time_delta >= 0) ret = poll(children_fds, self->count + EXTRA_FDS, monotonic_t_to_ms(time_delta));
+            if (time_delta >= 0) TIMED_POLL(children_fds, self->count + EXTRA_FDS, monotonic_t_to_ms(time_delta));
             else ret = 0;
         } else {
-            ret = poll(children_fds, self->count + EXTRA_FDS, -1);
+            TIMED_POLL(children_fds, self->count + EXTRA_FDS, -1);
         }
+#undef TIMED_POLL
         if (ret > 0) {
             if (children_fds[0].revents && POLLIN) drain_fd(children_fds[0].fd); // wakeup
             if (children_fds[1].revents && POLLIN) {

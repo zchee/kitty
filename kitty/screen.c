@@ -3676,6 +3676,7 @@ bool
 screen_pause_rendering(Screen *self, bool pause, int for_in_ms) {
     if (!pause) {
         if (!self->paused_rendering.expires_at) return false;
+        self->pause_stops++;
         self->paused_rendering.expires_at = 0;
         // ensure cell data is updated on GPU
         self->is_dirty = true;
@@ -3735,6 +3736,7 @@ screen_pause_rendering(Screen *self, bool pause, int for_in_ms) {
         }
     }
     grman_pause_rendering(self->grman, self->paused_rendering.grman);
+    self->pause_starts++;
     return true;
 }
 

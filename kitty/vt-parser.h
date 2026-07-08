@@ -23,6 +23,18 @@ typedef struct ParseData {
     bool input_read, write_space_created, has_pending_input;
     monotonic_t time_since_new_input;
     size_t bytes_read;  // bytes advanced out of the transport ring into the parse arena this parse (throughput probe)
+
+    // Wave-19 L4: DECSET-2026 pause/drain decomposition probe. Always
+    // populated (cheap per-tick bookkeeping, not per-byte) so KITTY_FRAME_TRACE
+    // can report tick shape without a rebuild; the child-monitor.c emitter
+    // remains the sole env-var-gated (zero-cost-when-off) consumer.
+    size_t parsed_bytes;      // bytes actually consumed out of the arena this tick (0 if not admitted)
+    size_t arena_fill_start;  // unparsed bytes already resident in the arena at tick entry
+    size_t arena_fill_end;    // unparsed bytes resident in the arena at tick exit
+    size_t ring_fill_start;   // transport ring bytes-used at tick entry
+    size_t ring_fill_end;     // transport ring bytes-used at tick exit
+    unsigned pause_starts;    // successful screen_pause_rendering(true) (BSU) calls this tick
+    unsigned pause_stops;     // successful screen_pause_rendering(false) (ESU) calls this tick
 } ParseData;
 
 // The must only be called on the main thread
@@ -38,5 +50,6 @@ void reset_vt_parser(Parser*);
 uint8_t* vt_parser_create_write_buffer(Parser*, size_t*);
 void vt_parser_commit_write(Parser*, size_t);
 bool vt_parser_arm_pollin(const Parser*);
+size_t vt_parser_ring_free_total(const Parser*);
 void parse_worker(void *p, ParseData *data, bool flush);
 void parse_worker_dump(void *p, ParseData *data, bool flush);
