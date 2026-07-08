@@ -2409,6 +2409,70 @@ Exit: both gates adjudicated with pre-registered arithmetic; no victory
 language anywhere; Wave-21 charter = L4 per-line-generation COW (from W19)
 + the per-child reader-thread design, now doubly-chartered.
 
+## Phase 21 (Wave 21): COW refuted at mechanism level; reader design ACCEPTED, W22 skeleton chartered
+
+Executed the consensus plan (`.omc/plans/ralplan-wave21-reader-l4.md` v3,
+Option A: one product-code lane = L4, design-only reader track). Artifacts
+under `.omc/verify/wave21/` — `L4-COW.md`, `L4-REVIEW.md`,
+`L-READER-DESIGN.md` (rev.2), `GATE-ADJUDICATION.md`, `P0-PREFLIGHT.md`;
+ADR-0006. Commits `8e2e7ea58` (L4 dormant trace) + `f5c538279` (harness).
+Two operator directives applied mid-wave: all measurement launches pin the
+operator's real font (MonoLisaCode + features; goldens re-baselined at
+901×601, old set archived) and every vtebench run emits a gnuplot PNG.
+
+**Track L4 (pause-snapshot COW)**: P2.L4 = **NO-LAND via the pre-registered
+L4.2 cheap-kill — R̂ = 0.1273 < 0.2**, three clean rounds identical to four
+decimals, so the 0.5 LAND bar was unreachable by ~4× (R ≤ R̂) and the
+behavioral skip was NEVER wired. The refutation is mechanistic, not
+implementational: sync_medium_cells' row invalidation is scroll-dominated —
+402 bytes/pair does NOT bound rows-invalidated/pair because a 3-byte LF
+shifts every visual row beneath it (mean ≈26/30 rows differ between
+consecutive BSU snapshots; 50/462 pairs carry DECSTBM+IL/DL) — so a
+per-VISUAL-row skip can never elide moved content. W19's "~400 bytes/pair →
+a few rows" expectation is thereby corrected. The gated plumbing
+(`KITTY_PAUSE_SNAPSHOT_COW`, one-shot cached getenv, per-phys-row uint32
+generation lane + allocation serial + snapshot key array) stays compiled-in
+**switch-dormant default-OFF**: goldens 4/4 max_diff=0 unset AND ON, idle
+0.0% 8/8 both arms, OFF ticks emit cow_copied=0, ON/OFF parse cost
+0.987×/1.012× (noise floor). Separate-lane review APPROVE-DORMANT; its
+three no-bump windows (eager clear_line on the head-bump path, hyperlink GC
+remap, TAB space-fill) all inflate R̂ — the kill stands a fortiori — and
+are scoped in-comment as must-bump-before-any-wiring. A slot-anchored
+refcounted-line COW (scroll-surviving) is recorded as an open question,
+unchartered.
+
+**Track D (reader design)**: P2.D = **ACCEPTED (with recorded conditions)**
+after the full two-lane loop — Architect SOUND-WITH-CHANGES ×2 (both
+ITERATE rounds consumed: F1–F12, then N1/F4-residual) → Architect FINAL
+SOUND → Critic ACCEPTED. The review process strengthened the protocol
+itself: **clear-before-drain** for the process-wide main-wakeup CAS (cased
+lost-final-bytes proof), the **flush-wakeup-before-park** liveness rule (a
+reader never blocks on a full ring without a wakeup in flight),
+**EVFILT_USER single-owner teardown** (close-only-after-join), the
+**kqueue availability-count** wait primitive (no trailing EAGAIN probe),
+and the finding that the reads/consumer-wakeup prize is a property of
+reader + **batching window** (eager consumer: 30.7k–43.3k wakeups/64 MiB at
+1.5–2.1 reads/wakeup; 1 ms window: 658–688 at 95–100 — a ~45–65× cut),
+matching R1.3's Alacritty evidence at the consumer, not the kernel poll.
+D4 harness (`r21_reader_proto.py`, bare PTY, zero kitty code): 6/7
+pre-registered scenarios PASS (idle 0.046%, 512 park cycles byte-exact,
+echo 0.52× under an actively-batched flood — the L5 bypass cuts through,
+0 shared-OFD flips, 50 teardown cycles 0 leaks, twofloods 50/50 no
+starvation); the flood ≥150 MB/s absolute MISSED and is reconciled
+(same-run single baseline itself 96–124; GIL-serialized mock; the
+product-legal poll+nonblocking shape cannot inherit R1.1's blocking-read
+number). **Consequence: the Wave-22 reader skeleton is chartered against
+the pre-registered D5 gate** (MB/s ≥1.3× same-block; PTY-servicing
+wakeups/s ≤0.5× the io_polls baseline; reads/PTY-wakeup ≥2; the
+baseline-must-fail discrimination clause; per-reader ftrace counters,
+RLIMIT_NOFILE raise, EVFILT_USER apple-docs verification and the other
+Critic conditions carried in ADR-0006). NO-LAND remains a valid outcome.
+
+Exit: both gates adjudicated with pre-registered arithmetic; zero default-ON
+behavior change (MATRIX cells untouched); no victory language; 60 Hz
+single-machine caveat everywhere; next action = Wave-22 plan re-pinning the
+D5 gate with the ten carried conditions.
+
 ## Final architecture (post-Phase-7 consolidation)
 
 The frame path is native end to end; the GL-name shim survives only where
