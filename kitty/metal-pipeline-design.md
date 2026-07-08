@@ -622,7 +622,7 @@ goldens byte-identical pre/post in BOTH arms, on-glass `screencapture` md5-ident
 (composite/colorspace parity — closes item 2 below), pace attribution unchanged,
 test suite at the known pre-existing baseline. The legacy path
 (`KITTY_METAL_IOSURFACE=0`) still creates a real CAMetalLayer (its flood
-SIGSEGV predates this change — `.scratch/legacy-drawable-flood-crash/`).
+SIGSEGV predates this change — `.omc/.scratch/legacy-drawable-flood-crash/`).
 
 Measurement semantics: `presentedTime` does not exist for a contents
 assignment, so `metal_present … pace=iosurface` lines are stamped by a
@@ -2337,9 +2337,9 @@ condition. Updated as captures land.
    green in all four arms, default ≡ explicit hwm+L2 (19.2 ms/MiB) and
    the hatch reproduces eager's 28.0 exactly.
 6. **Cross-backend composition difference** — §7 #6, tracked in
-   .scratch/metal-gl-composition-diff/.
+   .omc/.scratch/metal-gl-composition-diff/.
 7. **icat-GIF animation failure** — pre-existing, all configs; tracked in
-   .scratch/icat-gif-animation/.
+   .omc/.scratch/icat-gif-animation/.
 8. **Keypress→photon latency capture** — needs the Accessibility grant
    (§7 #4); PTY proxy stands in meanwhile.
 9. **Energy (powermetrics)** — operator sudo + a quiet machine (§7 #9;
