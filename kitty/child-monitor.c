@@ -531,6 +531,8 @@ typedef enum FtGateOutcome {
     FT_GATE_NREQ,       // deferred: NOT_REQUESTED -> requested a frame, no render this tick
     FT_GATE_FALLBACK,   // deferred: REQUESTED past the stall bound but refresh-capped, no render
     FT_GATE_WAITING,    // deferred: REQUESTED and link fresh, waiting for the pace tick, no render
+    FT_GATE_ECHO_IMM,   // Wave-20 L-TYPING lever: keypress-echo frame encoded inline from the
+                        // REQUESTED state (KITTY_METAL_ECHO_IMMEDIATE=1 only; default OFF)
 } FtGateOutcome;
 // All written on the render/main thread (gate + parse) and read by the emitter
 // on the same thread, so plain statics suffice (mirrors pacing_stall_bound_eff).
@@ -540,7 +542,7 @@ static uint64_t ft_bytes_drained;      // bytes drained from transport rings thi
 static FtGateOutcome ft_gate_outcome;  // focused window's gate branch this tick
 static bool ft_present_committed;      // focused window presented (swap) this tick
 static const char* const ft_gate_names[] = {
-    "none", "immediate", "ready", "rescue", "nreq", "fallback", "waiting"
+    "none", "immediate", "ready", "rescue", "nreq", "fallback", "waiting", "echo_imm"
 };
 // Wave-19 L4: DECSET-2026 pause/drain decomposition fields (summed across
 // every screen parsed this tick, mirroring ft_bytes_drained; the fill
@@ -1183,9 +1185,11 @@ os_window_refresh_hz(OSWindow *w) {
 // to the historical 8 ms when the refresh is unknown. Cached on the OS window
 // and recomputed at most ~1/s, which absorbs a monitor hotplug or refresh-rate
 // switch within a second without a per-frame query. This helper is only reached
-// on cold input (the caller's && chain short-circuits on render_state before
-// here), never on the flood hot path. KITTY_METAL_IMMEDIATE_FLOOR_MS=<n> forces
-// a fixed n-ms floor (n>0); 0/unset derives from the refresh.
+// on cold input (the caller checks render_state before it) — plus, with the
+// opt-in Wave-20 echo-immediate lever, on REQUESTED ticks within the 50 ms
+// key-recency window — never on the steady flood hot path.
+// KITTY_METAL_IMMEDIATE_FLOOR_MS=<n> forces a fixed n-ms floor (n>0); 0/unset
+// derives from the refresh.
 static monotonic_t
 immediate_encode_floor(OSWindow *w, monotonic_t now) {
     static int env_floor_ms = -2;  // -2 unread, -1 derive, >=0 fixed override
@@ -1206,6 +1210,35 @@ immediate_encode_floor(OSWindow *w, monotonic_t now) {
         w->immediate_floor_computed_at = now;
     }
     return w->immediate_present_floor;
+}
+
+// Wave-20 L-TYPING lever (P3, plan §Phase 3): extend the L2 immediate-encode
+// fast path to keypress-echo frames that arrive while a pace-link frame
+// request is already outstanding. T1-TYPING-DECOMP measured that 197/300
+// echo frames classify gate=waiting and eat one full link-tick wait (S5
+// 18.4 ms p50) — the only stage holding the typing rank prize. Rendering
+// inline while RENDER_FRAME_REQUESTED is the Wave-14 stall-rescue's proven
+// operation (request_frame_render is idempotent; the post-render resync
+// re-syncs the link), and the immediate-encode floor still applies, so an
+// autorepeat storm cannot present above the refresh-capped fast-path rate.
+// Eligibility marker: a local key press within L5_KEY_RECENCY_WINDOW (the
+// same 50 ms recency the io-side echo fast path uses).
+// VERDICT (P2.1 re-adjudication, n=300/arm, GATE-ADJUDICATION.md): the
+// lever works mechanically — the gate=waiting echo class vanishes and S5
+// collapses 16.7→9.4 ms p50, the physical vsync-quantization floor — but
+// the photon recovers only Δp50 5.96 / Δp99 1.67 ms against thresholds
+// 9.32 / 10.04 (ABS floor 2.90): NO-CHARTER. The residual gap lives in S2
+// (io wake + echo turnaround), Wave-21 reader-thread territory. This stays
+// a measurement/reproduction lever ONLY: default OFF is byte-identical
+// (goldens 4/4 max_diff=0, idle 0.0%); never flip without a fresh gate.
+static bool
+metal_echo_immediate_enabled(void) {
+    static int cached = -1;
+    if (UNLIKELY(cached < 0)) {
+        const char *v = getenv("KITTY_METAL_ECHO_IMMEDIATE");
+        cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return cached == 1;
 }
 
 // Wave-14 pacing stall-rescue bounds. Refresh-derived from the same cached
@@ -1446,11 +1479,26 @@ render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images, bo
 #endif
     bool immediate_encode = false;
 #ifdef KITTY_BACKEND_METAL
+    bool echo_immediate = false;
     if (metal_immediate_encode_enabled()
         && input_driven && !w->keep_rendering_till_swap && USE_RENDER_FRAMES
-        && w->render_state == RENDER_FRAME_NOT_REQUESTED && !w->live_resize.in_progress
-        && global_state.thumbnail_callback.os_window != w->id
-        && now - w->last_gpu_present_at >= immediate_encode_floor(w, now)) immediate_encode = true;
+        && !w->live_resize.in_progress
+        && global_state.thumbnail_callback.os_window != w->id) {
+        // Original eligibility: pace link idle. Lever (default OFF): a
+        // keypress-echo frame may also encode inline from the REQUESTED
+        // (gate=waiting) state — see metal_echo_immediate_enabled(). The
+        // floor check stays last so the flood hot path (REQUESTED, no
+        // recent key) still never reaches immediate_encode_floor().
+        bool state_ok = w->render_state == RENDER_FRAME_NOT_REQUESTED;
+        if (!state_ok && w->render_state == RENDER_FRAME_REQUESTED
+            && metal_echo_immediate_enabled()
+            && now - atomic_load_explicit(&last_local_key_input_at, memory_order_relaxed) <= L5_KEY_RECENCY_WINDOW) {
+            state_ok = true;
+            echo_immediate = true;
+        }
+        if (state_ok && now - w->last_gpu_present_at >= immediate_encode_floor(w, now)) immediate_encode = true;
+        else echo_immediate = false;
+    }
 #else
     (void)input_driven;
 #endif
@@ -1459,7 +1507,7 @@ render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images, bo
 #endif
     if (immediate_encode) {
 #ifdef KITTY_BACKEND_METAL
-        if (ft) ft_gate_outcome = FT_GATE_IMMEDIATE;
+        if (ft) ft_gate_outcome = echo_immediate ? FT_GATE_ECHO_IMM : FT_GATE_IMMEDIATE;
 #endif
 #ifdef __APPLE__
         if (sp) os_signpost_event_emit(slog, render_gate_sid, "render_gate", "window=%llu state=%{public}s", w->id, "immediate");
