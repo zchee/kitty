@@ -2333,6 +2333,82 @@ victory claim; Wave-20 charter auto-generated from the gap list.
 Standing operator item: `kill -CONT` the SIGSTOP-frozen mediaanalysisd
 (pid 17320; see QUIET-GATE-NOTE.md).
 
+## Phase 20 (Wave 20): both losing axes decomposed — typing NO-CHARTER ×2, reader CHARTERED
+
+The wave that executed Wave-19's top-2 gap list under the consensus plan
+(`.omc/plans/ralplan-wave20-typing-l3-l4.md` v2.1): Track T = typing
+input→present stage decomposition, Track R = L3 select-free reader
+adjudication. Artifacts under `.omc/verify/wave20/` — `T1-TYPING-DECOMP.md`,
+`R1-READER-ADJUDICATION.md`, `GATE-ADJUDICATION.md`, `L-TYPING.md`,
+`P0-PREFLIGHT.md`. Preflight fixed a real build defect en route: the
+launcher-bundle rebuild deleted `default.metallib` AFTER the shader step
+installed it (silent GL fallback; the launcher symlink defeats NSBundle so
+the runtime loads the LOOSE launcher-dir copy) — `setup.py` now reinstalls
+both copies at the end of bundle creation. Golden driver hardened (focus
+pin, cursor pin, non-black gate, vacuous-compare guard) + reference
+recaptured at 701×391.
+
+**Track T (typing)**: `KITTY_FRAME_TRACE` gained per-keypress `ktrace:`
+S1–S5 stage stamps (zero behavior unset; goldens max_diff=0, idle 0.0%).
+The n=300 decomposition (AC1 reconciliation 0.0%/0.0%) split kitty's
+keypress→photon into S1 3.4 (OS delivery) / S2 11.2 (io wake + echo
+turnaround) / S3 3.4 (input_delay batch floor, measured to 0.05 at
+delay=0) / S4 ≈0 / **S5 18.4 (pace-link wait — the dominant kitty-owned
+stage; 197/300 echoes gate=waiting)** / S6 6.8 (compositor floor). P2.1
+round 1: SYNC_IMMEDIATE recovers ~0 (scope excludes link-driven echo
+frames — W13A reproduced at stage level), input_delay=0 recovers 8.3/1.2
+(refuted family, component-sized only) → NO-CHARTER; structural charter =
+extend immediate-encode eligibility to echo frames. **P3 built that lever**
+(`KITTY_METAL_ECHO_IMMEDIATE`, echo frames encode inline from the
+REQUESTED/waiting state within the 50 ms key-recency window; W14
+stall-rescue mechanics; floor preserved; FRAME_TRACE gate class
+`echo_imm`). The re-adjudication A/B (n=300/arm, fresh same-block arms) is
+the wave's sharpest result: **the lever fully works mechanically —
+gate=waiting extinct (echo_imm 245/297), S5 16.68 → 9.40 ms p50 = the
+vsync-quantization physical floor (IOSurface `presented_time` stamps at the
+first refresh after the contents swap) — and still clears neither band**
+(Δp50 5.96 < 9.32*, Δp99 1.67 < 2.90 ABS floor): **NO-CHARTER, S5 is
+exhausted as a lever surface at 60 Hz.** The residual kitty−Alacritty gap
+(6.35 ms p50) lives in S2 — the per-poll io-wakeup round-trip. Lever stays
+in-tree default-OFF as a measurement/reproduction switch (byte-identical
+unset, guards green); no matrix change (P4.1 no-op).
+
+**Track R (reader)**: both pre-registered P2.2 preconditions adjudicated.
+(1) Inflow: the bare-PTY probe's **dedicated blocking-read thread idiom
+sustains 157.9 MB/s ≥ 150 at CPU 1.23× ≤ 1.5×** (hotpoll expected-fail
+confirmed — poll(0) re-reads always find an empty queue; the bounded
+`read_bytes` rework family is dead at the harness level). (2) Comparative:
+Alacritty @ bdb72b3, source-instrumented with the mirror io counters
+(`ALACRITTY_IO_TRACE`, observer-effect −0.57%/+4.58% ≤ 5%), on the
+identical PTY workload beats kitty **2.78× (unicode) / 1.53× (dense_cells)
+MB/s at the SAME ~1 KiB kernel read quantum** (99.8%+ of its reads ≤ 1024 B)
+via wakeup economics alone: its read→parse→read loop coalesces 3.6–17.4
+reads per wakeup (parse time lets the kernel queue refill) at 6–16%
+pollwait vs kitty's 1.0 read/wakeup at 86–90% pollwait → **band (b)
+WAKEUP-ECONOMICS CONFIRMED; charter = per-child reader-thread architecture**
+(design-first, Wave 21; mandatory: per-fd fairness, EAGAIN-vs-EINTR
+discipline, busy-spin guard). R1.4 Ghostty kill-veto never armed (band (a)
+never read). Zero reader-path kitty code landed this wave.
+
+**Convergence**: Track T's terminal finding (residual = S2 io-wake hop) and
+Track R's charter (reader thread eliminates the poll round-trip) are the
+same mechanism — Wave 21's reader-thread design carries BOTH the flood
+inflow prize (1.6–1.9× vs Ghostty) and the remaining typing-rank prize.
+
+Harness: typing arms now pin to the LG UltraFine center (operator
+directive; `typing_photon.py _measurement_display`, `TYPING_PHOTON_DISPLAY`
+override) after a slot survey found the main-display/top-left bands under
+the operator's ambient UI recomposite at ~59 hits/s while the secondary's
+center idles at ~0.7/s. Energy sidebar (S1) remains operator-gated
+(deferred again; no lever landed, so the conditional-default rule was not
+exercised). 60 Hz single-machine external-validity caveat rides every
+claim; kitty-arm absolute drift vs W19 (±5–11 ms across display/reboot
+changes) is recorded — same-block arithmetic only.
+
+Exit: both gates adjudicated with pre-registered arithmetic; no victory
+language anywhere; Wave-21 charter = L4 per-line-generation COW (from W19)
++ the per-child reader-thread design, now doubly-chartered.
+
 ## Final architecture (post-Phase-7 consolidation)
 
 The frame path is native end to end; the GL-name shim survives only where
