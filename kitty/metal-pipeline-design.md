@@ -2248,6 +2248,91 @@ Exit: item 15 resolved REFUTED-AS-LEVER; no new charter opened.
 Standing user items: the ff-merge of metal-fable-5-fast and the
 optional Accessibility grant for a measured typing p99.
 
+## Phase 19 (Wave 19): the founding competitive bar — measured; kitty is 3rd/4th
+
+The wave that finally cashed the campaign's founding claim: 4 competitors
+(Ghostty, Alacritty, iTerm2 nightly, Terminal.app) × 3 axes (throughput,
+typing keypress→photon, energy), same machine, parity config (Menlo 11pt,
+AA on, ligatures off, 100×30, shell integration off), sanitized env, kitty
+interleaved in the same measurement block. Plan
+`.omc/plans/2026-07-08-wave19-worlds-fastest-bar.md` (Option C′); artifacts
+under `.omc/verify/wave19/` — `MATRIX-BLOCK.md` (cells),
+`MATRIX-FINAL.md` (adjudication), `GATE-ADJUDICATION.md` (probe gates).
+
+**Step-0 probes first (zero product code), and two of three trace-lane
+mechanisms died on contact**: Probe A (render-suppress) returned r≈0.93–1.0
+— the dark residual on unicode/dense is NOT raster (render_ms ≈ 0.09); the
+follow-up io-side decomposition (L3) found the real wall: a hard macOS
+kernel ceiling of **1024 B per PTY read** (all idioms, content-independent,
+`pty_ceiling_probe.py`) times kitty's 11–22 µs io-wakeup round-trip → 45–93
+MB/s inflow vs a 173–240 MB/s blocking-loop bound; drain-until-EAGAIN
+refuted (queue is empty after one read). Probe B: `input_delay=0` moved the
+region axis only partially (D=0.304, prize ~2.7% < 5%) and vim/unicode/dense
+not at all — **L2 (adaptive/default input_delay) is dead on four axes**,
+with the flood side-benefit confirmed by direct evidence (delay=0 explodes
+flood render prep 0.01→~10 ms/MiB — the batching does real work). Probe C:
+survival 1.0 — the vim-axis excess attributes entirely to DECSET-2026, and
+the L4 decomposition showed the 3.2× sync headline is vtebench
+measurement-model amplification of a real **1.43×** cost, the per-BSU
+full-grid snapshot (~2.3 µs/pair); fix = per-line generation tracking (COW
+snapshot), architecture-level → Wave-20. The one lever landed stays landed:
+the do_parse input-cadence pause bound (8d47ab2da, goldens 4/4).
+
+**The matrix.** Throughput (7-bench vtebench subset × 3 interleaved
+rounds, lead-app rotation): **kitty is 3rd on all seven benches** — Ghostty
+wins 6/7, Alacritty 1/7 (bottom_region), iTerm2/Terminal.app trail
+everywhere. kitty÷best: dense 1.67×, unicode 1.60×, scrolling 1.92×,
+bottom_region 3.60×, sync 6.00×, medium 1.80×, fullscreen 2.81× — the worst
+two sit exactly on the L4 (BSU snapshot) and L3 (PTY ceiling) mechanisms.
+Typing (new app-agnostic instrument `typing_photon.py`: CGEventPost
+rotating-digit injection, CGDisplayStream dirty-rect photon detection, 300
+samples/arm, all arms same display, zero focus warnings): **Ghostty and
+Terminal.app tie for 1st at p50 7.9/8.2 ms; Alacritty 3rd at 33.5; kitty
+tied-4th with iTerm2 at 38.9 ms p50 / 60.9 p99**. kitty's own
+`metal_present` cross-validation (n=300) decomposes the cell: ~32.4 ms of
+the 38.9 accrues BEFORE present (the keypress→present p50 itself) — the
+input→parse-admission→render-schedule pipeline, ≈2 frames at 60 Hz — and
+only ~6.5 ms (38.9 − 32.4) is compositor/scan-out.
+L1 (gate-2 echo-bypass) was left unlanded by the net-of-matrix charter
+gate: its ~3 ms input_delay slice cannot change kitty's typing rank.
+Energy (powermetrics, idle/scroll/vim × 60 s × 5 apps): recorded as an
+explicit limitation — powermetrics needs root and the operator deferred
+the sudo session; the driver/analyzer (`p2b_energy.py`) is built and
+validated, so the five cells are replaceable later without disturbing
+the other axes. A limitation-only cell fails the victory declaration
+closed — moot here, the rule already failed on throughput and typing.
+
+**Instrument findings worth keeping** (they invalidated real data this
+wave): (1) windows created in an AppleEvent-launched, never-activated app
+are NEVER composited on macOS 27 — AppleScript reports `visible: false`,
+CGWindowList shows nothing, and AppleScript `activate` from a background
+osascript is ignored under cooperative activation (NSRunningApplication
+activation + frontmost verification is the reliable path); Terminal.app's
+occlusion throttling had inflated its entire throughput column 2.8–4.6×
+(corrected by a visible-window re-run; iTerm2 measured insensitive; ranks
+unchanged). (2) CGDisplayStream dirty rects are in the output buffer's
+coordinate space — watch the display that actually hosts the window and
+intersect in display-local points (windows on this machine open on a
+non-main display). (3) A mid-block `mediaanalysisd`+Raycast load storm
+(1-min load 151) forced one full matrix re-run; the quiet-gate's 120 s cap
+is not a guarantee — per-row loadavg recording is what made the
+contamination adjudicable.
+
+**Verdict (P4.2, mechanical): no declaration.** kitty is not 1st or
+tied-1st on any measured axis. The ranked Wave-20 gap list
+(`MATRIX-FINAL.md`): (1) typing input→present decomposition (~32.4 ms
+pre-present, ≈2 frames — pacing/admission, not raster); (2) select-free
+PTY reader hot path (L3, flood 1.6–1.9×); (3) per-line-generation COW
+snapshot for DECSET-2026 (L4, sync 6× cell); (4) region-scroll residual
+folded into the reader work (L2 policy lane closed). "No lever fires" was
+pre-registered as a valid, complete outcome — this wave is the measurement
+that makes Wave-20's engineering falsifiable.
+
+Exit: matrix complete and adjudicated; verdict = ranked gap list, no
+victory claim; Wave-20 charter auto-generated from the gap list.
+Standing operator item: `kill -CONT` the SIGSTOP-frozen mediaanalysisd
+(pid 17320; see QUIET-GATE-NOTE.md).
+
 ## Final architecture (post-Phase-7 consolidation)
 
 The frame path is native end to end; the GL-name shim survives only where
