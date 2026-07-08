@@ -52,6 +52,10 @@ from _kitty_harness_common import (
 CONTENT_HELPER = Path(__file__).resolve().parent / "_golden_content_helper.py"
 DEFAULT_GOLDEN_DIR = REPO_ROOT / ".omc" / "golden"
 BGIMAGE_ASSET = REPO_ROOT / "logo" / "kitty-128.png"
+# Floor for the non-black capture gate; the deterministic content helper
+# paints hundreds of distinct colors (reference set: 1700+), so anything
+# below this is an empty/failed frame, not a rendering difference.
+MIN_UNIQUE_COLORS = 32
 
 # Phase-0 starting matrix, exactly as specified by the task: default-opaque,
 # background_opacity=0.85, cursor_trail enabled, one bgimage config. Values
@@ -88,11 +92,24 @@ def capture_config(name: str, opts: list[str], output_dir: Path, timeout: float)
     # by a few bytes despite identical content, consistent with catching
     # different blink phases. A golden-image regression gate needs
     # bit-for-bit reproducibility for a fixed config to be trustworthy.
-    full_opts = ["cursor_blink_interval=0", *opts]
+    # cursor_shape_unfocused=unchanged: the dump overwrites on EVERY frame and
+    # content is static after the helper paints, so the surviving frame lands
+    # on an arbitrary side of the focus-arrival race — without this pin the
+    # focused (block) vs unfocused (hollow) cursor makes same-session pairs
+    # differ by max_diff≈204 in the cursor cell (Wave-2 finding, re-hit in
+    # Wave-20 P0; see .omc/golden/RECAPTURE-NOTES.md).
+    full_opts = ["cursor_blink_interval=0", "cursor_shape_unfocused=unchanged", *opts]
+    # take_focus=True is load-bearing (Wave-20 P0 finding): an unfocused
+    # spawn fully occluded by the user's windows renders ZERO frames (kitty's
+    # occlusion skip), so KITTY_METAL_DUMP_FRAME never fires and the capture
+    # silently produces nothing — or, at a display-attach boundary, a single
+    # empty (all-black) frame. The Wave-2/3 reference driver pinned focus for
+    # the same reason ("golden_capture_focus_pinned").
     proc = spawn_kitty(
         [sys.executable, str(CONTENT_HELPER)],
         extra_env={"KITTY_METAL_DUMP_FRAME": str(png_path)},
         extra_kitty_opts=full_opts,
+        take_focus=True,
     )
     timed_out = False
     try:
@@ -114,6 +131,23 @@ def capture_config(name: str, opts: list[str], output_dir: Path, timeout: float)
         return result
     result["path"] = str(png_path)
     result["bytes"] = png_path.stat().st_size
+    # Non-black gate (Wave-20 P0 finding): a capture that "succeeds" while
+    # the window never composits content is a valid-looking PNG of pure
+    # black; byte-identical black pairs pass a naive A/B diff. The fixed
+    # content helper paints 16/256/truecolor samples, so any real capture
+    # has far more than MIN_UNIQUE_COLORS distinct pixels.
+    try:
+        from PIL import Image
+        with Image.open(png_path) as im:
+            colors = im.convert("RGB").getcolors(maxcolors=1 << 24)
+        result["unique_colors"] = len(colors) if colors else 0
+        if result["unique_colors"] < MIN_UNIQUE_COLORS:
+            result["error"] = (
+                f"capture is visually EMPTY ({result['unique_colors']} unique colors < {MIN_UNIQUE_COLORS})"
+                " -- window likely never rendered content (occluded/display-off); capture is INVALID"
+            )
+    except ImportError:
+        result["unique_colors"] = None  # Pillow-less direct invocation: gate skipped, recorded as unknown
     return result
 
 
@@ -184,6 +218,11 @@ def cmd_compare(args: argparse.Namespace) -> int:
     configs_a = {p.stem for p in dir_a.glob("*.png")}
     configs_b = {p.stem for p in dir_b.glob("*.png")}
     all_configs = sorted(configs_a | configs_b)
+    if not all_configs:
+        # Vacuous-pass hole (hit in Wave-20 P0): comparing two empty/not-yet-
+        # written directories must be a loud failure, not an all_pass=True.
+        print(f"ERROR: no PNGs found in either {dir_a} or {dir_b} -- nothing to compare", file=sys.stderr)
+        return 2
 
     summary: dict[str, Any] = {
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
