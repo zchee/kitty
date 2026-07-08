@@ -1,6 +1,6 @@
 # Wave 19: prove the founding bar, discriminate the above-wall residual
 
-Status: ready-for-agent
+Status: ready-for-human
 
 ## Origin
 
@@ -49,3 +49,31 @@ real 1.43× BSU-snapshot cost; COW-snapshot fix → Wave-20. Probe D killed
 L2 on 4 axes (and showed input_delay batching saves ~10 ms/MiB of flood
 render CPU — energy evidence). L3 residual = io/PTY read path by
 elimination; io-side instrumentation in flight.
+
+**2026-07-08 (matrix: throughput + typing axes adjudicated)**: 5-app
+interleaved block complete (105/105 runs after one load-storm re-run —
+QUIET-GATE-NOTE.md). Throughput: **kitty 3rd on all 7 benches** (Ghostty
+6/7 wins, Alacritty 1/7); worst cells sit on L4 (sync 6×) and L3 (floods
+1.6–1.9×). Terminal.app column was occlusion-throttle contaminated
+(AppleEvent windows never composite un-activated — macOS 27 finding) and
+was re-captured visible: 2.8–4.6× faster, ranks unchanged; iTerm2 measured
+insensitive. Typing (typing_photon.py first live run; multi-display
+coord + activation teething fixed): Ghostty/Terminal tied-1st 7.9/8.2 ms
+p50; **kitty tied-4th 38.9 ms p50 / 60.9 p99**; cross-val shows ~32.4 ms
+is pre-present (input→present pipeline, ≈2 frames) — L1's ~3 ms slice cannot
+change rank, NOT landed (net-of-matrix gate). Victory rule already fails
+on both axes → outcome = ranked gap list (MATRIX-FINAL.md). Energy axis
+pending operator sudo.
+
+**2026-07-08 (CLOSED — adjudicated, no declaration)**: Energy row recorded
+as an explicit documented limitation (operator deferred the sudo session;
+`p2b_energy.py` driver+analyzer ready for later replacement — cells swap
+in without re-running other axes). Final verdict per the mechanical rule:
+**kitty is 1st on no axis** (throughput 3rd everywhere; typing tied-4th) —
+outcome = ranked Wave-20 gap list in MATRIX-FINAL.md: (1) typing
+input→present decomposition (~32.4 ms pre-present), (2) select-free PTY
+reader (L3), (3) BSU COW snapshot (L4), (4) region residual folded into
+(2). Ledger updated (metal-pipeline-design.md Phase 19). mediaanalysisd
+un-frozen at close. Remaining human items: Wave-20 charter kickoff,
+optional later energy capture, stale .omc/golden recapture (800×500 vs
+701×391 note from the resume handoff).
