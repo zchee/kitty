@@ -203,6 +203,11 @@ typedef struct {
         Selections selections, url_ranges;
         ExtraCursors extra_cursors;
     } paused_rendering;
+    // Wave-19 L4 probe: cumulative counts of successful BSU/ESU transitions
+    // (DECSET-2026 / DECRPM pending-mode set-reset), diffed per-tick by the
+    // parser (run_worker) to feed KITTY_FRAME_TRACE. Always maintained (two
+    // integer increments per transition, not per-byte).
+    uint64_t pause_starts, pause_stops;
     CharsetState charset;
     ListOfChars *lc;
     monotonic_t parsing_at;
