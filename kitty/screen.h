@@ -202,12 +202,28 @@ typedef struct {
         GraphicsManager *grman;
         Selections selections, url_ranges;
         ExtraCursors extra_cursors;
+        // Wave-21 L4 (KITTY_PAUSE_SNAPSHOT_COW): per-visual-row identity keys
+        // recorded at the last completed pause snapshot. A row may be skipped
+        // (L4.3) only when its current (lb_serial, phys, slot, gen) equals the
+        // recorded key — lb_serial 0 (history-backed rows, scrolled_by != 0)
+        // never matches a real serial. The array's lifetime is tied to the
+        // snapshot linebuf above: (re)allocated alongside it (all keys reset,
+        // forcing a full copy on the next pause) and freed with it. Only
+        // allocated when the switch is ON; NULL = every row copies.
+        struct SnapshotRowKey { uint32_t lb_serial; index_type phys, slot; uint32_t gen; } *cow_keys;
+        bool cow_keys_valid;
     } paused_rendering;
     // Wave-19 L4 probe: cumulative counts of successful BSU/ESU transitions
     // (DECSET-2026 / DECRPM pending-mode set-reset), diffed per-tick by the
     // parser (run_worker) to feed KITTY_FRAME_TRACE. Always maintained (two
     // integer increments per transition, not per-byte).
     uint64_t pause_starts, pause_stops;
+    // Wave-21 L4 probe: cumulative pause-snapshot row counts — rows actually
+    // deep-copied and rows whose identity key matched (skip-eligible; at L4.1
+    // trace-only, the copy still happens). Diffed per-tick by run_worker to
+    // feed KITTY_FRAME_TRACE cow_copied=/cow_skip_eligible=. Maintained only
+    // when KITTY_PAUSE_SNAPSHOT_COW is on (OFF = true legacy path).
+    uint64_t cow_copied, cow_skip_eligible;
     CharsetState charset;
     ListOfChars *lc;
     monotonic_t parsing_at;

@@ -35,6 +35,9 @@ typedef struct ParseData {
     size_t ring_fill_end;     // transport ring bytes-used at tick exit
     unsigned pause_starts;    // successful screen_pause_rendering(true) (BSU) calls this tick
     unsigned pause_stops;     // successful screen_pause_rendering(false) (ESU) calls this tick
+    // Wave-21 L4: pause-snapshot COW probe (KITTY_PAUSE_SNAPSHOT_COW; zero when off)
+    unsigned cow_copied;        // snapshot rows deep-copied this tick
+    unsigned cow_skip_eligible; // snapshot rows whose identity key matched this tick
 } ParseData;
 
 // The must only be called on the main thread

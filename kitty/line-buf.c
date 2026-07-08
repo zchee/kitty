@@ -81,6 +81,7 @@ clear_chars_to(LineBuf* linebuf, index_type y, char_type ch) {
 
 void
 linebuf_clear(LineBuf *self, char_type ch) {
+    linebuf_gen_bump_range(self, 0, self->ynum - 1);  // Wave-21 L4: every row's content changes
     // per-line via line_map: slot assignments are preserved, only the
     // content is cleared (cell storage is pool slots, not one block)
     for (index_type i = 0; i < self->ynum; i++) {
@@ -100,7 +101,9 @@ linebuf_clear(LineBuf *self, char_type ch) {
 
 void
 linebuf_mark_line_dirty(LineBuf *self, index_type y) {
-    self->line_attrs[lb_phys(self, y)].has_dirty_text = true;
+    const index_type p = lb_phys(self, y);
+    self->line_attrs[p].has_dirty_text = true;
+    linebuf_gen_bump(self, p);  // Wave-21 L4: co-located with the dirty mark
 }
 
 void
@@ -110,13 +113,17 @@ linebuf_mark_line_clean(LineBuf *self, index_type y) {
 
 void
 linebuf_set_line_has_image_placeholders(LineBuf *self, index_type y, bool val) {
-    self->line_attrs[lb_phys(self, y)].has_image_placeholders = val;
+    const index_type p = lb_phys(self, y);
+    self->line_attrs[p].has_image_placeholders = val;
+    linebuf_gen_bump(self, p);  // Wave-21 L4: attr change without a dirty mark
 }
 
 void
 linebuf_clear_attrs_and_dirty(LineBuf *self, index_type y) {
-    self->line_attrs[lb_phys(self, y)].val = 0;
-    self->line_attrs[lb_phys(self, y)].has_dirty_text = true;
+    const index_type p = lb_phys(self, y);
+    self->line_attrs[p].val = 0;
+    self->line_attrs[p].has_dirty_text = true;
+    linebuf_gen_bump(self, p);  // Wave-21 L4
 }
 
 static PyObject*
@@ -125,6 +132,10 @@ clear(LineBuf *self, PyObject *a UNUSED) {
     linebuf_clear(self, BLANK_CHAR);
     Py_RETURN_NONE;
 }
+
+// Wave-21 L4: allocation serials are 1-based (0 = the snapshot's
+// never-matches sentinel). Main-thread only, like all LineBuf allocation.
+static uint32_t linebuf_serial_counter = 0;
 
 LineBuf *
 alloc_linebuf_(PyTypeObject *cls, unsigned int lines, unsigned int columns, TextCache *text_cache, LineSlotPool *pool) {
@@ -150,16 +161,20 @@ alloc_linebuf_(PyTypeObject *cls, unsigned int lines, unsigned int columns, Text
         // history-segment-sized slabs and grows with scrollback.
         if (pool) { line_slot_pool_incref(pool); self->pool = pool; }
         else self->pool = line_slot_pool_alloc(columns, lines);
-        // Combined allocation: index_type lanes first (4-byte aligned), the
-        // 1-byte LineAttrs last -> line_map | scratch | line_xlimit | line_attrs.
-        // line_xlimit (Wave-15 L1) precedes line_attrs so the index_type array
-        // stays 4-byte aligned for any `lines` (a trailing index_type after the
-        // 1-byte LineAttrs lane would misalign unless lines%4==0).
-        self->line_map = self->pool ? PyMem_Calloc(1, lines * (3 * sizeof(index_type) + sizeof(LineAttrs))) : NULL;
+        // Combined allocation: 4-byte lanes first (4-byte aligned), the
+        // 1-byte LineAttrs last -> line_map | scratch | line_xlimit | line_gen
+        // | line_attrs. line_xlimit (Wave-15 L1) and line_gen (Wave-21 L4)
+        // precede line_attrs so the 4-byte arrays stay aligned for any `lines`
+        // (a trailing 4-byte lane after the 1-byte LineAttrs lane would
+        // misalign unless lines%4==0).
+        _Static_assert(sizeof(index_type) == sizeof(uint32_t), "line_gen lane sizing assumes 4-byte index_type");
+        self->line_map = self->pool ? PyMem_Calloc(1, lines * (4 * sizeof(index_type) + sizeof(LineAttrs))) : NULL;
         if (!self->line_map) { line_slot_pool_decref(self->pool); self->pool = NULL; Py_CLEAR(self); return NULL; }
         self->scratch = self->line_map + lines;
         self->line_xlimit = self->scratch + lines;
-        self->line_attrs = (LineAttrs*)(self->line_xlimit + lines);
+        self->line_gen = (uint32_t*)(self->line_xlimit + lines);
+        self->line_attrs = (LineAttrs*)(self->line_gen + lines);
+        self->serial = ++linebuf_serial_counter;  // Wave-21 L4: 1-based; 0 = never-matches sentinel
         self->text_cache = tc_incref(text_cache);
         self->line = alloc_line(self->text_cache);
         self->line->xnum = columns;
@@ -298,7 +313,9 @@ linebuf_line_ends_with_continuation(LineBuf *self, index_type y) {
 void
 linebuf_set_last_char_as_continuation(LineBuf *self, index_type y, bool continued) {
     if (y < self->ynum) {
-        cpu_lineptr(self, self->line_map[lb_phys(self, y)])[self->xnum - 1].next_char_was_wrapped = continued;
+        const index_type p = lb_phys(self, y);
+        cpu_lineptr(self, self->line_map[p])[self->xnum - 1].next_char_was_wrapped = continued;
+        linebuf_gen_bump(self, p);  // Wave-21 L4: cell mutation without a dirty mark
     }
 }
 
@@ -314,6 +331,7 @@ set_attribute(LineBuf *self, PyObject *args) {
             PyErr_SetString(PyExc_KeyError, "Unknown cell attribute"); return NULL;
         }
         self->line_attrs[y].has_dirty_text = true;
+        linebuf_gen_bump(self, y);  // Wave-21 L4 (order-agnostic full-row loop)
     }
     Py_RETURN_NONE;
 }
@@ -438,6 +456,17 @@ scroll_clear_mode(void) {
     return (ScrollClearMode)scroll_clear_mode_state;
 }
 
+// Wave-21 L4 (KITTY_PAUSE_SNAPSHOT_COW): one-shot process-lifetime resolution,
+// same pattern as scroll_clear_mode above. The cold resolver lives here; the
+// hot inline test is pause_snapshot_cow_enabled() in line-buf.h. -1 unresolved.
+int pause_snapshot_cow_state = -1;
+bool
+pause_snapshot_cow_resolve(void) {
+    const char *v = getenv("KITTY_PAUSE_SNAPSHOT_COW");
+    pause_snapshot_cow_state = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0;
+    return pause_snapshot_cow_state != 0;
+}
+
 // Wave-15 L1 escape hatches (see line-buf.h), resolved once like scroll_clear_mode.
 bool
 xlimit_track_disabled(void) {
@@ -514,6 +543,7 @@ linebuf_materialize_blank_line(LineBuf *self, index_type y) {
     if (!self->line_attrs[p].is_blank || scroll_clear_mode() != SCROLL_CLEAR_RELOCATE) return;
     self->line_attrs[p].is_blank = 0;
     zero_at_ptr_count(gpu_lineptr(self, self->line_map[p]), self->xnum);
+    linebuf_gen_bump(self, p);  // Wave-21 L4: GPU cells + is_blank changed
 }
 
 // Wave-15 S1-lite (ADR §10c): materialize a deferred (is_blank) row NOW -- zero the
@@ -531,6 +561,7 @@ linebuf_materialize_deferred_row(LineBuf *self, index_type y) {
     self->line_attrs[p].is_blank = 0;
     self->line_attrs[p].has_dirty_text = true;
     zero_at_ptr_count(gpu_lineptr(self, self->line_map[p]), self->xnum);
+    linebuf_gen_bump(self, p);  // Wave-21 L4
 }
 
 // L1: backward xlimit scan (last non-blank CPUCell + 1) starting from `start`.
@@ -555,6 +586,7 @@ linebuf_finalize_hwm_line(LineBuf *self, index_type y) {
     const index_type p = lb_phys(self, y);
     if (!self->line_attrs[p].is_blank) return;
     self->line_attrs[p].is_blank = 0;
+    linebuf_gen_bump(self, p);  // Wave-21 L4: is_blank drop + GPU tail zero below
     const index_type ym = self->line_map[p];
     const CPUCell *c = cpu_lineptr(self, ym);
     // L1: line_xlimit is an UPPER BOUND on the write extent -- the max cursor
@@ -611,6 +643,10 @@ clear_line(LineBuf *self, PyObject *val) {
 static void
 linebuf_normalize(LineBuf *self) {
     if (self->head == 0) return;
+    // Wave-21 L4: the phys meaning of every row changes; bump all generations
+    // so no snapshot key recorded against the old permutation can match. The
+    // line_gen lane itself is NOT rotated (monotonic per phys by design).
+    linebuf_gen_bump_range(self, 0, self->ynum - 1);
     const index_type h = self->head, n = self->ynum;
     for (index_type i = 0; i < n; i++) {
         index_type p = h + i; if (p >= n) p -= n;
@@ -653,6 +689,7 @@ linebuf_index(LineBuf* self, index_type top, index_type bottom) {
     self->line_map[bottom] = old_top;
     self->line_attrs[bottom] = old_attrs;
     self->line_xlimit[bottom] = old_xlimit;
+    linebuf_gen_bump_range(self, top, bottom);  // Wave-21 L4: line_map permuted over [top, bottom]
 }
 
 static PyObject*
@@ -685,6 +722,7 @@ linebuf_reverse_index(LineBuf *self, index_type top, index_type bottom) {
     self->line_map[top] = old_bottom;
     self->line_attrs[top] = old_attrs;
     self->line_xlimit[top] = old_xlimit;
+    linebuf_gen_bump_range(self, top, bottom);  // Wave-21 L4: line_map permuted over [top, bottom]
 }
 
 static PyObject*
@@ -728,6 +766,7 @@ linebuf_insert_lines(LineBuf *self, unsigned int num, unsigned int y, unsigned i
         self->line_attrs[i].val = 0;
         self->line_xlimit[i] = 0;
     }
+    linebuf_gen_bump_range(self, y, ylimit - 1);  // Wave-21 L4: line_map permuted + rows cleared
 }
 
 static PyObject*
@@ -761,6 +800,7 @@ linebuf_delete_lines(LineBuf *self, index_type num, index_type y, index_type bot
         self->line_attrs[i].val = 0;
         self->line_xlimit[i] = 0;
     }
+    linebuf_gen_bump_range(self, y, ylimit - 1);  // Wave-21 L4: line_map permuted + rows cleared
 }
 
 static PyObject*
@@ -779,6 +819,7 @@ linebuf_copy_line_to(LineBuf *self, Line *line, index_type where) {
     copy_line(line, self->line);
     self->line_attrs[wp] = line->attrs;
     self->line_attrs[wp].has_dirty_text = true;
+    linebuf_gen_bump(self, wp);  // Wave-21 L4
     // L2: a deferred (is_blank) source carried a stale GPU tail across and this
     // buffer's line_xlimit lane is not the source's extent; finalize-on-copy from
     // the eager-clean CPUCells so copy_line_to always yields an authoritative row.
