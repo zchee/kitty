@@ -285,6 +285,13 @@ def spawn_kitty(
         "-o", "remember_window_size=no",
         "-o", "initial_window_width=100c",
         "-o", "initial_window_height=30c",
+        # Wave-21 operator directive (2026-07-09): measure with the operator's
+        # real daily font — MonoLisaCode, ligature-capable, with their exact
+        # kitty.conf feature set — so shaping/rendering costs reflect actual
+        # use instead of the --config NONE fallback font. Overridable via
+        # extra_kitty_opts (appended after, so it wins on conflict).
+        "-o", 'font_family=family="MonoLisaCode" style="Regular" features="+zero +ss04 +ss07 +ss08 +ss09 +ss02"',
+        "-o", "font_size=14.0",
     ]
     for opt in (extra_kitty_opts or []):
         argv += ["-o", opt]

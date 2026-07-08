@@ -77,7 +77,7 @@ CONFIG_MATRIX: dict[str, list[str]] = {
 }
 
 
-def capture_config(name: str, opts: list[str], output_dir: Path, timeout: float) -> dict[str, Any]:
+def capture_config(name: str, opts: list[str], output_dir: Path, timeout: float, env: dict[str, str] | None = None) -> dict[str, Any]:
     require_kitty_binary()
     png_path = output_dir / f"{name}.png"
     if png_path.exists():
@@ -107,7 +107,7 @@ def capture_config(name: str, opts: list[str], output_dir: Path, timeout: float)
     # the same reason ("golden_capture_focus_pinned").
     proc = spawn_kitty(
         [sys.executable, str(CONTENT_HELPER)],
-        extra_env={"KITTY_METAL_DUMP_FRAME": str(png_path)},
+        extra_env={"KITTY_METAL_DUMP_FRAME": str(png_path), **(env or {})},
         extra_kitty_opts=full_opts,
         take_focus=True,
     )
@@ -175,7 +175,8 @@ def cmd_capture(args: argparse.Namespace) -> int:
     ok = True
     for name, opts in configs.items():
         print(f"[metal-golden] capturing {name!r} (opts={opts}) ...", file=sys.stderr)
-        result = capture_config(name, opts, args.output_dir, args.timeout)
+        result = capture_config(name, opts, args.output_dir, args.timeout,
+                                env=dict(kv.split("=", 1) for kv in (args.env or [])))
         manifest["captures"][name] = result
         if "error" in result:
             ok = False
@@ -258,6 +259,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_capture.add_argument("--output-dir", type=Path, default=DEFAULT_GOLDEN_DIR, help="directory to write PNGs + manifest.json into (default: .omc/golden/ directly, per the config-matrix spec's .omc/golden/<config>.png; pass an explicit subdirectory, e.g. .omc/golden/gl-baseline, to keep multiple captures around for `compare`)")
     p_capture.add_argument("--configs", nargs="+", choices=list(CONFIG_MATRIX), default=None, help="subset of the config matrix to capture (default: all)")
     p_capture.add_argument("--timeout", type=float, default=30.0, help="seconds to wait per config capture (default: 30)")
+    p_capture.add_argument("--env", action="append", default=None, metavar="KEY=VALUE", help="extra environment variable(s) for the spawned kitty (repeatable) -- for lever ON-arm golden runs, e.g. --env KITTY_PAUSE_SNAPSHOT_COW=1; passed through spawn_kitty's sanitized env as extra_env")
     p_capture.set_defaults(func=cmd_capture)
 
     p_compare = sub.add_parser("compare", help="compare two golden-image directories")
