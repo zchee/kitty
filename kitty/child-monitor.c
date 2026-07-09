@@ -588,6 +588,31 @@ static bool kt_epoch_emitted;                  // one-time mono↔mach anchor li
 // Instrumentation-only recency bound for stamping an echo that missed the
 // L5 window (plan T1.1 l5_miss rule: stamp + flag, never drop).
 #define KT_ECHO_STAMP_WINDOW (ms_to_monotonic_t(500ll))
+// Wave-22 (named gate instrument): per-reader-thread counters. One slot per
+// reader thread, claimed at reader spawn and owned single-writer by that
+// reader for its lifetime — keyed by reader, never by children[] index,
+// because remove_children() compacts that array. Cumulative, never reset;
+// summed onto the ftrace line by the main thread with the same
+// relaxed-atomic convention as the io_* family above. rd_wake_* decompose
+// wakeups by cause; their sum equals wakeups (the pinned gate-2 numerator
+// is ALL causes).
+typedef struct {
+    _Atomic(uint64_t) wakeups;         // returns from the blocking kevent wait, ALL causes
+    _Atomic(uint64_t) wake_data;       //   cause: master-fd data readiness
+    _Atomic(uint64_t) wake_timer;      //   cause: deferred batch-flush timeout
+    _Atomic(uint64_t) wake_unpark;     //   cause: consumer unpark trigger
+    _Atomic(uint64_t) wake_teardown;   //   cause: teardown/shutdown trigger
+    _Atomic(uint64_t) reads;           // successful read() syscalls
+    _Atomic(uint64_t) bytes;           // bytes returned by those reads
+    _Atomic(uint64_t) park_cycles;     // ring-full park entries
+    _Atomic(uint64_t) batch_flushes;   // deferred-window main-loop wakeups issued
+    _Atomic(uint64_t) echo_immediates; // L5 echo-bypass immediate wakeups issued
+} ReaderCounters;
+static ReaderCounters reader_counters[MAX_CHILDREN];
+// Slot high-water mark, bumped under children_mutex when a reader claims a
+// slot. Stays 0 while KITTY_READER_THREADS is off, so the ftrace sum loop
+// below runs zero iterations on the OFF arm.
+static _Atomic(unsigned) reader_slot_hwm;
 
 static bool
 frame_trace_enabled(void) {
@@ -595,6 +620,21 @@ frame_trace_enabled(void) {
     if (UNLIKELY(cached < 0)) {
         const char *v = getenv("KITTY_FRAME_TRACE");
         cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+// Wave-22 kill switch: per-child reader-thread skeleton. ON iff the env var
+// is set, non-empty and not exactly "0". One-shot cached like
+// frame_trace_enabled() — resolved at first use for the process lifetime, so
+// a mid-session env flip is structurally impossible and the OFF arm's only
+// cost is this cached-bool branch at each gated call site.
+static bool
+reader_threads_enabled(void) {
+    static int cached = -1;
+    if (UNLIKELY(cached < 0)) {
+        const char *v = getenv("KITTY_READER_THREADS");
+        cached = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0;
     }
     return cached == 1;
 }
@@ -619,12 +659,30 @@ frame_trace_emit(monotonic_t ts, bool input_read, monotonic_t parse_dt, monotoni
     const uint64_t io_avail = atomic_load_explicit(&io_avail_bytes, memory_order_relaxed);
     const uint64_t io_wrapcap = atomic_load_explicit(&io_wrap_capped_calls, memory_order_relaxed);
     const uint64_t io_pdis = atomic_load_explicit(&io_pollin_disarmed, memory_order_relaxed);
+    // Wave-22: per-reader instrument sums (cumulative, diff consecutive
+    // lines like io_*). The loop is bounded by the spawn high-water mark,
+    // so the OFF arm sums nothing and every rd_* field reads 0.
+    uint64_t rd_wakes = 0, rd_wd = 0, rd_wt = 0, rd_wu = 0, rd_wx = 0,
+             rd_reads = 0, rd_rbytes = 0, rd_parks = 0, rd_flushes = 0, rd_echo = 0;
+    const unsigned rd_hwm = atomic_load_explicit(&reader_slot_hwm, memory_order_relaxed);
+    for (unsigned ri = 0; ri < rd_hwm; ri++) {
+        const ReaderCounters *rc = reader_counters + ri;
+#define RSUM(dst, field) dst += atomic_load_explicit(&rc->field, memory_order_relaxed)
+        RSUM(rd_wakes, wakeups); RSUM(rd_wd, wake_data); RSUM(rd_wt, wake_timer);
+        RSUM(rd_wu, wake_unpark); RSUM(rd_wx, wake_teardown);
+        RSUM(rd_reads, reads); RSUM(rd_rbytes, bytes);
+        RSUM(rd_parks, park_cycles); RSUM(rd_flushes, batch_flushes); RSUM(rd_echo, echo_immediates);
+#undef RSUM
+    }
     log_error("ftrace: seq=%llu ts_ms=%.3f gap_ms=%.3f bytes=%llu parse_ms=%.3f render_ms=%.3f"
               " input_read=%d gate=%s present=%d parsed=%llu pause_on=%llu pause_off=%llu"
               " paused_end=%d arena0=%llu arena1=%llu ring0=%llu ring1=%llu"
               " cow_copied=%llu cow_skip_eligible=%llu"
               " io_iters=%llu io_polls=%llu io_poll_ms=%.3f io_reads=%llu io_read_bytes=%llu"
-              " io_read_ms=%.3f io_avail_bytes=%llu io_wrap_capped=%llu io_pollin_off=%llu",
+              " io_read_ms=%.3f io_avail_bytes=%llu io_wrap_capped=%llu io_pollin_off=%llu"
+              " rd_on=%d rd_kevent_wakeups=%llu rd_wake_data=%llu rd_wake_timer=%llu"
+              " rd_wake_unpark=%llu rd_wake_teardown=%llu rd_read_calls=%llu rd_read_bytes=%llu"
+              " rd_park_cycles=%llu rd_batch_flushes=%llu rd_echo_immediates=%llu",
               (unsigned long long)(++ft_seq), ft_ms(ts), ft_ms(gap),
               (unsigned long long)ft_bytes_drained, ft_ms(parse_dt), ft_ms(render_dt),
               input_read ? 1 : 0, ft_gate_names[ft_gate_outcome], ft_present_committed ? 1 : 0,
@@ -635,7 +693,11 @@ frame_trace_emit(monotonic_t ts, bool input_read, monotonic_t parse_dt, monotoni
               (unsigned long long)ft_cow_copied, (unsigned long long)ft_cow_skip_eligible,
               (unsigned long long)io_iters, (unsigned long long)io_polls, ft_ms((monotonic_t)io_pns),
               (unsigned long long)io_reads, (unsigned long long)io_rbytes, ft_ms((monotonic_t)io_rns),
-              (unsigned long long)io_avail, (unsigned long long)io_wrapcap, (unsigned long long)io_pdis);
+              (unsigned long long)io_avail, (unsigned long long)io_wrapcap, (unsigned long long)io_pdis,
+              reader_threads_enabled() ? 1 : 0, (unsigned long long)rd_wakes, (unsigned long long)rd_wd,
+              (unsigned long long)rd_wt, (unsigned long long)rd_wu, (unsigned long long)rd_wx,
+              (unsigned long long)rd_reads, (unsigned long long)rd_rbytes,
+              (unsigned long long)rd_parks, (unsigned long long)rd_flushes, (unsigned long long)rd_echo);
 }
 #endif
 
