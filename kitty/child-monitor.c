@@ -840,7 +840,9 @@ parse_input(ChildMonitor *self) {
         FREE_CHILD(remove_queue[remove_queue_count]);
     }
 
+    bool signal_tick = false;
     if (UNLIKELY(kill_signal_received || reload_config_signal_received)) {
+        signal_tick = true;
         if (kill_signal_received) {
             global_state.quit_request = IMPERATIVE_CLOSE_REQUESTED;
             global_state.has_pending_closes = true;
@@ -859,6 +861,20 @@ parse_input(ChildMonitor *self) {
         }
     }
     children_mutex(unlock);
+#ifdef KITTY_BACKEND_METAL
+    // Wave-22 (M3.5 review MAJOR-1): the signal branch leaves count == 0,
+    // so this tick drains NO child rings — yet the P4 clear above may have
+    // absorbed a reader's coalesced wakeup (a CAS-loser and any parked
+    // reader now expect THIS tick to drain and unpark). Re-arm immediately:
+    // the signal flags were consumed above, so the next tick takes the
+    // draining arm — no livelock. ON arm only; the OFF arm's analogous
+    // latent gap (a signal tick also skips do_parse, so write_space_created
+    // never reaches wakeup_io_loop) is inherited, not introduced here —
+    // recorded in open-questions.md, out of this lane's scope.
+    if (UNLIKELY(signal_tick) && reader_threads_enabled()) wakeup_main_loop();
+#else
+    (void)signal_tick;
+#endif
 
     Message *msgs = NULL;
     size_t msgs_count = 0;
