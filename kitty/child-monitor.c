@@ -2467,7 +2467,7 @@ reader_flush_wakeup_before_park(bool *deferred, monotonic_t *last_wakeup_at) {
 
 // Drain-batch epilogue: the coalesced main-wakeup decision (D2.5).
 static void
-reader_epilogue(ReaderThread *rt, ReaderCounters *rc, size_t total,
+reader_epilogue(ReaderCounters *rc, size_t total,
                 bool *deferred, monotonic_t *last_wakeup_at) {
     if (!total) return;
     const monotonic_t now = monotonic();
@@ -2505,7 +2505,6 @@ reader_epilogue(ReaderThread *rt, ReaderCounters *rc, size_t total,
         *last_wakeup_at = now;
         *deferred = false;
     } else *deferred = true;
-    (void)rt;
 }
 
 // D2.4 child-death path: bytes from every successful read are already
@@ -2636,7 +2635,7 @@ reader_main(void *arg) {
             if ((int64_t)len >= avail) break;  // avail-count satisfied, no EAGAIN probe
             avail -= len;
         }
-        reader_epilogue(rt, rc, total, &deferred, &last_wakeup_at);  // EPILOGUE (order per P-checklist 4)
+        reader_epilogue(rc, total, &deferred, &last_wakeup_at);  // EPILOGUE (order per P-checklist 4)
         if (child_dead) { reader_mark_child_dead(rt); break; }
     }
     return NULL;
