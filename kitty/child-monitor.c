@@ -2405,14 +2405,23 @@ reader_trigger_wake(ReaderThread *rt) {
 // O15 (Critic condition 1, conforming shape): children_mutex-held
 // load+trigger. Teardown retires the handle under the same mutex BEFORE the
 // join and the close, so no trigger here can ever land on a closed or
-// recycled kqueue; an unpark against a retired (NULL) handle is dropped —
-// benign, that reader is exiting and teardown wakes it via its own trigger.
+// recycled kqueue. A child ABSENT from children[] is a retired one — its
+// reader is exiting and teardown wakes it via its own ordered trigger, so
+// dropping that unpark is benign. A PRESENT child with reader == NULL is a
+// fallback child (reader_spawn failed, condition 6 fail-toward-OFF): the io
+// thread is ITS parked ring producer, and vt_ring_unpark_writer already
+// consumed writer_parked before this call — dropping the wake would stall
+// that child's input permanently (M3.5 review F1). Route it to the io loop
+// exactly as the OFF arm does; within children[] reader == NULL uniquely
+// means fallback, because teardown NULLs the handle and removes the child
+// in the same mutex-held remove_children pass.
 static void
 reader_unpark_for_screen(ChildMonitor *self, Screen *screen) {
     children_mutex(lock);
     for (size_t i = 0; i < self->count; i++) {
         if (children[i].screen == screen) {
             if (children[i].reader) reader_trigger_wake(children[i].reader);
+            else wakeup_io_loop(self, false);
             break;
         }
     }
