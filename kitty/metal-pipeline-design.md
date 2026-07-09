@@ -2638,3 +2638,64 @@ condition. Updated as captures land.
   CVDisplayLink code remains for the GL backend). L2/L3/L5 (immediate-encode,
   `sync_to_monitor`→`displaySyncEnabled`, adaptive `input_delay`, `pace=` tag)
   are the following Phase-4 task.
+
+## Phase 22 (Wave 22): reader skeleton built and guarded; wakeup-economics gate NO-LAND — dormant default-OFF
+
+Executed the consensus plan (`.omc/plans/ralplan-wave22-reader-skeleton.md`
+v2, Option A: one product-code lane = the per-child reader-thread skeleton
+behind `KITTY_READER_THREADS`, instrument-first ordering). Artifacts under
+`.omc/verify/wave22/` — `R22-EVFILT-USER.md`, `R22-B2-RESTATEMENT.md`
+(rev.2) + `R22-B2-REVIEW.md` (CONFIRMED-SOUND), `R22-GUARDS.md`,
+`R22-OBLIGATIONS.md`, `GATE-ADJUDICATION.md`; ADR-0007. Commits
+`9b3c2f024` (rd_* instrument + kill switch), `0b0c14ff6` (skeleton),
+`e61ebd5a8` (M3.5 MAJOR-1 signal-tick re-arm).
+
+**M0 (zero product code)**: EVFILT_USER PRIMARY CONFIRMED by an
+out-of-tree micro-probe (cross-thread NOTE_TRIGGER wake; trigger-before-
+wait retained; 50 stop→trigger→join→close cycles, zero blocked threads;
+×2 runs) after the honest negatives were recorded (apple-docs does not
+index kqueue BSD constants; this macOS ships no kevent man page and the
+SDK kqueue.2 omits EVFILT_USER — authority = SDK `sys/event.h`). Pipe
+fallback never activated; fd budget stayed 2/child.
+
+**Skeleton (all 15 obligations O1–O15 traced in `R22-OBLIGATIONS.md`)**:
+one reader/child (256 KiB stacks, "KittyReader"), kqueue avail-count drain
+(CAP=64, no trailing EAGAIN probe), per-reader `OPT(input_delay)` batch
+window + timed-kevent deferred flush, process-wide `main_wakeup_pending`
+CAS with clear-before-drain + seq_cst bracketing per the proof-carrying
+spec (drafted at M2 entry BEFORE the CAS code; review found 1 MAJOR — a
+signal tick clears the flag while draining zero rings, fixed by an ON-arm
+re-arm — plus 5 MINOR spec amendments; discharge CONFIRMED-SOUND), L5 echo
+bypass preserved with per-reader totals, kt_* stamping migrated into the
+reader epilogue, O15 unpark via children_mutex-held load+trigger with
+retire-before-join (Critic condition 1 conforming shape; exercised at
+runtime: rd_park_cycles 4045 > 0 across 150 teardowns).
+
+**Guards (final binary, all green)**: goldens 4/4 max_diff=0 unset AND ON;
+idle 0.0% 8/8 both arms; busy-spin (idle reader: rd_kevent_wakeups=0,
+rd_wake_timer=0); teardown battery 50×3 windows EOF-byte-exact and
+leak-free; kill-switch demo (OFF ticks: all rd_* frozen at 0); unit tests
+arm-parity (2 pre-existing zsh-environment errors reproduce at pre-wave
+HEAD); **OFF-arm cost 0.9825 ≤ 1.02** on interleaved dense_cells ftrace
+parse_ms/MiB medians vs the preserved pre-skeleton binary (Critic
+condition 2 statistic) — the dead-when-off claim holds, no revert.
+
+**Gate (P2.SKEL)**: **NO-LAND** — discrimination clause live (baseline
+reads/wakeup 1.0 < 2; baseline 90.5k/62.4k io_polls/s recorded), then t1
+MB/s 1.2217× dense (miss) / 1.4979× unicode; t2 arm wakeups/s 1.1824×/
+1.4239× vs the ≤0.5× target; t3 reads/wakeup 1.0 vs ≥2. Attribution via
+the pinned cause decomposition: 99.97% rd_wake_data, parks 0 (dense) — the
+C-speed parser (~5.6 ms/MiB ≈ 180 MB/s) outruns the ~91–176 MB/s PTY, so
+backpressure never arises and kernel queue depth stays ≈1 quantum: both
+named reduction mechanisms never engage, and no in-design parameter moves
+data-cause wakeups (ITERATE declined as futile within the band's own
+terms). Context recorded, never gate inputs: the io thread went idle
+(io_polls ≈2/5 s vs 90k/s) and main-loop wakeups coalesced to ≈398 reads
+per wakeup — but the gate was deliberately pinned to the PTY-servicing-
+thread counter (F4-RESIDUAL) and is not re-pinned post hoc. S2 re-check
+ran through the migrated instrument (120/120 paired; kt_l5_miss 0/120 on
+the per-reader denominator; S2 p50 9.81 ms — annotation only).
+Disposition: **switch-dormant default-OFF skeleton stays in-tree**; full
+revert not triggered. 60 Hz single machine; same-block arithmetic only; no
+victory language — the wakeup-economics prize, as pinned, is refuted at
+product scale on these workloads.
