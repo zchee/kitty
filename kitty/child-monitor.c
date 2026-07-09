@@ -46,6 +46,9 @@ void note_local_key_input(void) { atomic_store_explicit(&last_local_key_input_at
 #ifdef __APPLE__
 #include <os/signpost.h>
 #include <mach/mach_time.h>  // Wave-20 T1.1: ktrace_epoch mono↔mach clock anchor
+#include <sys/event.h>       // Wave-22: reader-thread kqueue wait + EVFILT_USER wake channel
+#include <sys/resource.h>    // Wave-22: RLIMIT_NOFILE raise (ON arm only)
+#include <limits.h>          // Wave-22: OPEN_MAX clamp for setrlimit
 
 // Phase 0 instrumentation: env-gated os_signpost spans for the main loop's
 // parse/render/render-gate stages. Uses the same log subsystem/category as
@@ -99,6 +102,11 @@ typedef struct {
 } ChildMonitor;
 
 
+#ifdef KITTY_BACKEND_METAL
+// Wave-22: per-child reader thread (KITTY_READER_THREADS, default-OFF).
+typedef struct ReaderThread ReaderThread;
+#endif
+
 typedef struct {
     Screen *screen;
     bool needs_removal, child_died;
@@ -106,6 +114,13 @@ typedef struct {
     unsigned long id;
     pid_t pid;
     int exit_status;
+#ifdef KITTY_BACKEND_METAL
+    // Wave-22: non-NULL iff this child's reads are owned by a reader thread
+    // (ON arm). Compaction memmoves it with the child; mutated on the io
+    // thread under children_mutex; read by the main thread only under
+    // children_mutex (the O15 publish/retire protocol).
+    ReaderThread *reader;
+#endif
 } Child;
 
 static const Child EMPTY_CHILD = {0};
@@ -192,6 +207,13 @@ mask_kitty_signals_process_wide(PyObject *self UNUSED, PyObject *a UNUSED) {
 
 static int verify_peer_uid = false;
 
+#ifdef KITTY_BACKEND_METAL
+// Wave-22: defined with the reader machinery in the io-thread section;
+// needed at ChildMonitor init for the condition-6 RLIMIT_NOFILE raise.
+static bool reader_threads_enabled(void);
+static void raise_nofile_limit_for_readers(void);
+#endif
+
 static PyObject *
 new_childmonitor_object(PyTypeObject *type, PyObject *args, PyObject UNUSED *kwds) {
     ChildMonitor *self;
@@ -223,6 +245,11 @@ new_childmonitor_object(PyTypeObject *type, PyObject *args, PyObject UNUSED *kwd
     children_fds[0].fd = self->io_loop_data.wakeup_read_fd; children_fds[1].fd = self->io_loop_data.signal_read_fd;
     children_fds[0].events = POLLIN; children_fds[1].events = POLLIN; children_fds[2].events = POLLIN;
     the_monitor = self;
+#ifdef KITTY_BACKEND_METAL
+    // Wave-22 condition 6: ON arm only, before the first reader spawn. The
+    // OFF arm performs no raise and stays the true legacy process.
+    if (reader_threads_enabled()) raise_nofile_limit_for_readers();
+#endif
 
     return (PyObject*) self;
 }
@@ -639,6 +666,40 @@ reader_threads_enabled(void) {
     return cached == 1;
 }
 
+// Wave-22 aggregate wakeup coalescing (design D2.5). Memory orders on every
+// operation touching this flag are pinned by the proof-carrying spec
+// .omc/verify/wave22/R22-B2-RESTATEMENT.md (P3/P4/P5): reader CAS 0->1 with
+// seq_cst success AND failure orders; main-thread clear = seq_cst store at
+// parse-tick entry BEFORE any ring drain (clear-before-drain, O2), followed
+// by a seq_cst fence. Do not weaken any of them: the CAS-loser's bytes are
+// proven visible only through that seq_cst bracketing.
+static _Atomic(bool) main_wakeup_pending;
+
+// Wave-22 reader thread (one per child, D2.1). The reader is the sole SPSC
+// producer for its child's ring (D2.2); its kqueue carries EVFILT_READ on
+// the master fd plus the EVFILT_USER wake channel (M0-verified: cross-thread
+// NOTE_TRIGGER wake, trigger-before-wait retention, trigger->join->close
+// teardown; .omc/verify/wave22/R22-EVFILT-USER.md).
+struct ReaderThread {
+    pthread_t thread;
+    ChildMonitor *monitor;
+    Screen *screen;      // borrowed: the Child's ref outlives the reader — the
+                         // child reaches remove_queue only AFTER the join
+    int kq;              // reader-owned kqueue; closed only after join (O6)
+    int master_fd;       // shared OFD: nonblocking reads only, flags never mutated (O9)
+    unsigned slot;       // reader_counters index, stable for the reader's lifetime
+    _Atomic(bool) stop;  // release-store by teardown, acquire-load by the reader (P10)
+    unsigned long child_id;
+};
+
+#define READER_WAKE_IDENT 1
+// Condition 7 (pre-registered): bounded drain CAP, the D4-validated value.
+#define READER_DRAIN_CAP 64
+// Wave-22: reader-owned wake-channel trigger; also used by the main thread
+// under children_mutex (O15) and by teardown before the join.
+static void reader_trigger_wake(ReaderThread *rt);
+static void reader_unpark_for_screen(ChildMonitor *self, Screen *screen);
+
 static inline double
 ft_ms(monotonic_t t) { return (double)t / (double)MONOTONIC_T_1e6; }
 
@@ -729,7 +790,16 @@ do_parse(ChildMonitor *self, Screen *screen, monotonic_t now, bool flush) {
     // independent of input_read: the top-of-tick ring drain can free a
     // full transport ring even when the input_delay gate declines to
     // parse, and the stalled reader needs its POLLIN re-armed either way
-    if (pd.write_space_created) wakeup_io_loop(self, false);
+    if (pd.write_space_created) {
+#ifdef KITTY_BACKEND_METAL
+        // Wave-22 ON arm: the parked producer is this screen's reader
+        // thread, not the io thread — deliver the unpark to its wake
+        // channel (children_mutex-held load+trigger, O15).
+        if (reader_threads_enabled()) reader_unpark_for_screen(self, screen);
+        else
+#endif
+        wakeup_io_loop(self, false);
+    }
     if (pd.input_read) {
         if (screen->paused_rendering.expires_at) {
             set_maximum_wait(MAX(0, screen->paused_rendering.expires_at - now));
@@ -750,6 +820,17 @@ parse_input(ChildMonitor *self) {
     size_t count = 0, remove_count = 0;
     bool input_read = false, reload_config_called = false;
     monotonic_t now = monotonic();
+#ifdef KITTY_BACKEND_METAL
+    // Wave-22 O2 clear-before-drain (R22-B2-RESTATEMENT.md P4+P5): consume
+    // the coalesced-wakeup flag BEFORE any ring drain of this tick, then
+    // fence so every drain load below is bracketed after the clear. The
+    // clear must never move after the drains; the fence must not be dropped
+    // in favor of the rings' internal fences (those run too late).
+    if (reader_threads_enabled()) {
+        atomic_store_explicit(&main_wakeup_pending, false, memory_order_seq_cst);
+        atomic_thread_fence(memory_order_seq_cst);
+    }
+#endif
     children_mutex(lock);
     while (remove_queue_count) {
         remove_queue_count--;
@@ -2243,6 +2324,391 @@ main_loop(ChildMonitor *self, PyObject *a UNUSED) {
 
 // I/O thread functions {{{
 
+#ifdef KITTY_BACKEND_METAL
+// Wave-22 reader-thread machinery (KITTY_READER_THREADS, default-OFF).
+// Implements L-READER-DESIGN.md rev.2 §D2.5's pinned loop shape with the
+// O1-O15 obligations; memory orders per .omc/verify/wave22/
+// R22-B2-RESTATEMENT.md. The OFF arm never reaches any of this.
+
+// Condition 6: fd budget. A reader costs its own kqueue beside the child's
+// already-open master (2 fds/child at MAX_CHILDREN=512 vs the macOS 256
+// soft default kitty never raises). ON arm only; failure fails toward OFF
+// (children beyond the budget keep the legacy io-thread read path).
+static unsigned reader_fd_budget_children;  // how many readers may exist at once
+static unsigned live_readers;               // io thread only, under children_mutex
+static bool reader_budget_warned;
+
+static void
+raise_nofile_limit_for_readers(void) {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0) {
+        log_error("Wave-22 readers: getrlimit(RLIMIT_NOFILE) failed: %s", strerror(errno));
+        return;
+    }
+    rlim_t target = (rlim_t)MAX_CHILDREN * 2 + 1024;
+    if (target > rl.rlim_max) target = rl.rlim_max;
+#ifdef OPEN_MAX
+    // macOS rejects rlim_cur > OPEN_MAX (pinned quirk): clamp the request.
+    if (target > OPEN_MAX) target = OPEN_MAX;
+#endif
+    if (rl.rlim_cur < target) {
+        struct rlimit want = {.rlim_cur = target, .rlim_max = rl.rlim_max};
+        if (setrlimit(RLIMIT_NOFILE, &want) == 0) rl.rlim_cur = target;
+        else log_error("Wave-22 readers: setrlimit(RLIMIT_NOFILE, %llu) failed: %s;"
+                       " readers limited to the current budget", (unsigned long long)target, strerror(errno));
+    }
+    // Keep half the remaining headroom (after a 256-fd reserve for the rest
+    // of the process) for the 2-fds/child budget.
+    reader_fd_budget_children = rl.rlim_cur > 256 ? (unsigned)((rl.rlim_cur - 256) / 2) : 0;
+    if (reader_fd_budget_children > MAX_CHILDREN) reader_fd_budget_children = MAX_CHILDREN;
+}
+
+// Counter-slot recycling: cumulative counters are never reset (the ftrace
+// consumer diffs consecutive line sums), so a recycled slot just keeps
+// accumulating — the sum stays monotone. All under children_mutex.
+static unsigned reader_slot_free[MAX_CHILDREN];
+static size_t reader_slot_free_count;
+
+// O7 deferral: children whose reader must be joined before their fds close
+// and before their death is published to remove_queue. io-thread private.
+static struct { Child child; ReaderThread *rt; } reader_teardown_pending[MAX_CHILDREN];
+static size_t reader_teardown_pending_count;
+
+static void
+reader_trigger_wake(ReaderThread *rt) {
+    struct kevent kev;
+    EV_SET(&kev, READER_WAKE_IDENT, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
+    if (kevent(rt->kq, &kev, 1, NULL, 0, NULL) < 0)
+        log_error("Wave-22 reader %lu: NOTE_TRIGGER failed: %s", rt->child_id, strerror(errno));
+}
+
+// O15 (Critic condition 1, conforming shape): children_mutex-held
+// load+trigger. Teardown retires the handle under the same mutex BEFORE the
+// join and the close, so no trigger here can ever land on a closed or
+// recycled kqueue; an unpark against a retired (NULL) handle is dropped —
+// benign, that reader is exiting and teardown wakes it via its own trigger.
+static void
+reader_unpark_for_screen(ChildMonitor *self, Screen *screen) {
+    children_mutex(lock);
+    for (size_t i = 0; i < self->count; i++) {
+        if (children[i].screen == screen) {
+            if (children[i].reader) reader_trigger_wake(children[i].reader);
+            break;
+        }
+    }
+    children_mutex(unlock);
+}
+
+static void
+reader_set_master_enabled(ReaderThread *rt, bool on) {
+    struct kevent kev;
+    EV_SET(&kev, rt->master_fd, EVFILT_READ, on ? EV_ENABLE : EV_DISABLE, 0, 0, NULL);
+    if (kevent(rt->kq, &kev, 1, NULL, 0, NULL) < 0)
+        log_error("Wave-22 reader %lu: EVFILT_READ %s failed: %s", rt->child_id,
+                  on ? "enable" : "disable", strerror(errno));
+}
+
+// O8: the io/main thread stays the sole servicer of KITTY_HANDLED_SIGNALS.
+static void
+reader_block_handled_signals(void) {
+    sigset_t signals;
+    sigemptyset(&signals);
+    const int sigs[] = { KITTY_HANDLED_SIGNALS };  // macro ends with the 0 sentinel
+    for (size_t i = 0; sigs[i] != 0; i++) sigaddset(&signals, sigs[i]);
+    pthread_sigmask(SIG_BLOCK, &signals, NULL);
+}
+
+// P3 (R22-B2-RESTATEMENT.md): the aggregate-coalescing CAS. seq_cst on BOTH
+// orders is load-bearing — the CAS-loser's commit-visibility proof needs the
+// failure load inside the seq_cst total order. Returns true iff this caller
+// won and issued the wakeup; a loser owes nothing (a winner's wakeup is in
+// flight and its tick drains ALL rings — condition 9).
+static bool
+reader_coalesced_wakeup(void) {
+    bool expected = false;
+    if (atomic_compare_exchange_strong_explicit(&main_wakeup_pending, &expected, true,
+                                                memory_order_seq_cst, memory_order_seq_cst)) {
+        wakeup_main_loop();
+        return true;
+    }
+    return false;
+}
+
+// O1 flush-wakeup-before-park (N1): a reader NEVER blocks on a full ring
+// without a covering main-loop wakeup in flight. Clear the deferred batch
+// state and wake NOW, bypassing the batch window, gated only by the CAS
+// (CAS-loss = one already in flight; correct either way).
+static void
+reader_flush_wakeup_before_park(bool *deferred, monotonic_t *last_wakeup_at) {
+    *deferred = false;
+    reader_coalesced_wakeup();
+    *last_wakeup_at = monotonic();
+}
+
+// Drain-batch epilogue: the coalesced main-wakeup decision (D2.5).
+static void
+reader_epilogue(ReaderThread *rt, ReaderCounters *rc, size_t total,
+                bool *deferred, monotonic_t *last_wakeup_at) {
+    if (!total) return;
+    const monotonic_t now = monotonic();
+    const monotonic_t kt_key = atomic_load_explicit(&last_local_key_input_at, memory_order_relaxed);
+    // O3 (per-reader total — the F11 delta: a flood in another pane no
+    // longer masks this pane's echo, so this is a per-child denominator).
+    const bool key_echo = total <= L5_SMALL_READ_MAX && now - kt_key <= L5_KEY_RECENCY_WINDOW;
+    // O13: kt_* stamping migrated from io_loop, FULL predicate preserved
+    // including the kt_key > 0 guard. The single-writer assumption behind
+    // kt_* relaxes to "the reader that first echoes each key": racing
+    // readers are benign — relaxed atomics guarding an instrument, and the
+    // kt_echo_read_at < kt_key guard is monotone (one reader wins, a stale
+    // read only misses one stamp).
+    if (UNLIKELY(frame_trace_enabled())
+            && kt_key > 0 && atomic_load_explicit(&kt_echo_read_at, memory_order_relaxed) < kt_key
+            && now - kt_key <= KT_ECHO_STAMP_WINDOW) {
+        atomic_store_explicit(&kt_echo_bytes, (uint64_t)total, memory_order_relaxed);
+        atomic_store_explicit(&kt_l5_miss, !key_echo, memory_order_relaxed);
+        atomic_store_explicit(&kt_echo_read_at, now, memory_order_relaxed);
+    }
+    if (key_echo) {
+        // Immediate: bypasses BOTH the input_delay window and the
+        // main_wakeup_pending batch flag (default-ON L5 semantics).
+        atomic_fetch_add_explicit(&rc->echo_immediates, 1, memory_order_relaxed);
+        wakeup_main_loop();
+        *last_wakeup_at = now;
+        *deferred = false;
+        return;
+    }
+    // O4: at most one wakeup per OPT(input_delay) window per reader; a
+    // within-window batch defers, and the next kevent wait gets the
+    // remaining-window timeout so the deferred flush fires on time.
+    if (now - *last_wakeup_at > OPT(input_delay)) {
+        if (reader_coalesced_wakeup()) atomic_fetch_add_explicit(&rc->batch_flushes, 1, memory_order_relaxed);
+        *last_wakeup_at = now;
+        *deferred = false;
+    } else *deferred = true;
+    (void)rt;
+}
+
+// D2.4 child-death path: bytes from every successful read are already
+// committed (commit-before-continue), so EOF is byte-exact by construction.
+static void
+reader_mark_child_dead(ReaderThread *rt) {
+    ChildMonitor *self = rt->monitor;
+    children_mutex(lock);
+    for (size_t i = 0; i < self->count; i++) {
+        if (children[i].id == rt->child_id) { children[i].needs_removal = true; break; }
+    }
+    children_mutex(unlock);
+    wakeup_io_loop(self, false);  // the io loop performs the ordered teardown
+    wakeup_main_loop();           // parse the final committed bytes promptly
+}
+
+static void*
+reader_main(void *arg) {
+    ReaderThread *rt = arg;
+    set_thread_name("KittyReader");
+    reader_block_handled_signals();  // O8
+    ReaderCounters *rc = reader_counters + rt->slot;
+    Screen *screen = rt->screen;
+    bool deferred = false;        // O4 pending-flush state
+    bool master_enabled = true;   // EVFILT_READ armed on the kqueue
+    monotonic_t last_wakeup_at = -1;
+    while (!atomic_load_explicit(&rt->stop, memory_order_acquire)) {
+        // ARM: ring-full parks the producer inside the ring's FR-2 protocol
+        // (flag + seq_cst fence + re-check), exactly as the io thread does
+        // today — the reader is the single producer, so the pairing holds.
+        if (!vt_parser_arm_pollin(screen->vt_parser)) {
+            reader_flush_wakeup_before_park(&deferred, &last_wakeup_at);  // O1
+            atomic_fetch_add_explicit(&rc->park_cycles, 1, memory_order_relaxed);
+            // PARKED: block on the wake channel ONLY. The master stays
+            // level-ready while the ring is full; leaving it armed would
+            // busy-loop the park (C4), so disable it for the park's
+            // duration.
+            if (master_enabled) { reader_set_master_enabled(rt, false); master_enabled = false; }
+            struct kevent ev;
+            const int n = kevent(rt->kq, NULL, 0, &ev, 1, NULL);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                log_error("Wave-22 reader %lu: park kevent failed: %s", rt->child_id, strerror(errno));
+                reader_mark_child_dead(rt);
+                break;
+            }
+            atomic_fetch_add_explicit(&rc->wakeups, 1, memory_order_relaxed);
+            if (atomic_load_explicit(&rt->stop, memory_order_acquire)) {
+                atomic_fetch_add_explicit(&rc->wake_teardown, 1, memory_order_relaxed);
+                break;
+            }
+            atomic_fetch_add_explicit(&rc->wake_unpark, 1, memory_order_relaxed);
+            continue;  // loop top re-checks stop and re-arms
+        }
+        if (!master_enabled) { reader_set_master_enabled(rt, true); master_enabled = true; }
+        // POLL: block; finite timeout only when a deferred flush is owed
+        // (timed-kevent deferred flush — kevent timespec is ns-granular, so
+        // the OPT(input_delay) ms window is representable exactly).
+        struct timespec ts, *tsp = NULL;
+        if (deferred) {
+            monotonic_t remaining = OPT(input_delay) - (monotonic() - last_wakeup_at);
+            if (remaining < 0) remaining = 0;
+            ts.tv_sec = remaining / MONOTONIC_T_1e9;
+            ts.tv_nsec = remaining % MONOTONIC_T_1e9;
+            tsp = &ts;
+        }
+        struct kevent evs[2];
+        const int n = kevent(rt->kq, NULL, 0, evs, 2, tsp);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            log_error("Wave-22 reader %lu: kevent failed: %s", rt->child_id, strerror(errno));
+            reader_mark_child_dead(rt);
+            break;
+        }
+        atomic_fetch_add_explicit(&rc->wakeups, 1, memory_order_relaxed);
+        if (atomic_load_explicit(&rt->stop, memory_order_acquire)) {
+            atomic_fetch_add_explicit(&rc->wake_teardown, 1, memory_order_relaxed);
+            break;
+        }
+        if (n == 0) {
+            // TIMER: the deferred batch window expired — flush (O4),
+            // CAS-gated like every batched wakeup.
+            atomic_fetch_add_explicit(&rc->wake_timer, 1, memory_order_relaxed);
+            if (deferred) {
+                if (reader_coalesced_wakeup()) atomic_fetch_add_explicit(&rc->batch_flushes, 1, memory_order_relaxed);
+                deferred = false;
+                last_wakeup_at = monotonic();
+            }
+            continue;
+        }
+        bool have_data = false;
+        int64_t avail = 0;
+        for (int e = 0; e < n; e++) {
+            if (evs[e].filter == EVFILT_READ) { have_data = true; avail = evs[e].data; }
+        }
+        if (!have_data) {
+            // Wake-channel trigger while not parked: a benign spurious
+            // unpark (a stale park claim at worst sends one — ring header
+            // comment) or a teardown race already handled at loop top.
+            atomic_fetch_add_explicit(&rc->wake_unpark, 1, memory_order_relaxed);
+            continue;
+        }
+        atomic_fetch_add_explicit(&rc->wake_data, 1, memory_order_relaxed);
+        // DRAIN: O5 kqueue-with-availability-count — read ceil(avail/quantum)
+        // times with NO trailing EAGAIN probe (the avail bound, not an empty
+        // read, ends the loop); O11 CAP bound; O10 errno discipline.
+        size_t total = 0;
+        bool child_dead = false;
+        for (unsigned iters = 0; iters < READER_DRAIN_CAP; iters++) {
+            if (!vt_parser_arm_pollin(screen->vt_parser)) break;  // ring filled -> park next loop
+            size_t space;
+            uint8_t *buf = vt_parser_create_write_buffer(screen->vt_parser, &space);
+            if (!space) break;
+            const ssize_t len = read(rt->master_fd, buf, space);  // NONBLOCKING (K1-K3, O9)
+            if (len < 0) {
+                vt_parser_commit_write(screen->vt_parser, 0);
+                if (errno == EINTR) continue;       // retry, bounded by CAP
+                if (errno == EAGAIN) break;         // kernel drained -> re-poll (C2)
+                if (errno != EIO) log_error("Wave-22 reader %lu: read failed: %s", rt->child_id, strerror(errno));
+                child_dead = true;
+                break;
+            }
+            if (len == 0) { vt_parser_commit_write(screen->vt_parser, 0); child_dead = true; break; }
+            vt_parser_commit_write(screen->vt_parser, (size_t)len);  // P1 publish + P2 fence
+            atomic_fetch_add_explicit(&rc->reads, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&rc->bytes, (uint64_t)len, memory_order_relaxed);
+            total += (size_t)len;
+            if ((int64_t)len >= avail) break;  // avail-count satisfied, no EAGAIN probe
+            avail -= len;
+        }
+        reader_epilogue(rt, rc, total, &deferred, &last_wakeup_at);  // EPILOGUE (order per P-checklist 4)
+        if (child_dead) { reader_mark_child_dead(rt); break; }
+    }
+    return NULL;
+}
+
+// Spawn at add_children (O14); children_mutex held by the caller.
+static ReaderThread*
+reader_spawn(ChildMonitor *self, Child *c) {
+    if (live_readers >= reader_fd_budget_children) {
+        if (!reader_budget_warned) {
+            log_error("Wave-22 readers: fd budget (%u) exhausted; child %lu keeps the legacy io read path",
+                      reader_fd_budget_children, c->id);
+            reader_budget_warned = true;
+        }
+        return NULL;
+    }
+    ReaderThread *rt = calloc(1, sizeof(ReaderThread));
+    if (!rt) return NULL;
+    rt->monitor = self; rt->screen = c->screen; rt->master_fd = c->fd; rt->child_id = c->id;
+    rt->kq = kqueue();
+    if (rt->kq < 0) {
+        log_error("Wave-22 readers: kqueue() failed: %s; child %lu keeps the legacy path", strerror(errno), c->id);
+        free(rt);
+        return NULL;
+    }
+    struct kevent evs[2];
+    EV_SET(&evs[0], rt->master_fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
+    EV_SET(&evs[1], READER_WAKE_IDENT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
+    if (kevent(rt->kq, evs, 2, NULL, 0, NULL) < 0) {
+        log_error("Wave-22 readers: kevent registration failed: %s; child %lu keeps the legacy path",
+                  strerror(errno), c->id);
+        safe_close(rt->kq, __FILE__, __LINE__);
+        free(rt);
+        return NULL;
+    }
+    if (reader_slot_free_count) rt->slot = reader_slot_free[--reader_slot_free_count];
+    else {
+        const unsigned hwm = atomic_load_explicit(&reader_slot_hwm, memory_order_relaxed);
+        if (hwm >= MAX_CHILDREN) { safe_close(rt->kq, __FILE__, __LINE__); free(rt); return NULL; }
+        rt->slot = hwm;
+        atomic_store_explicit(&reader_slot_hwm, hwm + 1, memory_order_relaxed);
+    }
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 256u * 1024u);  // O14: pinned 256 KiB
+    const int ret = pthread_create(&rt->thread, &attr, reader_main, rt);
+    pthread_attr_destroy(&attr);
+    if (ret != 0) {
+        log_error("Wave-22 readers: pthread_create failed: %s; child %lu keeps the legacy path",
+                  strerror(ret), c->id);
+        reader_slot_free[reader_slot_free_count++] = rt->slot;
+        safe_close(rt->kq, __FILE__, __LINE__);
+        free(rt);
+        return NULL;
+    }
+    live_readers++;
+    return rt;
+}
+
+// O6/O7 completion, run by the io thread with children_mutex RELEASED:
+// join (the reader is guaranteed to wake: its stop flag is set and its wake
+// channel was triggered while the handle was still published) -> close the
+// reader-owned kqueue only after the join -> close the child fd only now
+// that no thread can be blocked on it -> only then publish the child to
+// remove_queue, so the main thread's death notification (and the Child's
+// final DECREF) cannot run while the reader still uses the screen. Joining
+// under children_mutex would deadlock against a reader in its child-death
+// path; closing earlier would strand the reader on a closing fd (the macOS
+// hazard D2.4 rejects).
+static void
+finish_reader_teardowns(ChildMonitor *self UNUSED) {
+    if (!reader_teardown_pending_count) return;
+    for (size_t i = 0; i < reader_teardown_pending_count; i++) {
+        ReaderThread *rt = reader_teardown_pending[i].rt;
+        pthread_join(rt->thread, NULL);
+        safe_close(rt->kq, __FILE__, __LINE__);
+        safe_close(reader_teardown_pending[i].child.fd, __FILE__, __LINE__);
+        children_mutex(lock);
+        live_readers--;
+        reader_slot_free[reader_slot_free_count++] = rt->slot;
+        remove_queue[remove_queue_count] = reader_teardown_pending[i].child;
+        remove_queue_count++;
+        children_mutex(unlock);
+        free(rt);
+        reader_teardown_pending[i].rt = NULL;
+        reader_teardown_pending[i].child = EMPTY_CHILD;
+    }
+    reader_teardown_pending_count = 0;
+    wakeup_main_loop();  // deliver the deferred death notifications
+}
+#endif
+
 static void
 add_children(ChildMonitor *self) {
     for (; add_queue_count > 0 && self->count < MAX_CHILDREN;) {
@@ -2250,6 +2716,15 @@ add_children(ChildMonitor *self) {
         children[self->count] = add_queue[add_queue_count];
         add_queue[add_queue_count] = EMPTY_CHILD;
         children_fds[EXTRA_FDS + self->count].fd = children[self->count].fd;
+#ifdef KITTY_BACKEND_METAL
+        if (reader_threads_enabled()) {
+            // Wave-22 ON arm (O14): the reader owns this child's reads from
+            // birth; a failed spawn falls back to the legacy POLLIN path
+            // for this child only (fail toward OFF).
+            children[self->count].reader = reader_spawn(self, &children[self->count]);
+            children_fds[EXTRA_FDS + self->count].events = children[self->count].reader ? 0 : POLLIN;
+        } else
+#endif
         children_fds[EXTRA_FDS + self->count].events = POLLIN;
         self->count++;
     }
@@ -2282,9 +2757,33 @@ remove_children(ChildMonitor *self) {
         for (ssize_t i = self->count - 1; i >= 0; i--) {
             if (children[i].needs_removal) {
                 count++;
+#ifdef KITTY_BACKEND_METAL
+                if (children[i].reader) {
+                    // Wave-22 O7/O15: retire the wake handle under
+                    // children_mutex BEFORE the join (after this store no
+                    // main-thread unpark can reach this kqueue), request
+                    // stop (release), trigger the wake channel, and DEFER
+                    // the join + fd closes + remove_queue publication to
+                    // finish_reader_teardowns() outside the mutex. hangup()
+                    // keeps its legacy timing.
+                    ReaderThread *rt = children[i].reader;
+                    children[i].reader = NULL;
+                    atomic_store_explicit(&rt->stop, true, memory_order_release);
+                    reader_trigger_wake(rt);
+                    hangup(children[i].pid);
+                    reader_teardown_pending[reader_teardown_pending_count].child = children[i];
+                    reader_teardown_pending[reader_teardown_pending_count].rt = rt;
+                    reader_teardown_pending_count++;
+                } else {
+                    cleanup_child(i);
+                    remove_queue[remove_queue_count] = children[i];
+                    remove_queue_count++;
+                }
+#else
                 cleanup_child(i);
                 remove_queue[remove_queue_count] = children[i];
                 remove_queue_count++;
+#endif
                 children[i] = EMPTY_CHILD;
                 children_fds[EXTRA_FDS + i].fd = -1;
                 size_t num_to_right = self->count - 1 - i;
@@ -2487,6 +2986,11 @@ io_loop(void *data) {
         remove_children(self);
         add_children(self);
         children_mutex(unlock);
+#ifdef KITTY_BACKEND_METAL
+        // Wave-22: joins deferred by remove_children run with the mutex
+        // released (a reader's child-death path takes children_mutex).
+        finish_reader_teardowns(self);
+#endif
         data_received = false;
         total_read_bytes = 0;
 #ifdef KITTY_BACKEND_METAL
@@ -2500,6 +3004,22 @@ io_loop(void *data) {
         for (i = 0; i < self->count; i++) {
             screen = children[i].screen;
             /* printf("i:%lu id:%lu fd: %d read_buf_sz: %lu write_buf_used: %lu\n", i, children[i].id, children[i].fd, screen->read_buf_sz, screen->write_buf_used); */
+#ifdef KITTY_BACKEND_METAL
+            if (children[i].reader) {
+                // Wave-22 ON arm (D2.3): reads and the ring producer side
+                // belong to this child's reader; the io thread keeps only
+                // POLLOUT. With nothing to write the fd is excluded from
+                // the pollset entirely (fd = -1) so an unmaskable POLLHUP
+                // from a dying child cannot spin the io poll while the
+                // reader delivers the EOF through its own path.
+                screen_mutex(lock, write);
+                const bool wants_out = screen->write_buf_used > 0;
+                screen_mutex(unlock, write);
+                children_fds[EXTRA_FDS + i].fd = wants_out ? children[i].fd : -1;
+                children_fds[EXTRA_FDS + i].events = wants_out ? POLLOUT : 0;
+                continue;
+            }
+#endif
             // arm-or-park: on a full ring this parks the reader inside the
             // ring's waiter protocol before dropping POLLIN, so the parse
             // tick's unpark (write_space_created -> wakeup_io_loop) cannot
@@ -2552,6 +3072,18 @@ io_loop(void *data) {
                 if (ss.child_died) reap_children(self, OPT(close_on_child_death));
             }
             for (i = 0; i < self->count; i++) {
+#ifdef KITTY_BACKEND_METAL
+                // Wave-22 ON arm: this child's reads (and its EOF/POLLHUP)
+                // are the reader's; the io thread services only POLLOUT
+                // below. Reading here would violate the single-producer
+                // ring contract (D2.2).
+                if (children[i].reader) {
+                    if (children_fds[EXTRA_FDS + i].revents & POLLOUT) {
+                        write_to_child(children[i].fd, children[i].screen);
+                    }
+                    continue;
+                }
+#endif
                 if (children_fds[EXTRA_FDS + i].revents & (POLLIN | POLLHUP)) {
                     data_received = true;
                     size_t nread = 0;
@@ -2623,6 +3155,12 @@ io_loop(void *data) {
     for (i = 0; i < self->count; i++) children[i].needs_removal = true;
     remove_children(self);
     children_mutex(unlock);
+#ifdef KITTY_BACKEND_METAL
+    // Wave-22 O7 shutdown order: remove_children set every reader's stop
+    // flag and triggered every wake channel under the mutex; now join them
+    // all and only then close their fds.
+    finish_reader_teardowns(self);
+#endif
     return 0;
 }
 // }}}
