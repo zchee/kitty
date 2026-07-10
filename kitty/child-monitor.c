@@ -862,16 +862,20 @@ parse_input(ChildMonitor *self) {
     }
     children_mutex(unlock);
 #ifdef KITTY_BACKEND_METAL
-    // Wave-22 (M3.5 review MAJOR-1): the signal branch leaves count == 0,
-    // so this tick drains NO child rings — yet the P4 clear above may have
-    // absorbed a reader's coalesced wakeup (a CAS-loser and any parked
-    // reader now expect THIS tick to drain and unpark). Re-arm immediately:
-    // the signal flags were consumed above, so the next tick takes the
-    // draining arm — no livelock. ON arm only; the OFF arm's analogous
-    // latent gap (a signal tick also skips do_parse, so write_space_created
-    // never reaches wakeup_io_loop) is inherited, not introduced here —
-    // recorded in open-questions.md, out of this lane's scope.
-    if (UNLIKELY(signal_tick) && reader_threads_enabled()) wakeup_main_loop();
+    // W22 M3.5 MAJOR-1 + W23 F-A: the signal branch leaves count == 0, so
+    // this tick drains NO child rings — yet on the reader arm the P4 clear
+    // above may have absorbed a coalesced wakeup (a CAS-loser and any
+    // parked reader now expect THIS tick to drain and unpark), and on the
+    // legacy arm the skipped do_parse means write_space_created never
+    // reaches wakeup_io_loop for a parked io producer. Re-arm immediately
+    // for BOTH arms: the signal flags were consumed above, so the next
+    // tick takes the draining arm — no livelock. The legacy-arm window is
+    // mechanism-real but narrow (the io thread's own signal-delivery pass
+    // re-arms its wakeup chain via data_received; see
+    // .omc/verify/wave23/R23-SIGTICK-VERIFICATION.md); the GL build's
+    // instance of the same upstream-inherited gap is recorded for
+    // upstream reporting, not patched here.
+    if (UNLIKELY(signal_tick)) wakeup_main_loop();
 #else
     (void)signal_tick;
 #endif
