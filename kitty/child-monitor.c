@@ -3090,8 +3090,12 @@ io_loop(void *data) {
         }
 #undef TIMED_POLL
         if (ret > 0) {
-            if (children_fds[0].revents && POLLIN) drain_fd(children_fds[0].fd); // wakeup
-            if (children_fds[1].revents && POLLIN) {
+            // W23 F-B: the old logical `revents && POLLIN` was true on ANY
+            // event; the explicit mask keeps that drain-on-any-event intent
+            // (POLLERR/POLLHUP on these process-lifetime self-pipe fds is
+            // unreachable by construction — both ends process-owned).
+            if (children_fds[0].revents & (POLLIN | POLLHUP | POLLERR)) drain_fd(children_fds[0].fd); // wakeup
+            if (children_fds[1].revents & (POLLIN | POLLHUP | POLLERR)) {
                 SignalSet ss = {0};
                 data_received = true;
                 read_signals(children_fds[1].fd, handle_signal, &ss);
