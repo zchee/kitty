@@ -2699,3 +2699,51 @@ Disposition: **switch-dormant default-OFF skeleton stays in-tree**; full
 revert not triggered. 60 Hz single machine; same-block arithmetic only; no
 victory language — the wakeup-economics prize, as pinned, is refuted at
 product scale on these workloads.
+
+## Phase 23 (Wave 23): inherited-maintenance lane landed; wakeup-economics family CLOSED by the parks probe
+
+Executed the consensus plan (`.omc/plans/ralplan-wave23-maintenance-and-parks-probe.md`
+v3.1, both recorded conditions honored). Artifacts under
+`.omc/verify/wave23/` — `R23-SIGTICK-VERIFICATION.md`, `R23-GUARDS.md`,
+`W23-ADJUDICATION.md`; ADR-0008. Commits `4ed24e8c2` (F-A),
+`9c54fde7e` (F-B), `f35689f45` (F-C).
+
+**Maintenance lane (three independent commits, kitty/child-monitor.c)**:
+F-A widens the W22 signal-tick re-arm to the legacy arm (Metal build;
+probe evidence: 100 phase-scanned reload signals under ring-full flood
+could not reach the stall end-to-end — the io thread's signal-delivery
+pass re-arms its own wakeup chain — so the fix lands on the
+pre-registered mechanism-identity floor with severity revised DOWN, not
+as a demonstrated user-visible stall). F-B replaces the upstream
+`revents && POLLIN` logical-AND on the wakeup/signal fd branches with
+the explicit `& (POLLIN|POLLHUP|POLLERR)` superset (behavior-identical
+on reachable events; upstream-reportable). F-C adds the test-only
+KITTY_READER_SPAWN_FAIL injection lever, converting the W22 F1
+fallback-unpark leg from inspection-verified to battery-verified
+(25/25 flood cycles: parks present, EOF byte-exact, zero leaks).
+
+**Measurement lane — parks probe (zero product code): FAMILY-CLOSED.**
+Three concurrent sync_medium_cells windows constructed exactly the
+consumer-bottleneck regime the W22 NO-LAND attribution said the reader
+design's mechanisms needed (P1: sustained 74 parks/s, live unparks,
+every round) — and the reader arm STILL generated 1.643x the
+PTY-servicing wakeups of the io-thread baseline (1.579x per MiB),
+with throughput parity (1.0405x). The wakeup-reduction mechanisms
+engage and do not pay on this machine's PTY quantum physics. Per the
+pre-registered bands the wakeup-economics family is closed absent new
+evidence; the dormant KITTY_READER_THREADS skeleton stays in-tree
+(guards all green, OFF-arm cost 0.9828 <= 1.02 vs pre-W23).
+
+**Verification-integrity findings (recorded for future waves)**: the
+live fast_data_types.so was found silently reverted to a pre-W23 build
+mid-wave (caught by the per-row live-sha256 discipline the W23 plan
+carried; every affected block re-run on the verified binary with
+identical verdicts); test.py REBUILDS fast_data_types.so with its own
+flags, so any measurement after a test run must rebuild+hash-verify;
+builds are bit-deterministic per source+flags (hash = identity); the
+W22 absolute idle bar (0.0% x8) is unattainable on this machine as of
+2026-07-11 (a real ~1.2% cputime drift affecting pre-W23 binaries
+equally — idle guard moved to a four-cell parity form, ratios <= 1.10);
+the ON-arm ssh test failure was root-caused to a pre-existing ssh-kitten
+KITTY_* env-forwarding sensitivity (KITTY_FOO_THREADS=1 fails
+identically; FOO_READER_THREADS=1 passes). 60 Hz single machine.
