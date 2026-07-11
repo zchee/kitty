@@ -2669,7 +2669,7 @@ reader_spawn_fail_injected(void) {
         const char *v = getenv("KITTY_READER_SPAWN_FAIL");
         if (!v || !v[0] || strcmp(v, "0") == 0) mode = 0;
         else if (strcmp(v, "all") == 0) mode = -1;
-        else mode = atoi(v) > 0 ? atoi(v) : 0;
+        else mode = MAX(atoi(v), 0);
     }
     if (mode == 0) return false;
     if (mode == -1) return true;
