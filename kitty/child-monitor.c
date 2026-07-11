@@ -2654,9 +2654,36 @@ reader_main(void *arg) {
     return NULL;
 }
 
+// W23 F-C: test-only spawn-failure injection so the fallback-child paths
+// (budget exhaustion, F1 unpark delivery) are battery-exercisable instead
+// of inspection-only. KITTY_READER_SPAWN_FAIL unset or "0" = injection
+// off (one cached-bool branch, spawn path otherwise byte-identical);
+// "all" = every spawn fails; a number n = the first n spawns fail. The
+// failure happens BEFORE any fd or allocation, returning NULL exactly
+// like the budget-exhausted path the caller already handles. Counter
+// mutation is race-free: reader_spawn runs under children_mutex.
+static bool
+reader_spawn_fail_injected(void) {
+    static int mode = -2;  // -2 unresolved, -1 all, 0 off, >0 remaining count
+    if (UNLIKELY(mode == -2)) {
+        const char *v = getenv("KITTY_READER_SPAWN_FAIL");
+        if (!v || !v[0] || strcmp(v, "0") == 0) mode = 0;
+        else if (strcmp(v, "all") == 0) mode = -1;
+        else mode = atoi(v) > 0 ? atoi(v) : 0;
+    }
+    if (mode == 0) return false;
+    if (mode == -1) return true;
+    mode--;
+    return true;
+}
+
 // Spawn at add_children (O14); children_mutex held by the caller.
 static ReaderThread*
 reader_spawn(ChildMonitor *self, Child *c) {
+    if (UNLIKELY(reader_spawn_fail_injected())) {
+        log_error("Wave-23 readers: spawn failure injected (KITTY_READER_SPAWN_FAIL); child %lu keeps the legacy io read path", c->id);
+        return NULL;
+    }
     if (live_readers >= reader_fd_budget_children) {
         if (!reader_budget_warned) {
             log_error("Wave-22 readers: fd budget (%u) exhausted; child %lu keeps the legacy io read path",
