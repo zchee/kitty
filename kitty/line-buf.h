@@ -61,6 +61,12 @@ typedef struct {
     // Wave-24 D0: monotonic source for gen_at_pos assignments (see the lane
     // comment above). Only advances when pause_snapshot_cow_enabled().
     uint32_t gen_counter;
+    // Wave-25 Lane S: true for buffers whose write checkouts must COW-retire
+    // held slots (the live main/alt buffers). The pause-snapshot linebuf
+    // shares the live pool under KITTY_PAUSE_SNAPSHOT_SHARE and must NEVER
+    // retire (its rows are the holders) -- screen_pause_rendering clears
+    // this on the snapshot buffer; every other allocation defaults to true.
+    bool share_writer;
 } LineBuf;
 
 // Wave-21 L4 (KITTY_PAUSE_SNAPSHOT_COW): one-shot process-lifetime switch,
@@ -88,6 +94,41 @@ static inline void
 linebuf_gen_bump_range(LineBuf *self, index_type p_start, index_type p_end_incl) {
     if (UNLIKELY(pause_snapshot_cow_enabled())) {
         for (index_type p = p_start; p <= p_end_incl; p++) self->gen_at_pos[p] = ++self->gen_counter;
+    }
+}
+
+// Wave-25 Lane S (KITTY_PAUSE_SNAPSHOT_SHARE): one-shot behavioral switch,
+// resolved at first use exactly like pause_snapshot_cow_state above. OFF
+// (unset/"0") keeps the deep-copy snapshot world byte-identical.
+extern int pause_snapshot_share_state;  // -1 unresolved, else 0/1 (line-buf.c)
+bool pause_snapshot_share_resolve(void);
+static inline bool
+pause_snapshot_share_enabled(void) {
+    const int s = pause_snapshot_share_state;
+    return UNLIKELY(s < 0) ? pause_snapshot_share_resolve() : s != 0;
+}
+
+// Wave-25 Lane S: process-cumulative share counters, diffed per tick by the
+// parser (run_worker) into KITTY_FRAME_TRACE share_rows_total= /
+// share_rows_ref= / share_cow_retires= (the cow_copied precedent). The
+// retire counter increments inside the retire itself so every retire class
+// (handout helpers, self-lineptr direct mutators, the history-side ring
+// writers, the handover) is counted at one site.
+extern uint64_t share_rows_total_counter, share_rows_ref_counter, share_cow_retires_counter;
+
+// Wave-25 Lane S: the COW retire at pointer handout. The invariant is
+// "retire happens BEFORE cpu_lineptr/gpu_lineptr is computed; every cached
+// pointer derives from the post-retire slot". p is a PHYSICAL index
+// (lb_phys(y), or raw i in the order-agnostic full-row loops). Unset-world
+// cost: refcnt_lane is NULL until the first SHARE snapshot ever taken on
+// this pool -- one pointer load + branch.
+void linebuf_share_retire_cold(LineBuf *self, index_type p);
+static inline void
+linebuf_share_retire(LineBuf *self, index_type p) {
+    const LineSlotPool *pool = self->pool;
+    if (UNLIKELY(pool->refcnt_lane != NULL)) {
+        const index_type slot = self->line_map[p];
+        if (slot < pool->lane_cap && pool->refcnt_lane[slot] && self->share_writer) linebuf_share_retire_cold(self, p);
     }
 }
 

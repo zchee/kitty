@@ -578,6 +578,7 @@ static uint64_t ft_parsed_bytes;
 static uint64_t ft_pause_starts, ft_pause_stops;
 // Wave-21 L4: pause-snapshot COW probe counters (KITTY_PAUSE_SNAPSHOT_COW).
 static uint64_t ft_cow_copied, ft_cow_skip_eligible;
+static uint64_t ft_share_rows_total, ft_share_rows_ref, ft_share_cow_retires;  // Wave-25 Lane S
 static size_t ft_arena_fill_start, ft_arena_fill_end;
 static size_t ft_ring_fill_start, ft_ring_fill_end;
 static bool ft_paused_at_end;
@@ -739,6 +740,7 @@ frame_trace_emit(monotonic_t ts, bool input_read, monotonic_t parse_dt, monotoni
               " input_read=%d gate=%s present=%d parsed=%llu pause_on=%llu pause_off=%llu"
               " paused_end=%d arena0=%llu arena1=%llu ring0=%llu ring1=%llu"
               " cow_copied=%llu cow_skip_eligible=%llu"
+              " share_rows_total=%llu share_rows_ref=%llu share_cow_retires=%llu"
               " io_iters=%llu io_polls=%llu io_poll_ms=%.3f io_reads=%llu io_read_bytes=%llu"
               " io_read_ms=%.3f io_avail_bytes=%llu io_wrap_capped=%llu io_pollin_off=%llu"
               " rd_on=%d rd_kevent_wakeups=%llu rd_wake_data=%llu rd_wake_timer=%llu"
@@ -752,6 +754,7 @@ frame_trace_emit(monotonic_t ts, bool input_read, monotonic_t parse_dt, monotoni
               (unsigned long long)ft_arena_fill_start, (unsigned long long)ft_arena_fill_end,
               (unsigned long long)ft_ring_fill_start, (unsigned long long)ft_ring_fill_end,
               (unsigned long long)ft_cow_copied, (unsigned long long)ft_cow_skip_eligible,
+              (unsigned long long)ft_share_rows_total, (unsigned long long)ft_share_rows_ref, (unsigned long long)ft_share_cow_retires,
               (unsigned long long)io_iters, (unsigned long long)io_polls, ft_ms((monotonic_t)io_pns),
               (unsigned long long)io_reads, (unsigned long long)io_rbytes, ft_ms((monotonic_t)io_rns),
               (unsigned long long)io_avail, (unsigned long long)io_wrapcap, (unsigned long long)io_pdis,
@@ -780,6 +783,9 @@ do_parse(ChildMonitor *self, Screen *screen, monotonic_t now, bool flush) {
         ft_pause_stops += pd.pause_stops;
         ft_cow_copied += pd.cow_copied;  // Wave-21 L4
         ft_cow_skip_eligible += pd.cow_skip_eligible;
+        ft_share_rows_total += pd.share_rows_total;  // Wave-25 Lane S
+        ft_share_rows_ref += pd.share_rows_ref;
+        ft_share_cow_retires += pd.share_cow_retires;
         ft_arena_fill_start = pd.arena_fill_start;
         ft_arena_fill_end = pd.arena_fill_end;
         ft_ring_fill_start = pd.ring_fill_start;
@@ -2256,6 +2262,7 @@ process_global_state(void *data) {
         ft_bytes_drained = 0; ft_gate_outcome = FT_GATE_NONE; ft_present_committed = false;
         ft_parsed_bytes = 0; ft_pause_starts = 0; ft_pause_stops = 0; ft_paused_at_end = false;
         ft_cow_copied = 0; ft_cow_skip_eligible = 0;  // Wave-21 L4
+        ft_share_rows_total = 0; ft_share_rows_ref = 0; ft_share_cow_retires = 0;  // Wave-25 Lane S
     }
 #endif
 #ifdef __APPLE__

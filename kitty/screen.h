@@ -217,6 +217,19 @@ typedef struct {
         // the switch is ON; NULL = every row copies.
         struct SnapshotRowKey { uint32_t lb_serial; index_type slot; uint32_t gen; } *cow_keys;
         bool cow_keys_valid, cow_keys_flip;
+        // Wave-25 Lane S (KITTY_PAUSE_SNAPSHOT_SHARE): slot-sharing snapshot
+        // state. share_pool is the pool the held ids live in, increffed at
+        // acquire and decreffed at release -- the lifetime anchor that keeps
+        // slots alive even if the live buffer migrates to a fresh pool
+        // (design MAJOR-3). share_own_slots remembers the snapshot linebuf's
+        // OWN slot per row so a shared id can be swapped out at release and
+        // the own slot reused for deep-copy rows (history-backed snapshots).
+        // Arrays are sized to the row count and share the snapshot
+        // linebuf's lifetime (freed at the geometry realloc and dealloc).
+        LineSlotPool *share_pool;
+        index_type *share_own_slots;
+        uint8_t *share_row_is_ref;
+        index_type share_held;
     } paused_rendering;
     // Wave-19 L4 probe: cumulative counts of successful BSU/ESU transitions
     // (DECSET-2026 / DECRPM pending-mode set-reset), diffed per-tick by the

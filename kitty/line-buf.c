@@ -38,6 +38,7 @@ line_slot_pool_decref(LineSlotPool *pool) {
     if (!pool || --pool->refcnt) return;
     for (size_t i = 0; i < pool->num_slabs; i++) free(pool->slabs[i].mem);
     free(pool->slabs);
+    free(pool->refcnt_lane); free(pool->retired); free(pool->free_ids);  // Wave-25 Lane S
     free(pool);
 }
 
@@ -53,6 +54,9 @@ pool_add_slab(LineSlotPool *pool) {
     LineSlotSlab *s = pool->slabs + pool->num_slabs;
     s->mem = mem; s->cpu = mem; s->gpu = (GPUCell*)((uint8_t*)mem + cpu_sz);
     pool->num_slabs++;
+    // Wave-25 Lane S: the refcount lane rides the slab growth path (design
+    // §1) so slot ids handed out after a SHARE snapshot exists stay covered.
+    if (pool->refcnt_lane) line_slot_pool_ensure_share_lane(pool);
     return true;
 }
 
@@ -63,6 +67,87 @@ line_slot_pool_take(LineSlotPool *pool) {
     }
     return (index_type)pool->slots_used++;
 }
+
+// Wave-25 Lane S (KITTY_PAUSE_SNAPSHOT_SHARE) {{{
+// Process-cumulative share counters (line-buf.h): bumped at acquire
+// (screen.c) and inside the retire itself; diffed per tick by the parser.
+uint64_t share_rows_total_counter = 0, share_rows_ref_counter = 0, share_cow_retires_counter = 0;
+
+int pause_snapshot_share_state = -1;
+bool
+pause_snapshot_share_resolve(void) {
+    const char *v = getenv("KITTY_PAUSE_SNAPSHOT_SHARE");
+    pause_snapshot_share_state = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0;
+    return pause_snapshot_share_state != 0;
+}
+
+void
+line_slot_pool_ensure_share_lane(LineSlotPool *pool) {
+    const size_t cap = pool->num_slabs * pool->slab_capacity;
+    if (pool->lane_cap >= cap && pool->refcnt_lane) return;
+    uint16_t *lane = realloc(pool->refcnt_lane, cap * sizeof(uint16_t));
+    uint8_t *retired = realloc(pool->retired, cap * sizeof(uint8_t));
+    if (!lane || !retired) fatal("Out of memory allocating the line-slot share lane");
+    memset(lane + pool->lane_cap, 0, (cap - pool->lane_cap) * sizeof(uint16_t));
+    memset(retired + pool->lane_cap, 0, (cap - pool->lane_cap) * sizeof(uint8_t));
+    pool->refcnt_lane = lane; pool->retired = retired; pool->lane_cap = cap;
+}
+
+void
+line_slot_pool_slot_incref(LineSlotPool *pool, index_type slot) {
+    assert(slot < pool->lane_cap);
+    assert(pool->refcnt_lane[slot] < UINT16_MAX);  // ARCH NOTE-2: holders are {0,1} today
+    pool->refcnt_lane[slot]++;
+}
+
+void
+line_slot_pool_slot_decref(LineSlotPool *pool, index_type slot) {
+    // The SINGLE decref site is snapshot Release (design MAJOR-2 timeline:
+    // BSU increfs / COW never decrefs / Release single-decrefs). A slot is
+    // reclaimed only when its last holder leaves AND a COW retire already
+    // moved live containment away (retired flag) -- a held slot can never
+    // re-enter circulation mid-pause.
+    assert(slot < pool->lane_cap && pool->refcnt_lane[slot] > 0);
+    if (--pool->refcnt_lane[slot] == 0 && pool->retired[slot]) {
+        pool->retired[slot] = 0;
+        if (pool->free_count >= pool->free_cap) {
+            const size_t cap = pool->free_cap ? pool->free_cap * 2 : 64;
+            index_type *ids = realloc(pool->free_ids, cap * sizeof(index_type));
+            if (!ids) fatal("Out of memory growing the line-slot free list");
+            pool->free_ids = ids; pool->free_cap = cap;
+        }
+        pool->free_ids[pool->free_count++] = slot;
+    }
+}
+
+index_type
+line_slot_pool_take_reusing(LineSlotPool *pool) {
+    if (pool->free_count) return pool->free_ids[--pool->free_count];
+    const index_type slot = line_slot_pool_take(pool);
+    if (pool->refcnt_lane && slot >= pool->lane_cap) line_slot_pool_ensure_share_lane(pool);
+    return slot;
+}
+
+// The COW retire (design §3): a content write is about to reach a slot with
+// snapshot holders. Move live ownership to a fresh copy; the frozen slot's
+// refcount continues to represent its holders untouched (retire never
+// decrefs -- the live hold was never counted). The writer pays one row copy,
+// the same cost a snapshot deep copy would have paid.
+void
+linebuf_share_retire_cold(LineBuf *self, index_type p) {
+#ifdef __APPLE__
+    assert(pthread_main_np());  // W25-THREAD-AUDIT assertion 1
+#endif
+    LineSlotPool *pool = self->pool;
+    const index_type old = self->line_map[p];
+    const index_type fresh = line_slot_pool_take_reusing(pool);
+    memcpy(pool_cpu_lineptr(pool, fresh), pool_cpu_lineptr(pool, old), (size_t)pool->xnum * sizeof(CPUCell));
+    memcpy(pool_gpu_lineptr(pool, fresh), pool_gpu_lineptr(pool, old), (size_t)pool->xnum * sizeof(GPUCell));
+    pool->retired[old] = 1;  // live containment left while held -> reclaim at Release
+    self->line_map[p] = fresh;
+    share_cow_retires_counter++;
+}
+// }}}
 
 static CPUCell*
 cpu_lineptr(LineBuf *linebuf, index_type y) {
@@ -85,6 +170,7 @@ linebuf_clear(LineBuf *self, char_type ch) {
     // per-line via line_map: slot assignments are preserved, only the
     // content is cleared (cell storage is pool slots, not one block)
     for (index_type i = 0; i < self->ynum; i++) {
+        linebuf_share_retire(self, i);  // Wave-25: order-agnostic full-row clear
         const index_type slot = self->line_map[i];
         zero_at_ptr_count(cpu_lineptr(self, slot), self->xnum);
         zero_at_ptr_count(gpu_lineptr(self, slot), self->xnum);
@@ -155,6 +241,7 @@ alloc_linebuf_(PyTypeObject *cls, unsigned int lines, unsigned int columns, Text
         self->xnum = columns;
         self->ynum = lines;
         self->head = 0;  // S3: line_map/line_attrs start un-rotated
+        self->share_writer = true;  // Wave-25 Lane S: snapshot buffers clear this
         // Cell storage lives in the slot pool; a private pool's slab is
         // sized exactly for this container, while a shared pool (with the
         // paired HistoryBuf, for the slot handover on scroll) uses
@@ -209,6 +296,9 @@ dealloc(LineBuf* self) {
 
 void
 linebuf_init_cells(LineBuf *lb, index_type idx, CPUCell **c, GPUCell **g) {
+    // Wave-25 Lane S: retire BEFORE any pointer (or the materialize below)
+    // derives from the slot -- the retire-before-lineptr invariant.
+    linebuf_share_retire(lb, lb_phys(lb, idx));
     // S1 (Phase 13B): callers fetch these pointers to WRITE GPUCells (draw
     // run-fills, multicell, char shifts), so materialize any deferred clear.
     linebuf_materialize_blank(lb, idx);
@@ -229,6 +319,7 @@ linebuf_init_cells_notrack(LineBuf *lb, index_type idx, CPUCell **c, GPUCell **g
     // Wave-15 L1: the append-draw path's cell fetch. Identical to
     // linebuf_init_cells but WITHOUT the UNTRACKED mark -- the caller records the
     // exact write extent via linebuf_note_write_extent, keeping finalize O(1).
+    linebuf_share_retire(lb, lb_phys(lb, idx));  // Wave-25: retire before pointers
     linebuf_materialize_blank(lb, idx);
     const index_type ynum = lb->line_map[lb_phys(lb, idx)];
     *c = cpu_lineptr(lb, ynum);
@@ -237,6 +328,9 @@ linebuf_init_cells_notrack(LineBuf *lb, index_type idx, CPUCell **c, GPUCell **g
 
 CPUCell*
 linebuf_cpu_cells_for_line(LineBuf *lb, index_type idx) {
+    // Wave-25 Lane S: a write checkout (screen_tab space-fill, hyperlink
+    // remap) -- retire before the pointer derives.
+    linebuf_share_retire(lb, lb_phys(lb, idx));
     const index_type ynum = lb->line_map[lb_phys(lb, idx)];
     return cpu_lineptr(lb, ynum);
 }
@@ -262,6 +356,11 @@ linebuf_init_line(LineBuf *self, index_type idx) {
     // so materialize any deferred clear here. The explicit-Line variant
     // (linebuf_init_line_at) stays pure so the render path can peek is_blank and
     // emit blank_diff with the deferred GPUCells left untouched.
+    // Wave-25 Lane S: this is the write-side checkout choke; the pure
+    // render/reader path (linebuf_init_line_at) never retires. A read-only
+    // caller landing here pays at most one checkout-granularity false COW
+    // (the named ITERATE class -- plan Risk 5).
+    linebuf_share_retire(self, lb_phys(self, idx));
     linebuf_make_authoritative(self, idx);
     linebuf_init_line_at(self, idx, self->line);
 }
@@ -272,6 +371,8 @@ linebuf_clear_lines(LineBuf *self, const Cursor *cursor, index_type start, index
 #error This implementation is incorrect for BLANK_CHAR != 0
 #endif
 #define lineptr(which, i) which##_lineptr(self, self->line_map[lb_phys(self, i)])
+    // Wave-25 Lane S: every row in [start, end) is written below
+    for (index_type i = start; i < end; i++) linebuf_share_retire(self, lb_phys(self, i));
     GPUCell *first_gpu_line = lineptr(gpu, start);
     const GPUCell gc = cursor_as_gpu_cell(cursor);
     memset_array(first_gpu_line, gc, self->xnum);
@@ -314,6 +415,7 @@ void
 linebuf_set_last_char_as_continuation(LineBuf *self, index_type y, bool continued) {
     if (y < self->ynum) {
         const index_type p = lb_phys(self, y);
+        linebuf_share_retire(self, p);  // Wave-25: cell write below
         cpu_lineptr(self, self->line_map[p])[self->xnum - 1].next_char_was_wrapped = continued;
         linebuf_gen_bump(self, p);  // Wave-21 L4: cell mutation without a dirty mark
     }
@@ -327,6 +429,7 @@ set_attribute(LineBuf *self, PyObject *args) {
     char *which;
     if (!PyArg_ParseTuple(args, "sI", &which, &val)) return NULL;
     for (index_type y = 0; y < self->ynum; y++) {
+        linebuf_share_retire(self, y);  // Wave-25: GPU-cell write (raw physical loop)
         if (!set_named_attribute_on_line(gpu_lineptr(self, self->line_map[y]), which, val, self->xnum)) {
             PyErr_SetString(PyExc_KeyError, "Unknown cell attribute"); return NULL;
         }
@@ -506,6 +609,7 @@ linebuf_clear_line(LineBuf *self, index_type y, bool clear_attrs, bool allow_laz
 #error This implementation is incorrect for BLANK_CHAR != 0
 #endif
     const index_type p = lb_phys(self, y);
+    linebuf_share_retire(self, p);  // Wave-25: retire before the lineptrs below
     index_type ym = self->line_map[p];
     CPUCell *c = cpu_lineptr(self, ym); GPUCell *g = gpu_lineptr(self, ym);
     // The 12B CPUCell clear stays eager in EVERY arm: every text reader
@@ -542,6 +646,7 @@ void
 linebuf_materialize_blank_line(LineBuf *self, index_type y) {
     const index_type p = lb_phys(self, y);
     if (!self->line_attrs[p].is_blank || scroll_clear_mode() != SCROLL_CLEAR_RELOCATE) return;
+    linebuf_share_retire(self, p);  // Wave-25: GPU-row write below
     self->line_attrs[p].is_blank = 0;
     zero_at_ptr_count(gpu_lineptr(self, self->line_map[p]), self->xnum);
     linebuf_gen_bump(self, p);  // Wave-21 L4: GPU cells + is_blank changed
@@ -559,6 +664,7 @@ void
 linebuf_materialize_deferred_row(LineBuf *self, index_type y) {
     const index_type p = lb_phys(self, y);
     if (!self->line_attrs[p].is_blank) return;
+    linebuf_share_retire(self, p);  // Wave-25: GPU-row write below
     self->line_attrs[p].is_blank = 0;
     self->line_attrs[p].has_dirty_text = true;
     zero_at_ptr_count(gpu_lineptr(self, self->line_map[p]), self->xnum);
@@ -586,6 +692,7 @@ void
 linebuf_finalize_hwm_line(LineBuf *self, index_type y) {
     const index_type p = lb_phys(self, y);
     if (!self->line_attrs[p].is_blank) return;
+    linebuf_share_retire(self, p);  // Wave-25: GPU tail zero below
     self->line_attrs[p].is_blank = 0;
     linebuf_gen_bump(self, p);  // Wave-21 L4: is_blank drop + GPU tail zero below
     const index_type ym = self->line_map[p];
@@ -784,6 +891,7 @@ linebuf_insert_lines(LineBuf *self, unsigned int num, unsigned int y, unsigned i
     memcpy(self->line_map + y, self->scratch, scratch_sz);
     Line l;
     for (i = y; i < y + num; i++) {
+        linebuf_share_retire(self, i);  // Wave-25: rotated-in row is cleared below
         init_line(self, &l, self->line_map[i]);
         clear_line_(&l, self->xnum);
         self->line_attrs[i].val = 0;
@@ -823,6 +931,7 @@ linebuf_delete_lines(LineBuf *self, index_type num, index_type y, index_type bot
     memcpy(self->line_map + ylimit - num, self->scratch, scratch_sz);
     Line l;
     for (i = ylimit - num; i < ylimit; i++) {
+        linebuf_share_retire(self, i);  // Wave-25: rotated-in row is cleared below
         init_line(self, &l, self->line_map[i]);
         clear_line_(&l, self->xnum);
         self->line_attrs[i].val = 0;
@@ -843,6 +952,7 @@ delete_lines(LineBuf *self, PyObject *args) {
 void
 linebuf_copy_line_to(LineBuf *self, Line *line, index_type where) {
     const index_type wp = lb_phys(self, where);  // S3: logical row -> physical
+    linebuf_share_retire(self, wp);  // Wave-25: the copy below writes this row
     init_line(self, self->line, self->line_map[wp]);
     copy_line(line, self->line);
     self->line_attrs[wp] = line->attrs;
