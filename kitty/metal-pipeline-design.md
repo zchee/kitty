@@ -2814,3 +2814,50 @@ relinks only — arm identity = clean full-dependent build + live sha);
 header edits require header touches or the rebuild produces an
 ABI-mixed binary. 60 Hz single machine; no victory language — a ceiling
 was measured and a design was made executable, nothing landed.
+
+## Phase 25 (Wave 25): slot-anchored refcounted-line COW LANDS default-OFF (gate 1.1675x <= 1.25; realized R 0.68023); the flood-axis COW family closes
+
+Wave 25 implemented the W24 CONFIRMED-SOUND design behind new
+KITTY_PAUSE_SNAPSHOT_SHARE (default-OFF; unset = the deep-copy world,
+byte-identical in behavior). Lane S = the contiguous series bbf47373e
+(pool refcount lane + LIFO free list + retired flags; COW retire at
+pointer handout across 15 line-buf sites and 4 history-ring sites with
+the retire-before-lineptr invariant; the ONE snapshot-release funnel
+called from unpause/dealloc with the realloc edge asserting emptiness;
+deferred-row finalize-before-incref at BSU; share_* counters riding the
+FRAME_TRACE emitter; composed-world guard with a recorded stderr note;
+two debug accessors for the integrity battery; the five audit-specified
+debug assertions) + 5816866df (the OFF-cost fix: check the resolved
+one-shot switch before touching the pool cacheline). The blocking M1
+thread/release-path audit returned PASS before any product code (all
+readers main-thread, zero fences; 12 reset sites enumerated), and the
+first Lane S commit message references that PASS (AC-2 chronology).
+
+**The pre-registered gate, applied verbatim (bands from the plan, no
+post-measurement edits)**: same-block R-hat measured FIRST at 0.67807
+(3/3 rounds 0.6781, 4-digit stable — reproducing W24's ceiling to four
+digits on the byte-identical-unset COW arm), deriving the
+discrimination floor 0.54246; the ratio block then measured pause/
+no-pause = 1.1675x <= 1.25 (PASS with margin; the 1.20x stretch is an
+annotation only), realized R = 0.68023 >= 0.54246 (PASS — and above
+R-hat, the pre-registered expected reading: between-window writes cost
+eligibility but not sharing), baseline-must-hold 1.0111x <= 1.02
+(PASS). Composed smoke row: trace counters zero + the designed stderr
+guard note PRESENT. Guards: OFF-cost dense 1.0194x / sync 1.0107x
+(first run 1.0225x RED — a real pool-cacheline regression the guard
+caught, fixed in-series, both runs recorded); goldens 4/4 both arms;
+kill-switch 2178/2178 unset ticks share_*=0 with the ON identity
+total = pause_on x 30 exact; battery 50/50 cycles composing the nine
+pinned write classes with the post-storm byte compare; idle parity
+<= 0.01 s; unit tests 11/11 x3; full test.py at the recorded baseline.
+
+**Verification-integrity additions**: macOS dyld caches code-signing
+identity per inode — an in-place cp over the live .so breaks the next
+dlopen; arm swaps unlink first (fresh inode). Arm-swapping activities
+must be serialized against in-process .so consumers (a live agent race
+was caught by the sha-per-row rule and stopped correctly). ps -o
+cputime's fractional field is centiseconds. The shipped default is
+unchanged; any default-ON flip re-arms the W20 energy guard
+(operator-sudo-gated) as a separate decision. 60 Hz single machine; no
+victory language — a pre-registered gate was met and the mechanism
+lands behind a default-OFF switch.
