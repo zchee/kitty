@@ -38,6 +38,12 @@ typedef struct ParseData {
     // Wave-21 L4: pause-snapshot COW probe (KITTY_PAUSE_SNAPSHOT_COW; zero when off)
     unsigned cow_copied;        // snapshot rows deep-copied this tick
     unsigned cow_skip_eligible; // snapshot rows whose identity key matched this tick
+    // Wave-25 Lane S (KITTY_PAUSE_SNAPSHOT_SHARE; zero when off): per-tick
+    // diffs of the process-cumulative share counters (line-buf.h) -- realized
+    // R = (sum ref - sum retires) / sum total across a measurement block.
+    unsigned share_rows_total;  // snapshot rows processed at BSU this tick (grid + history)
+    unsigned share_rows_ref;    // grid rows acquired by reference this tick
+    unsigned share_cow_retires; // COW retire copies paid this tick
 } ParseData;
 
 // The must only be called on the main thread

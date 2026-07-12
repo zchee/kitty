@@ -42,6 +42,28 @@ cpu_lineptr(HistoryBuf *self, index_type y) {
     return pool_cpu_lineptr(self->pool, self->slot_ring[y]);
 }
 
+// Wave-25 Lane S: the history ring is swap-only for scroll, but two writers
+// mutate ring-slot cells IN PLACE (hyperlink remap via historybuf_cpu_cells,
+// the wrap-flag setter) -- a held slot must be retired (fresh copy swapped
+// into the ring) before such a write reaches it. Mirrors
+// linebuf_share_retire_cold; the ring has no snapshot-holder role, so no
+// share_writer gate is needed.
+static void
+historybuf_share_retire(HistoryBuf *self, index_type ring_pos) {
+    LineSlotPool *pool = self->pool;
+    if (UNLIKELY(pool->refcnt_lane != NULL)) {
+        const index_type slot = self->slot_ring[ring_pos];
+        if (slot < pool->lane_cap && pool->refcnt_lane[slot]) {
+            const index_type fresh = line_slot_pool_take_reusing(pool);
+            memcpy(pool_cpu_lineptr(pool, fresh), pool_cpu_lineptr(pool, slot), (size_t)pool->xnum * sizeof(CPUCell));
+            memcpy(pool_gpu_lineptr(pool, fresh), pool_gpu_lineptr(pool, slot), (size_t)pool->xnum * sizeof(GPUCell));
+            pool->retired[slot] = 1;
+            self->slot_ring[ring_pos] = fresh;
+            share_cow_retires_counter++;
+        }
+    }
+}
+
 static GPUCell*
 gpu_lineptr(HistoryBuf *self, index_type y) {
     ensure_position(self, y);
@@ -200,7 +222,10 @@ history_buf_endswith_wrap(HistoryBuf *self) {
 
 CPUCell*
 historybuf_cpu_cells(HistoryBuf *self, index_type lnum) {
-    return cpu_lineptr(self, index_of(self, lnum));
+    // Wave-25 Lane S: hyperlink remap rewrites these cells in place
+    const index_type pos = index_of(self, lnum);
+    historybuf_share_retire(self, pos);
+    return cpu_lineptr(self, pos);
 }
 
 void
@@ -658,7 +683,9 @@ HistoryBuf *alloc_historybuf_with_pool(unsigned int lines, unsigned int columns,
 static void
 history_buf_set_last_char_as_continuation(HistoryBuf *self, index_type y, bool wrapped) {
     if (self->count > 0) {
-        cpu_lineptr(self, index_of(self, y))[self->xnum-1].next_char_was_wrapped = wrapped;
+        const index_type pos = index_of(self, y);
+        historybuf_share_retire(self, pos);  // Wave-25: cell write below
+        cpu_lineptr(self, pos)[self->xnum-1].next_char_was_wrapped = wrapped;
     }
 }
 
@@ -667,6 +694,7 @@ historybuf_next_dest_line(HistoryBuf *self, ANSIBuf *as_ansi_buf, Line *src_line
     history_buf_set_last_char_as_continuation(self, 0, continued);
     bool needs_clear;
     index_type idx = historybuf_push(self, as_ansi_buf, &needs_clear);
+    historybuf_share_retire(self, idx);  // Wave-25: dest_line is written by the caller
     *attrptr(self, idx) = src_line->attrs;
     init_line(self, idx, dest_line);
     if (needs_clear) {
@@ -714,6 +742,10 @@ historybuf_take_line_from(HistoryBuf *self, LineBuf *lb, index_type lb_y, ANSIBu
     lb->line_map[lb_p] = self->slot_ring[idx];
     self->slot_ring[idx] = evicted;
     self->attrs_ring[idx] = lb->line_attrs[lb_p];
+    // Wave-25 Lane S: a wrapped-around ring slot entering the visible set may
+    // still be held by a snapshot; retire it here (design §3 lists the
+    // handover in the retire map) rather than relying on the later clear.
+    linebuf_share_retire(lb, lb_p);
     // Wave-24 D0: a history-ring slot just entered the visible set at lb_p;
     // the fresh gen_counter assignment guarantees it can never match a key
     // recorded for that slot id in an earlier snapshot (incoming slot is

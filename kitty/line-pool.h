@@ -39,6 +39,23 @@ typedef struct LineSlotPool {
     unsigned refcnt;
     size_t num_slabs, slots_used;
     LineSlotSlab *slabs;
+    // Wave-25 Lane S (KITTY_PAUSE_SNAPSHOT_SHARE): snapshot-holder refcount
+    // lane + retire bookkeeping. Allocated lazily at the first SHARE
+    // snapshot acquire on this pool and grown alongside the slabs; NULL
+    // means no snapshot has ever shared slots here, so the unset world's
+    // write checkouts pay exactly one pointer-load + branch. The lane
+    // counts SNAPSHOT holders only -- live/history containment stays
+    // implicit in id-containment (never counted). retired[] marks slots
+    // that left live containment via a COW retire while still held; only
+    // such slots are pushed to the LIFO free list, and ONLY at snapshot
+    // Release (BSU increfs / COW never decrefs / Release single-decref),
+    // which makes mid-pause recycling of a held slot structurally
+    // impossible.
+    uint16_t *refcnt_lane;
+    uint8_t *retired;
+    index_type *free_ids;
+    size_t free_count, free_cap;
+    size_t lane_cap;
 } LineSlotPool;
 
 LineSlotPool* line_slot_pool_alloc(index_type xnum, index_type slab_capacity);
@@ -47,6 +64,14 @@ void line_slot_pool_decref(LineSlotPool *pool);
 // hands out the next unused slot, growing by one slab if needed; aborts
 // on allocation failure like the rest of the cell-storage allocators
 index_type line_slot_pool_take(LineSlotPool *pool);
+// Wave-25 Lane S: lazy refcount-lane management + the retire-alloc path.
+// ensure_share_lane sizes the lane to current pool capacity (aborts on
+// allocation failure like the other cell allocators); take_reusing pops
+// the free list before growing.
+void line_slot_pool_ensure_share_lane(LineSlotPool *pool);
+void line_slot_pool_slot_incref(LineSlotPool *pool, index_type slot);
+void line_slot_pool_slot_decref(LineSlotPool *pool, index_type slot);
+index_type line_slot_pool_take_reusing(LineSlotPool *pool);
 
 static inline CPUCell*
 pool_cpu_lineptr(const LineSlotPool *pool, index_type slot) {

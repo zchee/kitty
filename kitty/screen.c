@@ -177,6 +177,7 @@ new_screen_object(PyTypeObject *type, PyObject *args, PyObject UNUSED *kwds) {
 }
 
 static Line* range_line_(Screen *self, int y);
+static void screen_share_release_snapshot(Screen *self);  // Wave-25 Lane S (def in the Rendering section)
 
 static void
 do_screen_reset(Screen *self, bool is_hard_reset) {
@@ -703,6 +704,11 @@ dealloc(Screen* self) {
     Py_CLEAR(self->overlay_line.overlay_text);
     PyMem_Free(self->main_tabstops);
     free(self->paused_rendering.cow_keys); self->paused_rendering.cow_keys = NULL;  // Wave-21 L4
+    // Wave-25 Lane S: dealloc can run mid-pause (window closed) -- release
+    // held refs + the pool anchor BEFORE the snapshot linebuf dies (site 11).
+    screen_share_release_snapshot(self);
+    free(self->paused_rendering.share_own_slots); self->paused_rendering.share_own_slots = NULL;
+    free(self->paused_rendering.share_row_is_ref); self->paused_rendering.share_row_is_ref = NULL;
     Py_CLEAR(self->paused_rendering.linebuf);
     Py_CLEAR(self->paused_rendering.grman);
     free(self->selections.items);
@@ -3676,12 +3682,44 @@ copy_selections(Selections *dest, const Selections *src) {
     return true;
 }
 
+// Wave-25 Lane S: the ONE snapshot-release funnel (W25-THREAD-AUDIT Part b:
+// unpause covers reset sites 1-8; dealloc is site 11; the acquire-time
+// geometry realloc asserts emptiness at site 9). Decrefs every held id --
+// refcount 1->0 on a retired slot pushes it to the pool free list inside
+// line_slot_pool_slot_decref (the single decref site, design MAJOR-2) --
+// restores the snapshot linebuf's own slots, and drops the pool lifetime
+// anchor (design MAJOR-3). Safe to call when nothing is held.
+static void
+screen_share_release_snapshot(Screen *self) {
+#ifdef __APPLE__
+    assert(pthread_main_np());  // W25-THREAD-AUDIT assertion 3
+#endif
+    LineSlotPool *pool = self->paused_rendering.share_pool;
+    if (!pool) return;
+    LineBuf *pl = self->paused_rendering.linebuf;
+    if (pl && self->paused_rendering.share_row_is_ref) {
+        for (index_type y = 0; y < pl->ynum; y++) {
+            if (!self->paused_rendering.share_row_is_ref[y]) continue;
+            const index_type pp = lb_phys(pl, y);
+            line_slot_pool_slot_decref(pool, pl->line_map[pp]);
+            pl->line_map[pp] = self->paused_rendering.share_own_slots[y];
+            self->paused_rendering.share_row_is_ref[y] = 0;
+            self->paused_rendering.share_held--;
+        }
+    }
+    assert(self->paused_rendering.share_held == 0);  // audit assertion 4 (balance)
+    self->paused_rendering.share_held = 0;
+    self->paused_rendering.share_pool = NULL;
+    line_slot_pool_decref(pool);
+}
+
 bool
 screen_pause_rendering(Screen *self, bool pause, int for_in_ms) {
     if (!pause) {
         if (!self->paused_rendering.expires_at) return false;
         self->pause_stops++;
         self->paused_rendering.expires_at = 0;
+        screen_share_release_snapshot(self);  // Wave-25: the release funnel
         // ensure cell data is updated on GPU
         self->is_dirty = true;
         // ensure selection data is updated on GPU
@@ -3696,6 +3734,18 @@ screen_pause_rendering(Screen *self, bool pause, int for_in_ms) {
     if (self->paused_rendering.expires_at) return false;
     if (!self->paused_rendering.grman) self->paused_rendering.grman = grman_alloc(true);
     if (!self->paused_rendering.grman) return false;
+    // Wave-25 Lane S: in the composed world (COW=1 SHARE=1) SHARE wins --
+    // the trace instrument's copy-assumption is false under sharing (plan
+    // §Design-text corrections item 1), so it self-disables with one
+    // recorded stderr note; its counters stay zero.
+    const bool share = pause_snapshot_share_enabled();
+    if (share && pause_snapshot_cow_enabled()) {
+        static bool composed_note_emitted = false;
+        if (!composed_note_emitted) {
+            composed_note_emitted = true;
+            fprintf(stderr, "KITTY_PAUSE_SNAPSHOT_SHARE: COW trace instrument disabled (SHARE wins; composed world)\n");
+        }
+    }
     if (for_in_ms <= 0) for_in_ms = 2000;
     self->paused_rendering.expires_at = monotonic() + ms_to_monotonic_t(for_in_ms);
     self->paused_rendering.inverted = self->modes.mDECSCNM;
@@ -3704,15 +3754,43 @@ screen_pause_rendering(Screen *self, bool pause, int for_in_ms) {
     self->paused_rendering.cursor_visible = self->modes.mDECTCEM;
     memcpy(&self->paused_rendering.cursor, self->cursor, sizeof(self->paused_rendering.cursor));
     memcpy(&self->paused_rendering.color_profile, self->color_profile, sizeof(self->paused_rendering.color_profile));
-    if (!self->paused_rendering.linebuf || self->paused_rendering.linebuf->xnum != self->columns || self->paused_rendering.linebuf->ynum != self->lines) {
+    if (!self->paused_rendering.linebuf || self->paused_rendering.linebuf->xnum != self->columns || self->paused_rendering.linebuf->ynum != self->lines
+            || (share && self->paused_rendering.linebuf->pool != self->linebuf->pool)) {
+        // Wave-25: reset site 9 -- reachable only unheld (:3639 no-op guard +
+        // the release funnel ran at the preceding unpause).
+        assert(self->paused_rendering.share_held == 0);
         if (self->paused_rendering.linebuf) Py_CLEAR(self->paused_rendering.linebuf);
-        self->paused_rendering.linebuf = alloc_linebuf(self->lines, self->columns, self->text_cache);
+        free(self->paused_rendering.share_own_slots); self->paused_rendering.share_own_slots = NULL;
+        free(self->paused_rendering.share_row_is_ref); self->paused_rendering.share_row_is_ref = NULL;
+        // Under SHARE the snapshot linebuf lives in the LIVE pool so its rows
+        // can hold live slot ids directly (design §1 pool-identity); its own
+        // freshly taken slots stay recorded in share_own_slots as the
+        // deep-copy targets (history-backed snapshots) and are restored at
+        // every release.
+        self->paused_rendering.linebuf = share
+            ? alloc_linebuf_with_pool(self->lines, self->columns, self->text_cache, self->linebuf->pool)
+            : alloc_linebuf(self->lines, self->columns, self->text_cache);
         if (!self->paused_rendering.linebuf) { PyErr_Clear(); self->paused_rendering.expires_at = 0; return false; }
+        if (share) {
+            LineBuf *pl = self->paused_rendering.linebuf;
+            pl->share_writer = false;  // the snapshot HOLDS; it must never retire
+            self->paused_rendering.share_own_slots = malloc((size_t)self->lines * sizeof(index_type));
+            self->paused_rendering.share_row_is_ref = calloc(self->lines, 1);
+            if (!self->paused_rendering.share_own_slots || !self->paused_rendering.share_row_is_ref) {
+                // site-10 rollback discipline: nothing is held yet (increfs
+                // happen in the acquire loop below), so a plain teardown
+                free(self->paused_rendering.share_own_slots); self->paused_rendering.share_own_slots = NULL;
+                free(self->paused_rendering.share_row_is_ref); self->paused_rendering.share_row_is_ref = NULL;
+                Py_CLEAR(self->paused_rendering.linebuf);
+                self->paused_rendering.expires_at = 0; return false;
+            }
+            for (index_type y = 0; y < self->lines; y++) self->paused_rendering.share_own_slots[y] = pl->line_map[lb_phys(pl, y)];
+        }
         // Wave-24 D0: the key store's lifetime is tied to the snapshot linebuf —
         // realloc resets every key, forcing a full copy on the next pause.
         free(self->paused_rendering.cow_keys); self->paused_rendering.cow_keys = NULL;
         self->paused_rendering.cow_keys_valid = false; self->paused_rendering.cow_keys_flip = false;
-        if (pause_snapshot_cow_enabled()) {
+        if (!share && pause_snapshot_cow_enabled()) {
             // Double-buffered: [0, lines) and [lines, 2*lines) alternate as
             // the previous/current sets so the slot-keyed scan below always
             // reads an intact previous snapshot.
@@ -3722,11 +3800,28 @@ screen_pause_rendering(Screen *self, bool pause, int for_in_ms) {
     // Wave-24 D0 (KITTY_PAUSE_SNAPSHOT_COW): slot-keyed identity, trace-only —
     // eligibility is counted but every row still copies (the behavioral skip
     // does not exist; it would be a W25 charter against the D2 gate).
-    const bool cow = pause_snapshot_cow_enabled() && self->paused_rendering.cow_keys != NULL;
+    const bool cow = !share && pause_snapshot_cow_enabled() && self->paused_rendering.cow_keys != NULL;
     struct SnapshotRowKey *cow_prev = NULL, *cow_cur = NULL;
     if (cow) {
         cow_prev = self->paused_rendering.cow_keys + (self->paused_rendering.cow_keys_flip ? self->lines : 0);
         cow_cur = self->paused_rendering.cow_keys + (self->paused_rendering.cow_keys_flip ? 0 : self->lines);
+    }
+    // Wave-25 Lane S: grid-backed rows share by reference; any
+    // scrolled_by != 0 snapshot keeps the W21 whole-snapshot deep copy
+    // (history rows alias the historybuf scratch and have no stable
+    // identity; a scrolled visual mapping shifts every row).
+    const bool share_rows = share && self->scrolled_by == 0;
+    if (share) {
+#ifdef __APPLE__
+        assert(pthread_main_np());  // W25-THREAD-AUDIT assertion 2
+#endif
+        assert(self->paused_rendering.share_held == 0);
+        if (share_rows) {
+            LineSlotPool *lp = self->linebuf->pool;
+            line_slot_pool_ensure_share_lane(lp);
+            line_slot_pool_incref(lp);  // the snapshot's lifetime anchor (design MAJOR-3)
+            self->paused_rendering.share_pool = lp;
+        }
     }
     for (index_type y = 0; y < self->lines; y++) {
         struct SnapshotRowKey k = {0};  // lb_serial 0 = never matches (history-backed rows keep it)
@@ -3758,6 +3853,30 @@ screen_pause_rendering(Screen *self, bool pause, int for_in_ms) {
             // snapshot copies unconditionally (pinned Wave-21 rule).
             cow_cur[y] = k;
         }
+        if (share_rows) {
+            LineBuf *lb = self->linebuf;
+            // Deferred-row disposition (Critic IMPORTANT-1): finalize the
+            // LIVE row BEFORE its slot is increffed -- no snapshot refcount
+            // exists yet (the :3639 no-op guard means no snapshot is held at
+            // any successful acquire), so this cannot retire; cost class =
+            // the deep-copy world's finalize-on-copy; the snapshot then
+            // needs no reader-side clip and no false COW is paid per
+            // deferred row per pause.
+            linebuf_make_authoritative(lb, y);
+            const index_type lp_ = lb_phys(lb, y);
+            const index_type live_slot = lb->line_map[lp_];
+            LineBuf *snap = self->paused_rendering.linebuf;
+            const index_type pp = lb_phys(snap, y);
+            snap->line_map[pp] = live_slot;
+            line_slot_pool_slot_incref(self->paused_rendering.share_pool, live_slot);
+            self->paused_rendering.share_row_is_ref[y] = 1;
+            self->paused_rendering.share_held++;
+            snap->line_attrs[pp] = lb->line_attrs[lp_];
+            snap->line_attrs[pp].is_blank = 0;  // finalized above
+            share_rows_total_counter++; share_rows_ref_counter++;
+            continue;
+        }
+        if (share) share_rows_total_counter++;  // deep-copied (history-backed) row
         Line *src = visual_line_(self, y);
         LineBuf *pl = self->paused_rendering.linebuf;
         linebuf_init_line(pl, y);
@@ -6246,6 +6365,41 @@ mark_as_dirty(Screen *self, PyObject *a UNUSED) {
     Py_RETURN_NONE;
 }
 
+// Wave-25 Lane S debug accessors (M2-SCOPING.md): the COW-integrity battery
+// reads snapshot row bytes and pool/refcount stats through these. Product
+// code inside the Lane S revert unit; behaviorally inert unless called.
+static PyObject*
+paused_snapshot_row_bytes(Screen *self, PyObject *args) {
+#define paused_snapshot_row_bytes_doc "paused_snapshot_row_bytes(y) -> (cpu_bytes, gpu_bytes) of snapshot row y, or None when not paused"
+    unsigned int y;
+    if (!PyArg_ParseTuple(args, "I", &y)) return NULL;
+    LineBuf *pl = self->paused_rendering.linebuf;
+    if (!self->paused_rendering.expires_at || !pl || y >= pl->ynum) Py_RETURN_NONE;
+    const index_type slot = pl->line_map[lb_phys(pl, y)];
+    const CPUCell *c = pool_cpu_lineptr(pl->pool, slot);
+    const GPUCell *g = pool_gpu_lineptr(pl->pool, slot);
+    return Py_BuildValue("y#y#", (const char*)c, (Py_ssize_t)((size_t)pl->xnum * sizeof(CPUCell)),
+                                 (const char*)g, (Py_ssize_t)((size_t)pl->xnum * sizeof(GPUCell)));
+}
+
+static PyObject*
+slot_share_stats(Screen *self, PyObject *a UNUSED) {
+#define slot_share_stats_doc "slot_share_stats() -> dict of Wave-25 share-lane state on the live pool"
+    LineSlotPool *pool = self->linebuf->pool;
+    unsigned long long refsum = 0;
+    if (pool->refcnt_lane) { for (size_t i = 0; i < pool->lane_cap; i++) refsum += pool->refcnt_lane[i]; }
+    return Py_BuildValue("{s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K}",
+        "held", (unsigned long long)self->paused_rendering.share_held,
+        "lane_refsum", refsum,
+        "free_count", (unsigned long long)pool->free_count,
+        "slots_used", (unsigned long long)pool->slots_used,
+        "num_slabs", (unsigned long long)pool->num_slabs,
+        "share_pool_active", (unsigned long long)(self->paused_rendering.share_pool != NULL),
+        "rows_total", (unsigned long long)share_rows_total_counter,
+        "rows_ref", (unsigned long long)share_rows_ref_counter,
+        "cow_retires", (unsigned long long)share_cow_retires_counter);
+}
+
 static PyObject*
 reload_all_gpu_data(Screen *self, PyObject *a UNUSED) {
     self->reload_all_gpu_data = true;
@@ -6798,6 +6952,8 @@ static PyMethodDef methods[] = {
     MND(set_last_visited_prompt, METH_VARARGS)
     MND(send_escape_code_to_child, METH_VARARGS)
     MND(pause_rendering, METH_VARARGS)
+    MND(paused_snapshot_row_bytes, METH_VARARGS)
+    MND(slot_share_stats, METH_NOARGS)
     MND(hyperlink_at, METH_VARARGS)
     MND(toggle_alt_screen, METH_NOARGS)
     MND(reset_callbacks, METH_NOARGS)
