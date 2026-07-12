@@ -125,10 +125,17 @@ extern uint64_t share_rows_total_counter, share_rows_ref_counter, share_cow_reti
 void linebuf_share_retire_cold(LineBuf *self, index_type p);
 static inline void
 linebuf_share_retire(LineBuf *self, index_type p) {
-    const LineSlotPool *pool = self->pool;
-    if (UNLIKELY(pool->refcnt_lane != NULL)) {
-        const index_type slot = self->line_map[p];
-        if (slot < pool->lane_cap && pool->refcnt_lane[slot] && self->share_writer) linebuf_share_retire_cold(self, p);
+    // Unset-arm ordering matters: check the resolved one-shot switch FIRST
+    // (one always-hot global load + predicted branch) so the unset world
+    // never dereferences the pool -- the pool struct lives on its own
+    // cacheline and touching it per checkout measured ~2% of dense-flood
+    // parse_ms/MiB (W25 OFF-cost rows 195047, distributions disjoint).
+    if (UNLIKELY(pause_snapshot_share_enabled())) {
+        const LineSlotPool *pool = self->pool;
+        if (pool->refcnt_lane != NULL) {
+            const index_type slot = self->line_map[p];
+            if (slot < pool->lane_cap && pool->refcnt_lane[slot] && self->share_writer) linebuf_share_retire_cold(self, p);
+        }
     }
 }
 

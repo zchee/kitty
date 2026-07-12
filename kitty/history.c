@@ -50,6 +50,7 @@ cpu_lineptr(HistoryBuf *self, index_type y) {
 // share_writer gate is needed.
 static void
 historybuf_share_retire(HistoryBuf *self, index_type ring_pos) {
+    if (LIKELY(!pause_snapshot_share_enabled())) return;  // never touch the pool cacheline unset
     LineSlotPool *pool = self->pool;
     if (UNLIKELY(pool->refcnt_lane != NULL)) {
         const index_type slot = self->slot_ring[ring_pos];
