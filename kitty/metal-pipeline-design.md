@@ -2795,11 +2795,15 @@ is the operator's.
 **Side lanes**: the idle machine-state drift RESOLVED-AS-TRANSIENT
 (absent today; absolute idle bars re-validated 0.0% x8 both arms; the
 30 s cputime pre-flight rule is the durable deliverable). Three upstream
-report drafts prepared (no submission). The D1b simulator passed the
-pure-LF slot gate bit-exactly but missed the full-transcript visual and
-anchor reproductions (0.1045 vs 0.1273; 0.6982 vs 0.6781 +/- 0.02) —
-per the pinned disposition the product verdict stands and the sim is
-flagged documentation-incomplete; no sim number is quoted.
+report drafts prepared (no submission). The D1b simulator converged
+after the first close-doc cut: ALL validation gates pass (R-hat_visual
+0.12958 within 0.1273 +/- 0.005; pure-LF slot form 0.96183 bit-exact;
+product anchor 0.6803 within 0.6781 +/- 0.02) — the decisive fixes
+were deferred-autowrap clamping and the finalize_hwm_line two-miss
+model, the same real-write class the IG-1-LF probe caught. The sim
+never decides: the product 0.6781 stays ground truth; its synthetic
+annotations are quotable as annotations (pure-LF flood 0.92867;
+region-scroll editor 0.96183).
 
 **Verification-integrity additions**: preserved arm binaries were
 deleted mid-wave by an undetermined actor (re-established; the
