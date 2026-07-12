@@ -23,23 +23,25 @@ typedef struct {
     // deferred HWM row); linebuf_finalize_hwm_line reads it to skip the O(xnum)
     // backward xlimit scan. Lives in the same combined allocation as line_map.
     index_type *line_xlimit;
-    // Wave-21 L4: per-physical-row monotonic mutation generation, indexed by
-    // lb_phys() like line_attrs/line_xlimit and living in the same combined
-    // allocation. Bumped (ONLY when pause_snapshot_cow_enabled()) at the
-    // dirty-marking mutation sites, the non-marking line-buf.c mutators, and
-    // every line_map[p] write/permute. For THAT family a (serial, phys, slot,
-    // gen) key recorded by the BSU pause snapshot can only falsely match
-    // after a full uint32 wrap (gen — or of the allocation serial counter)
-    // between two snapshots of the same window. Known exceptions that mutate
-    // content with NO bump (L4-REVIEW.md F1; trace-only impact — they inflate
-    // cow_skip_eligible, so the measured R-hat is an over-estimate and the
-    // L4.2 NO-LAND stands a fortiori; each must gain a bump if the skip is
-    // ever wired): eager-arm linebuf_clear_line on the head-bump scroll path,
-    // remap_hyperlink_ids' cell rewrites, and screen_tab's space-fill.
-    // NEVER moved by linebuf_normalize/reorder ops: permutes bump the
-    // affected physical range instead, keeping each lane entry monotonic
-    // per-phys (fail-toward-copying).
-    uint32_t *line_gen;
+    // Wave-24 D0 (repurposed from the Wave-21 visual-key lane): CONTENT
+    // generation of the pool slot currently mapped at each position, indexed
+    // by lb_phys() and living in the same combined allocation. Written (ONLY
+    // when pause_snapshot_cow_enabled()) as an ASSIGNMENT from the per-buffer
+    // monotonic gen_counter — values are unique per LineBuf, so two equal
+    // gens can only be the SAME assignment event carried along by the
+    // co-rotation below (coincidental equality across position lanes is
+    // structurally impossible; wrap caveat: 2^32 content writes between two
+    // snapshots of one window, same class as the serial wrap). Assigned at
+    // every content-write site including the three former W21 exceptions
+    // (linebuf_clear_line, remap_hyperlink_ids, screen_tab's space-fill) and
+    // the history slot handover (incoming slot never eligible). NEVER bumped
+    // by pure line_map permutes: linebuf_normalize and the region
+    // reorder ops CO-ROTATE this lane with line_map (same moves as
+    // line_attrs/line_xlimit, switch-gated) so each entry stays attached to
+    // the slot whose content it describes — that is the whole point of the
+    // slot-anchored key (the pause snapshot compares by slot id, not visual
+    // position; cell payloads themselves never move between slots).
+    uint32_t *gen_at_pos;
     Line *line;
     TextCache *text_cache;
     // S3 (Phase 13B): head-offset circular indexing of line_map/line_attrs so a
@@ -56,6 +58,9 @@ typedef struct {
     // unable to match (slot/phys ABA guard). Assigned unconditionally at
     // alloc: one increment per LineBuf allocation, never on a hot path.
     uint32_t serial;
+    // Wave-24 D0: monotonic source for gen_at_pos assignments (see the lane
+    // comment above). Only advances when pause_snapshot_cow_enabled().
+    uint32_t gen_counter;
 } LineBuf;
 
 // Wave-21 L4 (KITTY_PAUSE_SNAPSHOT_COW): one-shot process-lifetime switch,
@@ -70,18 +75,19 @@ pause_snapshot_cow_enabled(void) {
     return UNLIKELY(s < 0) ? pause_snapshot_cow_resolve() : s != 0;
 }
 
-// Wave-21 L4: bump the mutation generation of physical row p. Callers pass
-// lb_phys(y), or a raw physical index inside the head==0 reorder ops and the
-// order-agnostic full-row loops (the lane is permutation-order-agnostic
-// because permutes bump every row they touch).
+// Wave-24 D0: record a content write to the slot mapped at physical
+// position p. Callers pass lb_phys(y), or a raw physical index inside the
+// head==0 reorder ops and the order-agnostic full-row loops. Assignment
+// from the monotonic counter (not ++) so every write event carries a
+// buffer-unique value — see the gen_at_pos lane comment.
 static inline void
 linebuf_gen_bump(LineBuf *self, index_type p) {
-    if (UNLIKELY(pause_snapshot_cow_enabled())) self->line_gen[p]++;
+    if (UNLIKELY(pause_snapshot_cow_enabled())) self->gen_at_pos[p] = ++self->gen_counter;
 }
 static inline void
 linebuf_gen_bump_range(LineBuf *self, index_type p_start, index_type p_end_incl) {
     if (UNLIKELY(pause_snapshot_cow_enabled())) {
-        for (index_type p = p_start; p <= p_end_incl; p++) self->line_gen[p]++;
+        for (index_type p = p_start; p <= p_end_incl; p++) self->gen_at_pos[p] = ++self->gen_counter;
     }
 }
 

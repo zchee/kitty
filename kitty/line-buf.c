@@ -162,18 +162,18 @@ alloc_linebuf_(PyTypeObject *cls, unsigned int lines, unsigned int columns, Text
         if (pool) { line_slot_pool_incref(pool); self->pool = pool; }
         else self->pool = line_slot_pool_alloc(columns, lines);
         // Combined allocation: 4-byte lanes first (4-byte aligned), the
-        // 1-byte LineAttrs last -> line_map | scratch | line_xlimit | line_gen
-        // | line_attrs. line_xlimit (Wave-15 L1) and line_gen (Wave-21 L4)
-        // precede line_attrs so the 4-byte arrays stay aligned for any `lines`
-        // (a trailing 4-byte lane after the 1-byte LineAttrs lane would
-        // misalign unless lines%4==0).
-        _Static_assert(sizeof(index_type) == sizeof(uint32_t), "line_gen lane sizing assumes 4-byte index_type");
+        // 1-byte LineAttrs last -> line_map | scratch | line_xlimit | gen_at_pos
+        // | line_attrs. line_xlimit (Wave-15 L1) and gen_at_pos (Wave-21 L4,
+        // repurposed by Wave-24 D0) precede line_attrs so the 4-byte arrays
+        // stay aligned for any `lines` (a trailing 4-byte lane after the
+        // 1-byte LineAttrs lane would misalign unless lines%4==0).
+        _Static_assert(sizeof(index_type) == sizeof(uint32_t), "gen_at_pos lane sizing assumes 4-byte index_type");
         self->line_map = self->pool ? PyMem_Calloc(1, lines * (4 * sizeof(index_type) + sizeof(LineAttrs))) : NULL;
         if (!self->line_map) { line_slot_pool_decref(self->pool); self->pool = NULL; Py_CLEAR(self); return NULL; }
         self->scratch = self->line_map + lines;
         self->line_xlimit = self->scratch + lines;
-        self->line_gen = (uint32_t*)(self->line_xlimit + lines);
-        self->line_attrs = (LineAttrs*)(self->line_gen + lines);
+        self->gen_at_pos = (uint32_t*)(self->line_xlimit + lines);
+        self->line_attrs = (LineAttrs*)(self->gen_at_pos + lines);
         self->serial = ++linebuf_serial_counter;  // Wave-21 L4: 1-based; 0 = never-matches sentinel
         self->text_cache = tc_incref(text_cache);
         self->line = alloc_line(self->text_cache);
@@ -513,6 +513,7 @@ linebuf_clear_line(LineBuf *self, index_type y, bool clear_attrs, bool allow_laz
     // keys off CPUCell fields, so a recycled row must read blank immediately
     // (the pre-overwrite contract in kitty_tests/scroll_semantics.py) and the
     // HWM render clip derives its extent from these clean CPUCells.
+    linebuf_gen_bump(self, p);  // Wave-24 D0: content write (former W21 no-bump exception)
     zero_at_ptr_count(c, self->xnum);
     if (clear_attrs) self->line_attrs[p].val = 0;
     // RELOCATE/HWM on a full-screen marginless scroll defer the 20B GPUCell
@@ -643,10 +644,6 @@ clear_line(LineBuf *self, PyObject *val) {
 static void
 linebuf_normalize(LineBuf *self) {
     if (self->head == 0) return;
-    // Wave-21 L4: the phys meaning of every row changes; bump all generations
-    // so no snapshot key recorded against the old permutation can match. The
-    // line_gen lane itself is NOT rotated (monotonic per phys by design).
-    linebuf_gen_bump_range(self, 0, self->ynum - 1);
     const index_type h = self->head, n = self->ynum;
     for (index_type i = 0; i < n; i++) {
         index_type p = h + i; if (p >= n) p -= n;
@@ -664,6 +661,17 @@ linebuf_normalize(LineBuf *self) {
         self->scratch[i] = self->line_xlimit[p];
     }
     memcpy(self->line_xlimit, self->scratch, n * sizeof(self->line_xlimit[0]));
+    if (UNLIKELY(pause_snapshot_cow_enabled())) {
+        // Wave-24 D0: gen_at_pos co-rotates with line_map so each entry stays
+        // attached to the slot whose content it describes (pure permutes never
+        // change content). Switch-gated like every gen write; scratch is free
+        // for reuse here (its prior passes have been memcpy'd out).
+        for (index_type i = 0; i < n; i++) {
+            index_type p = h + i; if (p >= n) p -= n;
+            self->scratch[i] = self->gen_at_pos[p];
+        }
+        memcpy(self->gen_at_pos, self->scratch, n * sizeof(self->gen_at_pos[0]));
+    }
     self->head = 0;
 }
 
@@ -689,7 +697,14 @@ linebuf_index(LineBuf* self, index_type top, index_type bottom) {
     self->line_map[bottom] = old_top;
     self->line_attrs[bottom] = old_attrs;
     self->line_xlimit[bottom] = old_xlimit;
-    linebuf_gen_bump_range(self, top, bottom);  // Wave-21 L4: line_map permuted over [top, bottom]
+    if (UNLIKELY(pause_snapshot_cow_enabled())) {
+        // Wave-24 D0: gen co-moves with line_map (pure permute — no content
+        // change; the vacated row's clear happens at the caller and records
+        // its own content write there).
+        const uint32_t old_gen = self->gen_at_pos[top];
+        memmove(self->gen_at_pos + top, self->gen_at_pos + top + 1, sizeof(self->gen_at_pos[0]) * num);
+        self->gen_at_pos[bottom] = old_gen;
+    }
 }
 
 static PyObject*
@@ -714,15 +729,18 @@ linebuf_reverse_index(LineBuf *self, index_type top, index_type bottom) {
     index_type old_bottom = self->line_map[bottom];
     LineAttrs old_attrs = self->line_attrs[bottom];
     index_type old_xlimit = self->line_xlimit[bottom];
+    const bool cow_gen = UNLIKELY(pause_snapshot_cow_enabled());  // Wave-24 D0: gen co-moves
+    const uint32_t old_gen = cow_gen ? self->gen_at_pos[bottom] : 0;
     for (index_type i = bottom; i > top; i--) {
         self->line_map[i] = self->line_map[i - 1];
         self->line_attrs[i] = self->line_attrs[i - 1];
         self->line_xlimit[i] = self->line_xlimit[i - 1];
+        if (cow_gen) self->gen_at_pos[i] = self->gen_at_pos[i - 1];
     }
     self->line_map[top] = old_bottom;
     self->line_attrs[top] = old_attrs;
     self->line_xlimit[top] = old_xlimit;
-    linebuf_gen_bump_range(self, top, bottom);  // Wave-21 L4: line_map permuted over [top, bottom]
+    if (cow_gen) self->gen_at_pos[top] = old_gen;
 }
 
 static PyObject*
@@ -752,11 +770,16 @@ linebuf_insert_lines(LineBuf *self, unsigned int num, unsigned int y, unsigned i
     if (ylimit < y || (num = MIN(ylimit - y, num)) < 1) return;
     linebuf_normalize(self);  // S3: physical rotate below assumes head==0
     const size_t scratch_sz = sizeof(self->scratch[0]) * num;
+    const bool cow_gen = UNLIKELY(pause_snapshot_cow_enabled());  // Wave-24 D0
     memcpy(self->scratch, self->line_map + ylimit - num, scratch_sz);
     for (i = ylimit - 1; i >= y + num; i--) {
         self->line_map[i] = self->line_map[i - num];
         self->line_attrs[i] = self->line_attrs[i - num];
         self->line_xlimit[i] = self->line_xlimit[i - num];
+        // Wave-24 D0: gen co-moves with the shifted rows; the rotated-in rows
+        // at [y, y+num) are content-cleared below and get fresh assignments
+        // there, so their stale gens need no staging.
+        if (cow_gen) self->gen_at_pos[i] = self->gen_at_pos[i - num];
     }
     memcpy(self->line_map + y, self->scratch, scratch_sz);
     Line l;
@@ -765,8 +788,8 @@ linebuf_insert_lines(LineBuf *self, unsigned int num, unsigned int y, unsigned i
         clear_line_(&l, self->xnum);
         self->line_attrs[i].val = 0;
         self->line_xlimit[i] = 0;
+        linebuf_gen_bump(self, i);  // Wave-24 D0: content write (row cleared)
     }
-    linebuf_gen_bump_range(self, y, ylimit - 1);  // Wave-21 L4: line_map permuted + rows cleared
 }
 
 static PyObject*
@@ -786,11 +809,16 @@ linebuf_delete_lines(LineBuf *self, index_type num, index_type y, index_type bot
     if (y >= self->ynum || y > bottom || bottom >= self->ynum || num < 1) return;
     linebuf_normalize(self);  // S3: physical rotate below assumes head==0
     const size_t scratch_sz = sizeof(self->scratch[0]) * num;
+    const bool cow_gen = UNLIKELY(pause_snapshot_cow_enabled());  // Wave-24 D0
     memcpy(self->scratch, self->line_map + y, scratch_sz);
     for (i = y; i < ylimit && i + num < self->ynum; i++) {
         self->line_map[i] = self->line_map[i + num];
         self->line_attrs[i] = self->line_attrs[i + num];
         self->line_xlimit[i] = self->line_xlimit[i + num];
+        // Wave-24 D0: gen co-moves with the shifted rows; the rotated-in rows
+        // at [ylimit-num, ylimit) are content-cleared below and get fresh
+        // assignments there.
+        if (cow_gen) self->gen_at_pos[i] = self->gen_at_pos[i + num];
     }
     memcpy(self->line_map + ylimit - num, self->scratch, scratch_sz);
     Line l;
@@ -799,8 +827,8 @@ linebuf_delete_lines(LineBuf *self, index_type num, index_type y, index_type bot
         clear_line_(&l, self->xnum);
         self->line_attrs[i].val = 0;
         self->line_xlimit[i] = 0;
+        linebuf_gen_bump(self, i);  // Wave-24 D0: content write (row cleared)
     }
-    linebuf_gen_bump_range(self, y, ylimit - 1);  // Wave-21 L4: line_map permuted + rows cleared
 }
 
 static PyObject*

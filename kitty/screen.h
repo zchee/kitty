@@ -202,16 +202,21 @@ typedef struct {
         GraphicsManager *grman;
         Selections selections, url_ranges;
         ExtraCursors extra_cursors;
-        // Wave-21 L4 (KITTY_PAUSE_SNAPSHOT_COW): per-visual-row identity keys
-        // recorded at the last completed pause snapshot. A row may be skipped
-        // (L4.3) only when its current (lb_serial, phys, slot, gen) equals the
-        // recorded key — lb_serial 0 (history-backed rows, scrolled_by != 0)
-        // never matches a real serial. The array's lifetime is tied to the
-        // snapshot linebuf above: (re)allocated alongside it (all keys reset,
-        // forcing a full copy on the next pause) and freed with it. Only
-        // allocated when the switch is ON; NULL = every row copies.
-        struct SnapshotRowKey { uint32_t lb_serial; index_type phys, slot; uint32_t gen; } *cow_keys;
-        bool cow_keys_valid;
+        // Wave-24 D0 (KITTY_PAUSE_SNAPSHOT_COW; repurposed from the Wave-21
+        // per-visual-row keys): SLOT-keyed identity keys recorded at the last
+        // completed pause snapshot. Eligibility is looked up BY SLOT-ID VALUE
+        // (linear scan of the previous snapshot's <= lines entries), never by
+        // visual position — slot ids come from the shared line pool and
+        // exceed `lines` on any scrolling workload, so they must never be
+        // used as array indices. A row is skip-eligible only when its
+        // current (lb_serial, slot, gen) has a matching recorded key;
+        // lb_serial 0 (history-backed rows, scrolled_by != 0) never matches.
+        // Double-buffered (2*lines entries, flip selects the half being
+        // written) so the compare always scans the intact previous set.
+        // Lifetime tied to the snapshot linebuf above; only allocated when
+        // the switch is ON; NULL = every row copies.
+        struct SnapshotRowKey { uint32_t lb_serial; index_type slot; uint32_t gen; } *cow_keys;
+        bool cow_keys_valid, cow_keys_flip;
     } paused_rendering;
     // Wave-19 L4 probe: cumulative counts of successful BSU/ESU transitions
     // (DECSET-2026 / DECRPM pending-mode set-reset), diffed per-tick by the

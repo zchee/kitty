@@ -714,7 +714,11 @@ historybuf_take_line_from(HistoryBuf *self, LineBuf *lb, index_type lb_y, ANSIBu
     lb->line_map[lb_p] = self->slot_ring[idx];
     self->slot_ring[idx] = evicted;
     self->attrs_ring[idx] = lb->line_attrs[lb_p];
-    linebuf_gen_bump(lb, lb_p);  // Wave-21 L4: line_map[lb_p] rewritten (slot handover)
+    // Wave-24 D0: a history-ring slot just entered the visible set at lb_p;
+    // the fresh gen_counter assignment guarantees it can never match a key
+    // recorded for that slot id in an earlier snapshot (incoming slot is
+    // never eligible — Architect R2 M-NEW-1(c)).
+    linebuf_gen_bump(lb, lb_p);
 }
 
 void
