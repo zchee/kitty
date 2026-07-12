@@ -2747,3 +2747,66 @@ equally — idle guard moved to a four-cell parity form, ratios <= 1.10);
 the ON-arm ssh test failure was root-caused to a pre-existing ssh-kitten
 KITTY_* env-forwarding sensitivity (KITTY_FOO_THREADS=1 fails
 identically; FOO_READER_THREADS=1 passes). 60 Hz single machine.
+
+## Phase 24 (Wave 24): slot-COW cheap-kill measured GRAY (R-hat 0.6781); design CONFIRMED-SOUND; W25 charter input ready
+
+Executed the consensus plan (`.omc/plans/ralplan-wave24-slotcow-cheapkill-design.md`
+v4, both recorded conditions honored). Artifacts under `.omc/verify/wave24/` —
+IG gates, D1 jsonl+PNG, L-SLOTCOW-DESIGN.md + CONFIRMED-SOUND review,
+R24-IDLE-DRIFT.md, sim validation record; upstream drafts under
+`.omc/upstream/`; ADR-0009. Product commit: `884bc852c` only (trace-only
+instrument repurpose behind KITTY_PAUSE_SNAPSHOT_COW; unset byte-identical;
+OFF-cost 1.0000 on dense_cells AND on the region-rotating sync_medium_cells).
+
+**Instrument (D0)**: the dormant W21 visual-key instrument re-keyed to
+slot-anchored content identity — gen_at_pos assigned from a per-buffer
+monotonic counter (equality = same write event carried by co-rotation),
+co-rotating with line_map through normalize/region ops, permute bumps
+removed, the three W21 no-bump exceptions + the history slot handover now
+recording writes, slot-KEYED double-buffered snapshot compare. Correctness
+established by IG gates hitting closed forms BIT-EXACTLY on three
+independent paths (head-bump/history x2, region rotate), and the LF probe
+bit-exactly matching the two-miss form after tracing kitty's own
+text-loop mark-on-entry (screen.c:778) — the instrument caught a real
+write the stimulus model missed.
+
+**Cheap-kill verdict (D1)**: R-hat_slot = 0.6781, three rounds identical
+to four digits, identity pause_on x 30 = cow_copied exact per round.
+Pinned prize-derived bands: GRAY [0.53, 0.82), low-GRAY LEAN-KILL
+pre-commitment not triggered (>= 0.66). Ceiling at the 0.8 discrimination
+floor: reachable pause-ratio 1.1987x (benefit-only) vs the 1.43x baseline
+— clears the minimum-worthwhile 1.25x gate row, cannot reach the 1.15x
+flagship. The W21 visual ceiling on the same workload/driver was 0.1273:
+the slot mechanism's ceiling is 5.3x higher — the scroll-invariance
+thesis confirmed at ceiling level (a measurement, not a landing).
+
+**Design (D2)**: L-SLOTCOW-DESIGN.md reviewed SOUND-WITH-CHANGES -> all
+4 MAJORs applied (COW-retire at pointer handout, not the gen-bump sites;
+single-decref-at-Release refcount timeline; snapshot pool-identity +
+pool-refcnt lifetime across rewrap's fresh pool; workload provenance +
+same-block-R-hat discrimination re-derivation in W25) -> discharge
+CONFIRMED-SOUND. The concurrency KILL-BY-DESIGN axis does not fire: the
+single-thread precondition was code-verified (parse/render/snapshot
+readers all main-thread; Metal display links on the main run loop); the
+W25 pre-implementation audit + debug assertion remain blocking. Closing
+recommendation: LEAN-PROCEED on the 1.25x gate; the W25 charter decision
+is the operator's.
+
+**Side lanes**: the idle machine-state drift RESOLVED-AS-TRANSIENT
+(absent today; absolute idle bars re-validated 0.0% x8 both arms; the
+30 s cputime pre-flight rule is the durable deliverable). Three upstream
+report drafts prepared (no submission). The D1b simulator passed the
+pure-LF slot gate bit-exactly but missed the full-transcript visual and
+anchor reproductions (0.1045 vs 0.1273; 0.6982 vs 0.6781 +/- 0.02) —
+per the pinned disposition the product verdict stands and the sim is
+flagged documentation-incomplete; no sim number is quoted.
+
+**Verification-integrity additions**: preserved arm binaries were
+deleted mid-wave by an undetermined actor (re-established; the
+live-sha-per-row rule kept every block attributable); test.py deletes
+the launcher (post-test rule = FULL metal rebuild); build
+bit-determinism is narrower than the W23 note (holds for single-unit
+relinks only — arm identity = clean full-dependent build + live sha);
+header edits require header touches or the rebuild produces an
+ABI-mixed binary. 60 Hz single machine; no victory language — a ceiling
+was measured and a design was made executable, nothing landed.
