@@ -2328,6 +2328,9 @@ screen_tab(Screen *self) {
                 }
                 self->lc->count = 2; self->lc->chars[0] = '\t'; self->lc->chars[1] = diff;
                 cell_set_chars(cpu_cell, self->text_cache, self->lc);
+                // Wave-24 D0: space-fill is a content write (former W21
+                // no-bump exception).
+                linebuf_gen_bump(self->linebuf, lb_phys(self->linebuf, self->cursor->y));
             }
         }
         self->cursor->x = found;
@@ -3705,37 +3708,55 @@ screen_pause_rendering(Screen *self, bool pause, int for_in_ms) {
         if (self->paused_rendering.linebuf) Py_CLEAR(self->paused_rendering.linebuf);
         self->paused_rendering.linebuf = alloc_linebuf(self->lines, self->columns, self->text_cache);
         if (!self->paused_rendering.linebuf) { PyErr_Clear(); self->paused_rendering.expires_at = 0; return false; }
-        // Wave-21 L4: the key array's lifetime is tied to the snapshot linebuf —
+        // Wave-24 D0: the key store's lifetime is tied to the snapshot linebuf —
         // realloc resets every key, forcing a full copy on the next pause.
         free(self->paused_rendering.cow_keys); self->paused_rendering.cow_keys = NULL;
-        self->paused_rendering.cow_keys_valid = false;
+        self->paused_rendering.cow_keys_valid = false; self->paused_rendering.cow_keys_flip = false;
         if (pause_snapshot_cow_enabled()) {
-            self->paused_rendering.cow_keys = calloc(self->lines, sizeof(self->paused_rendering.cow_keys[0]));
+            // Double-buffered: [0, lines) and [lines, 2*lines) alternate as
+            // the previous/current sets so the slot-keyed scan below always
+            // reads an intact previous snapshot.
+            self->paused_rendering.cow_keys = calloc(2 * (size_t)self->lines, sizeof(self->paused_rendering.cow_keys[0]));
         }
     }
-    // Wave-21 L4 (KITTY_PAUSE_SNAPSHOT_COW): per-row identity keys. At L4.1 this
-    // is trace-only — eligibility is counted but every row still copies; the
-    // behavioral skip is wired at L4.3 after the pre-registered cheap-kill check.
+    // Wave-24 D0 (KITTY_PAUSE_SNAPSHOT_COW): slot-keyed identity, trace-only —
+    // eligibility is counted but every row still copies (the behavioral skip
+    // does not exist; it would be a W25 charter against the D2 gate).
     const bool cow = pause_snapshot_cow_enabled() && self->paused_rendering.cow_keys != NULL;
+    struct SnapshotRowKey *cow_prev = NULL, *cow_cur = NULL;
+    if (cow) {
+        cow_prev = self->paused_rendering.cow_keys + (self->paused_rendering.cow_keys_flip ? self->lines : 0);
+        cow_cur = self->paused_rendering.cow_keys + (self->paused_rendering.cow_keys_flip ? 0 : self->lines);
+    }
     for (index_type y = 0; y < self->lines; y++) {
         struct SnapshotRowKey k = {0};  // lb_serial 0 = never matches (history-backed rows keep it)
         if (cow) {
             if (self->scrolled_by == 0) {
-                // Grid-backed row: identity = (allocation serial, physical
-                // position, pool slot) + the monotonic mutation generation.
+                // Grid-backed row: identity = (allocation serial, pool slot,
+                // content generation). Visual/physical position is NOT part
+                // of the key — a slot that merely moved (scroll = line_map
+                // permute) still matches; only content writes advance gen.
                 LineBuf *lb = self->linebuf;
                 const index_type p = lb_phys(lb, y);
-                k.lb_serial = lb->serial; k.phys = p; k.slot = lb->line_map[p]; k.gen = lb->line_gen[p];
-                const struct SnapshotRowKey *prev = &self->paused_rendering.cow_keys[y];
-                if (self->paused_rendering.cow_keys_valid && k.lb_serial == prev->lb_serial
-                        && k.phys == prev->phys && k.slot == prev->slot && k.gen == prev->gen)
-                    self->cow_skip_eligible++;
+                k.lb_serial = lb->serial; k.slot = lb->line_map[p]; k.gen = lb->gen_at_pos[p];
+                if (self->paused_rendering.cow_keys_valid) {
+                    // Slot-keyed lookup: linear scan of the previous
+                    // snapshot's keys (<= lines entries; slot ids exceed
+                    // `lines`, so they are never array indices).
+                    for (index_type j = 0; j < self->lines; j++) {
+                        const struct SnapshotRowKey *prev = &cow_prev[j];
+                        if (prev->lb_serial == k.lb_serial && prev->slot == k.slot) {
+                            if (prev->gen == k.gen) self->cow_skip_eligible++;
+                            break;
+                        }
+                    }
+                }
             }
             // else: history rows (y < scrolled_by) alias the shared
             // historybuf->line scratch and have no stable identity — and any
             // scrolled_by != 0 visual mapping shifts every row — so the whole
             // snapshot copies unconditionally (pinned Wave-21 rule).
-            self->paused_rendering.cow_keys[y] = k;
+            cow_cur[y] = k;
         }
         Line *src = visual_line_(self, y);
         LineBuf *pl = self->paused_rendering.linebuf;
@@ -3757,7 +3778,11 @@ screen_pause_rendering(Screen *self, bool pause, int for_in_ms) {
             pl->line_attrs[pp].is_blank = 0;
         }
     }
-    if (cow) self->paused_rendering.cow_keys_valid = true;
+    if (cow) {
+        self->paused_rendering.cow_keys_valid = true;
+        // The just-written half becomes the previous set for the next pause.
+        self->paused_rendering.cow_keys_flip = !self->paused_rendering.cow_keys_flip;
+    }
     copy_selections(&self->paused_rendering.selections, &self->selections);
     copy_selections(&self->paused_rendering.url_ranges, &self->url_ranges);
     if (self->extra_cursors.count) {

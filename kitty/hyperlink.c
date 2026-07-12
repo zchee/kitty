@@ -110,6 +110,10 @@ remap_hyperlink_ids(Screen *self, bool preserve_hyperlinks_in_history, hyperlink
         CPUCell *cells = linebuf_cpu_cells_for_line(second, y);
         for (index_type x = 0; x < self->columns; x++) process_cell(pool, map, clone, cells + x);
     }
+    // Wave-24 D0: cell rewrites above are content writes (former W21 no-bump
+    // exception); full-range, order-agnostic.
+    linebuf_gen_bump_range(first, 0, self->lines - 1);
+    linebuf_gen_bump_range(second, 0, self->lines - 1);
 }
 
 static void
