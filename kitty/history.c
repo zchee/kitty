@@ -50,7 +50,10 @@ cpu_lineptr(HistoryBuf *self, index_type y) {
 // share_writer gate is needed.
 static void
 historybuf_share_retire(HistoryBuf *self, index_type ring_pos) {
-    if (LIKELY(!pause_snapshot_share_enabled())) return;  // never touch the pool cacheline unset
+    if (LIKELY(!pause_snapshot_share_enabled())) return;  // never touch the pool cacheline when opted out
+#ifdef __APPLE__
+    assert(pthread_main_np());  // W25-THREAD-AUDIT assertion 1 (the linebuf twin's mirror; W26 F2)
+#endif
     LineSlotPool *pool = self->pool;
     if (UNLIKELY(pool->refcnt_lane != NULL)) {
         const index_type slot = self->slot_ring[ring_pos];

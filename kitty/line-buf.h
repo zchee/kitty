@@ -98,8 +98,9 @@ linebuf_gen_bump_range(LineBuf *self, index_type p_start, index_type p_end_incl)
 }
 
 // Wave-25 Lane S (KITTY_PAUSE_SNAPSHOT_SHARE): one-shot behavioral switch,
-// resolved at first use exactly like pause_snapshot_cow_state above. OFF
-// (unset/"0") keeps the deep-copy snapshot world byte-identical.
+// resolved at first use exactly like pause_snapshot_cow_state above.
+// Default-ON since Wave-26 (unset/empty resolve to on); setting "0" opts
+// out and keeps the deep-copy snapshot world byte-identical.
 extern int pause_snapshot_share_state;  // -1 unresolved, else 0/1 (line-buf.c)
 bool pause_snapshot_share_resolve(void);
 static inline bool
