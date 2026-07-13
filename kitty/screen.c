@@ -949,11 +949,14 @@ text_cache_gc_process_cells(TextCache *tc, TextCacheGCData *gc, CPUCell *cells, 
 
 static void
 text_cache_gc_process_linebuf(TextCache *tc, TextCacheGCData *gc, LineBuf *lb) {
+    // cell storage lives in pool slots, so lines are not one contiguous
+    // block. The per-line write checkout COW-retires snapshot-held slots
+    // first, which guarantees each physical row is remapped exactly once
+    // (gc->map is old->new only; a second visit would corrupt the index).
     if (!lb) return;
-    // per-line: cell storage lives in pool slots, so lines are not one
-    // contiguous block (visual/physical order is irrelevant here — every
-    // cell gets remapped either way)
-    for (index_type y = 0; y < lb->ynum; y++) text_cache_gc_process_cells(tc, gc, linebuf_cpu_cells_for_line(lb, y), lb->xnum);
+    for (index_type y = 0; y < lb->ynum; y++) {
+        text_cache_gc_process_cells(tc, gc, linebuf_cpu_cells_for_line(lb, y), lb->xnum);
+    }
 }
 
 void
@@ -972,6 +975,10 @@ screen_garbage_collect_text_cache(Screen *self) {
     text_cache_gc_process_linebuf(self->text_cache, gc, self->main_linebuf);
     text_cache_gc_process_linebuf(self->text_cache, gc, self->alt_linebuf);
     text_cache_gc_process_linebuf(self->text_cache, gc, self->paused_rendering.linebuf);
+    // Wave-24 D0: the index rewrites above are content writes; full-range,
+    // order-agnostic (mirrors remap_hyperlink_ids).
+    linebuf_gen_bump_range(self->main_linebuf, 0, self->lines - 1);
+    linebuf_gen_bump_range(self->alt_linebuf, 0, self->lines - 1);
     if (self->overlay_line.cpu_cells) text_cache_gc_process_cells(
         self->text_cache, gc, self->overlay_line.cpu_cells, self->overlay_line.xnum);
     if (self->overlay_line.original_line.cpu_cells) text_cache_gc_process_cells(
