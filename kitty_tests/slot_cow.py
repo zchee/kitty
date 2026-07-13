@@ -7,13 +7,16 @@
 # per-slot refcount lane, free-list, `KITTY_PAUSE_SNAPSHOT_SHARE`) has
 # landed (commits bbf47373e + 5816866df), so the tests below split into:
 #
-#   - tests that pass against the unset (deep-copy) world regardless of
-#     Lane S (pause/write-storm/unpause content fidelity; the reset-site
-#     bypass scenarios named in `.omc/verify/wave25/W25-THREAD-AUDIT.md`
-#     Part (b), some now augmented with a SHARE=1 sub-check where the
-#     landed code changed what is observable at that site);
-#   - tests that exercise the Lane-S SHARE=1 (ON) semantics directly via
-#     `run_share_subprocess` (refcount-lane incref/retire/decref timeline,
+#   - in-process tests that hold in BOTH switch worlds (pause/write-storm/
+#     unpause content fidelity; the reset-site bypass scenarios named in
+#     `.omc/verify/wave25/W25-THREAD-AUDIT.md` Part (b), some augmented
+#     with a SHARE=1 sub-check where the landed code changed what is
+#     observable at that site) -- they run at whatever the build default
+#     resolves to and assert nothing default-specific;
+#   - arm-pinned subprocess tests via `run_share_subprocess`, which sets
+#     KITTY_PAUSE_SNAPSHOT_SHARE explicitly ('1' ON legs, '0' explicit-OFF
+#     legs) so each leg is correct regardless of the build default: the
+#     Lane-S ON semantics (refcount-lane incref/retire/decref timeline,
 #     pool identity across a rewrap-forcing resize, retire-before-lineptr
 #     per handout-helper class, the history serial-0 deep-copy carve-out,
 #     deferred-row finalize-before-incref, and the documented
@@ -273,14 +276,18 @@ def compare_snapshot_to_shadow(s, shadow: list, reader: str = 'stubbed') -> dict
 # call anywhere in the process locks the resolution in (e.g. `history.c:53`
 # checks it on every scroll, not just the first `pause_rendering()` call).
 # Since test.py runs every kitty_tests module in one process, another module
-# may already have forced the resolve to "unset" before this one even
-# starts. A fresh subprocess with the env var set before Python starts is
-# therefore the only robust way to exercise the ON arm from kitty_tests.
+# may already have resolved the one-shot switch (at whatever this build's
+# default is) before this one even starts. A fresh subprocess with the env
+# var set explicitly before Python starts is therefore the only robust way
+# to pin EITHER arm from kitty_tests.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def run_share_subprocess(body: str) -> dict:
-    """Run `body` in a fresh KITTY_PAUSE_SNAPSHOT_SHARE=1 subprocess.
+def run_share_subprocess(body: str, share: str = '1') -> dict:
+    """Run `body` in a fresh subprocess with KITTY_PAUSE_SNAPSHOT_SHARE=`share`.
+
+    share='1' pins the ON arm; share='0' pins the explicit-OFF (deep-copy)
+    arm -- both are meaningful whatever the build default resolves to.
 
     `body` is Python source with `feed`, `setup_screen_with_history`, `COLS`,
     `LINES`, `SCROLLBACK` and a ready-made screen `s` (via
@@ -301,31 +308,31 @@ def run_share_subprocess(body: str) -> dict:
         + body
     )
     env = dict(os.environ)
-    env['KITTY_PAUSE_SNAPSHOT_SHARE'] = '1'
+    env['KITTY_PAUSE_SNAPSHOT_SHARE'] = share
     proc = subprocess.run(
         [sys.executable, '-c', script], cwd=_REPO_ROOT, env=env,
         capture_output=True, text=True, timeout=60,
     )
     if proc.returncode != 0:
         raise AssertionError(
-            f'KITTY_PAUSE_SNAPSHOT_SHARE=1 subprocess exited {proc.returncode}\n'
+            f'KITTY_PAUSE_SNAPSHOT_SHARE={share} subprocess exited {proc.returncode}\n'
             f'--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}'
         )
     lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
     if not lines:
-        raise AssertionError(f'SHARE=1 subprocess produced no stdout verdict; stderr={proc.stderr!r}')
+        raise AssertionError(f'SHARE={share} subprocess produced no stdout verdict; stderr={proc.stderr!r}')
     try:
         return json.loads(lines[-1])
     except ValueError as err:
-        raise AssertionError(f'SHARE=1 subprocess stdout was not valid JSON: {lines[-1]!r}; stderr={proc.stderr!r}') from err
+        raise AssertionError(f'SHARE={share} subprocess stdout was not valid JSON: {lines[-1]!r}; stderr={proc.stderr!r}') from err
 
 
 class TestSlotCOW(BaseTest):
 
-    # -- Tests that pass TODAY, against the pre-implementation deep-copy
-    # -- world. Snapshot-sharing correctness is not implemented yet, so
-    # -- these only assert what is true regardless: no crash, and live
-    # -- content fidelity across a storm composing all 9 write classes.
+    # -- In-process tests: they run at whatever the build default resolves
+    # -- to and assert only what must hold in BOTH worlds -- no crash, and
+    # -- live content fidelity across a storm composing all 9 write
+    # -- classes. Arm-specific semantics live in the subprocess tests.
 
     def test_pause_storm_unpause_roundtrip_content_fidelity(self):
         s = self.create_screen(cols=COLS, lines=LINES, scrollback=SCROLLBACK)
@@ -354,8 +361,9 @@ class TestSlotCOW(BaseTest):
 
     def test_reset_site_bypass_dealloc(self):
         # Site #11 (screen.c:693-703): dealloc bypasses the unpause
-        # funnel. In the unset (deep-copy) world there is no refcount/pool
-        # state to leak, so the only honest assertion is "does not crash."
+        # funnel. In the deep-copy world (explicit OFF, or wherever the
+        # default resolves OFF) there is no refcount/pool state to leak, so
+        # the only honest assertion in-process is "does not crash."
         s = self.create_screen(cols=COLS, lines=LINES, scrollback=SCROLLBACK)
         self.assertTrue(s.pause_rendering(True, 5000))
         feed(s, 'still-paused')
@@ -718,3 +726,60 @@ print(json.dumps({"cycles": 50, "max_lane_refsum": max_lane_refsum, "lines": s.l
 ''')
         self.ae(result['cycles'], 50)
         self.assertLessEqual(result['max_lane_refsum'], result['lines'], 'lane_refsum exceeded lines -- the documented {0,1}-holder bound (incref-overflow assert) was violated')
+    # -- Explicit-OFF legs (W26 F3): pin the OPT-OUT world by value so its
+    # -- deep-copy semantics keep permanent unit coverage regardless of the
+    # -- build default (the W26 flip made unset resolve ON; SHARE='0' is
+    # -- now the only spelling of the deep-copy world).
+
+    def test_explicit_off_roundtrip_content_fidelity(self):
+        verdict = run_share_subprocess("""
+import json
+from kitty_tests.slot_cow import compose_write_storm, WRITE_CLASS_NAMES
+setup_screen_with_history(s)
+st0 = s.slot_share_stats()
+assert s.pause_rendering(True, 5000)
+st1 = s.slot_share_stats()
+classes = compose_write_storm(s, 0)
+feed(s, '\x1b[1;1H\x1b[KOFFEND')
+s.pause_rendering(False)
+st2 = s.slot_share_stats()
+print(json.dumps({
+    'classes': len(classes),
+    'line0': str(s.line(0)),
+    'held_at_bsu': st1['held'], 'refsum_at_bsu': st1['lane_refsum'],
+    'rows_ref_delta': st1['rows_ref'] - st0['rows_ref'],
+    'retires_delta': st2['cow_retires'] - st0['cow_retires'],
+    'pool_active': st1['share_pool_active'],
+}))
+""", share='0')
+        self.ae(verdict['classes'], 9)
+        self.ae(verdict['line0'], 'OFFEND')
+        self.ae(verdict['held_at_bsu'], 0)
+        self.ae(verdict['refsum_at_bsu'], 0)
+        self.ae(verdict['rows_ref_delta'], 0)
+        self.ae(verdict['retires_delta'], 0)
+        self.ae(verdict['pool_active'], 0)
+
+    def test_explicit_off_funnel_resize_release(self):
+        verdict = run_share_subprocess("""
+import json
+setup_screen_with_history(s)
+assert s.pause_rendering(True, 5000)
+before = s.slot_share_stats()
+s.resize(LINES, COLS - 2)
+mid = s.slot_share_stats()
+ok_second = s.pause_rendering(True, 5000)
+after = s.slot_share_stats()
+s.pause_rendering(False)
+print(json.dumps({
+    'held_paused': before['held'], 'pool_active_paused': before['share_pool_active'],
+    'held_after_resize': mid['held'], 'pool_active_after_resize': mid['share_pool_active'],
+    'second_pause_ok': bool(ok_second), 'held_second': after['held'],
+}))
+""", share='0')
+        self.ae(verdict['held_paused'], 0)
+        self.ae(verdict['pool_active_paused'], 0)
+        self.ae(verdict['held_after_resize'], 0)
+        self.ae(verdict['pool_active_after_resize'], 0)
+        self.assertTrue(verdict['second_pause_ok'])
+        self.ae(verdict['held_second'], 0)
