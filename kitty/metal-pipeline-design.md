@@ -2861,3 +2861,14 @@ unchanged; any default-ON flip re-arms the W20 energy guard
 (operator-sudo-gated) as a separate decision. 60 Hz single machine; no
 victory language — a pre-registered gate was met and the mechanism
 lands behind a default-OFF switch.
+
+### Wave-26 M2 freeze record (2026-07-13)
+
+The W26 gate table (plan §5, ralplan-wave26-share-default-on.md lines
+222-237, 16 lines) was FROZEN at M2 exit before any Lane-F code. C-R2-3
+byte-extraction sha256:
+d629954ee2e78e9387dd4a100ad8e70932613a89c41b6d864aaac77e2b1c96ff
+(the region from the "## 5." heading line through the line before the
+next "## " heading, LF endings, no normalization). This tracked entry
+is the PRIMARY freeze carrier (the plan file lives under gitignored
+.omc/); the M2 exit note carries the secondary copy.
