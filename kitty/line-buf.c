@@ -77,7 +77,7 @@ int pause_snapshot_share_state = -1;
 bool
 pause_snapshot_share_resolve(void) {
     const char *v = getenv("KITTY_PAUSE_SNAPSHOT_SHARE");
-    pause_snapshot_share_state = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0;
+    pause_snapshot_share_state = (!v || !v[0] || strcmp(v, "0") != 0) ? 1 : 0;
     return pause_snapshot_share_state != 0;
 }
 
