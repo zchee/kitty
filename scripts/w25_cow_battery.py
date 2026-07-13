@@ -81,7 +81,7 @@ def _make_harness():
     return _Harness()
 
 
-def run_battery(cycles: int, output_path: Path, snapshot_reader: str) -> bool:
+def run_battery(cycles: int, output_path: Path, snapshot_reader: str, expect_arm: str = 'env') -> bool:
     harness = _make_harness()
     from kitty_tests.slot_cow import (
         COLS,
@@ -104,9 +104,17 @@ def run_battery(cycles: int, output_path: Path, snapshot_reader: str) -> bool:
     # and per-cycle slot_share_stats deltas whose values are IMPOSSIBLE on
     # the wrong arm (held == lines after BSU and retires >= 1 across the
     # frozen storm cannot happen under SHARE=0; both are exactly 0 there).
-    share_on = os.environ.get('KITTY_PAUSE_SNAPSHOT_SHARE', '') not in ('', '0')
+    # W26: the build DEFAULT decides what an unset env resolves to, so the
+    # env can no longer classify the arm by itself. --expect-arm pins the
+    # expectation ('on'/'off'); 'env' keeps the pre-W26 unset==off reading.
+    if expect_arm == 'env':
+        share_on = os.environ.get('KITTY_PAUSE_SNAPSHOT_SHARE', '') not in ('', '0')
+    else:
+        share_on = expect_arm == 'on'
     arm_state = {'COW': 1 if os.environ.get('KITTY_PAUSE_SNAPSHOT_COW', '') not in ('', '0') else 0,
-                 'SHARE': 1 if share_on else 0, 'FRAME_TRACE': 0}
+                 'SHARE': 1 if share_on else 0, 'FRAME_TRACE': 0,
+                 'SHARE_env': os.environ.get('KITTY_PAUSE_SNAPSHOT_SHARE', '<unset>'),
+                 'expect_arm': expect_arm}
     so_path = REPO_ROOT / 'kitty' / 'fast_data_types.so'
     so_sha16 = hashlib.sha256(so_path.read_bytes()).hexdigest()[:16]
     have_stats = hasattr(s, 'slot_share_stats')
@@ -188,12 +196,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--cycles', type=int, default=50, help='number of pause/write-storm/unpause cycles (default: 50)')
     parser.add_argument('--output', type=Path, default=DEFAULT_OUTPUT, help=f'jsonl output path (default: {DEFAULT_OUTPUT})')
+    parser.add_argument('--expect-arm', choices=('env', 'on', 'off'), default='env',
+                        help="arm expectation for the impossible-on-wrong-arm assertions; 'env' derives it from KITTY_PAUSE_SNAPSHOT_SHARE (pre-W26 reading), 'on'/'off' pin it explicitly (needed on default-ON builds where unset resolves on)")
     parser.add_argument('--snapshot-reader', choices=('stubbed', 'available'), default='stubbed',
                          help='stubbed (M2 default): record the comparator as unimplemented, never fabricate a pass. '
                               'available: use the Lane-S debug accessor once it lands (M3).')
     args = parser.parse_args()
 
-    ok = run_battery(args.cycles, args.output, args.snapshot_reader)
+    ok = run_battery(args.cycles, args.output, args.snapshot_reader, args.expect_arm)
     raise SystemExit(0 if ok else 1)
 
 
