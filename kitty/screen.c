@@ -935,7 +935,11 @@ text_cache_gc_process_cells(TextCache *tc, TextCacheGCData *gc, CPUCell *cells, 
 
 static void
 text_cache_gc_process_linebuf(TextCache *tc, TextCacheGCData *gc, LineBuf *lb) {
-    if (lb) text_cache_gc_process_cells(tc, gc, lb->cpu_cell_buf, (size_t)lb->ynum * lb->xnum);
+    if (!lb) return;
+    // per-line: cell storage lives in pool slots, so lines are not one
+    // contiguous block (visual/physical order is irrelevant here — every
+    // cell gets remapped either way)
+    for (index_type y = 0; y < lb->ynum; y++) text_cache_gc_process_cells(tc, gc, linebuf_cpu_cells_for_line(lb, y), lb->xnum);
 }
 
 void
