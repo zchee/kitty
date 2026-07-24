@@ -169,10 +169,20 @@ oob_read_loop(void *arg) {
             break;  // EOF (peer closed on child exit) or read error
         }
     }
-    // Close our direction on every exit path so a still-writing peer gets
-    // EPIPE now instead of blocking against a departed reader (fail-open).
-    // The fd itself stays open for detach to close after the join.
-    shutdown(c->fd, SHUT_RDWR);
+    // Fail-open must surface as an ERROR at the peer, not a black hole:
+    // macOS silently discards writes into a shutdown() unix-stream peer,
+    // so the exiting reader CLOSES our end (=> EPIPE at the writer). fd
+    // ownership hands back to detach through the -1 sentinel under the
+    // mutex, so the pre-join shutdown there can never touch a recycled
+    // fd number.
+    pthread_mutex_lock(&c->mutex);
+    const int fd = c->fd;
+    c->fd = -1;
+    pthread_mutex_unlock(&c->mutex);
+    if (fd > -1) {
+        shutdown(fd, SHUT_RDWR);
+        safe_close(fd, __FILE__, __LINE__);
+    }
     atomic_store_explicit(&c->thread_done, true, memory_order_relaxed);
     oob_notify_main(c);  // let the main loop observe the terminal state promptly
     return NULL;
@@ -258,8 +268,9 @@ py_oob_channel_detach(PyObject *self UNUSED, PyObject *args) {
     pthread_mutex_lock(&c->mutex);
     c->stop = true;
     pthread_cond_broadcast(&c->cond);
+    const int live_fd = c->fd;  // -1 once the reader has already closed it
     pthread_mutex_unlock(&c->mutex);
-    shutdown(c->fd, SHUT_RDWR);  // unblock a reader sleeping in read()
+    if (live_fd > -1) shutdown(live_fd, SHUT_RDWR);  // unblock a reader sleeping in read()
     if (c->thread_started) {
         Py_BEGIN_ALLOW_THREADS
         pthread_join(c->thread, NULL);
@@ -270,7 +281,8 @@ py_oob_channel_detach(PyObject *self UNUSED, PyObject *args) {
     OOBChannel **pp = &channels;
     while (*pp && *pp != c) pp = &(*pp)->next;
     if (*pp) { *pp = c->next; num_channels--; }
-    safe_close(c->fd, __FILE__, __LINE__);
+    // after the join the reader owns nothing; close only if it never did
+    if (c->fd > -1) safe_close(c->fd, __FILE__, __LINE__);
     Py_DECREF(c->parser);
     free_channel_struct(c);
     Py_RETURN_TRUE;
