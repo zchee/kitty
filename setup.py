@@ -1800,6 +1800,13 @@ def build_launcher(args: Options, launcher_dir: str = '.', bundle_type: str = 's
     desc = f'Linking {emphasis("launcher")} ...'
     cmd = env.cc + ldflags + objects + libs + pylib + ['-o', dest]
     args.compilation_database.add_command(desc, cmd, partial(newer, dest, *objects), key=LinkKey('kitty'))
+    # The KITTY_PTY_PUMP helper ships beside the launcher (and therefore
+    # inside app bundles): a single-file compile+link, no python linkage.
+    pump_src = 'kitty/pump.c'
+    pump_dest = os.path.join(launcher_dir, 'kitty-pump')
+    cmd = env.cc + cppflags + cflags + [pump_src] + ldflags + ['-o', pump_dest]
+    args.compilation_database.add_command(
+        f'Building {emphasis("kitty-pump")} ...', cmd, partial(newer, pump_dest, pump_src), key=LinkKey('kitty-pump'))
     if args.build_dsym and is_macos:
         desc = f'Linking dSYM {emphasis("launcher")} ...'
         dsym = f'{dest}.dSYM/Contents/Resources/DWARF/{os.path.basename(dest)}'
