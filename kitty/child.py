@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, DefaultDict, Optional, TypedDict
 
 import kitty.fast_data_types as fast_data_types
 
-from .constants import handled_signals, is_freebsd, is_macos, kitten_exe, kitty_base_dir, shell_path, terminfo_dir
+from .constants import handled_signals, is_freebsd, is_macos, kitten_exe, kitty_base_dir, kitty_exe, shell_path, terminfo_dir
 from .types import run_once
 from .utils import cmdline_for_hold, log_error, resolved_shell, which
 
@@ -239,8 +239,25 @@ class ProcessDesc(TypedDict):
 child_counter = count()
 
 
+@run_once
+def pty_pump_enabled() -> bool:
+    # KITTY_PTY_PUMP=1 interposes a kitty-pump process between the pty master
+    # and kitty: the pump pays the macOS 1 KiB tty-queue ping-pong so kitty's
+    # io thread wakes per ~16-64 KiB pipe batch instead. Read from
+    # default_env() so both the process environment and kitty.conf
+    # `env KITTY_PTY_PUMP=1` enable it (the conf path is the only route for
+    # Finder/Dock launches, which inherit the launchd session environment).
+    # Resolved once at the first fork; a config reload does not toggle it.
+    return default_env().get('KITTY_PTY_PUMP', '') == '1'
+
+
 class Child:
     child_fd: int | None = None
+    # Where this child's output is read from: == child_fd normally, the pump
+    # pipe's read end under KITTY_PTY_PUMP. child_fd (the pty master) keeps
+    # serving writes, TIOCSWINSZ and process-group queries either way.
+    data_fd: int | None = None
+    pump_pid: int | None = None
     pid: int | None = None
     initial_termios_state: list[Any] | None = None
     forked = False
@@ -430,6 +447,24 @@ class Child:
         os.close(slave)
         self.pid = pid
         self.child_fd = master
+        self.data_fd = master
+        if pty_pump_enabled():
+            pump_exe = os.path.join(os.path.dirname(kitty_exe()), 'kitty-pump')
+            try:
+                data_read, data_write = os.pipe()
+                try:
+                    pump_env = {'KITTY_PUMP_DEBUG': '1'} if os.environ.get('KITTY_PUMP_DEBUG') else {}
+                    self.pump_pid = os.posix_spawn(pump_exe, (pump_exe,), pump_env, file_actions=(
+                        (os.POSIX_SPAWN_DUP2, master, 0), (os.POSIX_SPAWN_DUP2, data_write, 1)))
+                    self.data_fd = data_read
+                except OSError:
+                    os.close(data_read)
+                    raise
+                finally:
+                    os.close(data_write)
+            except OSError as err:
+                # fail toward OFF: the child keeps the direct pty read path
+                log_error(f'Failed to spawn kitty-pump ({pump_exe}), falling back to direct pty reads: {err}')
         if stdin is not None:
             os.close(stdin_read_fd)
             fast_data_types.thread_write(stdin_write_fd, stdin)
@@ -437,6 +472,8 @@ class Child:
         self.terminal_ready_fd = ready_write_fd
         if self.child_fd is not None:
             os.set_blocking(self.child_fd, False)
+        if self.data_fd is not None and self.data_fd != self.child_fd:
+            os.set_blocking(self.data_fd, False)
         if not is_macos:
             ppid = getpid()
             try:

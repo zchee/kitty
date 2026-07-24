@@ -1486,7 +1486,7 @@ class ChildMonitor:
     def set_iutf8_winid(self, win_id: int, on: bool) -> bool:
         pass
 
-    def add_child(self, id: int, pid: int, fd: int, screen: Screen) -> None:
+    def add_child(self, id: int, pid: int, fd: int, read_fd: int, screen: Screen) -> None:
         pass
 
     def mark_for_close(self, window_id: int) -> bool:

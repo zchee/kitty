@@ -111,6 +111,11 @@ typedef struct {
     Screen *screen;
     bool needs_removal, child_died;
     int fd;
+    // Where this child's OUTPUT is read from. Equal to fd normally; under
+    // KITTY_PTY_PUMP it is the pump pipe's read end while fd (the pty
+    // master) keeps serving writes, TIOCSWINSZ and process-group queries.
+    // Every POLLIN/read site must use read_fd; every other use stays on fd.
+    int read_fd;
     unsigned long id;
     pid_t pid;
     int exit_status;
@@ -124,6 +129,10 @@ typedef struct {
 } Child;
 
 static const Child EMPTY_CHILD = {0};
+// Gauge of live children whose read_fd != fd (KITTY_PTY_PUMP interposed).
+// Ungated: add/remove_children run in both backends; only the ftrace
+// reporting of it is Metal-gated.
+static _Atomic(unsigned) io_pump_children;
 #define screen_mutex(op, which) \
     pthread_mutex_##op(&screen->which##_buf_lock);
 #define children_mutex(op) \
@@ -136,7 +145,14 @@ static Child children[MAX_CHILDREN] = {{0}};
 static Child scratch[MAX_CHILDREN] = {{0}};
 static Child add_queue[MAX_CHILDREN] = {{0}}, remove_queue[MAX_CHILDREN] = {{0}}, remove_notify[MAX_CHILDREN] = {{0}};
 static size_t add_queue_count = 0, remove_queue_count = 0;
-static struct pollfd children_fds[MAX_CHILDREN + EXTRA_FDS] = {{0}};
+// Sized for the KITTY_PTY_PUMP worst case: every child slot may need one
+// per-iteration POLLOUT tail slot for its pty master (the child slot itself
+// watches the pump pipe for POLLIN). Tail slots are rebuilt every io_loop
+// iteration; pump-off worlds never use them.
+static struct pollfd children_fds[2 * MAX_CHILDREN + EXTRA_FDS] = {{0}};
+// Tail-slot index -> child index map for the current io_loop iteration
+// (io-thread private, rebuilt alongside the tail slots).
+static size_t pump_out_child[MAX_CHILDREN];
 static pthread_mutex_t children_lock, talk_lock;
 static bool kill_signal_received = false, reload_config_signal_received = false;
 static ChildMonitor *the_monitor = NULL;
@@ -362,12 +378,12 @@ wakeup(ChildMonitor *self, PyObject *args UNUSED) {
 
 static PyObject *
 add_child(ChildMonitor *self, PyObject *args) {
-#define add_child_doc "add_child(id, pid, fd, screen) -> Add a child."
+#define add_child_doc "add_child(id, pid, fd, read_fd, screen) -> Add a child. read_fd is where output is read from (== fd unless KITTY_PTY_PUMP interposes a pump pipe)."
     children_mutex(lock);
     if (self->count + add_queue_count >= MAX_CHILDREN) { PyErr_SetString(PyExc_ValueError, "Too many children"); children_mutex(unlock); return NULL; }
     add_queue[add_queue_count] = EMPTY_CHILD;
 #define A(attr) &add_queue[add_queue_count].attr
-    if (!PyArg_ParseTuple(args, "kiiO", A(id), A(pid), A(fd), A(screen))) {
+    if (!PyArg_ParseTuple(args, "kiiiO", A(id), A(pid), A(fd), A(read_fd), A(screen))) {
         children_mutex(unlock);
         return NULL;
     }
@@ -743,6 +759,7 @@ frame_trace_emit(monotonic_t ts, bool input_read, monotonic_t parse_dt, monotoni
               " share_rows_total=%llu share_rows_ref=%llu share_cow_retires=%llu"
               " io_iters=%llu io_polls=%llu io_poll_ms=%.3f io_reads=%llu io_read_bytes=%llu"
               " io_read_ms=%.3f io_avail_bytes=%llu io_wrap_capped=%llu io_pollin_off=%llu"
+              " pump_children=%u"
               " rd_on=%d rd_kevent_wakeups=%llu rd_wake_data=%llu rd_wake_timer=%llu"
               " rd_wake_unpark=%llu rd_wake_teardown=%llu rd_read_calls=%llu rd_read_bytes=%llu"
               " rd_park_cycles=%llu rd_batch_flushes=%llu rd_echo_immediates=%llu",
@@ -758,6 +775,7 @@ frame_trace_emit(monotonic_t ts, bool input_read, monotonic_t parse_dt, monotoni
               (unsigned long long)io_iters, (unsigned long long)io_polls, ft_ms((monotonic_t)io_pns),
               (unsigned long long)io_reads, (unsigned long long)io_rbytes, ft_ms((monotonic_t)io_rns),
               (unsigned long long)io_avail, (unsigned long long)io_wrapcap, (unsigned long long)io_pdis,
+              atomic_load_explicit(&io_pump_children, memory_order_relaxed),
               reader_threads_enabled() ? 1 : 0, (unsigned long long)rd_wakes, (unsigned long long)rd_wd,
               (unsigned long long)rd_wt, (unsigned long long)rd_wu, (unsigned long long)rd_wx,
               (unsigned long long)rd_reads, (unsigned long long)rd_rbytes,
@@ -2697,7 +2715,7 @@ reader_spawn(ChildMonitor *self, Child *c) {
     }
     ReaderThread *rt = calloc(1, sizeof(ReaderThread));
     if (!rt) return NULL;
-    rt->monitor = self; rt->screen = c->screen; rt->master_fd = c->fd; rt->child_id = c->id;
+    rt->monitor = self; rt->screen = c->screen; rt->master_fd = c->read_fd; rt->child_id = c->id;
     rt->kq = kqueue();
     if (rt->kq < 0) {
         log_error("Wave-22 readers: kqueue() failed: %s; child %lu keeps the legacy path", strerror(errno), c->id);
@@ -2756,6 +2774,8 @@ finish_reader_teardowns(ChildMonitor *self UNUSED) {
         pthread_join(rt->thread, NULL);
         safe_close(rt->kq, __FILE__, __LINE__);
         safe_close(reader_teardown_pending[i].child.fd, __FILE__, __LINE__);
+        if (reader_teardown_pending[i].child.read_fd != reader_teardown_pending[i].child.fd)
+            safe_close(reader_teardown_pending[i].child.read_fd, __FILE__, __LINE__);
         children_mutex(lock);
         live_readers--;
         reader_slot_free[reader_slot_free_count++] = rt->slot;
@@ -2777,7 +2797,12 @@ add_children(ChildMonitor *self) {
         add_queue_count--;
         children[self->count] = add_queue[add_queue_count];
         add_queue[add_queue_count] = EMPTY_CHILD;
-        children_fds[EXTRA_FDS + self->count].fd = children[self->count].fd;
+        children_fds[EXTRA_FDS + self->count].fd = children[self->count].read_fd;
+        if (children[self->count].read_fd != children[self->count].fd)
+            atomic_fetch_add_explicit(&io_pump_children, 1, memory_order_relaxed);
+        if (UNLIKELY(getenv("KITTY_PUMP_DEBUG")))
+            log_error("pump-dbg: add child id=%lu fd=%d read_fd=%d slot=%u", children[self->count].id,
+                      children[self->count].fd, children[self->count].read_fd, EXTRA_FDS + self->count);
 #ifdef KITTY_BACKEND_METAL
         if (reader_threads_enabled()) {
             // Wave-22 ON arm (O14): the reader owns this child's reads from
@@ -2808,6 +2833,7 @@ hangup(pid_t pid) {
 static void
 cleanup_child(ssize_t i) {
     safe_close(children[i].fd, __FILE__, __LINE__);
+    if (children[i].read_fd != children[i].fd) safe_close(children[i].read_fd, __FILE__, __LINE__);
     hangup(children[i].pid);
 }
 
@@ -2846,6 +2872,8 @@ remove_children(ChildMonitor *self) {
                 remove_queue[remove_queue_count] = children[i];
                 remove_queue_count++;
 #endif
+                if (children[i].read_fd != children[i].fd)
+                    atomic_fetch_sub_explicit(&io_pump_children, 1, memory_order_relaxed);
                 children[i] = EMPTY_CHILD;
                 children_fds[EXTRA_FDS + i].fd = -1;
                 size_t num_to_right = self->count - 1 - i;
@@ -3055,6 +3083,8 @@ io_loop(void *data) {
 #endif
         data_received = false;
         total_read_bytes = 0;
+        // KITTY_PTY_PUMP: per-iteration POLLOUT tail slots (see children_fds).
+        size_t pump_out_count = 0;
 #ifdef KITTY_BACKEND_METAL
         // Wave-19 L3 probe: one io_loop pass. frame_trace_enabled() is a
         // cached static-bool check (getenv() runs once), cheap to call
@@ -3092,8 +3122,23 @@ io_loop(void *data) {
 #endif
             children_fds[EXTRA_FDS + i].events = pollin_armed ? POLLIN : 0;
             screen_mutex(lock, write);
-            children_fds[EXTRA_FDS + i].events |= (screen->write_buf_used ? POLLOUT  : 0);
+            const bool wants_out = screen->write_buf_used > 0;
             screen_mutex(unlock, write);
+            if (children[i].read_fd != children[i].fd) {
+                // KITTY_PTY_PUMP: this child's slot fd is the pump pipe
+                // (POLLIN only); pending writes need the pty master, which
+                // one pollfd cannot also watch — append a per-iteration
+                // POLLOUT tail slot for the master instead.
+                if (wants_out) {
+                    const size_t t = EXTRA_FDS + self->count + pump_out_count;
+                    children_fds[t].fd = children[i].fd;
+                    children_fds[t].events = POLLOUT;
+                    children_fds[t].revents = 0;
+                    pump_out_child[pump_out_count++] = i;
+                }
+            } else {
+                children_fds[EXTRA_FDS + i].events |= wants_out ? POLLOUT : 0;
+            }
         }
 #ifdef KITTY_BACKEND_METAL
         // count/time only the branches that actually issue poll(2); the
@@ -3113,10 +3158,10 @@ io_loop(void *data) {
         if (has_pending_wakeups) {
             now = monotonic();
             monotonic_t time_delta = OPT(input_delay) - (now - last_main_loop_wakeup_at);
-            if (time_delta >= 0) TIMED_POLL(children_fds, self->count + EXTRA_FDS, monotonic_t_to_ms(time_delta));
+            if (time_delta >= 0) TIMED_POLL(children_fds, self->count + EXTRA_FDS + pump_out_count, monotonic_t_to_ms(time_delta));
             else ret = 0;
         } else {
-            TIMED_POLL(children_fds, self->count + EXTRA_FDS, -1);
+            TIMED_POLL(children_fds, self->count + EXTRA_FDS + pump_out_count, -1);
         }
 #undef TIMED_POLL
         if (ret > 0) {
@@ -3171,6 +3216,16 @@ io_loop(void *data) {
                     children[i].needs_removal = true;
                     children_mutex(unlock);
                     log_error("The child %lu had its fd unexpectedly closed", children[i].id);
+                }
+            }
+            // KITTY_PTY_PUMP: service the per-iteration POLLOUT tail slots
+            // (pty masters of pump children with pending writes). The child
+            // indices are stable within this iteration: add/remove ran with
+            // the mutex at loop top and only this thread compacts children[].
+            for (size_t t = 0; t < pump_out_count; t++) {
+                if (children_fds[EXTRA_FDS + self->count + t].revents & POLLOUT) {
+                    const size_t ci = pump_out_child[t];
+                    write_to_child(children[ci].fd, children[ci].screen);
                 }
             }
 #ifdef DEBUG_POLL_EVENTS

@@ -714,7 +714,8 @@ class Boss:
 
     def add_child(self, window: Window) -> None:
         assert window.child.pid is not None and window.child.child_fd is not None
-        self.child_monitor.add_child(window.id, window.child.pid, window.child.child_fd, window.screen)
+        data_fd = window.child.data_fd if window.child.data_fd is not None else window.child.child_fd
+        self.child_monitor.add_child(window.id, window.child.pid, window.child.child_fd, data_fd, window.screen)
         self.window_id_map[window.id] = window
 
     def _handle_remote_command(self, cmd: memoryview, window: Window | None = None, peer_id: int = 0) -> RCResponse:
