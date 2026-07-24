@@ -7,16 +7,21 @@ set nomore noswapfile nowritebackup number
 syntax on
 
 function! R3Replay(timer) abort
+  " NVIM_AB_LOOPS > 1 (R3 bill battery) repeats the full scroll so process
+  " lifetime rusage totals are replay-dominated (startup < 2% at 10 loops).
+  let loops = max([1, str2nr(get(environ(), 'NVIM_AB_LOOPS', '1'))])
   let t0 = reltime()
   let pages = 0
-  normal! gg
-  while line('w$') < line('$')
-    execute "normal! \<C-f>"
-    redraw
-    let pages += 1
-  endwhile
+  for l in range(loops)
+    normal! gg
+    while line('w$') < line('$')
+      execute "normal! \<C-f>"
+      redraw
+      let pages += 1
+    endwhile
+  endfor
   let elapsed = reltimefloat(reltime(t0))
-  call writefile([json_encode({'seconds': elapsed, 'pages': pages,
+  call writefile([json_encode({'seconds': elapsed, 'pages': pages, 'loops': loops,
         \ 'lines': line('$'), 'oob_env': getenv('KITTY_TUI_OOB_FD') isnot v:null})],
         \ $NVIM_AB_RESULT)
   quitall!
