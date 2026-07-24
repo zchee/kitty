@@ -44,6 +44,9 @@ typedef struct ParseData {
     unsigned share_rows_total;  // snapshot rows processed at BSU this tick (grid + history)
     unsigned share_rows_ref;    // grid rows acquired by reference this tick
     unsigned share_cow_retires; // COW retire copies paid this tick
+    // R3: bytes merged from the out-of-band bulk channel's ring into the
+    // parse arena this tick (a subset of bytes_read; 0 when no channel).
+    size_t oob_bytes_read;
 } ParseData;
 
 // The must only be called on the main thread
@@ -60,5 +63,11 @@ uint8_t* vt_parser_create_write_buffer(Parser*, size_t*);
 void vt_parser_commit_write(Parser*, size_t);
 bool vt_parser_arm_pollin(const Parser*);
 size_t vt_parser_ring_free_total(const Parser*);
+// R3 out-of-band bulk channel backlink (main thread only): the channel's
+// ring is a second SPSC transport drained into the same parse arena as
+// the pty ring by the main-thread parse tick.
+struct OOBChannel;
+void vt_parser_set_oob_channel(Parser*, struct OOBChannel*);
+struct OOBChannel* vt_parser_oob_channel(const Parser*);
 void parse_worker(void *p, ParseData *data, bool flush);
 void parse_worker_dump(void *p, ParseData *data, bool flush);

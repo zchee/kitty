@@ -765,6 +765,7 @@ extern int init_Shlex(PyObject *);
 extern int init_Parser(PyObject *);
 extern int init_DiskCache(PyObject *);
 extern bool init_child_monitor(PyObject *);
+extern bool init_oob_channel(PyObject *);
 extern int init_Line(PyObject *);
 extern int init_ColorProfile(PyObject *);
 extern int init_Screen(PyObject *);
@@ -825,6 +826,7 @@ PyInit_fast_data_types(void) {
     if (!init_Parser(m)) return NULL;
     if (!init_DiskCache(m)) return NULL;
     if (!init_child_monitor(m)) return NULL;
+    if (!init_oob_channel(m)) return NULL;
     if (!init_ColorProfile(m)) return NULL;
     if (!init_Screen(m)) return NULL;
     if (!init_glfw(m)) return NULL;
