@@ -386,7 +386,9 @@ class Child:
         if self.remote_control_fd > -1:
             pass_fds += (self.remote_control_fd,)
         oob_child_fd = -1
-        if os.environ.get('KITTY_ENABLE_TUI_OOB') == '1':
+        # gate: kitty process env, kitty.conf `env`, or `launch --env`
+        # (final_env folds the latter two in and is computed above)
+        if os.environ.get('KITTY_ENABLE_TUI_OOB') == '1' or self.final_env.get('KITTY_ENABLE_TUI_OOB') == '1':
             # R3 out-of-band bulk channel: hand the child one end of a
             # socketpair so a cooperating full-screen app can send its bulk
             # TUI output past the 1024-byte kernel pty queue. The pty stays
