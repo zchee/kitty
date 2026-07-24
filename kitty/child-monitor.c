@@ -582,6 +582,7 @@ typedef enum FtGateOutcome {
 static uint64_t ft_seq;                // emitted-line counter
 static monotonic_t ft_prev_ts;         // previous emitted tick timestamp, for gap_ms
 static uint64_t ft_bytes_drained;      // bytes drained from transport rings this tick
+static uint64_t ft_oob_drained;        // R3: subset of ft_bytes_drained that came from OOB channel rings
 static FtGateOutcome ft_gate_outcome;  // focused window's gate branch this tick
 static bool ft_present_committed;      // focused window presented (swap) this tick
 static const char* const ft_gate_names[] = {
@@ -762,7 +763,8 @@ frame_trace_emit(monotonic_t ts, bool input_read, monotonic_t parse_dt, monotoni
               " pump_children=%u"
               " rd_on=%d rd_kevent_wakeups=%llu rd_wake_data=%llu rd_wake_timer=%llu"
               " rd_wake_unpark=%llu rd_wake_teardown=%llu rd_read_calls=%llu rd_read_bytes=%llu"
-              " rd_park_cycles=%llu rd_batch_flushes=%llu rd_echo_immediates=%llu",
+              " rd_park_cycles=%llu rd_batch_flushes=%llu rd_echo_immediates=%llu"
+              " oob_drained=%llu",
               (unsigned long long)(++ft_seq), ft_ms(ts), ft_ms(gap),
               (unsigned long long)ft_bytes_drained, ft_ms(parse_dt), ft_ms(render_dt),
               input_read ? 1 : 0, ft_gate_names[ft_gate_outcome], ft_present_committed ? 1 : 0,
@@ -779,7 +781,8 @@ frame_trace_emit(monotonic_t ts, bool input_read, monotonic_t parse_dt, monotoni
               reader_threads_enabled() ? 1 : 0, (unsigned long long)rd_wakes, (unsigned long long)rd_wd,
               (unsigned long long)rd_wt, (unsigned long long)rd_wu, (unsigned long long)rd_wx,
               (unsigned long long)rd_reads, (unsigned long long)rd_rbytes,
-              (unsigned long long)rd_parks, (unsigned long long)rd_flushes, (unsigned long long)rd_echo);
+              (unsigned long long)rd_parks, (unsigned long long)rd_flushes, (unsigned long long)rd_echo,
+              (unsigned long long)ft_oob_drained);
 }
 #endif
 
@@ -796,6 +799,7 @@ do_parse(ChildMonitor *self, Screen *screen, monotonic_t now, bool flush) {
             if (kt_echo > kt_parse_at) kt_parse_at = now;
         }
         ft_bytes_drained += pd.bytes_read;
+        ft_oob_drained += pd.oob_bytes_read;  // R3: pty/oob drain split
         ft_parsed_bytes += pd.parsed_bytes;
         ft_pause_starts += pd.pause_starts;
         ft_pause_stops += pd.pause_stops;
@@ -2281,6 +2285,7 @@ process_global_state(void *data) {
         ft_parsed_bytes = 0; ft_pause_starts = 0; ft_pause_stops = 0; ft_paused_at_end = false;
         ft_cow_copied = 0; ft_cow_skip_eligible = 0;  // Wave-21 L4
         ft_share_rows_total = 0; ft_share_rows_ref = 0; ft_share_cow_retires = 0;  // Wave-25 Lane S
+        ft_oob_drained = 0;  // R3
     }
 #endif
 #ifdef __APPLE__

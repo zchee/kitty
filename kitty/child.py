@@ -341,6 +341,7 @@ class Child:
     # serving writes, TIOCSWINSZ and process-group queries either way.
     data_fd: int | None = None
     pump_pid: int | None = None
+    oob_fd: int = -1  # kitty-side end of the R3 OOB bulk channel socketpair (-1 = none)
     pid: int | None = None
     initial_termios_state: list[Any] | None = None
     forked = False
@@ -467,6 +468,33 @@ class Child:
         pass_fds = self.pass_fds
         if self.remote_control_fd > -1:
             pass_fds += (self.remote_control_fd,)
+        oob_child_fd = -1
+        if os.environ.get('KITTY_ENABLE_TUI_OOB') == '1':
+            # R3 out-of-band bulk channel: hand the child one end of a
+            # socketpair so a cooperating full-screen app can send its bulk
+            # TUI output past the 1024-byte kernel pty queue. The pty stays
+            # the controlling terminal (identity, input, signals, winsize);
+            # unpatched children simply never write the handshake. Created
+            # only under this opt-in gate so the default world stays
+            # byte-identical (no socketpair syscall at all).
+            import socket as socket_module
+            oob_parent_sock, oob_child_sock = socket_module.socketpair(socket_module.AF_UNIX, socket_module.SOCK_STREAM)
+            for oob_sock in (oob_parent_sock, oob_child_sock):
+                try:
+                    oob_sock.setsockopt(socket_module.SOL_SOCKET, socket_module.SO_SNDBUF, 1024 * 1024)
+                    oob_sock.setsockopt(socket_module.SOL_SOCKET, socket_module.SO_RCVBUF, 1024 * 1024)
+                except OSError:
+                    pass  # buffer sizing is best-effort; the 1 MiB transport ring still applies
+            self.oob_fd = oob_parent_sock.detach()
+            oob_child_fd = oob_child_sock.detach()
+            os.set_blocking(self.oob_fd, True)
+            os.set_inheritable(self.oob_fd, False)
+            os.set_inheritable(oob_child_fd, True)
+            self.final_env['KITTY_TUI_OOB_FD'] = str(oob_child_fd)
+            # rides the pass_fds preserve list through spawn (and, like
+            # forward_stdio, keeps macOS launches off /usr/bin/login, which
+            # closes inherited fds)
+            pass_fds += (oob_child_fd,)
         if self.should_run_via_run_shell_kitten or must_run_startup_command_via_kitten:
             # bash will only source ~/.bash_profile if it detects it is a login
             # shell (see the invocation section of the bash man page), which it
@@ -528,6 +556,8 @@ class Child:
             pass_fds,
         )
         os.close(slave)
+        if oob_child_fd > -1:
+            os.close(oob_child_fd)
         self.pid = pid
         self.child_fd = master
         self.data_fd = master

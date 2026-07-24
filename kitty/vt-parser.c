@@ -14,6 +14,7 @@
 #include "state.h"
 #include "simd-string.h"
 #include "vt-input-ring.h"
+#include "oob-channel.h"
 #include <stdalign.h>
 
 #define BUF_SZ (1024u*1024u)
@@ -228,6 +229,10 @@ typedef struct PS {
     // buf/read are touched only by the main thread now, so the parse
     // side needs no synchronization at all.
     VTInputRing *input_ring;
+    // R3: optional out-of-band bulk channel (NULL unless attached); its
+    // ring is a second SPSC transport merged into the same arena by this
+    // same single consumer.
+    OOBChannel *oob;
     struct { size_t consumed, pos, sz; } read;
 } PS;
 
@@ -1570,6 +1575,40 @@ drain_ring(PS *self) {
     return total;
 }
 
+// R3: merge the out-of-band channel's ring into the same arena. A second
+// SPSC transport with the same single consumer (this main-thread tick);
+// ordering between the pty and OOB streams is parse-granularity
+// arbitrary under the full-screen-owner contract.
+static void
+drain_oob(PS *self, ParseData *pd) {
+    VTInputRing *ring = oob_channel_drain_ring(self->oob);  // clear-before-drain wakeup bracket
+    size_t total = 0;
+    while (self->read.sz < BUF_SZ) {
+        size_t avail;
+        const uint8_t *src = vt_ring_readable(ring, &avail);
+        if (!avail) break;
+        const size_t n = MIN(avail, BUF_SZ - self->read.sz);
+        memcpy(self->buf + self->read.sz, src, n);
+        self->read.sz += n;
+        vt_ring_advance(ring, n);
+        total += n;
+    }
+    pd->bytes_read += total;
+    pd->oob_bytes_read += total;
+}
+
+// Oldest first-unabsorbed-input stamp across both transports (input_delay
+// batching); identical to the pty-only stamp when no channel is attached.
+static monotonic_t
+effective_new_input_at(PS *self) {
+    monotonic_t a = vt_ring_new_input_at(self->input_ring);
+    if (UNLIKELY(self->oob != NULL)) {
+        const monotonic_t b = vt_ring_new_input_at(oob_channel_ring(self->oob));
+        if (b && (!a || b < a)) a = b;
+    }
+    return a;
+}
+
 static void
 run_worker(void *p, ParseData *pd, bool flush) {
     Screen *screen = (Screen*)p;
@@ -1587,14 +1626,18 @@ run_worker(void *p, ParseData *pd, bool flush) {
     // drain before the parse gate, mirroring the old absorb placement so
     // the gate and the nearly-full override see the post-drain state
     pd->bytes_read += drain_ring(self);
+    if (UNLIKELY(self->oob != NULL)) drain_oob(self, pd);  // R3: OOB merge rides the same pre-gate drain
     pd->has_pending_input = self->read.pos < self->read.sz;
     if (pd->has_pending_input) {
-        pd->time_since_new_input = pd->now - vt_ring_new_input_at(self->input_ring);
+        pd->time_since_new_input = pd->now - effective_new_input_at(self);
         // parse when the ring is full even inside the batching window:
         // the reader is stalled and only parsing frees transport space
         // (the analog of the old arena nearly-full override)
         if (flush || pd->time_since_new_input >= OPT(input_delay) || self->read.sz + 16 * 1024 > BUF_SZ
-                || !vt_ring_has_space(self->input_ring)) {
+                || !vt_ring_has_space(self->input_ring)
+                // R3: a full OOB ring means its producer is parked and only
+                // parsing frees transport space (same override as the pty ring)
+                || (UNLIKELY(self->oob != NULL) && !vt_ring_has_space(oob_channel_ring(self->oob)))) {
             pd->input_read = true;
             self->dump_callback = pd->dump_callback; self->now = pd->now;
             self->screen = screen;
@@ -1603,11 +1646,13 @@ run_worker(void *p, ParseData *pd, bool flush) {
             do {
                 consume_input(self, pd->dump_callback, screen->window_id);
                 pd->bytes_read += drain_ring(self);  // pick up bytes that arrived mid-parse
+                if (UNLIKELY(self->oob != NULL)) drain_oob(self, pd);  // R3: same mid-parse pickup
             } while (self->read.pos < self->read.sz);
             pd->parsed_bytes = self->read.pos - pos_before;
             // CAS-clear with fail-open re-cover; the helper self-guards
             // on ring emptiness (final-review FR-1)
             vt_ring_clear_new_input_at(self->input_ring, pd->now);
+            if (UNLIKELY(self->oob != NULL)) vt_ring_clear_new_input_at(oob_channel_ring(self->oob), pd->now);  // R3
             if (self->read.consumed) {
                 self->read.pos -= MIN(self->read.pos, self->read.consumed);
                 self->read.sz -= MIN(self->read.sz, self->read.consumed);
@@ -1620,6 +1665,9 @@ run_worker(void *p, ParseData *pd, bool flush) {
     // the park in vt_ring_writer_arm_or_park, so the wakeup cannot be lost
     // even when the fill raced past drain_ring's view.
     if (vt_ring_unpark_writer(self->input_ring)) pd->write_space_created = true;
+    // R3: the OOB producer parks on its own condvar, not the io loop —
+    // deliver its unpark directly (never via write_space_created)
+    if (UNLIKELY(self->oob != NULL)) oob_channel_after_drain(self->oob);
     // Wave-19 L4 probe: tick-exit state (post-admission shift, if any).
     pd->arena_fill_end = self->read.sz - self->read.pos;
     pd->ring_fill_end = vt_ring_used(self->input_ring);
@@ -1663,6 +1711,20 @@ size_t
 vt_parser_ring_free_total(const Parser *p) {
     PS *self = (PS*)p->state;
     return VT_RING_SZ - vt_ring_used(self->input_ring);
+}
+
+// R3: out-of-band channel backlink. Attach/detach and the parse tick all
+// run on the main thread, so a plain store suffices.
+void
+vt_parser_set_oob_channel(Parser *p, struct OOBChannel *c) {
+    PS *self = (PS*)p->state;
+    self->oob = (OOBChannel*)c;
+}
+
+struct OOBChannel*
+vt_parser_oob_channel(const Parser *p) {
+    PS *self = (PS*)p->state;
+    return (struct OOBChannel*)self->oob;
 }
 #endif
 

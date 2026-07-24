@@ -107,6 +107,8 @@ from .fast_data_types import (
     mark_os_window_for_close,
     monitor_pid,
     monotonic,
+    oob_channel_attach,
+    oob_channel_detach,
     os_window_focus_counters,
     os_window_font_size,
     redirect_mouse_handling,
@@ -716,6 +718,12 @@ class Boss:
         assert window.child.pid is not None and window.child.child_fd is not None
         data_fd = window.child.data_fd if window.child.data_fd is not None else window.child.child_fd
         self.child_monitor.add_child(window.id, window.child.pid, window.child.child_fd, data_fd, window.screen)
+        if window.child.oob_fd > -1:
+            # R3: hand the kitty-side socketpair end to the OOB reader
+            # (attach takes ownership of the fd on every path)
+            if not oob_channel_attach(window.screen, window.child.oob_fd):
+                log_error(f'Failed to attach TUI OOB channel for window {window.id}')
+            window.child.oob_fd = -1
         self.window_id_map[window.id] = window
 
     def _handle_remote_command(self, cmd: memoryview, window: Window | None = None, peer_id: int = 0) -> RCResponse:
@@ -1041,6 +1049,9 @@ class Boss:
                 w.ignore_focus_changes = val
 
     def on_child_death(self, window_id: int, child_died: bool, exit_status: int) -> None:
+        # R3: reap the OOB channel (if any) before the window teardown; the
+        # child-monitor removal path already ran its final flushing parse
+        oob_channel_detach(window_id)
         prev_active_window = self.active_window
         window = self.window_id_map.pop(window_id, None)
         if window is None:
