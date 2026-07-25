@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -48,7 +49,10 @@ import _r3_rusage as ru
 from r3_bill_battery import ftrace_sums
 from r3_nvim_ab import FIXTURE, NVIM, REPLAY_VIM, build_fixture, parse_oob_stats
 
-TMUX = Path("/Users/zchee/src/github.com/tmux/tmux-worktrees/r3t-oob-m0/tmux")
+# R3T_TMUX_BIN overrides the binary under test (M2 builds land in the main
+# checkout); the default stays the M0/M1 worktree binary for reproducibility.
+TMUX = Path(os.environ.get("R3T_TMUX_BIN",
+                           "/Users/zchee/src/github.com/tmux/tmux-worktrees/r3t-oob-m0/tmux"))
 VERIFY_DIR = h.REPO_ROOT / ".omc" / "verify" / "r3t"
 CLIENT = h.REPO_ROOT / "scripts" / "oob_flood_client.py"
 T1_DURATION_S = 30.0
@@ -88,6 +92,9 @@ def resolve_pids(kitty_pid: int, sock: str, deadline_s: float = 20.0) -> dict:
     return pids
 
 
+PANE_OFF_CFG = Path("/tmp/r3t-pane-off.conf")
+
+
 def run_row(workload: str, arm: str, round_no: int, tag: str) -> dict:
     h.wait_for_build_lock_clear()
     VERIFY_DIR.mkdir(parents=True, exist_ok=True)
@@ -96,8 +103,16 @@ def run_row(workload: str, arm: str, round_no: int, tag: str) -> dict:
     stderr_file = VERIFY_DIR / f"kitty-{tag}{workload}-{arm}-r{round_no}.stderr.log"
     result_file.unlink(missing_ok=True)
 
+    # M2 pane-hop A/B: both arms keep the client hop armed; the pane offer
+    # is toggled via a config file setting kitty-oob-pane off.
+    pane_ab = arm in ("paneon", "paneoff")
+    cfg = "/dev/null"
+    if arm == "paneoff":
+        PANE_OFF_CFG.write_text("set -g kitty-oob-pane off\n")
+        cfg = str(PANE_OFF_CFG)
+
     env = {"KITTY_FRAME_TRACE": "1"}
-    if arm == "oob":
+    if arm == "oob" or pane_ab:
         env["KITTY_ENABLE_TUI_OOB"] = "1"
         env["KITTY_OOB_STATS"] = "1"
 
@@ -109,11 +124,13 @@ def run_row(workload: str, arm: str, round_no: int, tag: str) -> dict:
         inner = ["-e", f"NVIM_AB_RESULT={result_file}",
                  "-e", f"NVIM_AB_LOOPS={T2_LOOPS}",
                  str(NVIM), "--clean", "+source " + str(REPLAY_VIM), str(FIXTURE)]
-    argv = [str(TMUX), "-L", sock, "-f", "/dev/null", "new-session"] + inner
+    argv = [str(TMUX), "-L", sock, "-f", cfg, "new-session"] + inner
 
     row: dict = {"workload": workload, "arm": arm, "round": round_no,
                  "load_before": os.getloadavg()[0]}
-    snaps: dict = {"kitty": None, "client": None, "server": None}
+    snaps: dict = {"kitty": None, "client": None, "server": None, "inner": None}
+    pane_var = ""
+    last_pane_poll = 0.0
     with open(stderr_file, "wb") as ef:
         proc = h.spawn_kitty(argv, extra_env=env, stderr=ef)
         pids = resolve_pids(proc.pid, sock)
@@ -121,13 +138,18 @@ def run_row(workload: str, arm: str, round_no: int, tag: str) -> dict:
         deadline = time.monotonic() + ROW_TIMEOUT
         while proc.poll() is None and time.monotonic() < deadline:
             for name, pid in (("kitty", proc.pid), ("client", pids["client"]),
-                              ("server", pids["server"])):
+                              ("server", pids["server"]), ("inner", pids["inner"])):
                 if pid is None:
                     continue
                 try:
                     snaps[name] = ru.snap(pid)
                 except OSError:
                     pass
+            if pane_ab and time.monotonic() - last_pane_poll > 2.0:
+                last_pane_poll = time.monotonic()
+                s = tmux_ctl(sock, "list-panes", "-F", "#{pane_kitty_oob}")
+                if s:
+                    pane_var = s
             time.sleep(0.1)
         if proc.poll() is None:
             h.terminate_kitty(proc)
@@ -144,12 +166,25 @@ def run_row(workload: str, arm: str, round_no: int, tag: str) -> dict:
         return row
     row["inner_result"] = json.loads(result_file.read_text())
     row["bills"] = snaps
+    row["pane_var"] = pane_var
+    row["pane_counts"] = parse_pane_var(pane_var)
     text = stderr_file.read_text(errors="replace")
     row["ftrace"] = ftrace_sums(text)
     row["oob_stats"] = parse_oob_stats(text)
-    if any(v is None for v in snaps.values()):
+    if any(v is None for k, v in snaps.items() if k != "inner" or pane_ab):
         row.setdefault("error", "rusage sampling never succeeded for a pid")
     return row
+
+
+def parse_pane_var(s: str) -> dict:
+    m = re.match(r"armed r=(\d+) b=(\d+) pty=(\d+)", s)
+    if m:
+        return {"state": "armed", "oob_reads": int(m.group(1)),
+                "oob_bytes": int(m.group(2)), "pty_reads": int(m.group(3))}
+    m = re.match(r"(none|offered|fallback) pty=(\d+)", s)
+    if m:
+        return {"state": m.group(1), "pty_reads": int(m.group(2))}
+    return {"state": s or "unknown"}
 
 
 def check_identity(row: dict, arm: str, patched: bool) -> None:
@@ -158,6 +193,16 @@ def check_identity(row: dict, arm: str, patched: bool) -> None:
         if ft["oob_drained"] != 0:
             row.setdefault("error", "baseline: oob_drained > 0 with stock tmux?!")
         return
+    if arm in ("paneon", "paneoff"):
+        # Client hop is armed in BOTH pane-A/B arms.
+        if st is None or st.get("handshake_ok") != 1 or st.get("fallbacks", 0) != 0:
+            row.setdefault("error", f"identity FAIL: bad client channel {st}")
+        pc = row.get("pane_counts", {})
+        if arm == "paneon" and (pc.get("state") != "armed" or pc.get("oob_bytes", 0) <= 0):
+            row.setdefault("error", f"identity FAIL: paneon not armed ({row.get('pane_var')})")
+        if arm == "paneoff" and pc.get("state") != "none":
+            row.setdefault("error", f"identity FAIL: paneoff state {row.get('pane_var')}")
+        return
     if arm == "oob":
         if st is None or st.get("handshake_ok") != 1 or st.get("fallbacks", 0) != 0:
             row.setdefault("error", f"identity FAIL: bad channel state {st}")
@@ -165,6 +210,61 @@ def check_identity(row: dict, arm: str, patched: bool) -> None:
             row.setdefault("error", "identity FAIL: oob row drained nothing via channel")
     elif ft["oob_drained"] != 0:
         row.setdefault("error", "identity FAIL: unset row with channel bytes")
+
+
+def analyze_pane(rows: list[dict]) -> dict:
+    def mib(r):
+        return r["ftrace"]["bytes_drained"] / (1024 * 1024)
+
+    def pooled_p(arm, fn):
+        vals = [fn(r) for r in rows if r["arm"] == arm and not r.get("error")]
+        return statistics.fmean(vals) if vals else float("nan")
+
+    def pane_reads(r):
+        pc = r["pane_counts"]
+        if pc.get("state") == "armed":
+            return pc["oob_reads"] + pc["pty_reads"]
+        return pc.get("pty_reads", 0)
+
+    get = {
+        "out_mib": mib,
+        "quartet_cpu_per_mib": lambda r: sum(r["bills"][p]["cpu_ns"] for p in ("kitty", "client", "server", "inner")) / mib(r),
+        "quartet_wk_per_mib": lambda r: sum(r["bills"][p]["wakeups"] for p in ("kitty", "client", "server", "inner")) / mib(r),
+        "nvim_cpu_per_mib": lambda r: r["bills"]["inner"]["cpu_ns"] / mib(r),
+        "server_cpu_per_mib": lambda r: r["bills"]["server"]["cpu_ns"] / mib(r),
+        "kitty_cpu_per_mib": lambda r: r["bills"]["kitty"]["cpu_ns"] / mib(r),
+        "client_cpu_per_mib": lambda r: r["bills"]["client"]["cpu_ns"] / mib(r),
+        "wall_s": lambda r: r["inner_result"].get("seconds") or float("nan"),
+    }
+    means = {a: {k: pooled_p(a, f) for k, f in get.items()} for a in ("paneoff", "paneon")}
+    off, on = means["paneoff"], means["paneon"]
+    ratios = {k: (on[k] / off[k] if off[k] else float("nan")) for k in get}
+    on_reads = pooled_p("paneon", pane_reads)
+    off_reads = pooled_p("paneoff", pane_reads)
+    nvim_bytes = pooled_p("paneon", lambda r: r["pane_counts"].get("oob_bytes", 0))
+    g1 = on_reads / off_reads if off_reads else float("nan")
+    # Aliases so the shared emit_png bar chart renders the P-family ratios.
+    ratios["reads_per_mib"] = g1
+    ratios["wakeups_per_mib"] = ratios["quartet_wk_per_mib"]
+    ratios["cpu_ns_per_mib"] = ratios["quartet_cpu_per_mib"]
+    out = {"means": means, "ratios": ratios,
+           "paneon_reads": on_reads, "paneoff_reads": off_reads,
+           "nvim_pane_bytes": nvim_bytes,
+           "bytes_band": ratios["out_mib"],
+           "bytes_band_ok": 0.80 <= ratios["out_mib"] <= 1.25}
+    out["gates"] = {
+        "P_G1_pane_reads": {"ratio": g1, "gate": 0.35, "pass": g1 <= 0.35},
+        "P_G2_quartet_cpu": {"ratio": ratios["quartet_cpu_per_mib"], "gate": 0.92,
+                             "kitty": ratios["kitty_cpu_per_mib"], "client": ratios["client_cpu_per_mib"],
+                             "server": ratios["server_cpu_per_mib"], "nvim": ratios["nvim_cpu_per_mib"],
+                             "pass": ratios["quartet_cpu_per_mib"] <= 0.92
+                             and all(ratios[f"{p}_cpu_per_mib"] <= 1.10
+                                     for p in ("kitty", "client", "server", "nvim"))},
+        "P_G3_wall": {"ratio": ratios["wall_s"], "gate": 1.05,
+                      "pass": ratios["wall_s"] <= 1.05},
+    }
+    out["quartet_wk_ratio_observational"] = ratios["quartet_wk_per_mib"]
+    return out
 
 
 def analyze(rows: list[dict], workload: str) -> dict:
@@ -245,9 +345,11 @@ def main() -> int:
     ap.add_argument("--workload", choices=("t1", "t2"), required=True)
     ap.add_argument("--baseline", action="store_true")
     ap.add_argument("--rounds", type=int, default=3)
+    ap.add_argument("--pane-ab", action="store_true",
+                    help="M2 W-P1: pane-hop A/B (client hop armed in both arms)")
     args = ap.parse_args()
     rounds = 1 if args.baseline else args.rounds
-    tag = "baseline-" if args.baseline else ""
+    tag = ("paneab-" if args.pane_ab else "") + ("baseline-" if args.baseline else "")
 
     if not TMUX.exists():
         print(f"ERROR: worktree tmux not found at {TMUX}", file=sys.stderr)
@@ -260,7 +362,10 @@ def main() -> int:
 
     rows: list[dict] = []
     for round_no in range(1, rounds + 1):
-        arms = ("unset", "oob") if round_no % 2 == 1 else ("oob", "unset")
+        if args.pane_ab:
+            arms = ("paneoff", "paneon") if round_no % 2 == 1 else ("paneon", "paneoff")
+        else:
+            arms = ("unset", "oob") if round_no % 2 == 1 else ("oob", "unset")
         for arm in arms:
             print(f"[r3t-bill] {tag}{args.workload} round {round_no}/{rounds} arm={arm} ...", flush=True)
             row = run_row(args.workload, arm, round_no, tag)
@@ -284,13 +389,19 @@ def main() -> int:
                      "loadavg_range": [min(r["load_before"] for r in rows),
                                        max(r.get("load_after", r["load_before"]) for r in rows)]}
     if not errors:
-        summary.update(analyze(rows, args.workload))
-        if not args.baseline:
-            summary["png"] = emit_png(summary, args.workload)
+        if args.pane_ab:
+            summary.update(analyze_pane(rows))
+            summary["png"] = emit_png(summary, f"paneab-{args.workload}")
             summary["verdict"] = ("ALL-PASS" if all(g["pass"] for g in summary["gates"].values())
                                   else "GATE-MISS")
         else:
-            summary["verdict"] = "BASELINE-OK"
+            summary.update(analyze(rows, args.workload))
+            if not args.baseline:
+                summary["png"] = emit_png(summary, args.workload)
+                summary["verdict"] = ("ALL-PASS" if all(g["pass"] for g in summary["gates"].values())
+                                      else "GATE-MISS")
+            else:
+                summary["verdict"] = "BASELINE-OK"
     else:
         summary["verdict"] = "ERROR"
     (VERIFY_DIR / f"bill-{tag}{args.workload}-summary.json").write_text(json.dumps(summary, indent=2))
