@@ -460,6 +460,7 @@ static void*
 write_loop(void *data) {
     DiskCache *self = (DiskCache*)data;
     set_thread_name("DiskCacheWrite");
+    report_thread_qos("disk-cache");  // R4 M1d probe
     struct pollfd fds[1] = {0};
     fds[0].fd = self->loop_data.wakeup_read_fd;
     fds[0].events = POLLIN;

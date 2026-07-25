@@ -2694,6 +2694,7 @@ process_global_state(void *data) {
 static PyObject*
 main_loop(ChildMonitor *self, PyObject *a UNUSED) {
 #define main_loop_doc "The main thread loop"
+    report_thread_qos("main");  // R4 M1d probe
     state_check_timer = add_main_loop_timer(1000, true, do_state_check, self, NULL);
     run_main_loop(process_global_state, self);
 #ifdef KITTY_BACKEND_METAL
@@ -2900,6 +2901,7 @@ static void*
 reader_main(void *arg) {
     ReaderThread *rt = arg;
     set_thread_name("KittyReader");
+    report_thread_qos("reader");  // R4 M1d probe (dormant arm; fires only if enabled)
     reader_block_handled_signals();  // O8
     ReaderCounters *rc = reader_counters + rt->slot;
     Screen *screen = rt->screen;
@@ -3411,6 +3413,7 @@ io_loop(void *data) {
     Screen *screen;
     ChildMonitor *self = (ChildMonitor*)data;
     set_thread_name("KittyChildMon");
+    report_thread_qos("io");  // R4 M1d probe
 
     while (LIKELY(!self->shutting_down)) {
         children_mutex(lock);

@@ -133,6 +133,7 @@ static void*
 oob_read_loop(void *arg) {
     OOBChannel *c = arg;
     set_thread_name("KittyOOBRead");
+    report_thread_qos("oob");  // R4 M1d probe
     if (oob_read_handshake(c)) {
         for (;;) {
             pthread_mutex_lock(&c->mutex);
