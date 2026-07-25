@@ -366,7 +366,10 @@ def emit_png(rollup: dict, date: str) -> Path | None:
     bars = [("fail-open (=0)", g["S_G1_no_fail_open"]["value"]),
             ("broken panes (=0)", g["S_G2_no_broken_panes"]["value"]),
             ("pty fallback % (<=2)", g["S_G3_pty_fallback_rate"]["value"] * 100),
-            ("srv pid changes (=0)", g["S_G4_server_continuity"]["value"])]
+            ("srv breaks (=0)", g["S_G4_server_continuity"]["value"]),
+            ("unparsed states (=0)", g["S_G5_states_understood"]["value"]),
+            ("armed panes vanished",
+             rollup.get("armed_panes_vanished_unobserved", 0))]
     dat2.write_text("\n".join(f'{i} {v:.4f} "{n}"'
                               for i, (n, v) in enumerate(bars)) + "\n")
     png = SOAK_DIR.parent / f"r3t-soak-{date}.png"
@@ -388,7 +391,7 @@ plot '{dat}' using 1:2 with lines lw 2 lc rgb '#2ca02c' title 'armed', \\
 unset key
 set xlabel ''
 set ylabel 'value (lower is better)'
-set xrange [-0.6:3.6]
+set xrange [-0.6:5.6]
 set yrange [0:*]
 set boxwidth 0.5
 set style fill solid 0.55
