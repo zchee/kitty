@@ -366,6 +366,11 @@ window_iconify_callback(GLFWwindow *window, int iconified) {
 #ifdef __APPLE__
 static void
 cocoa_out_of_sequence_render(OSWindow *window) {
+    // R4 M1c: bracket the third main-thread render entry point (live
+    // resize / screen-change synchronous render). Expected zero in every R4
+    // measurement cell (M0a(h)); the counters exist so that expectation is
+    // checkable rather than assumed.
+    const monotonic_t r4_t0 = ft_render_span_begin();
     make_os_window_context_current(window);
     window->needs_render = true;
 
@@ -397,6 +402,7 @@ cocoa_out_of_sequence_render(OSWindow *window) {
         if (!glfwCocoaRecreateGLDrawable(window->handle) || !current_framebuffer_is_ok()) {
             debug_rendering("Cocoa OpenGL framebuffer re-creation failed\n");
             request_tick_callback();
+            ft_oos_span_end(r4_t0);
             return;
         }
     }
@@ -414,6 +420,7 @@ cocoa_out_of_sequence_render(OSWindow *window) {
     }
     window->needs_render = true;
 #endif
+    ft_oos_span_end(r4_t0);
 }
 
 static void
@@ -2948,8 +2955,21 @@ get_cocoa_key_equivalent(uint32_t key, int mods, char *cocoa_key, size_t key_sz,
 }
 
 #ifdef KITTY_BACKEND_METAL
+static bool cocoa_metal_frame_callback_impl(GLFWwindow *window);
+
+// R4 M1c: bracket the whole link-callback span (prepare + encode + present +
+// bookkeeping) so the out-of-tick render cost group E is measurable; the
+// in-tick/EMIT attribution lives in ft_link_span_end (child-monitor.c). The
+// unset world pays one cached-branch test.
 static void
 cocoa_metal_frame_callback(GLFWwindow *window) {
+    const monotonic_t r4_t0 = ft_render_span_begin();
+    const bool rendered = cocoa_metal_frame_callback_impl(window);
+    ft_link_span_end(r4_t0, rendered);
+}
+
+static bool
+cocoa_metal_frame_callback_impl(GLFWwindow *window) {
     // Phase 4 (L1): invoked on the main runloop by the CAMetalDisplayLink delegate
     // (glfw/metal_context.m) once per vsync-timed frame, with the frame's drawable
     // already published via glfwGetCocoaPendingMetalDrawable(). Unlike the GL
@@ -2966,7 +2986,7 @@ cocoa_metal_frame_callback(GLFWwindow *window) {
         // Live resize drives synchronous presents via cocoa_out_of_sequence_render
         // (presentsWithTransaction); the delegate already guards this, but a tick
         // could have been in flight when the drag started.
-        if (w->live_resize.in_progress) return;
+        if (w->live_resize.in_progress) return false;
         const bool scan = global_state.check_for_active_animated_images;
         global_state.check_for_active_animated_images = false;
         w->render_state = RENDER_FRAME_READY;
@@ -2991,8 +3011,9 @@ cocoa_metal_frame_callback(GLFWwindow *window) {
             w->render_state = RENDER_FRAME_NOT_REQUESTED;
             glfwCocoaSetRenderLinkPaused(window, true);
         }
-        return;
+        return rendered;
     }
+    return false;
 }
 #else
 static void

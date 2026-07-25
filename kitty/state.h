@@ -704,3 +704,18 @@ bool change_drag_image(int idx);
 int start_window_drag(Window *w, bool in_test_mode);
 int notify_drag_data_ready(id_type os_window_id, const char *mime_type, const char *data, size_t data_sz, int type);
 BackgroundImage* background_image_for_os_window(OSWindow *w);
+
+// R4 M1a/M1c (KITTY_FRAME_TRACE-gated; no-ops when unset and on the GL
+// build). child-monitor.c owns the counters; kitty/glfw.c brackets the two
+// off-tick render entry points (display-link callback + live-resize
+// out-of-sequence render), and screen.c/hyperlink.c/graphics.c bracket the
+// maintenance sites. All main-thread only.
+typedef enum {
+    FT_MAINT_TEXT_CACHE = 0, FT_MAINT_HYPERLINK, FT_MAINT_IMAGES,
+    FT_MAINT_CONFIG_RELOAD, FT_MAINT_SITE_COUNT
+} FtMaintSite;
+monotonic_t ft_render_span_begin(void);
+void ft_link_span_end(monotonic_t t0, bool rendered);
+void ft_oos_span_end(monotonic_t t0);
+monotonic_t ft_maint_clock(void);
+void ft_maint_span(FtMaintSite site, monotonic_t t0);

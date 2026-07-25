@@ -964,8 +964,9 @@ screen_garbage_collect_text_cache(Screen *self) {
     // The TextCache interns unique cell texts forever; remap every live cell
     // index onto a fresh cache so entries that scrolled out of the history
     // buffer are freed. Mirrors screen_garbage_collect_hyperlink_pool().
+    const monotonic_t ft_t0 = ft_maint_clock();  // R4 maint_ms site
     TextCacheGCData *gc = tc_gc_begin(self->text_cache);
-    if (!gc) return;  // allocation failure, cache left unchanged
+    if (!gc) { ft_maint_span(FT_MAINT_TEXT_CACHE, ft_t0); return; }  // allocation failure, cache left unchanged
     if (self->historybuf->count) {
         for (index_type y = self->historybuf->count; y-- > 0;) {
             CPUCell *cells = historybuf_cpu_cells(self->historybuf, y);
@@ -984,6 +985,7 @@ screen_garbage_collect_text_cache(Screen *self) {
     if (self->overlay_line.original_line.cpu_cells) text_cache_gc_process_cells(
         self->text_cache, gc, self->overlay_line.original_line.cpu_cells, self->overlay_line.xnum);
     tc_gc_end(self->text_cache, gc);
+    ft_maint_span(FT_MAINT_TEXT_CACHE, ft_t0);  // R4
 }
 
 static bool

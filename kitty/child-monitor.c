@@ -630,6 +630,140 @@ static monotonic_t kt_parse_at;                // S3: first do_parse at/after th
 static monotonic_t kt_emitted_key_at;          // dedupe: newest key stamp already emitted
 static uint64_t kt_seq;                        // emitted ktrace line counter
 static bool kt_epoch_emitted;                  // one-time mono↔mach anchor line
+// R4 M1a/M1b/M1c: tick-partition + main-thread CPU split + out-of-tick render
+// counters (plan-2026-07-25-main-thread-visibility-qos-r4.md v4.5.1). All of
+// this is main-thread state behind frame_trace_enabled(); the unset world
+// never reaches any of it.
+static bool frame_trace_enabled(void);
+typedef enum {
+    FT_SEG_NONE = 0, FT_SEG_RESIZE, FT_SEG_PARSE, FT_SEG_RENDER,
+    FT_SEG_COCOA, FT_SEG_CLOSE, FT_SEG_OTHER, FT_SEG_EMIT
+} FtInTickSegment;
+// Written only by the depth-0 tick (main thread); read by the render/maint
+// span hooks, which also run on the main thread — plain statics suffice.
+static FtInTickSegment ft_in_tick_seg = FT_SEG_NONE;
+static unsigned ft_depth;               // reentrant-tick guard (pre-mortem 2)
+static uint64_t ft_nested;              // cumulative count of skipped nested ticks
+// M1b: previous tick's CPU-exit and post-emit reads, for outside_cpu_ms and
+// emit_cpu_ms on the FOLLOWING line (both -1-sentineled until a prior
+// instrumented tick exists).
+static long long ft_prev_cpu_exit_ns = -1, ft_prev_post_emit_ns = -1;
+// M1a nested annotations (per tick, reset in the tick head; strict subsets
+// of parse_ms):
+static monotonic_t ft_peer_ns, ft_death_ns, ft_maint_ns;
+// M1a maintenance per-site-group occurrence counters (cumulative,
+// diff-consecutive-lines) + the I5 structural check (must stay 0):
+static uint64_t ft_maint_occ[FT_MAINT_SITE_COUNT];
+static uint64_t ft_maint_outside_parse;
+// M1c cumulative render-span counters (diff-consecutive-lines, io_* style):
+static uint64_t ft_link_render_ns, ft_link_frames, ft_link_norender_frames;
+static uint64_t ft_link_in_tick_ns[6];  // by open segment RESIZE..OTHER (seg-1)
+static uint64_t ft_link_in_tick_frames;
+static uint64_t ft_link_in_emit_ns, ft_oos_in_emit_ns;  // required zero (W2)
+static uint64_t ft_oos_render_ns, ft_oos_frames, ft_oos_in_tick_ns;
+// F: cumulative main-thread python-timer callback time (fires outside the
+// tick, so a per-tick field would be a lie — diff consecutive lines):
+static uint64_t ft_timer_cb_ns, ft_timer_cb_calls;
+
+static inline long long
+thread_cpu_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return (long long)ts.tv_sec * 1000000000ll + ts.tv_nsec;
+}
+
+// KITTY_FTRACE_SELFTEST=<target>:<ms> — I4's discrimination injection. One
+// named region sleeps <ms> every tick while set (cells run one target at a
+// time). Resolved once, like frame_trace_enabled().
+typedef enum {
+    FT_ST_NONE = 0, FT_ST_RESIZE, FT_ST_PARSE, FT_ST_RENDER, FT_ST_COCOA,
+    FT_ST_CLOSE, FT_ST_PEER, FT_ST_DEATH, FT_ST_MAINT, FT_ST_UNATTRIBUTED
+} FtSelftestTarget;
+static FtSelftestTarget ft_selftest_target = FT_ST_NONE;
+static useconds_t ft_selftest_us;
+
+static void
+ft_selftest_resolve(void) {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    const char *v = getenv("KITTY_FTRACE_SELFTEST");
+    if (!v || !v[0]) return;
+    const char *colon = strchr(v, ':');
+    if (!colon) return;
+    static const char* const names[] = {
+        "", "resize", "parse", "render", "cocoa", "close", "peer", "death",
+        "maint", "unattributed" };
+    for (unsigned i = 1; i < arraysz(names); i++) {
+        if (strncmp(v, names[i], (size_t)(colon - v)) == 0 && strlen(names[i]) == (size_t)(colon - v)) {
+            ft_selftest_target = (FtSelftestTarget)i;
+            ft_selftest_us = (useconds_t)(strtod(colon + 1, NULL) * 1000.0);
+            break;
+        }
+    }
+}
+
+static inline void
+ft_selftest_fire(FtSelftestTarget t) {
+    if (UNLIKELY(ft_selftest_target == t && ft_selftest_us)) usleep(ft_selftest_us);
+}
+
+// M1c span hooks (declared in state.h; bracketed from kitty/glfw.c). begin
+// returns 0 when the trace is off so end() is a no-op — the unset world
+// pays one cached-branch test per render entry.
+monotonic_t
+ft_render_span_begin(void) {
+    return UNLIKELY(frame_trace_enabled()) ? monotonic() : 0;
+}
+
+void
+ft_link_span_end(monotonic_t t0, bool rendered) {
+    if (!t0) return;
+    const uint64_t dur = (uint64_t)(monotonic() - t0);
+    ft_link_render_ns += dur; ft_link_frames++;
+    if (!rendered) ft_link_norender_frames++;
+    switch (ft_in_tick_seg) {
+        case FT_SEG_NONE: break;
+        case FT_SEG_EMIT: ft_link_in_emit_ns += dur; break;  // W2: required zero
+        default:
+            ft_link_in_tick_ns[ft_in_tick_seg - 1] += dur;
+            ft_link_in_tick_frames++;
+            break;
+    }
+}
+
+void
+ft_oos_span_end(monotonic_t t0) {
+    if (!t0) return;
+    const uint64_t dur = (uint64_t)(monotonic() - t0);
+    ft_oos_render_ns += dur; ft_oos_frames++;
+    if (ft_in_tick_seg == FT_SEG_EMIT) ft_oos_in_emit_ns += dur;
+    else if (ft_in_tick_seg != FT_SEG_NONE) ft_oos_in_tick_ns += dur;
+}
+
+// M1a maintenance spans (text-cache GC, hyperlink GC, remove_images, config
+// reload). Nested inside parse_ms by construction — the counter records any
+// violation (I5's structural check) and a debug build asserts.
+monotonic_t
+ft_maint_clock(void) {
+    return UNLIKELY(frame_trace_enabled()) ? monotonic() : 0;
+}
+
+void
+ft_maint_span(FtMaintSite site, monotonic_t t0) {
+    if (!t0) return;
+    ft_maint_occ[site]++;
+    // maint_ms is defined as maintenance time inside the MEASURED parse
+    // bracket, so the I5 subset identity (peer+death+maint <= parse) is
+    // structural; work reached from a nested (uninstrumented) tick or any
+    // other segment is counted, not accumulated. A violation with
+    // ft_depth == 1 is a mis-bracketed site — debug builds assert.
+    if (LIKELY(ft_in_tick_seg == FT_SEG_PARSE)) ft_maint_ns += monotonic() - t0;
+    else {
+        ft_maint_outside_parse++;
+        assert(ft_depth != 1 && "R4: maintenance span outside the parse bracket in the instrumented tick");
+    }
+}
 // Instrumentation-only recency bound for stamping an echo that missed the
 // L5 window (plan T1.1 l5_miss rule: stamp + flag, never drop).
 #define KT_ECHO_STAMP_WINDOW (ms_to_monotonic_t(500ll))
@@ -722,7 +856,10 @@ static inline double
 ft_ms(monotonic_t t) { return (double)t / (double)MONOTONIC_T_1e6; }
 
 static void
-frame_trace_emit(monotonic_t ts, bool input_read, monotonic_t parse_dt, monotonic_t render_dt) {
+frame_trace_emit(monotonic_t ts, bool input_read, monotonic_t tick_dt,
+                 monotonic_t resize_dt, monotonic_t parse_dt, monotonic_t render_dt,
+                 monotonic_t cocoa_dt, monotonic_t close_dt, monotonic_t other_dt,
+                 long long tick_cpu_ns, long long outside_cpu_ns, long long emit_cpu_ns) {
     const monotonic_t gap = ft_prev_ts ? ts - ft_prev_ts : 0;
     ft_prev_ts = ts;
     // Wave-19 L3: cumulative (never-reset) io-thread counters, loaded with
@@ -764,7 +901,17 @@ frame_trace_emit(monotonic_t ts, bool input_read, monotonic_t parse_dt, monotoni
               " rd_on=%d rd_kevent_wakeups=%llu rd_wake_data=%llu rd_wake_timer=%llu"
               " rd_wake_unpark=%llu rd_wake_teardown=%llu rd_read_calls=%llu rd_read_bytes=%llu"
               " rd_park_cycles=%llu rd_batch_flushes=%llu rd_echo_immediates=%llu"
-              " oob_drained=%llu",
+              " oob_drained=%llu"
+              " tick_ms=%.3f resize_ms=%.3f cocoa_ms=%.3f close_ms=%.3f other_ms=%.3f"
+              " peer_ms=%.3f death_ms=%.3f maint_ms=%.3f"
+              " tick_cpu_ms=%.3f outside_cpu_ms=%.3f emit_cpu_ms=%.3f"
+              " maint_tc=%llu maint_hl=%llu maint_img=%llu maint_cfg=%llu maint_outside_parse=%llu"
+              " ft_nested=%llu timer_ms=%.3f timer_calls=%llu"
+              " link_ms=%.3f link_frames=%llu link_norender=%llu"
+              " lit_resize_ms=%.3f lit_parse_ms=%.3f lit_render_ms=%.3f"
+              " lit_cocoa_ms=%.3f lit_close_ms=%.3f lit_other_ms=%.3f"
+              " link_it_frames=%llu link_emit_ms=%.3f"
+              " oos_ms=%.3f oos_frames=%llu oos_it_ms=%.3f oos_emit_ms=%.3f",
               (unsigned long long)(++ft_seq), ft_ms(ts), ft_ms(gap),
               (unsigned long long)ft_bytes_drained, ft_ms(parse_dt), ft_ms(render_dt),
               input_read ? 1 : 0, ft_gate_names[ft_gate_outcome], ft_present_committed ? 1 : 0,
@@ -782,8 +929,40 @@ frame_trace_emit(monotonic_t ts, bool input_read, monotonic_t parse_dt, monotoni
               (unsigned long long)rd_wt, (unsigned long long)rd_wu, (unsigned long long)rd_wx,
               (unsigned long long)rd_reads, (unsigned long long)rd_rbytes,
               (unsigned long long)rd_parks, (unsigned long long)rd_flushes, (unsigned long long)rd_echo,
-              (unsigned long long)ft_oob_drained);
+              (unsigned long long)ft_oob_drained,
+              ft_ms(tick_dt), ft_ms(resize_dt), ft_ms(cocoa_dt), ft_ms(close_dt), ft_ms(other_dt),
+              ft_ms(ft_peer_ns), ft_ms(ft_death_ns), ft_ms(ft_maint_ns),
+              (double)tick_cpu_ns / 1e6,
+              outside_cpu_ns < 0 ? -1.0 : (double)outside_cpu_ns / 1e6,
+              emit_cpu_ns < 0 ? -1.0 : (double)emit_cpu_ns / 1e6,
+              (unsigned long long)ft_maint_occ[FT_MAINT_TEXT_CACHE],
+              (unsigned long long)ft_maint_occ[FT_MAINT_HYPERLINK],
+              (unsigned long long)ft_maint_occ[FT_MAINT_IMAGES],
+              (unsigned long long)ft_maint_occ[FT_MAINT_CONFIG_RELOAD],
+              (unsigned long long)ft_maint_outside_parse,
+              (unsigned long long)ft_nested,
+              (double)ft_timer_cb_ns / 1e6, (unsigned long long)ft_timer_cb_calls,
+              (double)ft_link_render_ns / 1e6, (unsigned long long)ft_link_frames,
+              (unsigned long long)ft_link_norender_frames,
+              (double)ft_link_in_tick_ns[FT_SEG_RESIZE-1] / 1e6,
+              (double)ft_link_in_tick_ns[FT_SEG_PARSE-1] / 1e6,
+              (double)ft_link_in_tick_ns[FT_SEG_RENDER-1] / 1e6,
+              (double)ft_link_in_tick_ns[FT_SEG_COCOA-1] / 1e6,
+              (double)ft_link_in_tick_ns[FT_SEG_CLOSE-1] / 1e6,
+              (double)ft_link_in_tick_ns[FT_SEG_OTHER-1] / 1e6,
+              (unsigned long long)ft_link_in_tick_frames,
+              (double)ft_link_in_emit_ns / 1e6,
+              (double)ft_oos_render_ns / 1e6, (unsigned long long)ft_oos_frames,
+              (double)ft_oos_in_tick_ns / 1e6, (double)ft_oos_in_emit_ns / 1e6);
 }
+#else
+// R4: GL-build stubs so the state.h span/maint hooks link everywhere; the
+// frame-trace machinery itself is Metal-only.
+monotonic_t ft_render_span_begin(void) { return 0; }
+void ft_link_span_end(monotonic_t t0 UNUSED, bool rendered UNUSED) {}
+void ft_oos_span_end(monotonic_t t0 UNUSED) {}
+monotonic_t ft_maint_clock(void) { return 0; }
+void ft_maint_span(FtMaintSite site UNUSED, monotonic_t t0 UNUSED) {}
 #endif
 
 static bool
@@ -922,6 +1101,16 @@ parse_input(ChildMonitor *self) {
     }
     talk_mutex(unlock);
 
+#ifdef KITTY_BACKEND_METAL
+    // R4 M1a nested annotation: peer-command execution time inside parse_ms.
+    // Gated on the instrumented tick's own parse bracket (ft_in_tick_seg is
+    // nonzero only there), so the unset world and nested ticks pay nothing.
+    monotonic_t ft_peer_t0 = 0;
+    if (UNLIKELY(ft_in_tick_seg == FT_SEG_PARSE)) {
+        ft_peer_t0 = monotonic();
+        ft_selftest_fire(FT_ST_PEER);
+    }
+#endif
     if (msgs_count) {
         for (size_t i = 0; i < msgs_count; i++) {
             Message *msg = msgs + i;
@@ -940,6 +1129,16 @@ parse_input(ChildMonitor *self) {
         }
         free(msgs); msgs = NULL;
     }
+#ifdef KITTY_BACKEND_METAL
+    if (ft_peer_t0) ft_peer_ns += monotonic() - ft_peer_t0;
+    // R4 M1a nested annotation: child-removal (final flushing do_parse +
+    // death_notify) time inside parse_ms.
+    monotonic_t ft_death_t0 = 0;
+    if (UNLIKELY(ft_in_tick_seg == FT_SEG_PARSE)) {
+        ft_death_t0 = monotonic();
+        ft_selftest_fire(FT_ST_DEATH);
+    }
+#endif
 
     while(remove_count) {
         // must be done while no locks are held, since the locks are non-recursive and
@@ -952,6 +1151,9 @@ parse_input(ChildMonitor *self) {
         else Py_DECREF(t);
         FREE_CHILD(remove_notify[remove_count]);
     }
+#ifdef KITTY_BACKEND_METAL
+    if (ft_death_t0) ft_death_ns += monotonic() - ft_death_t0;
+#endif
 
     for (size_t i = 0; i < count; i++) {
         if (!scratch[i].needs_removal) {
@@ -960,7 +1162,11 @@ parse_input(ChildMonitor *self) {
         DECREF_CHILD(scratch[i]);
     }
     if (reload_config_called) {
+        // R4: a config reload is L-class maintenance inside parse_ms
+        // (FT_MAINT_CONFIG_RELOAD site).
+        const monotonic_t ft_cfg_t0 = ft_maint_clock();
         call_boss(load_config_file, NULL);
+        ft_maint_span(FT_MAINT_CONFIG_RELOAD, ft_cfg_t0);
     }
     return input_read;
 }
@@ -2005,9 +2211,18 @@ static void
 python_timer_callback(id_type timer_id, void *data) {
     PyObject *callback = (PyObject*)data;
     unsigned long long id = timer_id;
+#ifdef KITTY_BACKEND_METAL
+    // R4 M1a group-F probe: GLFW timer callbacks fire OUTSIDE the tick, so
+    // this is a cumulative counter (diff consecutive ftrace lines), never a
+    // per-tick field.
+    const monotonic_t ft_t0 = UNLIKELY(frame_trace_enabled()) ? monotonic() : 0;
+#endif
     PyObject *ret = PyObject_CallFunction(callback, "K", id);
     if (ret == NULL) PyErr_Print();
     else Py_DECREF(ret);
+#ifdef KITTY_BACKEND_METAL
+    if (ft_t0) { ft_timer_cb_ns += (uint64_t)(monotonic() - ft_t0); ft_timer_cb_calls++; }
+#endif
 }
 
 static void
@@ -2268,24 +2483,59 @@ static void
 process_global_state(void *data) {
     EVDBG("Processing global state");
     ChildMonitor *self = data;
+#ifdef KITTY_BACKEND_METAL
+    // R4 M1a: the trace arm is resolved ABOVE the resize work so resize_ms
+    // sits inside its bracket; ft_depth guards a reentrant tick (a nested
+    // runloop inside a Python call) — the inner invocation runs
+    // uninstrumented and is counted (pre-mortem 2).
+    const bool ft_on = UNLIKELY(frame_trace_enabled());
+    bool ft_tick = false;
+    monotonic_t ft_wall_entry = 0, ft_cursor = 0;
+    long long ft_cpu_entry = 0;
+    monotonic_t ft_resize_dt = 0, ft_parse_dt = 0, ft_render_dt = 0,
+                ft_cocoa_dt = 0, ft_close_dt = 0, ft_other_dt = 0;
+    FtGateOutcome ft_lat_gate = FT_GATE_NONE; bool ft_lat_present = false;
+    monotonic_t ft_lat_key = 0, ft_lat_echo = 0, ft_lat_parse_at = 0;
+    uint64_t ft_lat_echo_bytes = 0; bool ft_lat_l5 = false;
+    if (ft_on) {
+        if (ft_depth++ == 0) {
+            ft_tick = true;
+            ft_selftest_resolve();
+            // M1b pinned read order: wall_entry -> cpu_entry -> ... (M0a(j))
+            ft_wall_entry = monotonic();
+            ft_cpu_entry = thread_cpu_ns();
+            ft_cursor = ft_wall_entry;
+            ft_in_tick_seg = FT_SEG_OTHER;
+            // per-tick accumulator reset (pre-existing fields + R4 nested)
+            ft_bytes_drained = 0; ft_gate_outcome = FT_GATE_NONE; ft_present_committed = false;
+            ft_parsed_bytes = 0; ft_pause_starts = 0; ft_pause_stops = 0; ft_paused_at_end = false;
+            ft_cow_copied = 0; ft_cow_skip_eligible = 0;  // Wave-21 L4
+            ft_share_rows_total = 0; ft_share_rows_ref = 0; ft_share_cow_retires = 0;  // Wave-25 Lane S
+            ft_oob_drained = 0;  // R3
+            ft_peer_ns = 0; ft_death_ns = 0; ft_maint_ns = 0;  // R4 nested
+        } else ft_nested++;
+    }
+#endif
     maximum_wait = -1;
     bool state_check_timer_enabled = false;
     bool input_read = false;
 
     monotonic_t now = monotonic();
+#ifdef KITTY_BACKEND_METAL
+    if (ft_tick) {
+        const monotonic_t t0 = monotonic();
+        ft_other_dt += t0 - ft_cursor; ft_cursor = t0; ft_in_tick_seg = FT_SEG_RESIZE;
+        ft_selftest_fire(FT_ST_RESIZE);
+    }
+#endif
     if (global_state.has_pending_resizes) {
         process_pending_resizes(now);
         input_read = true;
     }
 #ifdef KITTY_BACKEND_METAL
-    // Frame-trace: reset this tick's per-tick accumulators before parse/render.
-    const bool ft_on = UNLIKELY(frame_trace_enabled());
-    if (ft_on) {
-        ft_bytes_drained = 0; ft_gate_outcome = FT_GATE_NONE; ft_present_committed = false;
-        ft_parsed_bytes = 0; ft_pause_starts = 0; ft_pause_stops = 0; ft_paused_at_end = false;
-        ft_cow_copied = 0; ft_cow_skip_eligible = 0;  // Wave-21 L4
-        ft_share_rows_total = 0; ft_share_rows_ref = 0; ft_share_cow_retires = 0;  // Wave-25 Lane S
-        ft_oob_drained = 0;  // R3
+    if (ft_tick) {
+        const monotonic_t t1 = monotonic();
+        ft_resize_dt = t1 - ft_cursor; ft_cursor = t1; ft_in_tick_seg = FT_SEG_OTHER;
     }
 #endif
 #ifdef __APPLE__
@@ -2294,49 +2544,60 @@ process_global_state(void *data) {
     if (sp) os_signpost_interval_begin(slog, OS_SIGNPOST_ID_EXCLUSIVE, "parse", "");
 #endif
 #ifdef KITTY_BACKEND_METAL
-    const monotonic_t ft_parse_t0 = ft_on ? monotonic() : 0;
+    if (ft_tick) {
+        const monotonic_t t0 = monotonic();
+        ft_other_dt += t0 - ft_cursor; ft_cursor = t0; ft_in_tick_seg = FT_SEG_PARSE;
+        ft_selftest_fire(FT_ST_PARSE);
+        if (UNLIKELY(ft_selftest_target == FT_ST_MAINT && ft_selftest_us)) {
+            // I4's maint injection: raise maint_ms (and therefore parse_ms,
+            // the nested-target rule) without touching the per-site
+            // occurrence counters.
+            const monotonic_t m0 = monotonic();
+            usleep(ft_selftest_us);
+            ft_maint_ns += monotonic() - m0;
+        }
+    }
 #endif
     if (parse_input(self)) input_read = true;
 #ifdef KITTY_BACKEND_METAL
-    const monotonic_t ft_parse_t1 = ft_on ? monotonic() : 0;
+    if (ft_tick) {
+        const monotonic_t t1 = monotonic();
+        ft_parse_dt = t1 - ft_cursor; ft_cursor = t1; ft_in_tick_seg = FT_SEG_OTHER;
+    }
 #endif
 #ifdef __APPLE__
     if (sp) os_signpost_interval_end(slog, OS_SIGNPOST_ID_EXCLUSIVE, "parse", "");
 #endif
+#ifdef KITTY_BACKEND_METAL
+    if (ft_tick) {
+        const monotonic_t t0 = monotonic();
+        ft_other_dt += t0 - ft_cursor; ft_cursor = t0; ft_in_tick_seg = FT_SEG_RENDER;
+        ft_selftest_fire(FT_ST_RENDER);
+    }
+#endif
     render(now, input_read);
 #ifdef KITTY_BACKEND_METAL
-    // One ftrace line per tick, after render so the gate outcome + present are set.
-    if (ft_on) {
-        const monotonic_t ft_render_t1 = monotonic();
-        frame_trace_emit(now, input_read, ft_parse_t1 - ft_parse_t0, ft_render_t1 - ft_parse_t1);
-        // Wave-20 T1.1: emit one ktrace line per completed keypress-echo
-        // journey — this tick both parsed the echo (S3 stamped) and
-        // classified the render gate (S4 = this tick's ts). S5 (present)
-        // pairs offline against the metal_present line; present= records
-        // whether THIS tick already committed a swap.
-        // One-time clock anchor: kitty's monotonic() is PROCESS-relative
-        // (monotonic_() - monotonic_start_time, monotonic.h) while the
-        // harness's injection stamps and metal_present's presented_time are
-        // mach_absolute_time-derived since boot (CACurrentMediaTime
-        // equivalent). Emitting both clocks in one instant lets the analyzer
-        // shift every ktrace stamp into the mach timebase.
-        if (UNLIKELY(!kt_epoch_emitted)) {
-            kt_epoch_emitted = true;
-            mach_timebase_info_data_t kt_tb; mach_timebase_info(&kt_tb);
-            const double kt_mach_ms = (double)mach_absolute_time() * kt_tb.numer / kt_tb.denom / 1e6;
-            log_error("ktrace_epoch: mono_ms=%.3f mach_ms=%.3f", ft_ms(monotonic()), kt_mach_ms);
-        }
-        const monotonic_t kt_key = atomic_load_explicit(&last_local_key_input_at, memory_order_relaxed);
-        const monotonic_t kt_echo = atomic_load_explicit(&kt_echo_read_at, memory_order_relaxed);
-        if (kt_key > kt_emitted_key_at && kt_echo >= kt_key && kt_parse_at >= kt_echo) {
-            log_error("ktrace: seq=%llu key_ms=%.3f echo_ms=%.3f echo_bytes=%llu parse_ms=%.3f gate_ms=%.3f gate=%s present=%d l5_miss=%d",
-                      (unsigned long long)(++kt_seq), ft_ms(kt_key), ft_ms(kt_echo),
-                      (unsigned long long)atomic_load_explicit(&kt_echo_bytes, memory_order_relaxed),
-                      ft_ms(kt_parse_at), ft_ms(now),
-                      ft_gate_names[ft_gate_outcome], ft_present_committed ? 1 : 0,
-                      atomic_load_explicit(&kt_l5_miss, memory_order_relaxed) ? 1 : 0);
-            kt_emitted_key_at = kt_key;
-        }
+    // R4 M1a: the emit itself moves to the tick tail (after the timer
+    // re-arm); the render-derived and ktrace fields are LATCHED here, at
+    // the pre-move emit position, so a link frame delivered from a nested
+    // runloop later in the tick (cocoa actions, closes) cannot rewrite
+    // what this tick reports (pre-mortem 2's latch).
+    if (ft_tick) {
+        const monotonic_t t1 = monotonic();
+        ft_render_dt = t1 - ft_cursor; ft_cursor = t1; ft_in_tick_seg = FT_SEG_OTHER;
+        ft_lat_gate = ft_gate_outcome; ft_lat_present = ft_present_committed;
+        ft_lat_key = atomic_load_explicit(&last_local_key_input_at, memory_order_relaxed);
+        ft_lat_echo = atomic_load_explicit(&kt_echo_read_at, memory_order_relaxed);
+        ft_lat_echo_bytes = atomic_load_explicit(&kt_echo_bytes, memory_order_relaxed);
+        ft_lat_l5 = atomic_load_explicit(&kt_l5_miss, memory_order_relaxed);
+        ft_lat_parse_at = kt_parse_at;
+    }
+#endif
+#ifdef KITTY_BACKEND_METAL
+    if (ft_tick) {
+        const monotonic_t t0 = monotonic();
+        ft_other_dt += t0 - ft_cursor; ft_cursor = t0; ft_in_tick_seg = FT_SEG_COCOA;
+        ft_selftest_fire(FT_ST_COCOA);
     }
 #endif
 #ifdef __APPLE__
@@ -2345,9 +2606,25 @@ process_global_state(void *data) {
         maximum_wait = 0;  // ensure loop ticks again so that the actions side effects are performed immediately
     }
 #endif
+#ifdef KITTY_BACKEND_METAL
+    // cocoa_t1 == close_t0: the two brackets are adjacent by design (the
+    // plan's other_ms regions are only entry->resize, resize->parse,
+    // render->cocoa and close->exit).
+    if (ft_tick) {
+        const monotonic_t t1 = monotonic();
+        ft_cocoa_dt = t1 - ft_cursor; ft_cursor = t1; ft_in_tick_seg = FT_SEG_CLOSE;
+        ft_selftest_fire(FT_ST_CLOSE);
+    }
+#endif
     report_reaped_pids();
     bool should_quit = false;
     if (global_state.has_pending_closes) should_quit = process_pending_closes(self);
+#ifdef KITTY_BACKEND_METAL
+    if (ft_tick) {
+        const monotonic_t t1 = monotonic();
+        ft_close_dt = t1 - ft_cursor; ft_cursor = t1; ft_in_tick_seg = FT_SEG_OTHER;
+    }
+#endif
     if (should_quit) {
         stop_main_loop();
     } else {
@@ -2356,7 +2633,66 @@ process_global_state(void *data) {
             else state_check_timer_enabled = true;
         }
     }
+#ifdef KITTY_BACKEND_METAL
+    // I4's negative control: a region no named bracket covers.
+    if (ft_tick) ft_selftest_fire(FT_ST_UNATTRIBUTED);
+#endif
     update_main_loop_timer(state_check_timer, MAX(0, maximum_wait), state_check_timer_enabled);
+#ifdef KITTY_BACKEND_METAL
+    // R4 tick tail: the emit is the LAST work of the tick, after the timer
+    // re-arm above (an NSTimer is destroyed and recreated there — plausibly
+    // the largest fixed per-tick cost other_ms exists to find). Read order
+    // stays wall_entry -> cpu_entry -> ... -> cpu_exit -> wall_exit
+    // (M1b); the [cpu_exit, wall_exit] sliver belongs to both tick_ms and
+    // emit_cpu_ms by design (M0a(j)) — no call between the two reads pumps
+    // the runloop, so no render can be delivered inside it. The EMIT
+    // segment begins at wall_exit; a render delivered during the emit goes
+    // to the required-zero emit-window counters (W2), and the following
+    // line's emit_cpu_ms carries this emit's CPU so the analyzer can
+    // subtract the instrument's own cost from outside_cpu_ms (F2).
+    if (ft_tick) {
+        const long long ft_cpu_exit = thread_cpu_ns();
+        const monotonic_t ft_wall_exit = monotonic();
+        ft_other_dt += ft_wall_exit - ft_cursor;
+        ft_in_tick_seg = FT_SEG_EMIT;
+        const monotonic_t ft_tick_dt = ft_wall_exit - ft_wall_entry;
+        const long long ft_tick_cpu = ft_cpu_exit - ft_cpu_entry;
+        long long ft_outside_cpu = -1, ft_emit_cpu = -1;
+        if (ft_prev_cpu_exit_ns >= 0) {
+            ft_outside_cpu = ft_cpu_entry - ft_prev_cpu_exit_ns;
+            if (ft_prev_post_emit_ns >= 0)
+                ft_emit_cpu = ft_prev_post_emit_ns - ft_prev_cpu_exit_ns;
+        }
+        frame_trace_emit(now, input_read, ft_tick_dt, ft_resize_dt, ft_parse_dt,
+                         ft_render_dt, ft_cocoa_dt, ft_close_dt, ft_other_dt,
+                         ft_tick_cpu, ft_outside_cpu, ft_emit_cpu);
+        // Wave-20 T1.1 ktrace (latched values; the offline metal_present
+        // pairing is timestamp-based, so the emit move does not affect it).
+        // One-time clock anchor: kitty's monotonic() is PROCESS-relative
+        // while injection stamps and metal_present are mach-since-boot;
+        // both clocks in one instant let the analyzer shift timebases.
+        if (UNLIKELY(!kt_epoch_emitted)) {
+            kt_epoch_emitted = true;
+            mach_timebase_info_data_t kt_tb; mach_timebase_info(&kt_tb);
+            const double kt_mach_ms = (double)mach_absolute_time() * kt_tb.numer / kt_tb.denom / 1e6;
+            log_error("ktrace_epoch: mono_ms=%.3f mach_ms=%.3f", ft_ms(monotonic()), kt_mach_ms);
+        }
+        if (ft_lat_key > kt_emitted_key_at && ft_lat_echo >= ft_lat_key && ft_lat_parse_at >= ft_lat_echo) {
+            log_error("ktrace: seq=%llu key_ms=%.3f echo_ms=%.3f echo_bytes=%llu parse_ms=%.3f gate_ms=%.3f gate=%s present=%d l5_miss=%d",
+                      (unsigned long long)(++kt_seq), ft_ms(ft_lat_key), ft_ms(ft_lat_echo),
+                      (unsigned long long)ft_lat_echo_bytes,
+                      ft_ms(ft_lat_parse_at), ft_ms(now),
+                      ft_gate_names[ft_lat_gate], ft_lat_present ? 1 : 0,
+                      ft_lat_l5 ? 1 : 0);
+            kt_emitted_key_at = ft_lat_key;
+        }
+        const long long ft_post_emit = thread_cpu_ns();
+        ft_prev_cpu_exit_ns = ft_cpu_exit;
+        ft_prev_post_emit_ns = ft_post_emit;
+        ft_in_tick_seg = FT_SEG_NONE;
+    }
+    if (ft_on) ft_depth--;
+#endif
 }
 
 static PyObject*

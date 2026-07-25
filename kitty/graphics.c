@@ -233,11 +233,15 @@ remove_image(GraphicsManager *self, Image *img) {
 
 static void
 remove_images(GraphicsManager *self, bool(*predicate)(Image*), id_type skip_image_internal_id) {
+    // R4 maint_ms site: bracketing the function body covers every caller
+    // (add-command trim, storage quota, delete commands).
+    const monotonic_t ft_t0 = ft_maint_clock();
     for (image_map_itr i = vt_first(&self->images_by_internal_id); !vt_is_end(i);) {
         Image *img = i.data->val;
         if (img->internal_id != skip_image_internal_id && predicate(img)) i = remove_image_itr(self, i);
         else i = vt_next(i);
     }
+    ft_maint_span(FT_MAINT_IMAGES, ft_t0);
 }
 
 void
