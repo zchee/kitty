@@ -53,6 +53,13 @@ BARE_RE = re.compile(r"^(offered|fallback|none) pty=(\d+)$")
 # cadence works out to. A sleeping laptop must not bank hours of "armed".
 GAP_CEILING_S = 900.0
 
+# A window can pass every gate without having asked the channel to do anything.
+# Below this exposure the right answer is INCONCLUSIVE, not ALL-PASS: either a
+# MiB of channel traffic, or one sample of a program that is known to use the
+# channel, has to be present before "nothing broke" carries weight.
+EXPOSURE_MIN_BYTES = 1024 * 1024
+CHANNEL_AWARE_COMMANDS = ("nvim", "vim")
+
 
 def tmux_q(sock: str, *args: str, timeout: float = 10.0) -> str:
     """Run a read-only tmux query against one server, returning stdout."""
@@ -208,12 +215,14 @@ def aggregate(recs: list[dict]) -> dict:
     client_hist: dict[str, int] = {}
     server_pids: dict[str, set[int]] = {}
     server_last_seen: dict[str, float] = {}
+    server_first_appearance: dict[str, float] = {}
     last_record_keys: set[str] = set()
     last_record_sockets: set[str] = set()
     for r in recs:
         counts: dict[str, int] = {}
         for srv in r["servers"]:
             server_pids.setdefault(srv["socket"], set()).add(srv["server_pid"])
+            server_first_appearance.setdefault(srv["socket"], r["t"])
             server_last_seen[srv["socket"]] = r["t"]
             for p in srv["panes"]:
                 key = f"{srv['socket']}\t{p['pane_id']}\t{p['pane_pid']}"
@@ -290,6 +299,10 @@ def aggregate(recs: list[dict]) -> dict:
     servers_vanished = {s: t for s, t in server_last_seen.items()
                         if s not in last_record_sockets}
     unknown_samples = hist_total.get("unknown", 0)
+    channel_bytes = sum(max(p["oob_bytes_delta"], 0) for p in pane_reports)
+    aware_samples = sum(1 for _k, seq in per_key.items() for _t, p in seq
+                        if any(c in (p.get("pane_current_command") or "")
+                               for c in CHANNEL_AWARE_COMMANDS))
     out = {
         "samples": len(recs),
         "window_s": window_s,
@@ -312,7 +325,14 @@ def aggregate(recs: list[dict]) -> dict:
         "server_pid_changes": {s: sorted(p) for s, p in server_pids.items()
                                if len(p) > 1},
         "servers_vanished": servers_vanished,
+        "server_transient_absences": {
+            s: sum(1 for r in recs
+                   if server_first_appearance[s] < r["t"] < server_last_seen[s]
+                   and s not in {v["socket"] for v in r["servers"]})
+            for s in server_last_seen},
         "unknown_state_samples": unknown_samples,
+        "in_window_channel_bytes": channel_bytes,
+        "channel_aware_command_samples": aware_samples,
         "max_gap_s": max_gap,
         "armed_pane_reports": pane_reports,
         "series": state_series,
@@ -340,12 +360,22 @@ def aggregate(recs: list[dict]) -> dict:
     if unknown_samples:
         void_reasons.append(f"{unknown_samples} unparsed state samples")
     out["void_reasons"] = void_reasons
+    # Passing every gate while nothing used the channel is not evidence that
+    # the channel works; it is evidence that nothing asked.
+    exposure_ok = (channel_bytes >= EXPOSURE_MIN_BYTES or aware_samples > 0)
+    out["exposure_floor"] = {
+        "min_bytes": EXPOSURE_MIN_BYTES,
+        "in_window_channel_bytes": channel_bytes,
+        "channel_aware_command_samples": aware_samples,
+        "met": exposure_ok}
     if void_reasons:
         out["verdict"] = "VOID"
+    elif not all(g["pass"] for g in out["s_gates"].values()):
+        out["verdict"] = "FAIL"
+    elif not exposure_ok:
+        out["verdict"] = "INCONCLUSIVE"
     else:
-        out["verdict"] = ("ALL-PASS"
-                          if all(g["pass"] for g in out["s_gates"].values())
-                          else "FAIL")
+        out["verdict"] = "ALL-PASS"
     return out
 
 
@@ -378,7 +408,9 @@ def emit_png(rollup: dict, date: str) -> Path | None:
 set output '{png}'
 set multiplot layout 2,1 title 'M2 pane-lane soak {date} \
 ({rollup["window_min"]:.1f} min, {rollup["samples"]} samples, \
-cadence {rollup["cadence_s"]:.0f}s)'
+cadence {rollup["cadence_s"]:.0f}s) — {rollup["verdict"]}: \
+{rollup["exposure_floor"]["in_window_channel_bytes"]} channel bytes in window, \
+floor {rollup["exposure_floor"]["min_bytes"]}'
 set key outside right
 set xlabel 'minutes into window'
 set ylabel 'panes'
@@ -465,7 +497,7 @@ def selftest() -> int:
              "client_kitty_oob": "armed"}], "panes": [
             {"pane_id": "%1", "session_name": "x", "window_index": "0",
              "pane_index": "0", "pane_pid": pid, "pane_dead": "0",
-             "pane_current_command": "nvim", "state": state,
+             "pane_current_command": "zsh", "state": state,
              "oob_reads": oob_reads, "oob_bytes": oob_bytes,
              "pty_reads": pty}]}]}
 
@@ -536,6 +568,19 @@ def selftest() -> int:
     checks["server pid change fails S-G4"] = (
         not aggregate(restart)["s_gates"]["S_G4_server_continuity"]["pass"])
     # Sleep must not be banked as armed time even when it dominates the cadence.
+    # Gates green but nothing used the channel: INCONCLUSIVE, not ALL-PASS.
+    thin = aggregate([rec(0, "armed", 1, 1000, 1), rec(15, "armed", 2, 2000, 2)])
+    checks["low exposure is inconclusive"] = thin["verdict"] == "INCONCLUSIVE"
+    checks["exposure floor is reported"] = (
+        thin["exposure_floor"]["met"] is False
+        and thin["exposure_floor"]["in_window_channel_bytes"] == 1000)
+    fat = aggregate([rec(0, "armed", 1, 0, 1),
+                     rec(15, "armed", 2, 2 * 1024 * 1024, 2)])
+    checks["a MiB of channel traffic clears the floor"] = fat["verdict"] == "ALL-PASS"
+    aware = [rec(0, "armed", 1, 10, 1), rec(15, "armed", 2, 20, 2)]
+    aware[1]["servers"][0]["panes"][0]["pane_current_command"] = "nvim"
+    checks["a channel-aware program clears the floor"] = (
+        aggregate(aware)["verdict"] == "ALL-PASS")
     sleepy = [rec(0, "armed", 1, 100, 1), rec(36000, "armed", 2, 200, 2),
               rec(72000, "armed", 3, 300, 3), rec(108000, "armed", 4, 400, 4)]
     sl = aggregate(sleepy)
