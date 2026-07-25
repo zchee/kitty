@@ -7,6 +7,7 @@
 
 #include "hyperlink.h"
 #include "lineops.h"
+#include "state.h"  // R4: ft_maint_clock/ft_maint_span
 #include <string.h>
 
 #define MAX_KEY_LEN 2048
@@ -120,6 +121,7 @@ static void
 _screen_garbage_collect_hyperlink_pool(Screen *screen, bool preserve_hyperlinks_in_history) {
     HyperLinkPool *pool = (HyperLinkPool*)screen->hyperlink_pool;
     if (!pool->array.count) return;
+    const monotonic_t ft_t0 = ft_maint_clock();  // R4 maint_ms site (full GC body)
     pool->adds_since_last_gc = 0;
     RAII_ALLOC(hyperlink_id_type, map, calloc(pool->array.count, sizeof(hyperlink_id_type)));
     RAII_ALLOC(void, buf, malloc(pool->array.count * sizeof(pool->array.items[0])));
@@ -130,6 +132,7 @@ _screen_garbage_collect_hyperlink_pool(Screen *screen, bool preserve_hyperlinks_
     pool->array.count = 1;  // First id must be 1
     remap_hyperlink_ids(screen, preserve_hyperlinks_in_history, map, clone);
     free_hyperlink_items(clone);
+    ft_maint_span(FT_MAINT_HYPERLINK, ft_t0);  // R4
 }
 
 void
