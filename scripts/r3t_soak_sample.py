@@ -92,7 +92,10 @@ def parse_pane_state(value: str) -> dict:
     if m:
         return {"state": m.group(1), "oob_reads": 0, "oob_bytes": 0,
                 "pty_reads": int(m.group(2))}
-    return {"state": "unknown", "raw": value}
+    # Zeroed counters even here: an unparsed value must not make the aggregator
+    # trip over a missing key while it is reporting that the value was unparsed.
+    return {"state": "unknown", "raw": value, "oob_reads": 0, "oob_bytes": 0,
+            "pty_reads": 0}
 
 
 def sample_once() -> dict:
@@ -279,13 +282,17 @@ def aggregate(recs: list[dict]) -> dict:
             vanished.append({"key": key, "last_seen": seq[-1][0],
                              "cmd": seq[-1][1].get("pane_current_command")})
         first, last = seq[0][1], seq[-1][1]
+
+        def delta(field: str, first: dict = first, last: dict = last) -> int:
+            return last.get(field, 0) - first.get(field, 0)
+
         if ever_armed:
             pane_reports.append({
                 "key": key, "cmd": last.get("pane_current_command"),
                 "samples": len(seq), "states": sorted(set(states)),
-                "oob_bytes_delta": last.get("oob_bytes", 0) - first.get("oob_bytes", 0),
-                "pty_reads_delta": last.get("pty_reads", 0) - first.get("pty_reads", 0),
-                "oob_reads_delta": last.get("oob_reads", 0) - first.get("oob_reads", 0)})
+                "oob_bytes_delta": delta("oob_bytes"),
+                "pty_reads_delta": delta("pty_reads"),
+                "oob_reads_delta": delta("oob_reads")})
 
     rate = (ever_armed_nonarmed / ever_armed_samples) if ever_armed_samples else 0.0
     window_s = times[-1] - times[0]
@@ -567,7 +574,6 @@ def selftest() -> int:
     restart[1]["servers"][0]["server_pid"] = 8
     checks["server pid change fails S-G4"] = (
         not aggregate(restart)["s_gates"]["S_G4_server_continuity"]["pass"])
-    # Sleep must not be banked as armed time even when it dominates the cadence.
     # Gates green but nothing used the channel: INCONCLUSIVE, not ALL-PASS.
     thin = aggregate([rec(0, "armed", 1, 1000, 1), rec(15, "armed", 2, 2000, 2)])
     checks["low exposure is inconclusive"] = thin["verdict"] == "INCONCLUSIVE"
@@ -581,6 +587,7 @@ def selftest() -> int:
     aware[1]["servers"][0]["panes"][0]["pane_current_command"] = "nvim"
     checks["a channel-aware program clears the floor"] = (
         aggregate(aware)["verdict"] == "ALL-PASS")
+    # Sleep must not be banked as armed time even when it dominates the cadence.
     sleepy = [rec(0, "armed", 1, 100, 1), rec(36000, "armed", 2, 200, 2),
               rec(72000, "armed", 3, 300, 3), rec(108000, "armed", 4, 400, 4)]
     sl = aggregate(sleepy)
