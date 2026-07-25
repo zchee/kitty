@@ -49,6 +49,10 @@ CLIENT_FIELDS = ("client_name", "client_session", "client_kitty_oob")
 ARMED_RE = re.compile(r"^armed r=(\d+) b=(\d+) pty=(\d+)$")
 BARE_RE = re.compile(r"^(offered|fallback|none) pty=(\d+)$")
 
+# Armed time never accrues across a gap longer than this, whatever the observed
+# cadence works out to. A sleeping laptop must not bank hours of "armed".
+GAP_CEILING_S = 900.0
+
 
 def tmux_q(sock: str, *args: str, timeout: float = 10.0) -> str:
     """Run a read-only tmux query against one server, returning stdout."""
@@ -194,16 +198,23 @@ def aggregate(recs: list[dict]) -> dict:
     times = [r["t"] for r in recs]
     gaps = [b - a for a, b in zip(times, times[1:])]
     cadence = statistics.median(gaps) if gaps else 0.0
-    max_gap = 3 * cadence if cadence else float("inf")
+    # Three cadences, but never more than the absolute ceiling: the median
+    # itself grows when a laptop sleeps through most of the intervals, so a
+    # purely relative rule would credit the sleep as armed time.
+    max_gap = min(3 * cadence, GAP_CEILING_S) if cadence else GAP_CEILING_S
 
     per_key: dict[str, list[tuple[float, dict]]] = {}
     state_series: list[dict] = []
     client_hist: dict[str, int] = {}
     server_pids: dict[str, set[int]] = {}
+    server_last_seen: dict[str, float] = {}
+    last_record_keys: set[str] = set()
+    last_record_sockets: set[str] = set()
     for r in recs:
         counts: dict[str, int] = {}
         for srv in r["servers"]:
             server_pids.setdefault(srv["socket"], set()).add(srv["server_pid"])
+            server_last_seen[srv["socket"]] = r["t"]
             for p in srv["panes"]:
                 key = f"{srv['socket']}\t{p['pane_id']}\t{p['pane_pid']}"
                 per_key.setdefault(key, []).append((r["t"], p))
@@ -212,8 +223,13 @@ def aggregate(recs: list[dict]) -> dict:
                 st = c["client_kitty_oob"]
                 client_hist[st] = client_hist.get(st, 0) + 1
         state_series.append({"t": r["t"], **counts})
+    for srv in recs[-1]["servers"]:
+        last_record_sockets.add(srv["socket"])
+        for p in srv["panes"]:
+            last_record_keys.add(f"{srv['socket']}\t{p['pane_id']}\t{p['pane_pid']}")
 
     fail_open = []
+    vanished = []
     broken_keys = set()
     armed_seconds = 0.0
     longest_streak = 0.0
@@ -237,10 +253,22 @@ def aggregate(recs: list[dict]) -> dict:
                 longest_streak = max(longest_streak, streak)
             else:
                 streak = 0.0
-            if p0["state"] == "armed" and _p1["state"] == "fallback":
+            # Any armed pane that stops being armed lost its channel. Only
+            # `fallback` names the fail-open explicitly, but a kill-switch flip
+            # or a respawn drop lands in `none`, and a format change lands in
+            # `unknown` — all of them are the failure this gate exists to catch.
+            if p0["state"] == "armed" and _p1["state"] != "armed":
                 fail_open.append({"key": key, "at": t1,
-                                  "last_armed": p0.get("oob_bytes"),
+                                  "to_state": _p1["state"],
+                                  "oob_bytes_when_armed": p0.get("oob_bytes"),
                                   "cmd": _p1.get("pane_current_command")})
+                broken_keys.add(key)
+        # A pane killed mid-window stops appearing, so a fail-open in its last
+        # unsampled seconds is unobservable. Count those cases instead of
+        # letting them read as a clean armed exit.
+        if key not in last_record_keys and seq[-1][1]["state"] == "armed":
+            vanished.append({"key": key, "last_seen": seq[-1][0],
+                             "cmd": seq[-1][1].get("pane_current_command")})
         first, last = seq[0][1], seq[-1][1]
         if ever_armed:
             pane_reports.append({
@@ -257,6 +285,11 @@ def aggregate(recs: list[dict]) -> dict:
         for k, v in row.items():
             if k != "t":
                 hist_total[k] = hist_total.get(k, 0) + v
+    # A server that stops answering is the crash S-G4 exists to exclude; it
+    # leaves no pid change behind, so it has to be caught by absence.
+    servers_vanished = {s: t for s, t in server_last_seen.items()
+                        if s not in last_record_sockets}
+    unknown_samples = hist_total.get("unknown", 0)
     out = {
         "samples": len(recs),
         "window_s": window_s,
@@ -268,6 +301,8 @@ def aggregate(recs: list[dict]) -> dict:
         "ever_armed_panes": len(pane_reports),
         "fail_open_events": len(fail_open),
         "fail_open_detail": fail_open,
+        "armed_panes_vanished_unobserved": len(vanished),
+        "armed_panes_vanished_detail": vanished,
         "broken_panes": len(broken_keys),
         "pty_fallback_rate": rate,
         "armed_seconds": armed_seconds,
@@ -276,9 +311,13 @@ def aggregate(recs: list[dict]) -> dict:
         "client_state_samples": client_hist,
         "server_pid_changes": {s: sorted(p) for s, p in server_pids.items()
                                if len(p) > 1},
+        "servers_vanished": servers_vanished,
+        "unknown_state_samples": unknown_samples,
+        "max_gap_s": max_gap,
         "armed_pane_reports": pane_reports,
         "series": state_series,
     }
+    srv_break = len(out["server_pid_changes"]) + len(servers_vanished)
     out["s_gates"] = {
         "S_G1_no_fail_open": {"value": len(fail_open), "gate": 0,
                               "pass": len(fail_open) == 0},
@@ -286,12 +325,27 @@ def aggregate(recs: list[dict]) -> dict:
                                  "pass": len(broken_keys) == 0},
         "S_G3_pty_fallback_rate": {"value": rate, "gate": 0.02,
                                    "pass": rate <= 0.02},
-        "S_G4_server_continuity": {"value": len(out["server_pid_changes"]),
-                                   "gate": 0,
-                                   "pass": not out["server_pid_changes"]},
+        "S_G4_server_continuity": {"value": srv_break, "gate": 0,
+                                   "pid_changes": out["server_pid_changes"],
+                                   "vanished": servers_vanished,
+                                   "pass": srv_break == 0},
+        "S_G5_states_understood": {"value": unknown_samples, "gate": 0,
+                                   "pass": unknown_samples == 0},
     }
-    out["verdict"] = ("ALL-PASS" if all(g["pass"] for g in out["s_gates"].values())
-                      else "FAIL")
+    # A window that observed no armed pane, or whose states could not be
+    # parsed, has nothing to be green about: silence must not read as a pass.
+    void_reasons = []
+    if not pane_reports:
+        void_reasons.append("no armed pane observed")
+    if unknown_samples:
+        void_reasons.append(f"{unknown_samples} unparsed state samples")
+    out["void_reasons"] = void_reasons
+    if void_reasons:
+        out["verdict"] = "VOID"
+    else:
+        out["verdict"] = ("ALL-PASS"
+                          if all(g["pass"] for g in out["s_gates"].values())
+                          else "FAIL")
     return out
 
 
@@ -433,6 +487,57 @@ def selftest() -> int:
     checks["respawn splits identities"] = b["panes_tracked"] == 2
     checks["ever-armed rate counts both generations"] = (
         abs(b["pty_fallback_rate"] - 0.25) < 1e-9)
+    # An armed pane that stops appearing (killed) hides whatever happened next.
+    empty = {"t": 0.0, "servers": [{"socket": "s", "server_pid": 7,
+                                    "clients": [], "panes": []}]}
+    gone = [rec(0, "armed", 1, 100, 1), rec(15, "armed", 2, 200, 2),
+            {**empty, "t": 30.0}, {**empty, "t": 45.0}, {**empty, "t": 60.0}]
+    c = aggregate(gone)
+    checks["vanished armed pane is flagged"] = (
+        c["armed_panes_vanished_unobserved"] == 1)
+    checks["vanished pane is not a fail-open"] = c["fail_open_events"] == 0
+    still = aggregate([rec(0, "armed", 1, 100, 1), rec(15, "armed", 2, 200, 2)])
+    checks["pane present at window end is not vanished"] = (
+        still["armed_panes_vanished_unobserved"] == 0)
+    # armed -> none is a channel loss too (kill-switch flip or respawn drop).
+    to_none = aggregate([rec(0, "armed", 1, 100, 1), rec(15, "armed", 2, 200, 2),
+                         rec(30, "none", 3), rec(45, "none", 4)])
+    checks["armed->none counts as fail-open"] = to_none["fail_open_events"] == 1
+    checks["armed->none marks the pane broken"] = to_none["broken_panes"] == 1
+    checks["armed->none fails the window"] = to_none["verdict"] == "FAIL"
+    # An unparsed state means the instrument, not the lane, is the unknown.
+    unk = [rec(0, "armed", 1, 100, 1), rec(15, "unknown", 0)]
+    u = aggregate(unk)
+    checks["unknown state is counted"] = u["unknown_state_samples"] == 1
+    checks["unknown state voids the window"] = u["verdict"] == "VOID"
+    # A window with nothing armed has nothing to be green about.
+    idle = [{"t": float(i * 15), "servers": [{"socket": "s", "server_pid": 7,
+             "clients": [], "panes": [
+                 {"pane_id": "%9", "session_name": "x", "window_index": "0",
+                  "pane_index": "0", "pane_pid": 900, "pane_dead": "0",
+                  "pane_current_command": "zsh", "state": "none",
+                  "oob_reads": 0, "oob_bytes": 0, "pty_reads": i}]}]}
+            for i in range(6)]
+    idl = aggregate(idle)
+    checks["no armed pane voids the window"] = idl["verdict"] == "VOID"
+    checks["void reason is recorded"] = bool(idl["void_reasons"])
+    # A server that stops answering is a crash, even without a pid change.
+    srv_gone = [rec(0, "armed", 1, 100, 1), rec(15, "armed", 2, 200, 2),
+                {"t": 30.0, "servers": []}, {"t": 45.0, "servers": []},
+                {"t": 60.0, "servers": []}]
+    sg = aggregate(srv_gone)
+    checks["vanished server fails S-G4"] = (
+        not sg["s_gates"]["S_G4_server_continuity"]["pass"])
+    restart = [rec(0, "armed", 1, 100, 1), rec(15, "armed", 2, 200, 2)]
+    restart[1]["servers"][0]["server_pid"] = 8
+    checks["server pid change fails S-G4"] = (
+        not aggregate(restart)["s_gates"]["S_G4_server_continuity"]["pass"])
+    # Sleep must not be banked as armed time even when it dominates the cadence.
+    sleepy = [rec(0, "armed", 1, 100, 1), rec(36000, "armed", 2, 200, 2),
+              rec(72000, "armed", 3, 300, 3), rec(108000, "armed", 4, 400, 4)]
+    sl = aggregate(sleepy)
+    checks["long gaps never credit armed time"] = sl["armed_seconds"] == 0.0
+    checks["gap ceiling is applied"] = sl["max_gap_s"] == GAP_CEILING_S
     for name, ok in checks.items():
         print(f"  {'PASS' if ok else 'FAIL'}  {name}")
     bad = [n for n, ok in checks.items() if not ok]
