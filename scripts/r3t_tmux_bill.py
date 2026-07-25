@@ -228,6 +228,7 @@ def analyze_pane(rows: list[dict]) -> dict:
 
     get = {
         "out_mib": mib,
+        "pane_reads_per_mib": lambda r: pane_reads(r) / mib(r),
         "quartet_cpu_per_mib": lambda r: sum(r["bills"][p]["cpu_ns"] for p in ("kitty", "client", "server", "inner")) / mib(r),
         "quartet_wk_per_mib": lambda r: sum(r["bills"][p]["wakeups"] for p in ("kitty", "client", "server", "inner")) / mib(r),
         "nvim_cpu_per_mib": lambda r: r["bills"]["inner"]["cpu_ns"] / mib(r),
@@ -242,18 +243,25 @@ def analyze_pane(rows: list[dict]) -> dict:
     on_reads = pooled_p("paneon", pane_reads)
     off_reads = pooled_p("paneoff", pane_reads)
     nvim_bytes = pooled_p("paneon", lambda r: r["pane_counts"].get("oob_bytes", 0))
-    g1 = on_reads / off_reads if off_reads else float("nan")
+    # P-G1 is priced per delivered MiB, matching the M0/M1 analyze() convention:
+    # the pane arm delivers more bytes, so a raw read-count ratio understates
+    # the per-byte cost of the pty arm. The raw ratio stays reported because the
+    # W-P1 verdict quotes it.
+    g1 = ratios["pane_reads_per_mib"]
+    g1_raw = on_reads / off_reads if off_reads else float("nan")
     # Aliases so the shared emit_png bar chart renders the P-family ratios.
     ratios["reads_per_mib"] = g1
     ratios["wakeups_per_mib"] = ratios["quartet_wk_per_mib"]
     ratios["cpu_ns_per_mib"] = ratios["quartet_cpu_per_mib"]
     out = {"means": means, "ratios": ratios,
            "paneon_reads": on_reads, "paneoff_reads": off_reads,
+           "P_G1_raw_reads_ratio": g1_raw,
            "nvim_pane_bytes": nvim_bytes,
            "bytes_band": ratios["out_mib"],
            "bytes_band_ok": 0.80 <= ratios["out_mib"] <= 1.25}
     out["gates"] = {
-        "P_G1_pane_reads": {"ratio": g1, "gate": 0.35, "pass": g1 <= 0.35},
+        "P_G1_pane_reads": {"ratio": g1, "gate": 0.35, "pass": g1 <= 0.35,
+                            "raw_ratio": g1_raw, "convention": "per delivered MiB"},
         "P_G2_quartet_cpu": {"ratio": ratios["quartet_cpu_per_mib"], "gate": 0.92,
                              "kitty": ratios["kitty_cpu_per_mib"], "client": ratios["client_cpu_per_mib"],
                              "server": ratios["server_cpu_per_mib"], "nvim": ratios["nvim_cpu_per_mib"],
