@@ -2901,6 +2901,7 @@ static void*
 reader_main(void *arg) {
     ReaderThread *rt = arg;
     set_thread_name("KittyReader");
+    assign_thread_qos("reader", QOS_CLASS_USER_INITIATED, 0);  // R5 opt-in (D3: dormant arm)
     report_thread_qos("reader");  // R4 M1d probe (dormant arm; fires only if enabled)
     reader_block_handled_signals();  // O8
     ReaderCounters *rc = reader_counters + rt->slot;
@@ -3413,6 +3414,7 @@ io_loop(void *data) {
     Screen *screen;
     ChildMonitor *self = (ChildMonitor*)data;
     set_thread_name("KittyChildMon");
+    assign_thread_qos("io", QOS_CLASS_USER_INITIATED, 0);  // R5 opt-in
     report_thread_qos("io");  // R4 M1d probe
 
     while (LIKELY(!self->shutting_down)) {
