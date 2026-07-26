@@ -72,28 +72,3 @@ report_thread_qos(const char *name) {
     (void)name;
 #endif
 }
-
-// R5: opt-in QoS *assignment* for the spawning thread heads (io, oob,
-// reader, disk-cache; main is already user_interactive — R4/P1). Plain
-// getenv (process environment only) — NOT default_env(), which is
-// resolved once at first fork from kitty.conf/launch/process env and is
-// the wrong lens for a thread head that must see the live process
-// environment at start; same discipline as report_thread_qos above.
-// KITTY_THREAD_QOS unset/empty/"0" is a complete no-op: the unset world
-// stays byte-identical to the unassigned binary.
-#if defined(__APPLE__)
-static inline void
-assign_thread_qos(const char *name, qos_class_t qos_class, int rel) {
-    const char *v = getenv("KITTY_THREAD_QOS");
-    if (!v || !v[0] || strcmp(v, "0") == 0) return;
-    int ret = pthread_set_qos_class_self_np(qos_class, rel);
-    if (ret != 0) fprintf(stderr,
-        "assign_thread_qos: thread=%s error=%s\n", name, strerror(ret));
-}
-#else
-// Non-Apple: swallow the arguments unevaluated — qos_class_t and the
-// QOS_CLASS_* tokens exist only under the __APPLE__ include of
-// <pthread/qos.h> above, and call sites pass those tokens
-// unconditionally from cross-platform files.
-#define assign_thread_qos(name, qos_class, rel) ((void)0)
-#endif
