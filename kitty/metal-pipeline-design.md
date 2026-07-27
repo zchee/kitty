@@ -2891,3 +2891,10 @@ t4_producer pinned to `w26b_statecost.py --engaged`. This tracked entry
 is the PRIMARY freeze carrier (the plan file lives under gitignored
 .omc/); .omc/verify/wave26b/M0-FREEZE.md carries the secondary copy.
 The M4 verdict line will be appended here at close.
+
+W26b M4 verdict (2026-07-28): **LAND** — P1 1.018435 (band 1.016836);
+r_fix 0.9760 (band 1.008558); T3 0.9783/0.9995/1.0035; T4 0.9851;
+T5' 0.9812 (band 1.006407); F1-F6 all PASS; E1 UNRUN (deferral,
+daytime-session validity failure; re-run allowance retained). Fix
+commit 2b629d194 stays; default remains OFF. Freeze hash re-verified
+at M4. Record: .omc/verify/wave26b/W26B-VERDICT.md, ADR-0019.
