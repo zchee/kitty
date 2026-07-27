@@ -60,7 +60,10 @@ KV_RE = re.compile(r"(\w+)=([-\d.]+)")
 
 
 def bench_dir(bench: str) -> Path:
-    d = VERIFY / "bench-links"
+    """Per-benchmark dir holding a single symlink, so `vtebench -b <dir>`
+    sees exactly one benchmark (the w17 shape -- a shared links dir makes
+    vtebench run every accumulated bench sequentially per row)."""
+    d = VERIFY / "bench-links" / bench
     d.mkdir(parents=True, exist_ok=True)
     link = d / bench
     if not link.exists():
