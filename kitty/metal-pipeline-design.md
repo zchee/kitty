@@ -2872,3 +2872,22 @@ d629954ee2e78e9387dd4a100ad8e70932613a89c41b6d864aaac77e2b1c96ff
 next "## " heading, LF endings, no normalization). This tracked entry
 is the PRIMARY freeze carrier (the plan file lives under gitignored
 .omc/); the M2 exit note carries the secondary copy.
+
+## Phase 26b (W26b): state=1 fast-path root-cause wave — M0 freeze
+
+The W26b gate table (plan §3 incl. §3b, plan-2026-07-27-w26b-share-
+state1-fastpath.md v5) is frozen at sha256
+
+928f9746cd15bc6695624b29c597dabae9cdc0ae6b7174f4e144ea3483e940da
+
+(the region from the "## 3." heading line through the line before the
+next "## " heading — 126 lines, 13818 bytes — LF endings, no
+normalization). Constants resolved before the hash: aa_hw 0.008418,
+aa_hw_cyc 0.009111, aa_hw_xbin 0.008558, aa_hw_cyc_xbin 0.006407
+(bootstrap CI95 half-widths, 4000 resamples seed 4, of the ratio of
+medians-of-8 from the two 16-row 60 s pilots); determinism record
+reproducible=false (so the M2 sha rule is patch-text equality);
+t4_producer pinned to `w26b_statecost.py --engaged`. This tracked entry
+is the PRIMARY freeze carrier (the plan file lives under gitignored
+.omc/); .omc/verify/wave26b/M0-FREEZE.md carries the secondary copy.
+The M4 verdict line will be appended here at close.
