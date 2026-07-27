@@ -101,6 +101,11 @@ def snap(pid: int) -> dict[str, int]:
         "wakeups": int(s.ri_pkg_idle_wkups + s.ri_interrupt_wkups),
         "billed_energy_nj": int(s.ri_billed_energy),
         "runnable_ns": ticks_to_ns(s.ri_runnable_time),
+        # W26b: raw PMC lifetime counters. Availability is machine/entitlement
+        # dependent — callers must treat zero as "not populated" unless the
+        # M0 feasibility probe showed them tracking work (plan v5 §1-M0-3).
+        "instructions": int(s.ri_instructions),
+        "cycles": int(s.ri_cycles),
     }
 
 
