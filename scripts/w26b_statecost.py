@@ -428,6 +428,43 @@ def cmd_engaged(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_energy(args: argparse.Namespace) -> int:
+    """M3 drive: 4-arm flood cell against an operator-started powermetrics
+    capture. Frozen validity: every binding rep must have present > 0
+    (a zero-present rep is INVALID and re-run once). Emits a ledger with
+    t0/t1 per rep for the trim-join analysis."""
+    arms = ["base0", "base1", "flag0", "flag1"]
+    binmap = {"base": "B_base", "flag": "B_flag"}
+    tag = "energy"
+    rows = []
+    for seq, arm in enumerate(latin_order(arms, args.rounds)):
+        binary, env_arm = arm[:-1], arm[-1]
+        sha = install_binary(binmap[binary])
+        row = run_row("scrolling", env_arm, tag, seq)
+        row["arm_label"] = arm
+        row["installed_sha"] = sha
+        row["binding"] = True
+        if row["ftrace"].get("present", 0) == 0:
+            print(f"{tag} seq={seq} {arm}: INVALID zero-present; re-running once",
+                  file=sys.stderr)
+            row["binding"] = False
+            row["invalid_zero_present"] = True
+            rows.append(row)
+            row = run_row("scrolling", env_arm, tag, seq + 1000)
+            row["arm_label"] = arm
+            row["installed_sha"] = sha
+            row["binding"] = row["ftrace"].get("present", 0) > 0
+            row["rerun_of"] = seq
+        rows.append(row)
+        print(f"{tag} seq={seq} {arm}: parse/mib="
+              f"{row.get('parse_ms_per_mib')} present={int(row['ftrace'].get('present', 0))}",
+              file=sys.stderr)
+    install_binary("B_flag")
+    out = {"tag": tag, "rounds": args.rounds, "rows": rows}
+    write_rows("energy-ledger", out)
+    return 0
+
+
 def main() -> int:
     # The plan's frozen t4_producer invocation is `w26b_statecost.py
     # --engaged ...`; map that spelling onto the engaged subcommand.
@@ -463,6 +500,9 @@ def _dispatch() -> int:
     p.add_argument("--rounds", type=int, default=8)
     p.add_argument("--share0-only", action="store_true")
     p.set_defaults(fn=cmd_fourarm)
+    p = sub.add_parser("energy")
+    p.add_argument("--rounds", type=int, default=6)
+    p.set_defaults(fn=cmd_energy)
     p = sub.add_parser("engaged")
     p.add_argument("--rounds", type=int, default=5)
     p.add_argument("--with-flag", action="store_true")
