@@ -99,8 +99,9 @@ linebuf_gen_bump_range(LineBuf *self, index_type p_start, index_type p_end_incl)
 
 // Wave-25 Lane S (KITTY_PAUSE_SNAPSHOT_SHARE): one-shot behavioral switch,
 // resolved at first use exactly like pause_snapshot_cow_state above.
-// Default-ON since Wave-26 (unset/empty resolve to on); setting "0" opts
-// out and keeps the deep-copy snapshot world byte-identical.
+// Opt-in since the Wave-26 NO-FLIP revert (c71c42027, ADR-0018): unset,
+// empty and "0" resolve to OFF and keep the deep-copy snapshot world
+// byte-identical; "1" (any non-"0" value) opts in.
 extern int pause_snapshot_share_state;  // -1 unresolved, else 0/1 (line-buf.c)
 bool pause_snapshot_share_resolve(void);
 static inline bool
@@ -108,6 +109,22 @@ pause_snapshot_share_enabled(void) {
     const int s = pause_snapshot_share_state;
     return UNLIKELY(s < 0) ? pause_snapshot_share_resolve() : s != 0;
 }
+
+// W26b: the HOT gate for the two retire fast paths. 0 until some pool has
+// armed its refcount lane (i.e. until the first SHARE snapshot ever taken
+// in this process). Checking this instead of the resolved state keeps the
+// non-engaged state=1 world cost-identical to the unset world: one hot
+// global load + a correctly-hinted not-taken branch, no pool deref. The
+// behavioural switch (pause_snapshot_share_enabled) is unchanged and still
+// owns every acquire/release decision (screen.c). Set only inside
+// line_slot_pool_ensure_share_lane (the single NULL->non-NULL transition
+// site for refcnt_lane), never cleared: after pool teardown a stale 1
+// costs one pool cacheline load and nothing else -- the inner
+// refcnt_lane != NULL test still guards every dereference, so this is a
+// performance gate, never a correctness gate. Main-thread only (the parse
+// tick and all retire sites run on the main thread -- vt-parser.c), so a
+// plain uint8_t store suffices.
+extern uint8_t pause_snapshot_share_live;
 
 // Wave-25 Lane S: process-cumulative share counters, diffed per tick by the
 // parser (run_worker) into KITTY_FRAME_TRACE share_rows_total= /
@@ -126,12 +143,13 @@ extern uint64_t share_rows_total_counter, share_rows_ref_counter, share_cow_reti
 void linebuf_share_retire_cold(LineBuf *self, index_type p);
 static inline void
 linebuf_share_retire(LineBuf *self, index_type p) {
-    // Unset-arm ordering matters: check the resolved one-shot switch FIRST
-    // (one always-hot global load + predicted branch) so the unset world
-    // never dereferences the pool -- the pool struct lives on its own
-    // cacheline and touching it per checkout measured ~2% of dense-flood
-    // parse_ms/MiB (W25 OFF-cost rows 195047, distributions disjoint).
-    if (UNLIKELY(pause_snapshot_share_enabled())) {
+    // Ordering matters in BOTH worlds: check the share_live hot gate FIRST
+    // (one always-hot global load + a correctly-hinted not-taken branch) so
+    // neither the unset world nor the non-engaged state=1 world ever
+    // dereferences the pool -- the pool struct lives on its own cacheline
+    // and touching it per checkout measured ~2% of flood parse_ms/MiB
+    // (W25 OFF-cost rows 195047; W26b P1 r_base 1.0184 on scrolling).
+    if (UNLIKELY(pause_snapshot_share_live)) {
         const LineSlotPool *pool = self->pool;
         if (pool->refcnt_lane != NULL) {
             const index_type slot = self->line_map[p];

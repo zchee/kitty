@@ -81,8 +81,14 @@ pause_snapshot_share_resolve(void) {
     return pause_snapshot_share_state != 0;
 }
 
+uint8_t pause_snapshot_share_live = 0;
+
 void
 line_slot_pool_ensure_share_lane(LineSlotPool *pool) {
+    // W26b: set FIRST, before the already-sized early return -- this is the
+    // single NULL -> non-NULL transition site for refcnt_lane, so the flag
+    // is live on every path that leaves a lane armed (line-buf.h comment).
+    pause_snapshot_share_live = 1;
     const size_t cap = pool->num_slabs * pool->slab_capacity;
     if (pool->lane_cap >= cap && pool->refcnt_lane) return;
     uint16_t *lane = realloc(pool->refcnt_lane, cap * sizeof(uint16_t));
