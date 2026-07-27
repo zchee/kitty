@@ -50,7 +50,7 @@ cpu_lineptr(HistoryBuf *self, index_type y) {
 // share_writer gate is needed.
 static void
 historybuf_share_retire(HistoryBuf *self, index_type ring_pos) {
-    if (LIKELY(!pause_snapshot_share_enabled())) return;  // never touch the pool cacheline when opted out
+    if (LIKELY(!pause_snapshot_share_live)) return;  // W26b hot gate: no pool cacheline touch until a lane exists
 #ifdef __APPLE__
     assert(pthread_main_np());  // W25-THREAD-AUDIT assertion 1 (the linebuf twin's mirror; W26 F2)
 #endif
