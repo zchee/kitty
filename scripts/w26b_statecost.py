@@ -417,6 +417,18 @@ def main() -> int:
     # --engaged ...`; map that spelling onto the engaged subcommand.
     if sys.argv[1:2] == ["--engaged"]:
         sys.argv[1:2] = ["engaged"]
+    # Display sleep collapses presents for entire 60 s rows (throughput -35%,
+    # parse_ms/MiB +55% -- the OQ-1 regime, reproduced in the first threebin
+    # block at ~01:00 with the operator idle). caffeinate -dis co-runs every
+    # block so rows stay in the rendering regime; identical for all arms.
+    caf = subprocess.Popen(["caffeinate", "-dis"])
+    try:
+        return _dispatch()
+    finally:
+        caf.terminate()
+
+
+def _dispatch() -> int:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("pilot")
