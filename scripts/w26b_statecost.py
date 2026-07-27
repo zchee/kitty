@@ -119,6 +119,10 @@ def run_row(bench: str, env_arm: str, tag: str, seq: int, engaged: bool = False)
     """One fresh-spawn 60 s vtebench row on the CURRENTLY INSTALLED binary."""
     h.wait_for_build_lock_clear()
     RESULTS.mkdir(parents=True, exist_ok=True)
+    # Wake pulse: the -dis co-run prevents future display sleep but does not
+    # wake an already-dark display, and zero-present rows still appeared at
+    # block starts. -u declares user activity, which wakes the display.
+    subprocess.run(["caffeinate", "-u", "-t", "2"], check=False)
     load = wait_for_quiet()
     td = Path(tempfile.mkdtemp(prefix=f"w26b-{tag}-"))
     dat = td / "out.dat"
