@@ -337,10 +337,14 @@ def cmd_threebin(args: argparse.Namespace) -> int:
 
 
 def cmd_fourarm(args: argparse.Namespace) -> int:
-    """M2: {B_base,B_flag} x {SHARE=0,1}, Latin square, n rounds/arm."""
-    arms = ["base0", "base1", "flag0", "flag1"]
+    """M2: {B_base,B_flag} x {SHARE=0,1}, Latin square, n rounds/arm.
+    --share0-only restricts to the two SHARE=0 arms: on an engaging bench
+    (sync_medium_cells) the SHARE=1 arms would be engaged-class rows that
+    feed no gate -- T3 is the only context-bench consumer."""
+    arms = (["base0", "flag0"] if args.share0_only
+            else ["base0", "base1", "flag0", "flag1"])
     binmap = {"base": "B_base", "flag": "B_flag"}
-    tag = f"fourarm-{args.bench}"
+    tag = f"fourarm-{args.bench}" + ("-share0" if args.share0_only else "")
     rows = []
     for seq, arm in enumerate(latin_order(arms, args.rounds)):
         binary, env_arm = arm[:-1], arm[-1]
@@ -356,7 +360,12 @@ def cmd_fourarm(args: argparse.Namespace) -> int:
     med = {a: statistics.median(series(rows, a)) for a in arms
            if len(series(rows, a)) == args.rounds}
     out["medians"] = med
-    if len(med) == 4:
+    if args.share0_only:
+        if len(med) == 2:
+            out["t3_context"] = med["flag0"] / med["base0"]
+        else:
+            out["error"] = "n-floor breach"
+    elif len(med) == 4:
         out["r_fix"] = med["flag1"] / med["base0"]
         out["t1_obs"] = med["flag1"] / med["flag0"]
         out["r_base_inblock"] = med["base1"] / med["base0"]
@@ -377,7 +386,7 @@ def cmd_fourarm(args: argparse.Namespace) -> int:
     render_png(tag, rows)
     print(json.dumps({k: out.get(k) for k in
                       ("medians", "r_fix", "t1_obs", "r_base_inblock",
-                       "t3_scrolling", "t2_elimination_fraction",
+                       "t3_scrolling", "t3_context", "t2_elimination_fraction",
                        "t5_cycles_ratio", "instructions_ratio", "error")}, indent=1))
     return 1 if out.get("error") else 0
 
@@ -449,6 +458,7 @@ def _dispatch() -> int:
     p = sub.add_parser("fourarm")
     p.add_argument("--bench", default="scrolling")
     p.add_argument("--rounds", type=int, default=8)
+    p.add_argument("--share0-only", action="store_true")
     p.set_defaults(fn=cmd_fourarm)
     p = sub.add_parser("engaged")
     p.add_argument("--rounds", type=int, default=5)
