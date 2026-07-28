@@ -686,6 +686,7 @@ void update_menu_bar_title(PyObject *title UNUSED);
 void change_live_resize_state(OSWindow*, bool);
 bool render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images, bool input_driven);
 void note_local_key_input(void);  // Phase 4 (L5): stamp local key input for the echo fast-path
+monotonic_t last_local_key_input_time(void);  // W27 P6.2 L-A: read the stamp (main-thread relaxed load)
 void update_mouse_pointer_shape(void);
 void adjust_window_size_for_csd(OSWindow *w, int width, int height, int *adjusted_width, int *adjusted_height);
 void dispatch_buffered_keys(Window *w);

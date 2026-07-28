@@ -28,6 +28,11 @@ extern PyTypeObject Screen_Type;
 // only misses one fast-path, which is harmless.
 static _Atomic(monotonic_t) last_local_key_input_at = 0;
 void note_local_key_input(void) { atomic_store_explicit(&last_local_key_input_at, monotonic(), memory_order_relaxed); }
+// W27 P6.2 L-A: main-thread reader for the parse-admission echo bypass
+// (kitty/vt-parser.c gate-2). Relaxed load — writers are also main-thread
+// (keys.c via note_local_key_input above); the atomic exists for the io
+// thread's L5 fast-path, this accessor just shares the stamp.
+monotonic_t last_local_key_input_time(void) { return atomic_load_explicit(&last_local_key_input_at, memory_order_relaxed); }
 // A keystroke echo is a SMALL read arriving shortly after the key; bulk output
 // (large reads) keeps batching to avoid full-redraw flicker.
 #define L5_SMALL_READ_MAX ((size_t)128)

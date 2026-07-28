@@ -1630,10 +1630,32 @@ run_worker(void *p, ParseData *pd, bool flush) {
     pd->has_pending_input = self->read.pos < self->read.sz;
     if (pd->has_pending_input) {
         pd->time_since_new_input = pd->now - effective_new_input_at(self);
+        // W27 P6.2 L-A (the W19 §L1 gate-2 echo bypass, ADR-0004 authority;
+        // env-gated for the A/B): a SMALL pending read (≤128 B — the io-side
+        // L5 cap that spares floods, child-monitor.c L5_SMALL_READ_MAX)
+        // arriving within the key-recency window (50 ms, matching
+        // L5_KEY_RECENCY_WINDOW) parses NOW instead of waiting out
+        // input_delay. Gate-1 (io coalescing) is already L5-bypassed, so this
+        // gate-2 wait is the last structural ~input_delay in the echo path
+        // (P6.1 memo: S3 3.24 ms ≈ 3.0 gate + 0.24 wake). Main-thread relaxed
+        // load; recency clock is pd->now, the gate's existing basis.
+        // P6.2 verdict (2026-07-28, INGEST-S2.md): S3 3.09→0.03 ms in the
+        // stage-decomposed A/B (n=300/arm), photon p50 14.40 (best measured),
+        // flood-neutral ratio 1.0000 on scrolling + sync_medium_cells (3
+        // interleaved rounds) — DEFAULT ON per the probe-gated lever rule;
+        // =0 is the opt-out.
+        static int echo_bypass = -1;
+        if (UNLIKELY(echo_bypass < 0)) {
+            const char *v = getenv("KITTY_PARSE_ECHO_BYPASS");
+            echo_bypass = (v && v[0] && v[0] == '0') ? 0 : 1;
+        }
+        const bool echo_admit = echo_bypass
+            && self->read.sz <= 128
+            && pd->now - last_local_key_input_time() <= ms_to_monotonic_t(50ll);
         // parse when the ring is full even inside the batching window:
         // the reader is stalled and only parsing frees transport space
         // (the analog of the old arena nearly-full override)
-        if (flush || pd->time_since_new_input >= OPT(input_delay) || self->read.sz + 16 * 1024 > BUF_SZ
+        if (flush || echo_admit || pd->time_since_new_input >= OPT(input_delay) || self->read.sz + 16 * 1024 > BUF_SZ
                 || !vt_ring_has_space(self->input_ring)
                 // R3: a full OOB ring means its producer is parked and only
                 // parsing frees transport space (same override as the pty ring)
