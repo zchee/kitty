@@ -958,9 +958,8 @@ static void _glfwUpdateNotchCover(_GLFWwindow*);
 #ifdef KITTY_USE_METAL
 // AppKit may re-create the backing layer at any time (backing-property
 // changes, full-screen transitions, screen moves). Always hand back the
-// window's own layer (CAMetalLayer on the legacy path, KittyIOSurfaceLayer
-// in IOSurface mode) so the render target is never silently replaced by a
-// fresh AppKit-vended layer.
+// window's own layer (the CAMetalLayer created in metal_context.m) so the
+// render target is never silently replaced by a fresh AppKit-vended layer.
 - (CALayer *)makeBackingLayer {
     if (window && window->ns.layer) return (CALayer*)window->ns.layer;
     return [super makeBackingLayer];

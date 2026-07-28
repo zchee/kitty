@@ -785,7 +785,7 @@ csi_letter(unsigned code) {
 // unsigned divide the legacy high-end scheme paid at commit. Setting
 // KITTY_VTP_LEGACY_CSI_PARSE=1 restores the legacy multiply-up-against-
 // digit_multipliers-then-divide-down path so the same binary can A/B the two.
-// Cached function-static getenv (cf. metal.m metal_sync_present_forced); the
+// Cached function-static getenv (cf. metal.m metal_timer_pace_enabled); the
 // result is fixed for the process, so the per-digit branch is perfectly
 // predicted. Default = fast path (legacy off unless explicitly enabled).
 static bool

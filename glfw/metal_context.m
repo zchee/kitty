@@ -121,19 +121,6 @@ link_trace(const char *event, _GLFWwindow *w, double extra) {
 }
 @end
 
-// Wave-5 default: IOSurface presentation. KITTY_METAL_IOSURFACE=0 is the kill
-// switch back to the legacy CAMetalDisplayLink + drawable path. Must agree
-// with metal_iosurface_enabled() in kitty/metal.m (same env var, same default).
-static bool
-iosurface_present_mode(void) {
-    // W27 (ADR-0021): default flipped — the CAMetalLayer arm won the
-    // consolidation (EDR eligibility). =1 is the transition-period kill switch
-    // back to the IOSurface host; the host is deleted at P2.4b completion.
-    static int state = -1;
-    if (state < 0) { const char *v = getenv("KITTY_METAL_IOSURFACE"); state = (v && v[0] && strcmp(v, "1") == 0) ? 1 : 0; }
-    return state == 1;
-}
-
 // W27 P2.4a (ADR-0021): timer-paced drawable arm — drive the CAMetalLayer arm
 // with the plain-CADisplayLink pace timer (KittyIOSurfacePaceLinkTarget) so no
 // CAMetalDisplayLink owns the drawable pool and kitty's L2 immediate-encode is
@@ -157,7 +144,6 @@ timer_paced_mode(void) {
 static void
 apply_display_sync_policy(_GLFWwindow *window) {
     if (!window || !window->context.metal.layer) return;
-    if (iosurface_present_mode()) return;  // mirror-flag arm keeps its own path
     NSWindow *nswin = (NSWindow*)window->ns.object;
     const bool fullscreen = window->monitor != NULL
         || window->ns.in_traditional_fullscreen
@@ -170,17 +156,16 @@ void _glfwCocoaApplyMetalDisplaySyncPolicy(_GLFWwindow* window) {
     apply_display_sync_policy(window);
 }
 
-// Wave-5 governor: under the IOSurface model the render driver is a plain
-// CADisplayLink — the same per-window vsync-timed callback cadence as
-// CAMetalDisplayLink, but a pure timer: it owns NO drawable pool, so the
-// kitty-side input fast path (immediate encode) can render at any instant
-// without corrupting anything, and glfwGetCocoaPendingMetalDrawable() simply
-// returns NULL during its ticks (kitty's ensure_drawable takes the IOSurface
-// ring instead). This link IS the flood pacing governor: the render gate
-// defers sustained damage to these ticks, so flood encodes at the refresh
-// rate instead of the parse rate. Same lifecycle as the CAMetalDisplayLink it
-// replaces: created unpaused, idle pause = runloop removal, destroyed for
-// live resize and sync_to_monitor=no.
+// Wave-5 governor: the render driver is a plain CADisplayLink — the same
+// per-window vsync-timed callback cadence as CAMetalDisplayLink, but a pure
+// timer: it owns NO drawable pool, so the kitty-side input fast path
+// (immediate encode) can render at any instant without corrupting anything,
+// and glfwGetCocoaPendingMetalDrawable() simply returns NULL during its ticks
+// (kitty's ensure_drawable falls through to nextDrawable). This link IS the
+// flood pacing governor: the render gate defers sustained damage to these
+// ticks, so flood encodes at the refresh rate instead of the parse rate. Same
+// lifecycle as the CAMetalDisplayLink it replaces: created unpaused, idle
+// pause = runloop removal, destroyed for live resize and sync_to_monitor=no.
 @interface KittyIOSurfacePaceLinkTarget : NSObject
 {
     @public
@@ -226,8 +211,8 @@ static void create_metal_display_link(_GLFWwindow *window)
     // (the DEFECT-1 flicker). [NSEvent pressedMouseButtons] is AppKit ground truth;
     // a genuine drag keeps the transaction, a stuck/programmatic resize clears it.
     if (!([NSEvent pressedMouseButtons] & 1)) layer.presentsWithTransaction = NO;
-    if (iosurface_present_mode() || timer_paced_mode()) {
-        // IOSurface default: a plain CADisplayLink paces render frames (see
+    if (timer_paced_mode()) {
+        // Timer-pace default: a plain CADisplayLink paces render frames (see
         // KittyIOSurfacePaceLinkTarget above). NSWindow-vended so it tracks
         // the display the window is actually on (macOS 14+; build floor 15.3).
         NSWindow *nswin = (NSWindow*)window->ns.object;
@@ -276,7 +261,7 @@ static void destroy_metal_display_link(_GLFWwindow *window)
 {
     if (window->context.metal.display_link) link_trace("DESTROY", window, 0);
     if (window->context.metal.display_link) {
-        if (iosurface_present_mode() || timer_paced_mode()) {
+        if (timer_paced_mode()) {
             CADisplayLink *dl = (CADisplayLink*)window->context.metal.display_link;
             [dl invalidate];  // removes it from all runloops (and drops its own target retain)
             [dl release];
@@ -343,14 +328,9 @@ static void swapIntervalMetal(int interval)
     _GLFWwindow *window = _glfwPlatformGetTls(&_glfw.contextSlot);
     if (window && window->context.metal.layer) {
         window->context.metal.sync_interval = interval;
-        if (iosurface_present_mode()) {
-            // Mirror-flag arm (transition-period only): direct mapping as before.
-            ((CAMetalLayer*)window->context.metal.layer).displaySyncEnabled = interval != 0 ? YES : NO;
-        } else {
-            // W27 winner arm: interval feeds the windowed-immediate /
-            // fullscreen-vsync policy instead of mapping 1:1.
-            apply_display_sync_policy(window);
-        }
+        // W27: interval feeds the windowed-immediate / fullscreen-vsync policy
+        // instead of mapping 1:1.
+        apply_display_sync_policy(window);
     }
 }
 
@@ -366,125 +346,64 @@ static GLFWglproc getProcAddressMetal(const char* procname UNUSED)
     return NULL;
 }
 
-// IOSurface presentation mode's backing layer: a plain CALayer, not a
-// CAMetalLayer. Manually assigning IOSurfaces to `contents` is a fully
-// supported CALayer operation, which silences Core Animation's per-present
-// "changing `contents' on CAMetalLayer may result in undefined behavior"
-// error log and removes the standing UB exposure of bypassing the drawable
-// pool (same shape as Ghostty's IOSurfaceLayer). presentsWithTransaction /
-// displaySyncEnabled / drawableSize are MIRROR properties: plain stored
-// state with CAMetalLayer's exact selector names and types, because every
-// shared read/write site (the glfw resize signals here and in
-// cocoa_window.m, kitty/metal.m's present decisions and ring sizing)
-// accesses them through a CAMetalLayer* static type and resolves at runtime
-// via selector dispatch. In IOSurface mode there are no drawable presents,
-// so the flags carry no CA-side behavior — the sync swap already happens
-// inside an explicit CATransaction (iosurface_swap_contents, kitty/metal.m).
-// Selector names and types MUST stay exactly aligned with CAMetalLayer's;
-// metal_set_current_layer (kitty/metal.m) fatals if the layer class ever
-// disagrees with metal_iosurface_enabled().
-@interface KittyIOSurfaceLayer : CALayer
-@property (nonatomic) BOOL presentsWithTransaction;
-@property (nonatomic) BOOL displaySyncEnabled;
-@property (nonatomic) CGSize drawableSize;
-@end
-
-@implementation KittyIOSurfaceLayer
-// Kill ALL implicit animations (the 0.25 s contents crossfade, bounds moves
-// during AppKit-driven live resize). The contents swap itself already runs
-// under setDisableActions:YES, but AppKit's geometry changes land outside
-// that transaction.
-- (id<CAAction>)actionForKey:(NSString *)event { (void)event; return (id<CAAction>)[NSNull null]; }
-@end
-
-// Create a Metal rendering context for a window: the view's backing layer —
-// a plain KittyIOSurfaceLayer in IOSurface presentation mode (the default),
-// a CAMetalLayer on the legacy drawable path (KITTY_METAL_IOSURFACE=0).
+// Create a Metal rendering context for a window: the view's backing layer is a
+// CAMetalLayer driving the drawable path.
 // Modeled on the Vulkan surface creation code in cocoa_window.m
 bool _glfwCreateContextMetal(_GLFWwindow* window)
 {
-    CAMetalLayer *layer;
-    if (iosurface_present_mode()) {
-        // The static type stays CAMetalLayer* so the shared property sites
-        // below and across kitty compile unchanged; only the mirror
-        // selectors and the inherited CALayer surface are ever used on it.
-        // None of the legacy branch's drawable-pool configuration applies
-        // (device/pixelFormat/framebufferOnly/maximumDrawableCount/
-        // allowsNextDrawableTimeout): this layer has no drawable pool. The
-        // frame format lives in the IOSurface ring (kitty/metal.m), and no
-        // colorspace is attached anywhere (nil-colorspace parity, see the
-        // legacy branch's colorspace comment below).
-        layer = (CAMetalLayer*)[KittyIOSurfaceLayer layer];
-        if (!layer)
-        {
-            _glfwInputError(GLFW_PLATFORM_ERROR,
-                            "Metal: Failed to create KittyIOSurfaceLayer");
-            return false;
-        }
-        // Mirror-flag seeds, matching the legacy branch: no resize
-        // transaction in progress; vsync on (CAMetalLayer's default —
-        // swapIntervalMetal overwrites this from the swap interval).
-        // drawableSize starts zero = "unset"; set_gpu_viewport
-        // (kitty/metal.m) drives it, and the ring sizing falls back to
-        // mtl_viewport while it is zero.
-        layer.presentsWithTransaction = NO;
-        layer.displaySyncEnabled = YES;
-    } else {
-        // Legacy drawable path: a real CAMetalLayer.
-        layer = [CAMetalLayer layer];
-        if (!layer)
-        {
-            _glfwInputError(GLFW_PLATFORM_ERROR,
-                            "Metal: Failed to create CAMetalLayer");
-            return false;
-        }
+    CAMetalLayer *layer = [CAMetalLayer layer];
+    if (!layer)
+    {
+        _glfwInputError(GLFW_PLATFORM_ERROR,
+                        "Metal: Failed to create CAMetalLayer");
+        return false;
+    }
 
-        // Configure the layer
-        layer.device = (id<MTLDevice>)_glfw.metal.device;
-        // Plain (non-sRGB) BGRA8Unorm base. C1: sRGB is now encoded in-shader — the
-        // opaque cell/border fragments via the SRGB_ENCODE_OUTPUT function constant,
-        // and layered content in the single-pass resolve draw (kitty/metal.m) — so
-        // no per-frame sRGB texture view of the drawable is created any more.
-        layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
-        // C4a: framebufferOnly=YES lets Core Animation optimize the drawable for
-        // display (lossless framebuffer compression). Safe now that nothing creates a
-        // texture view of the drawable (that per-frame view creation was the Wave-1
-        // blocker that forced this to NO). Read-back paths — the KITTY_METAL_DUMP_FRAME
-        // golden harness and take_screenshot_of_rectangular_region — render to a
-        // readable offscreen instead (metal_capture_to_offscreen in metal.m), never
-        // the drawable.
-        layer.framebufferOnly = YES;
-        layer.presentsWithTransaction = NO;
-        // CAMetalLayer.maximumDrawableCount accepts only 2 or 3 (any other value
-        // raises an exception, Apple docs); default is 3. Wave-4 measured 2 vs 3
-        // under the CAMetalDisplayLink driver (flood + typing): the link delivers a
-        // vsync-timed drawable to each delegate callback, so there is no CPU-side
-        // nextDrawable race and a 2-deep pool already yields a perfectly steady
-        // present cadence (16.667 ms p50==p99==max at 60 Hz) with drawable_wait_ms
-        // structurally 0. Count 3 gave BYTE-IDENTICAL cadence and zero tail stalls
-        // (no smoothness gain) while adding ~2 ms of PTY-write->present latency (one
-        // more frame of queue depth). The old 2-pass-era "60 ms tail stall at 2" is
-        // gone. So 2 is optimal: shallowest presentation queue == lowest latency.
-        layer.maximumDrawableCount = 2;
-        // W27: seed the sync policy (windowed at creation => immediate). The
-        // stored interval defaults to 1 (sync_to_monitor default yes) until
-        // kitty applies the real option via swapIntervalMetal.
-        window->context.metal.sync_interval = 1;
-        // layer.colorspace is intentionally left at its default, nil. Per Apple
-        // docs a nil colorspace means the drawable's content "isn't
-        // color-matched" -- Core Animation performs no colorspace transform at
-        // composite time, which is the fast, GL-parity path. kitty already does
-        // its own sRGB handling in the render pipeline (texture views selected
-        // per pass in metal.m), so a CA-side conversion would be redundant work
-        // at best and a double-conversion bug at worst. Never set a colorspace
-        // here.
-        // Allow nextDrawable to return nil instead of blocking indefinitely
-        // when all drawables are in-flight. This prevents deadlock when
-        // the main thread blocks in nextDrawable while the GPU needs the
-        // run loop to process drawable release callbacks.
-        if (@available(macOS 12.3, *)) {
-            layer.allowsNextDrawableTimeout = YES;
-        }
+    // Configure the layer
+    layer.device = (id<MTLDevice>)_glfw.metal.device;
+    // Plain (non-sRGB) BGRA8Unorm base. C1: sRGB is now encoded in-shader — the
+    // opaque cell/border fragments via the SRGB_ENCODE_OUTPUT function constant,
+    // and layered content in the single-pass resolve draw (kitty/metal.m) — so
+    // no per-frame sRGB texture view of the drawable is created any more.
+    layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    // C4a: framebufferOnly=YES lets Core Animation optimize the drawable for
+    // display (lossless framebuffer compression). Safe now that nothing creates a
+    // texture view of the drawable (that per-frame view creation was the Wave-1
+    // blocker that forced this to NO). Read-back paths — the KITTY_METAL_DUMP_FRAME
+    // golden harness and take_screenshot_of_rectangular_region — render to a
+    // readable offscreen instead (metal_capture_to_offscreen in metal.m), never
+    // the drawable.
+    layer.framebufferOnly = YES;
+    layer.presentsWithTransaction = NO;
+    // CAMetalLayer.maximumDrawableCount accepts only 2 or 3 (any other value
+    // raises an exception, Apple docs); default is 3. Wave-4 measured 2 vs 3
+    // under the CAMetalDisplayLink driver (flood + typing): the link delivers a
+    // vsync-timed drawable to each delegate callback, so there is no CPU-side
+    // nextDrawable race and a 2-deep pool already yields a perfectly steady
+    // present cadence (16.667 ms p50==p99==max at 60 Hz) with drawable_wait_ms
+    // structurally 0. Count 3 gave BYTE-IDENTICAL cadence and zero tail stalls
+    // (no smoothness gain) while adding ~2 ms of PTY-write->present latency (one
+    // more frame of queue depth). The old 2-pass-era "60 ms tail stall at 2" is
+    // gone. So 2 is optimal: shallowest presentation queue == lowest latency.
+    layer.maximumDrawableCount = 2;
+    // W27: seed the sync policy (windowed at creation => immediate). The
+    // stored interval defaults to 1 (sync_to_monitor default yes) until
+    // kitty applies the real option via swapIntervalMetal.
+    window->context.metal.sync_interval = 1;
+    // layer.colorspace is intentionally left at its default, nil. Per Apple
+    // docs a nil colorspace means the drawable's content "isn't
+    // color-matched" -- Core Animation performs no colorspace transform at
+    // composite time, which is the fast, GL-parity path. kitty already does
+    // its own sRGB handling in the render pipeline (texture views selected
+    // per pass in metal.m), so a CA-side conversion would be redundant work
+    // at best and a double-conversion bug at worst. Never set a colorspace
+    // here.
+    // Allow nextDrawable to return nil instead of blocking indefinitely
+    // when all drawables are in-flight. This prevents deadlock when
+    // the main thread blocks in nextDrawable while the GPU needs the
+    // run loop to process drawable release callbacks.
+    if (@available(macOS 12.3, *)) {
+        layer.allowsNextDrawableTimeout = YES;
     }
 
     // Match the layer's scale to the backing store. The drawable size is
@@ -560,9 +479,9 @@ void _glfwCocoaSetMetalLinkPaused(_GLFWwindow* window, bool paused)
     // reliably. The once-then-freeze defect was never here — it was the resize
     // handoff. Idempotent via link_in_runloop; safe to toggle from the delegate.
     if (!window || !window->context.metal.display_link) return;
-    // id, not a concrete cast: the link is a CADisplayLink under the IOSurface
-    // default and a CAMetalDisplayLink on the legacy path; both implement the
-    // runloop add/remove selectors used below.
+    // id, not a concrete cast: the link is a CADisplayLink under the timer-pace
+    // default and a CAMetalDisplayLink with KITTY_METAL_TIMER_PACE=0; both
+    // implement the runloop add/remove selectors used below.
     id dl = window->context.metal.display_link;
     if (paused) {
         if (window->context.metal.link_in_runloop) {

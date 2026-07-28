@@ -1521,9 +1521,8 @@ render_prepared_os_window(OSWindow *os_window, unsigned int active_window_id, co
     }
     swap_window_buffers(os_window);
 #ifdef KITTY_BACKEND_METAL
-    // Governor floor: on the IOSurface path the present happens synchronously
-    // inside the swap, so this is the per-window last-present stamp the
-    // immediate-encode gate compares against.
+    // Governor floor: the present is issued inside the swap, so this is the
+    // per-window last-present stamp the immediate-encode gate compares against.
     os_window->last_gpu_present_at = monotonic();
 #endif
     os_window->last_active_tab = os_window->active_tab; os_window->last_num_tabs = os_window->num_tabs; os_window->last_active_window_id = active_window_id;
@@ -1862,14 +1861,14 @@ render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images, bo
     os_log_t slog = sp ? child_monitor_signpost_log() : NULL;
     os_signpost_id_t render_gate_sid = sp ? os_signpost_id_make_with_pointer(slog, w) : OS_SIGNPOST_ID_INVALID;
 #endif
-    // L2 immediate-encode-on-input — the low-latency half of the IOSurface
-    // flood governor. When damage is input-driven and the pace link is idle
+    // L2 immediate-encode-on-input — the low-latency half of the flood
+    // governor. When damage is input-driven and the pace link is idle
     // (render_state NOT_REQUESTED) and at least the immediate-encode floor
     // (L6: ~0.5x the display refresh period; see immediate_encode_floor) has
     // passed since THIS window last presented, render the frame now instead of
-    // deferring to the next link tick (which costs ~1 frame of latency). On the
-    // IOSurface path the present is a layer.contents swap — no drawable pool
-    // exists, so rendering at an arbitrary instant is safe (pace=immediate).
+    // deferring to the next link tick (which costs ~1 frame of latency). Under
+    // timer pace no CAMetalDisplayLink owns the drawable pool, so rendering at
+    // an arbitrary instant is safe (pace=immediate).
     // render_prepared_os_window's request_frame_render resyncs the link
     // afterward, so continuous output (flood) transitions to link pacing on
     // its next frame — that resync IS the governor's throughput half: flood

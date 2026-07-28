@@ -214,11 +214,9 @@ void* metal_get_device(void);
 // keep the nextDrawable path.
 void metal_set_link_drawable(void *drawable);
 
-bool metal_immediate_encode_enabled(void);  // true on the IOSurface path (L2 intrinsic) AND under timer pace on the drawable arm (W27)
-bool metal_iosurface_enabled(void);         // IOSurface presentation model (the default; KITTY_METAL_IOSURFACE=0 = legacy kill switch)
+bool metal_immediate_encode_enabled(void);  // true under timer pace (L2 intrinsic once no link owns the drawable pool)
 bool metal_timer_pace_enabled(void);        // W27 P2.4a: drive the drawable arm with the plain pace timer (no CAMetalDisplayLink)
-void metal_set_frame_link_driven(bool v);   // pace attribution: bracketed around link-tick renders
-void metal_forget_layer(void *layer);       // window teardown: free the surface ring + state slot
+void metal_forget_layer(void *layer);       // window teardown: free the per-window state slot
 
 // M1: single-pass layered rendering. metal_begin_layered_frame opens ONE render
 // pass whose color attachment 0 is a memoryless RGBA16Unorm working surface

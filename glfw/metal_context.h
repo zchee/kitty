@@ -11,18 +11,14 @@
 
 #if defined(__OBJC__)
 // Full CAMetalLayer type for the .m files that toggle presentation
-// properties on window->ns.layer (live resize, backing changes). In
-// IOSurface mode the object is actually a KittyIOSurfaceLayer (a plain
-// CALayer subclass defined in metal_context.m with mirror properties for
-// presentsWithTransaction/displaySyncEnabled/drawableSize), so the
-// CAMetalLayer* casts still resolve correctly at runtime.
+// properties on window->ns.layer (live resize, backing changes).
 #import <QuartzCore/CAMetalLayer.h>
 #endif
 
 // Metal-specific per-context data (replaces _GLFWcontextNSGL)
 typedef struct _GLFWcontextMetal
 {
-    id              layer;            // CAMetalLayer* (legacy) or KittyIOSurfaceLayer* (IOSurface mode)
+    id              layer;            // CAMetalLayer*
     id              device;           // id<MTLDevice>
     // Phase 4 (L1): CAMetalDisplayLink render driver. One link per window
     // (per CAMetalLayer) — it follows the layer's display automatically, so no
@@ -81,11 +77,11 @@ void _glfwCocoaSetMetalLinkEnabled(_GLFWwindow* window, bool enabled);
 // at a stall. Main/render-thread only, no lock; false when the window has no link.
 bool _glfwCocoaIsMetalLinkInRunloop(_GLFWwindow* window);
 
-// W27 (ADR-0021 addendum): re-evaluate the winner arm's displaySync policy
-// (windowed = immediate/tear-free-composited, fullscreen = vsync) from the
-// stored sync_interval + the window's CURRENT fullscreen state. Called from
-// layer creation, swapIntervalMetal, and the fullscreen transition handlers
-// in cocoa_window.m. No-op on the IOSurface arm and for windows without a layer.
+// W27 (ADR-0021 addendum): re-evaluate the displaySync policy (windowed =
+// immediate/tear-free-composited, fullscreen = vsync) from the stored
+// sync_interval + the window's CURRENT fullscreen state. Called from layer
+// creation, swapIntervalMetal, and the fullscreen transition handlers in
+// cocoa_window.m. No-op for windows without a layer.
 void _glfwCocoaApplyMetalDisplaySyncPolicy(_GLFWwindow* window);
 
 #endif // KITTY_USE_METAL

@@ -9,7 +9,6 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
 #import <Cocoa/Cocoa.h>
-#import <IOSurface/IOSurface.h>
 #import <os/signpost.h>
 
 // Undefine system MAX/MIN before data-types.h redefines them
@@ -109,42 +108,18 @@ static id<MTLCommandBuffer> mtl_current_command_buffer = nil;
 static id<MTLRenderCommandEncoder> mtl_current_encoder = nil;
 static id<CAMetalDrawable> mtl_current_drawable = nil;
 static MTLRenderPassDescriptor *mtl_current_render_pass = nil;
-// Static type is CAMetalLayer*, but in IOSurface mode (the default) the
-// object is glfw's KittyIOSurfaceLayer — a plain-CALayer subclass with
-// mirror properties for presentsWithTransaction/displaySyncEnabled/
-// drawableSize (glfw/metal_context.m), resolved at runtime via selector
-// dispatch. Shared code may only touch those mirror selectors and the
-// inherited CALayer surface; CAMetalLayer-only API (nextDrawable,
-// maximumDrawableCount, ...) must stay behind !metal_iosurface_enabled().
-// metal_set_current_layer fatals on a layer-class/mode mismatch.
+// The window's backing layer, created in glfw/metal_context.m.
 static CAMetalLayer *mtl_current_layer = nil;
 // Phase 4 (L1): the drawable delivered by the CAMetalDisplayLink for this frame,
 // set via metal_set_link_drawable() before the link-driven render and cleared
 // after. Unretained: it is owned by the CAMetalDisplayLinkUpdate for the duration
 // of the delegate callback, and by the committed command buffer once presented.
 static id<CAMetalDrawable> mtl_link_drawable = nil;
-// Pace attribution (legacy drawable path): distinguishes a
-// CAMetalDisplayLink-driven frame (pace=link) from anything else. The
-// immediate-encode floor is per-OSWindow now (last_gpu_present_at,
-// kitty/child-monitor.c), so no global present timestamp is kept.
+// Pace attribution: distinguishes a CAMetalDisplayLink-driven frame (pace=link)
+// from anything else. The immediate-encode floor is per-OSWindow now
+// (last_gpu_present_at, kitty/child-monitor.c), so no global present timestamp
+// is kept.
 static bool metal_frame_used_link_drawable = false;
-// Phase-4 step 7 spike (KITTY_METAL_IOSURFACE=1): IOSurface presentation model.
-// The frame renders into an IOSurface-backed texture from a per-window ring
-// instead of a CAMetalLayer drawable, and presents by assigning the surface to
-// layer.contents once the GPU completes — no drawable pool, no nextDrawable
-// (pacing comes from a plain CADisplayLink). These hold the CURRENT window's in-flight target
-// (register-file pattern; saved/loaded with the window slot). Both are
-// borrowed from the ring — never retained/released here.
-static id<MTLTexture> mtl_iosurface_target = nil;
-static IOSurfaceRef mtl_iosurface_surface = NULL;
-// Wave-5c: true when the frame had to take an in-use ring slot (all slots
-// held by CA or by a still-in-flight GPU write) — the present then falls back
-// to the synchronous path instead of swapping a surface someone still reads.
-static bool mtl_iosurface_slot_dirty = false;
-// Governor attribution: set (via metal_set_frame_link_driven) around the render
-// invoked from the CADisplayLink pace-tick callback, so metal_end_frame can tag
-// link-paced frames pace=iosurface vs input-immediate frames pace=immediate.
-static bool metal_frame_link_driven = false;
 
 // Clear color state
 static float clear_r = 0, clear_g = 0, clear_b = 0, clear_a = 1;
@@ -1261,7 +1236,7 @@ set_gpu_viewport(unsigned w, unsigned h) {
     mtl_viewport = (MTLViewport){0, 0, (double)w, (double)h, 0, 1};
     // Update the layer's drawableSize to match the viewport (the real
     // drawable size on the legacy CAMetalLayer; the stored mirror property —
-    // read back by the IOSurface ring sizing — on KittyIOSurfaceLayer)
+    // drawable size on the CAMetalLayer)
     if (mtl_current_layer) {
         CGSize desired = CGSizeMake(w, h);
         if (!CGSizeEqualToSize(mtl_current_layer.drawableSize, desired)) {
@@ -1750,9 +1725,6 @@ typedef struct {
     double frame_drawable_wait; // p99: seconds spent in nextDrawable this frame
     bool drawable_pass_opened;  // M3: first drawable pass seen this frame?
     bool layered_pass_active;   // M1: mid single-pass layered render?
-    id<MTLTexture> iosurface_target;  // in-flight IOSurface render target (borrowed from the ring)
-    IOSurfaceRef iosurface_surface;   // its backing surface (borrowed)
-    bool iosurface_slot_dirty;        // Wave-5c: frame must present synchronously (no clean slot)
 } MetalWindowSlot;
 #define MAX_METAL_WINDOWS 64
 static MetalWindowSlot metal_windows[MAX_METAL_WINDOWS];
@@ -1773,9 +1745,6 @@ save_current_window_state(void) {
     s->frame_drawable_wait = metal_frame_drawable_wait;
     s->drawable_pass_opened = drawable_pass_opened;
     s->layered_pass_active = layered_pass_active;
-    s->iosurface_target = mtl_iosurface_target;
-    s->iosurface_surface = mtl_iosurface_surface;
-    s->iosurface_slot_dirty = mtl_iosurface_slot_dirty;
 }
 
 static void
@@ -1791,14 +1760,10 @@ load_window_state(const MetalWindowSlot *s) {
     metal_frame_drawable_wait = s->frame_drawable_wait;
     drawable_pass_opened = s->drawable_pass_opened;
     layered_pass_active = s->layered_pass_active;
-    mtl_iosurface_target = s->iosurface_target;
-    mtl_iosurface_surface = s->iosurface_surface;
-    mtl_iosurface_slot_dirty = s->iosurface_slot_dirty;
 }
 
-// Set the current layer for rendering (CAMetalLayer on the legacy path,
-// KittyIOSurfaceLayer in IOSurface mode). Called when the OS window is
-// made current.
+// Set the current layer for rendering. Called when the OS window is made
+// current.
 void
 metal_set_current_layer(void *layer) {
     if (current_window_slot && current_window_slot->layer_ptr == layer) {
@@ -1815,18 +1780,6 @@ metal_set_current_layer(void *layer) {
         }
         if (!slot) {
             if (!free_slot) { log_error("Metal: too many OS windows for per-window state table"); return; }
-            // Layer class and presentation mode must agree: the env check
-            // lives in two copies (iosurface_present_mode in
-            // glfw/metal_context.m picks the layer class;
-            // metal_iosurface_enabled here picks the code path). A
-            // divergence would send nextDrawable to a plain CALayer
-            // (unrecognized selector) or manual contents assignments to a
-            // layer with a live drawable pool — fail loudly instead.
-            const bool is_metal_layer = [(__bridge CALayer*)layer isKindOfClass:[CAMetalLayer class]];
-            if (metal_iosurface_enabled() == is_metal_layer)
-                fatal("Metal: layer class/mode mismatch (iosurface=%d, CAMetalLayer=%d): "
-                      "glfw iosurface_present_mode() and metal_iosurface_enabled() diverged",
-                      (int)metal_iosurface_enabled(), (int)is_metal_layer);
             slot = free_slot;
             memset(slot, 0, sizeof(*slot));
             slot->in_use = true;
@@ -1849,9 +1802,6 @@ metal_set_current_layer(void *layer) {
         metal_frame_drawable_wait = 0.0;
         drawable_pass_opened = false;
         layered_pass_active = false;
-        mtl_iosurface_target = nil;
-        mtl_iosurface_surface = NULL;
-        mtl_iosurface_slot_dirty = false;
     }
     mtl_current_layer = (__bridge CAMetalLayer *)layer;
 }
@@ -1862,314 +1812,11 @@ metal_get_device(void) {
     return (__bridge void *)mtl_device;
 }
 
-// ----- IOSurface presentation model (the default; Phase-4 step 7 graduated) -----
-// Frames render into IOSurface-backed BGRA8 textures (a per-window ring)
-// and present by assigning the surface to layer.contents inside an
-// explicit CATransaction once the GPU completes. The backing layer in this
-// mode is glfw's KittyIOSurfaceLayer (plain CALayer subclass,
-// glfw/metal_context.m): manual contents assignment is a supported CALayer
-// operation there, so Core Animation logs no "changing `contents' on
-// CAMetalLayer" error and no drawable-pool state can interfere. The swap
-// happens — asynchronously since
-// Wave-5c: the completed handler dispatches the swap to the main queue, so
-// the main thread never stalls in waitUntilCompleted (live resize, dirty ring
-// slots and KITTY_METAL_SYNC_PRESENT=1 still swap synchronously). Core
-// Animation composites the new contents at the next display refresh —
-// vsync-clean with no drawable pool, which is what makes input-driven
-// immediate rendering safe (the L2 blocker was nextDrawable corrupting the
-// pool under an attached CAMetalDisplayLink). Pacing (the flood governor) is a plain CADisplayLink
-// in glfw/metal_context.m driving the render gate at the refresh rate; cold
-// input bypasses it via the immediate-encode gate (kitty/child-monitor.c).
-// Rings are freed on window close (metal_forget_layer). No colorspace is
-// attached to the surfaces (see metal-pipeline-design.md).
-// KITTY_METAL_IOSURFACE=0 = legacy CAMetalDisplayLink + drawable path.
-// Wave-5c kill switch: KITTY_METAL_SYNC_PRESENT=1 forces the synchronous
-// present (commit + waitUntilCompleted + swap on this main-thread turn)
-// everywhere, restoring Wave-5b behavior.
-static bool
-metal_sync_present_forced(void) {
-    static int state = -1;
-    if (state < 0) { const char *v = getenv("KITTY_METAL_SYNC_PRESENT"); state = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0; }
-    return state == 1;
-}
-
-// L1 (Wave-13a) opt-in: when KITTY_METAL_SYNC_IMMEDIATE=1, input-immediate
-// frames (pace=immediate — an input-driven render that ran outside the pace
-// link) present SYNCHRONOUSLY (commit + waitUntilCompleted + swap on this same
-// main-thread turn) instead of the Wave-5c async double hop (completed handler
-// -> dispatch_async(main) -> swap). Rationale: a lone keystroke frame has no
-// second frame chasing it, so the two post-GPU scheduler hops are pure latency.
-// VERIFY VERDICT (wave13a, 60 Hz machine): no reliable >=0.5 ms p99 typing win
-// (p50 slightly favored async; p99 swings were symmetric across both arms) with
-// zero flood-cadence regression, so per the pre-agreed handoff rule the default
-// is OFF. Retained as an opt-in flag for a future 120 Hz / quiet-machine
-// re-evaluation, where the async hops are a larger fraction of the shorter frame
-// budget. Default OFF (async — the Wave-5c behavior); =1 enables
-// sync-on-immediate; =0 is an explicit off. Mirrors metal_sync_present_forced()'s
-// polarity (on only when set and not "0"). Flood frames are link-driven
-// (pace=iosurface) and never take this path regardless;
-// KITTY_METAL_SYNC_PRESENT=1 still forces sync everywhere and takes precedence.
-static bool
-metal_sync_immediate_enabled(void) {
-    static int state = -1;
-    if (state < 0) { const char *v = getenv("KITTY_METAL_SYNC_IMMEDIATE"); state = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0; }
-    return state == 1;
-}
-
-bool
-metal_iosurface_enabled(void) {
-    // W27 (ADR-0021): default flipped — the CAMetalLayer arm won the
-    // consolidation (EDR eligibility; timer-paced echo-immediate ported).
-    // =1 is the transition-period switch back to the IOSurface host (must
-    // agree with iosurface_present_mode() in glfw/metal_context.m); the host
-    // is deleted at P2.4b completion.
-    static int state = -1;
-    if (state < 0) { const char *v = getenv("KITTY_METAL_IOSURFACE"); state = (v && v[0] && strcmp(v, "1") == 0) ? 1 : 0; }
-    return state == 1;
-}
-
-// 4-deep (Wave-5c): async present keeps up to one extra frame in flight
-// (encoding + GPU-in-flight + queued-swap + on-glass), so a 3-deep ring
-// saturates under an immediate+link-tick burst and forces the dirty-slot
-// sync fallback. The extra slot (~10-31 MB/window by size) makes that rare;
-// the generation guard below makes the residual fallback reorder-safe.
-#define IOSURFACE_RING_DEPTH 4
-typedef struct {
-    void *layer_ptr;
-    IOSurfaceRef surfaces[IOSURFACE_RING_DEPTH];
-    id<MTLTexture> textures[IOSURFACE_RING_DEPTH];
-    NSUInteger width, height;
-    unsigned next_slot;
-    bool in_use;
-} IOSurfacePresentRing;
-static IOSurfacePresentRing iosurface_rings[MAX_METAL_WINDOWS];
-
-static void
-iosurface_ring_release(IOSurfacePresentRing *r) {
-    for (unsigned i = 0; i < IOSURFACE_RING_DEPTH; i++) {
-        [r->textures[i] release]; r->textures[i] = nil;
-        if (r->surfaces[i]) { CFRelease(r->surfaces[i]); r->surfaces[i] = NULL; }
-    }
-    r->width = 0; r->height = 0; r->next_slot = 0;
-}
-
-static bool
-iosurface_ring_ensure(IOSurfacePresentRing *r, NSUInteger w, NSUInteger h) {
-    if (r->width == w && r->height == h && r->textures[0]) return true;
-    iosurface_ring_release(r);
-    for (unsigned i = 0; i < IOSURFACE_RING_DEPTH; i++) {
-        const size_t bpr = IOSurfaceAlignProperty(kIOSurfaceBytesPerRow, (size_t)w * 4);
-        NSDictionary *props = @{
-            (__bridge NSString*)kIOSurfaceWidth: @(w),
-            (__bridge NSString*)kIOSurfaceHeight: @(h),
-            (__bridge NSString*)kIOSurfaceBytesPerElement: @4u,
-            (__bridge NSString*)kIOSurfaceBytesPerRow: @(bpr),
-            // 0x42475241 = 'BGRA', matching MTLPixelFormatBGRA8Unorm (the
-            // drawable format) so the render pipeline is byte-identical.
-            (__bridge NSString*)kIOSurfacePixelFormat: @((uint32_t)0x42475241),
-        };
-        r->surfaces[i] = IOSurfaceCreate((__bridge CFDictionaryRef)props);
-        if (!r->surfaces[i]) {
-            log_error("Metal: IOSurfaceCreate failed (%lux%lu)", (unsigned long)w, (unsigned long)h);
-            iosurface_ring_release(r); return false;
-        }
-        MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                                                        width:w height:h mipmapped:NO];
-        // RenderTarget: the frame draws into it. ShaderRead + Shared keep it
-        // readable, so screenshot/thumbnail copies work directly off the target
-        // (framebufferOnly does not apply — this is not a drawable).
-        desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-        desc.storageMode = MTLStorageModeShared;
-        r->textures[i] = [mtl_device newTextureWithDescriptor:desc iosurface:r->surfaces[i] plane:0];
-        if (!r->textures[i]) {
-            log_error("Metal: IOSurface-backed texture creation failed (%lux%lu)", (unsigned long)w, (unsigned long)h);
-            iosurface_ring_release(r); return false;
-        }
-    }
-    r->width = w; r->height = h; r->next_slot = 0;
-    return true;
-}
-
-static IOSurfacePresentRing *
-iosurface_ring_for_layer(void *layer_ptr) {
-    IOSurfacePresentRing *free_r = NULL;
-    for (unsigned i = 0; i < MAX_METAL_WINDOWS; i++) {
-        if (iosurface_rings[i].in_use) {
-            if (iosurface_rings[i].layer_ptr == layer_ptr) return &iosurface_rings[i];
-        } else if (!free_r) free_r = &iosurface_rings[i];
-    }
-    if (!free_r) { log_error("Metal: too many OS windows for IOSurface ring table"); return NULL; }
-    memset(free_r, 0, sizeof(*free_r));
-    free_r->in_use = true; free_r->layer_ptr = layer_ptr;
-    return free_r;
-}
-
-// Wave-5c present-generation guard. Two present disciplines share one layer —
-// synchronous swaps (live resize, dirty slot, kill switch) and main-queue
-// deferred asynchronous swaps — and ordering is only intrinsic WITHIN each
-// discipline. Without a guard, a sync swap can overtake an already-queued
-// async swap and the older frame lands on glass after the newer one. Every
-// swap (all strictly main-thread) records the global frame index here and a
-// swap whose frame index is older than the last one swapped for that layer is
-// dropped (its surface is still released/unmarked by the caller). Entries are
-// keyed by layer pointer, recycled on metal_forget_layer; a pending async
-// block for a destroyed window misses (lookup_only) and skips its swap.
-typedef struct {
-    void *layer_ptr;
-    uint64_t last_swapped_fidx;
-    bool in_use;
-} IOSurfacePresentGen;
-static IOSurfacePresentGen iosurface_present_gens[MAX_METAL_WINDOWS];
-
-static IOSurfacePresentGen*
-iosurface_present_gen_find(void *layer_ptr, bool create) {
-    IOSurfacePresentGen *free_e = NULL;
-    for (unsigned i = 0; i < MAX_METAL_WINDOWS; i++) {
-        if (iosurface_present_gens[i].in_use) {
-            if (iosurface_present_gens[i].layer_ptr == layer_ptr) return &iosurface_present_gens[i];
-        } else if (!free_e) free_e = &iosurface_present_gens[i];
-    }
-    if (!create || !free_e) return NULL;
-    free_e->in_use = true; free_e->layer_ptr = layer_ptr; free_e->last_swapped_fidx = 0;
-    return free_e;
-}
-
-// Both swap sites call this on the main thread just before assigning
-// layer.contents. The entry is created at acquire time (window provably
-// alive), so a miss here means metal_forget_layer recycled it — the window
-// is gone and the swap must be skipped (the caller still drops its
-// use-count/CF references).
-static void iosurface_swap_contents(CAMetalLayer *layer, IOSurfaceRef surf);
-static bool
-iosurface_present_gen_swap_ok(void *layer_ptr, uint64_t fidx) {
-    IOSurfacePresentGen *e = iosurface_present_gen_find(layer_ptr, false);
-    if (!e) { METAL_TRACE("iosurface: swap skipped, window gone (frame %llu)\n", (unsigned long long)fidx); return false; }
-    if (fidx < e->last_swapped_fidx) {
-        METAL_TRACE("iosurface: swap skipped, stale frame %llu < %llu\n",
-                    (unsigned long long)fidx, (unsigned long long)e->last_swapped_fidx);
-        return false;  // a newer frame already swapped (async->sync overtake)
-    }
-    e->last_swapped_fidx = fidx;
-    return true;
-}
-
-// Pick this frame's render target from the ring. IOSurfaceIsInUse covers both
-// the window server's hold (scan-out / in-flight compositing) and our own
-// GPU-in-flight mark: Wave-5c increments the surface's use count at acquire
-// and decrements after the contents swap, so under async present a slot whose
-// GPU write has not completed can never be handed out again. Governor pacing
-// keeps at most ~1 frame in flight + 1 on glass, so the 4-deep ring has a
-// clean slot in practice; if none is clean (present burst), the frame is
-// marked dirty and presents synchronously instead of reusing a busy surface.
-static bool
-iosurface_acquire_target(void) {
-    if (mtl_iosurface_target) return true;
-    if (!mtl_current_layer) { METAL_TRACE("iosurface: no current layer\n"); return false; }
-    CGSize ds = mtl_current_layer.drawableSize;
-    NSUInteger w = (NSUInteger)ds.width, h = (NSUInteger)ds.height;
-    if (w < 1 || h < 1) {
-        if (mtl_viewport.width > 0 && mtl_viewport.height > 0) {
-            w = (NSUInteger)mtl_viewport.width; h = (NSUInteger)mtl_viewport.height;
-        } else return false;
-    }
-    IOSurfacePresentRing *r = iosurface_ring_for_layer((__bridge void*)mtl_current_layer);
-    if (!r || !iosurface_ring_ensure(r, w, h)) return false;
-    unsigned chosen = r->next_slot;
-    bool clean = false;
-    for (unsigned probe = 0; probe < IOSURFACE_RING_DEPTH; probe++) {
-        unsigned s = (r->next_slot + probe) % IOSURFACE_RING_DEPTH;
-        if (!IOSurfaceIsInUse(r->surfaces[s])) { chosen = s; clean = true; break; }
-    }
-    r->next_slot = (chosen + 1) % IOSURFACE_RING_DEPTH;
-    mtl_iosurface_target = r->textures[chosen];
-    mtl_iosurface_surface = r->surfaces[chosen];
-    mtl_iosurface_slot_dirty = !clean;
-    // GPU-in-flight mark; dropped after the swap (or in the end-frame tail).
-    // Skipped under the kill switch so KITTY_METAL_SYNC_PRESENT=1 keeps
-    // Wave-5b's exact IsInUse semantics (sync never has >1 frame in flight).
-    if (!metal_sync_present_forced()) IOSurfaceIncrementUseCount(mtl_iosurface_surface);
-    if (!iosurface_present_gen_find((__bridge void*)mtl_current_layer, true))  // guard entry lives while the window does
-        log_error("Metal: present-generation table full; frame ordering unguarded for this window");
-    METAL_TRACE("iosurface: acquired slot %u (%lux%lu)\n", chosen, (unsigned long)w, (unsigned long)h);
-    if (metal_stats_enabled()) metal_frame_encode_start = CACurrentMediaTime();  // encode_ms starts here, as on the drawable paths
-    return true;
-}
-
-// Measurement-only (stats/signpost runs): the drawable path stamps presents
-// with -presentedTime; a contents assignment has no such callback, so pair
-// each present with the next display-refresh timestamp from a CADisplayLink
-// (macOS 14+). presented_time is therefore a lower bound within one refresh
-// of true glass time (exact when the render server makes that refresh's
-// deadline, one refresh early when it misses); commit_time is tail-appended
-// so offline analysis can bound it — since Wave-5c it records the SWAP time
-// (post-GPU, when contents was assigned), not the command-buffer commit. The
-// link stays paused whenever no presents are pending; note_present is only
-// ever called on the main thread (the async swap block runs on the main
-// queue), so the pending arrays need no locking.
-#define IOSURFACE_PENDING_MAX 64u
-@interface KittyIOSurfacePresentStamper : NSObject {
-    @public
-    uint64_t frames[IOSURFACE_PENDING_MAX];
-    double commit_times[IOSURFACE_PENDING_MAX];
-    const char *paces[IOSURFACE_PENDING_MAX];
-    unsigned count;
-    CADisplayLink *link;
-}
-- (void)tick:(CADisplayLink *)dl;
-@end
-
-@implementation KittyIOSurfacePresentStamper
-- (void)tick:(CADisplayLink *)dl {
-    const double ts = dl.timestamp;  // the refresh that just displayed
-    unsigned emitted = 0;
-    while (emitted < count && commit_times[emitted] <= ts) {
-        char line[192];
-        snprintf(line, sizeof line, "metal_present frame=%llu presented_time=%.9f pace=%s commit_time=%.9f\n",
-                 (unsigned long long)frames[emitted], ts, paces[emitted], commit_times[emitted]);
-        metal_stats_emit(line);
-        emitted++;
-    }
-    if (emitted && emitted < count) {
-        memmove(frames, frames + emitted, (count - emitted) * sizeof(frames[0]));
-        memmove(commit_times, commit_times + emitted, (count - emitted) * sizeof(commit_times[0]));
-        memmove(paces, paces + emitted, (count - emitted) * sizeof(paces[0]));
-    }
-    count -= emitted;
-    if (!count) dl.paused = YES;
-}
-@end
-
-// Window teardown: free the per-window IOSurface ring (3 surfaces pin up to
-// ~90 MB for a retina-fullscreen window) and retire the per-window state slot,
-// so neither outlives the window. Core Animation retains whatever surface is
-// still set as layer.contents, so releasing our refs here is safe even if the
-// closing window is mid-composite.
+// Window teardown: retire the per-window state slot so it does not outlive the
+// window.
 void
 metal_forget_layer(void *layer) {
     if (!layer) return;
-    // Symmetric with the acquire-side increment: if the dying window is
-    // current and holds an acquired-but-never-presented frame, drop its
-    // GPU-in-flight mark BEFORE the ring release frees the surface — the
-    // ring reference is what guarantees the surface is still alive here.
-    if (current_window_slot && current_window_slot->layer_ptr == layer
-            && mtl_iosurface_surface && !metal_sync_present_forced())
-        IOSurfaceDecrementUseCount(mtl_iosurface_surface);
-    for (unsigned i = 0; i < MAX_METAL_WINDOWS; i++) {
-        if (iosurface_rings[i].in_use && iosurface_rings[i].layer_ptr == layer) {
-            iosurface_ring_release(&iosurface_rings[i]);
-            iosurface_rings[i].in_use = false;
-            iosurface_rings[i].layer_ptr = NULL;
-            break;
-        }
-    }
-    // Recycle the present-generation entry: pending async swap blocks for
-    // this window then miss their lookup and skip the swap.
-    for (unsigned i = 0; i < MAX_METAL_WINDOWS; i++) {
-        if (iosurface_present_gens[i].in_use && iosurface_present_gens[i].layer_ptr == layer) {
-            memset(&iosurface_present_gens[i], 0, sizeof(iosurface_present_gens[i]));
-            break;
-        }
-    }
     for (int i = 0; i < MAX_METAL_WINDOWS; i++) {
         if (metal_windows[i].in_use && metal_windows[i].layer_ptr == layer) {
             if (current_window_slot == &metal_windows[i]) {
@@ -2179,61 +1826,12 @@ metal_forget_layer(void *layer) {
                 mtl_current_command_buffer = nil;
                 mtl_current_drawable = nil;
                 mtl_current_encoder = nil;
-                // (The GPU-in-flight mark was already dropped at the top of
-                // this function, before the ring release, while the ring
-                // reference still guaranteed the surface was alive.)
-                mtl_iosurface_target = nil;
-                mtl_iosurface_surface = NULL;
                 if (mtl_current_layer == (__bridge CAMetalLayer *)layer) mtl_current_layer = nil;
             }
             memset(&metal_windows[i], 0, sizeof(metal_windows[i]));
             break;
         }
     }
-}
-
-// The one true contents swap, shared by the sync and async present paths so
-// their transaction discipline cannot drift: explicit transaction (so an
-// enclosing implicit AppKit transaction cannot defer it), no animation, and
-// a flush that pushes the swap to the render server immediately. The param
-// type is CAMetalLayer* only because that is the shared static type; in
-// IOSurface mode the object is a KittyIOSurfaceLayer (plain CALayer), for
-// which this assignment is a fully supported operation.
-static void
-iosurface_swap_contents(CAMetalLayer *layer, IOSurfaceRef surf) {
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    layer.contents = (__bridge id)surf;
-    [CATransaction commit];
-    [CATransaction flush];
-}
-
-static KittyIOSurfacePresentStamper *iosurface_stamper = nil;
-
-static void
-iosurface_note_present(uint64_t frame, double commit_time, const char *pace) {
-    if (!iosurface_stamper) {
-        iosurface_stamper = [[KittyIOSurfacePresentStamper alloc] init];
-        CADisplayLink *dl = [[NSScreen mainScreen] displayLinkWithTarget:iosurface_stamper selector:@selector(tick:)];
-        if (dl) {
-            [dl retain];  // MRC: returned autoreleased; keep it alive with the stamper
-            [dl addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
-            iosurface_stamper->link = dl;
-        }
-    }
-    KittyIOSurfacePresentStamper *s = iosurface_stamper;
-    if (!s->link) return;  // headless (no screen): presents go unstamped
-    if (s->count >= IOSURFACE_PENDING_MAX) {  // sustained flood: drop the oldest (coalesced by CA anyway)
-        memmove(s->frames, s->frames + 1, (IOSURFACE_PENDING_MAX - 1) * sizeof(s->frames[0]));
-        memmove(s->commit_times, s->commit_times + 1, (IOSURFACE_PENDING_MAX - 1) * sizeof(s->commit_times[0]));
-        memmove(s->paces, s->paces + 1, (IOSURFACE_PENDING_MAX - 1) * sizeof(s->paces[0]));
-        s->count = IOSURFACE_PENDING_MAX - 1;
-    }
-    s->frames[s->count] = frame;
-    s->commit_times[s->count] = commit_time;
-    s->paces[s->count] = pace;
-    s->count++;
-    s->link.paused = NO;
 }
 
 static void
@@ -2273,15 +1871,6 @@ ensure_command_buffer(void) {
 }
 
 void
-metal_set_frame_link_driven(bool v) {
-    // Pace attribution for the IOSurface model: cocoa_metal_frame_callback
-    // brackets its render with true/false so a link-tick render is tagged
-    // pace=iosurface and everything else (input-immediate, sync=no inline,
-    // resize) falls through to the other tags.
-    metal_frame_link_driven = v;
-}
-
-void
 metal_set_link_drawable(void *drawable) {
     // Phase 4 (L1): stash the CAMetalDisplayLink-delivered drawable for this
     // frame (or NULL to clear). __bridge only reinterprets the pointer — no
@@ -2292,9 +1881,6 @@ metal_set_link_drawable(void *drawable) {
 static bool
 ensure_drawable(void) {
     if (mtl_current_drawable) return true;
-    // Phase-4 step 7 spike: the IOSurface presentation model never touches the
-    // drawable pool — the frame's target comes from the per-window surface ring.
-    if (metal_iosurface_enabled()) return iosurface_acquire_target();
     // Phase 4 (L1): a CAMetalDisplayLink-delivered drawable short-circuits the
     // nextDrawable path. The vsync backpressure was already absorbed by the link
     // scheduling this delegate callback, so there is no nextDrawable block to
@@ -2340,11 +1926,9 @@ ensure_drawable(void) {
 }
 
 // The texture the current frame's drawable-bound content renders into: the
-// link/nextDrawable drawable normally, or the ring surface under the
-// IOSurface spike (in which case no drawable exists).
+// link/nextDrawable drawable.
 static id<MTLTexture>
 current_drawable_texture(void) {
-    if (mtl_iosurface_target) return mtl_iosurface_target;
     return mtl_current_drawable.texture;
 }
 
@@ -2674,10 +2258,6 @@ metal_end_frame(void) {
         // immediate (L2 input-driven render outside the link). String literals are
         // static, so capturing `pace` in the async handlers below is safe.
         const char *pace =
-            mtl_iosurface_target ? (
-                (mtl_current_layer && mtl_current_layer.presentsWithTransaction) ? "resize" :
-                (mtl_current_layer && !mtl_current_layer.displaySyncEnabled) ? "unsynced" :
-                metal_frame_link_driven ? "iosurface" : "immediate") :
             (mtl_current_layer && mtl_current_layer.presentsWithTransaction) ? "resize" :
             (mtl_current_layer && !mtl_current_layer.displaySyncEnabled) ? "unsynced" :
             metal_frame_used_link_drawable ? "link" : "immediate";
@@ -2717,82 +2297,6 @@ metal_end_frame(void) {
             // Golden dump: the frame was rendered to the readable offscreen and
             // no drawable was acquired — commit + wait + read it + write the PNG.
             dump_offscreen_frame(mtl_current_command_buffer, dump_path);
-        } else if (mtl_iosurface_target) {
-            // No implicit GPU→CA fence exists for manually assigned contents,
-            // so the swap must happen after the GPU completes. Wave-5c: the
-            // normal path commits and returns — the completed handler
-            // dispatches the swap to the main queue (Ghostty's setSurface
-            // requires the same main-thread affinity), reclaiming the
-            // waitUntilCompleted stall (~30% of flood main-thread time in the
-            // Phase-5 profile). The explicit transaction + flush pushes the
-            // swap to the render server immediately; CA composites it at the
-            // next display refresh — vsync-clean without a drawable pool.
-            // Cases that swap synchronously on this turn: live resize (the swap
-            // must land inside the resize transaction), a dirty ring slot
-            // (someone may still read the surface we rendered into), the
-            // KITTY_METAL_SYNC_PRESENT=1 kill switch, and — as an OPT-IN (L1,
-            // KITTY_METAL_SYNC_IMMEDIATE=1) — an input-immediate frame
-            // (pace=immediate: an input-driven render that ran outside the pace
-            // link, so no follow-up frame amortizes the async hops).
-            // frame_is_immediate mirrors the pace ladder's "immediate" arm
-            // exactly (not link-driven, vsync-clean, not mid-resize), so the
-            // opt-in's scope is provably identical to the pace=immediate tag.
-            // The L1 default is OFF (async): the wave13a verify A/B found no
-            // reliable p99 win on 60 Hz — see metal_sync_immediate_enabled().
-            // Flood frames are link-driven and never satisfy this, so flood
-            // stays async (cadence p50=p99 unchanged) in both arms. When the
-            // opt-in IS set, the sync swap routes through the SAME per-layer
-            // generation guard below, so overtaking an older still-queued async
-            // swap is reorder-safe: it records the newer fidx and the stale
-            // async block is dropped when it runs (identical to the
-            // dirty-slot/resize sync case the guard was built for in Wave-5c).
-            const bool frame_is_immediate = mtl_current_layer &&
-                mtl_current_layer.displaySyncEnabled &&
-                !mtl_current_layer.presentsWithTransaction && !metal_frame_link_driven;
-            const bool sync_swap = metal_sync_present_forced() || mtl_iosurface_slot_dirty ||
-                                   (mtl_current_layer && mtl_current_layer.presentsWithTransaction) ||
-                                   (metal_sync_immediate_enabled() && frame_is_immediate);
-            if (sync_swap) {
-                [mtl_current_command_buffer commit];
-                [mtl_current_command_buffer waitUntilCompleted];
-                // Generation guard: records this frame as the newest swapped;
-                // an inline sync swap is never stale in practice, but the
-                // record is what lets it win over queued async swaps.
-                if (iosurface_present_gen_swap_ok((__bridge void*)mtl_current_layer, fidx)) {
-                    iosurface_swap_contents(mtl_current_layer, mtl_iosurface_surface);
-                    METAL_TRACE("iosurface: presented frame %llu (sync)\n", (unsigned long long)fidx);
-                    if (st || sp) iosurface_note_present(fidx, CACurrentMediaTime(), pace);
-                }
-                // GPU-in-flight mark dropped by the end-frame tail (surface still set).
-            } else {
-                // MRC: the block retains captured ObjC pointers when copied
-                // (layer); the CF surface needs a manual retain, released at
-                // the end of the swap block. Ownership of the in-flight use
-                // count moves to the block too, so the end-frame tail must
-                // not decrement it — hand off by nulling the globals below.
-                CAMetalLayer *layer = mtl_current_layer;
-                IOSurfaceRef surf = (IOSurfaceRef)CFRetain(mtl_iosurface_surface);
-                const bool note = (st || sp);
-                [mtl_current_command_buffer addCompletedHandler:^(id<MTLCommandBuffer> cb2) {
-                    (void)cb2;
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        // Generation guard: skip if a newer frame already
-                        // swapped (sync overtake) or the window died
-                        // (metal_forget_layer recycled the entry) — the
-                        // references are dropped either way.
-                        if (iosurface_present_gen_swap_ok((__bridge void*)layer, fidx)) {
-                            iosurface_swap_contents(layer, surf);
-                            METAL_TRACE("iosurface: presented frame %llu (async)\n", (unsigned long long)fidx);
-                            if (note) iosurface_note_present(fidx, CACurrentMediaTime(), pace);
-                        }
-                        IOSurfaceDecrementUseCount(surf);
-                        CFRelease(surf);
-                    });
-                }];
-                [mtl_current_command_buffer commit];
-                mtl_iosurface_target = nil;    // ownership handed to the block:
-                mtl_iosurface_surface = NULL;  // the tail must not decrement
-            }
         } else if (mtl_current_drawable && mtl_current_layer && mtl_current_layer.presentsWithTransaction) {
             // Live resize: present inside the current CA transaction so the
             // frame stays in lockstep with the window chrome. Documented
@@ -2823,16 +2327,6 @@ metal_end_frame(void) {
     drawable_pass_opened = false; // M3: next frame's first drawable pass discards again
     layered_pass_active = false;  // M1: defensive — resolve normally clears it
     metal_frame_used_link_drawable = false; // pace: recomputed per frame in ensure_drawable
-    // Any path that still holds the surface here (sync swap, golden dump, a
-    // frame that never presented) drops the GPU-in-flight mark now; the async
-    // path handed both the surface and the mark to its swap block and nulled
-    // these already. Gated to mirror the acquire-side increment (skipped
-    // under KITTY_METAL_SYNC_PRESENT=1).
-    if (mtl_iosurface_surface && !metal_sync_present_forced()) IOSurfaceDecrementUseCount(mtl_iosurface_surface);
-    mtl_iosurface_target = nil;   // next frame acquires a fresh ring slot
-    mtl_iosurface_surface = NULL;
-    mtl_iosurface_slot_dirty = false;
-    metal_frame_link_driven = false; // pace: re-marked per link-tick render
 }
 
 // W27 P2.4a (ADR-0021): timer-paced CAMetalLayer opt-in. When set, the legacy
@@ -2854,20 +2348,17 @@ metal_timer_pace_enabled(void) {
 
 bool
 metal_immediate_encode_enabled(void) {
-    // Under the IOSurface presentation model (the default) there is no drawable
-    // pool, so an input-driven frame can render + present at any instant — L2
-    // immediate-encode is intrinsic and always on. This is the low-latency half
-    // of the flood pacing governor: cold input renders NOW (~14 ms
-    // PTY-write→present), and render_prepared_os_window's request_frame_render
-    // resumes the pace link so sustained damage collapses to refresh-rate ticks.
-    if (metal_iosurface_enabled()) return true;
-    // W27: under timer pace the drawable arm has no CAMetalDisplayLink either —
-    // the pool is unowned, nextDrawable-at-any-instant is the pre-Wave-4 proven
-    // path, and L2 is safe (the SIGSEGV below was pool ownership, not the layer).
+    // W27: under timer pace no CAMetalDisplayLink is attached — the drawable
+    // pool is unowned, nextDrawable-at-any-instant is the pre-Wave-4 proven
+    // path, and L2 immediate-encode is safe (the SIGSEGV below was pool
+    // ownership, not the layer). This is the low-latency half of the flood
+    // pacing governor: cold input renders NOW, and render_prepared_os_window's
+    // request_frame_render resumes the pace link so sustained damage collapses
+    // to refresh-rate ticks.
     if (metal_timer_pace_enabled()) return true;
-    // Legacy (KITTY_METAL_IOSURFACE=0) drawable path: rendering an input frame
-    // via nextDrawable while the CAMetalDisplayLink is attached corrupts the
-    // drawable pool (SIGSEGV — see the "L2 ... DEFERRED" note in
+    // KITTY_METAL_TIMER_PACE=0 restores the CAMetalDisplayLink driver, where
+    // rendering an input frame via nextDrawable while the link is attached
+    // corrupts the drawable pool (SIGSEGV — see the "L2 ... DEFERRED" note in
     // metal-pipeline-design.md). KITTY_METAL_IMMEDIATE stays NEUTERED there —
     // it logs once and does nothing.
     static bool checked = false;
@@ -2875,8 +2366,8 @@ metal_immediate_encode_enabled(void) {
         checked = true;
         const char *v = getenv("KITTY_METAL_IMMEDIATE");
         if (v && v[0] && strcmp(v, "0") != 0)
-            log_error("KITTY_METAL_IMMEDIATE: immediate-encode requires the IOSurface "
-                      "presentation model (see kitty/metal-pipeline-design.md); ignored");
+            log_error("KITTY_METAL_IMMEDIATE: immediate-encode requires the timer-paced "
+                      "driver (see kitty/metal-pipeline-design.md); ignored");
     }
     return false;
 }
@@ -3257,7 +2748,7 @@ void metal_gl_copy_tex_image_2d(GLenum target, int level, GLenum internalformat,
         source = framebuffers[bound_framebuffer].render_target;
     } else if (metal_capture_to_offscreen() && dump_offscreen_base) {
         source = dump_offscreen_base;  // C4a: framebufferOnly drawable is unreadable; the frame rendered here
-    } else if (mtl_current_drawable || mtl_iosurface_target) {
+    } else if (mtl_current_drawable) {
         source = current_drawable_texture();
     }
     if (source && t->texture) {
@@ -3354,7 +2845,7 @@ void metal_gl_read_pixels(int x, int y, int width, int height, GLenum format, GL
         source = framebuffers[bound_framebuffer].render_target;
     } else if (metal_capture_to_offscreen() && dump_offscreen_base) {
         source = dump_offscreen_base;  // C4a: framebufferOnly drawable is unreadable; the frame rendered here
-    } else if (mtl_current_drawable || mtl_iosurface_target) {
+    } else if (mtl_current_drawable) {
         source = current_drawable_texture();
     }
     if (source && data) {

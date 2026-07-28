@@ -464,10 +464,10 @@ typedef struct OSWindow {
     id_type temp_font_group_id;
     enum RENDER_STATE render_state;
     monotonic_t last_render_frame_received_at;
-    // Metal/IOSurface governor: when this window last swapped a frame to the
-    // GPU (present is synchronous with the swap on the IOSurface path). The
-    // immediate-encode floor compares against THIS window, so one window's
-    // flood cannot starve another window's input fast path.
+    // Metal governor: when this window last swapped a frame to the GPU (the
+    // present is issued inside the swap). The immediate-encode floor compares
+    // against THIS window, so one window's flood cannot starve another
+    // window's input fast path.
     monotonic_t last_gpu_present_at;
     // L6 (Wave-13a): immediate-encode floor derived from the window display's
     // refresh period (~0.5x it). Cached here and refreshed lazily (<=1/s) so a
@@ -585,11 +585,9 @@ void gl_init(void);
 void metal_end_frame(void);
 void metal_set_current_layer(void *layer);
 void* metal_get_device(void);
-void metal_set_link_drawable(void *drawable);  // Phase 4 (L1): link-delivered drawable for this frame (legacy path)
-bool metal_immediate_encode_enabled(void);      // true on the IOSurface path (L2 intrinsic); neutered on legacy
-bool metal_iosurface_enabled(void);             // IOSurface presentation model (default; KITTY_METAL_IOSURFACE=0 = legacy)
-void metal_set_frame_link_driven(bool v);       // pace attribution: bracketed around link-tick renders
-void metal_forget_layer(void *layer);           // window teardown: free the surface ring + state slot
+void metal_set_link_drawable(void *drawable);  // Phase 4 (L1): link-delivered drawable for this frame (CAMetalDisplayLink driver)
+bool metal_immediate_encode_enabled(void);      // true under timer pace (L2 intrinsic); neutered under the CAMetalDisplayLink driver
+void metal_forget_layer(void *layer);           // window teardown: free the per-window state slot
 #endif
 void remove_vao(ssize_t vao_idx);
 bool remove_os_window(id_type os_window_id);
