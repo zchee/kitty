@@ -471,6 +471,28 @@ target_color_space_for(MTLPixelFormat fmt, bool layered) {
     return TARGET_SPACE_ENCODE_SRGB;
 }
 
+// W27 P3.5: the primaries half of the attachment vocabulary. The wide arms'
+// layers are tagged Display P3 (kitty_drawable_colorspace_name), so their
+// fragments convert linear sRGB -> linear P3 at the exit; every BGRA8 target
+// (default drawable, capture offscreen, FBO) and the layered working surface
+// stay sRGB-primaries — the capture path remains a byte-stable sRGB control
+// arm and the resolve converts for the whole layered stack. Same (fmt,
+// layered) shape as target_color_space_for so the two halves of the
+// attachment contract are specialized from the same inputs.
+static bool
+target_primaries_is_p3_for(MTLPixelFormat fmt, bool layered) {
+    if (layered) return false;
+    return fmt == MTLPixelFormatBGRA10_XR_sRGB || fmt == MTLPixelFormatBGRA10_XR || fmt == MTLPixelFormatRGBA16Float;
+}
+
+// Linear sRGB-primaries -> linear Display-P3-primaries, the C-side twin of the
+// MSL srgb_to_p3() (values pinned once in kitty/color_transfer.metal.h).
+static const double srgb_to_p3_matrix[3][3] = {
+    { KITTY_SRGB_TO_P3_R0 },
+    { KITTY_SRGB_TO_P3_R1 },
+    { KITTY_SRGB_TO_P3_R2 },
+};
+
 // Programs that composite in LINEAR space and depend on the layered resolve to
 // apply the transfer. They carry no target-space constant, so one of them
 // rendering straight to the drawable would write linear values into an
@@ -527,6 +549,7 @@ build_pso(int program, bool blend, MTLPixelFormat fmt, bool layered, MTLPixelFor
     if (!mtl_default_library) return nil;
     layered_only_program_check(program, layered);
     const int target_color_space = target_color_space_for(fmt, layered);
+    const bool target_primaries_is_p3 = target_primaries_is_p3_for(fmt, layered);
     switch (program) {
         case 0: case 1: case 2: {
             MTLFunctionConstantValues *fc = [[MTLFunctionConstantValues alloc] init];
@@ -539,11 +562,13 @@ build_pso(int program, bool blend, MTLPixelFormat fmt, bool layered, MTLPixelFor
             [fc setConstantValue:&cell_shader_opts.fg_override_threshold type:MTLDataTypeFloat atIndex:4]; // FG_OVERRIDE_THRESHOLD
             [fc setConstantValue:&cell_shader_opts.text_new_gamma type:MTLDataTypeBool atIndex:5]; // TEXT_NEW_GAMMA
             [fc setConstantValue:&target_color_space type:MTLDataTypeInt atIndex:6]; // TARGET_COLOR_SPACE
+            [fc setConstantValue:&target_primaries_is_p3 type:MTLDataTypeBool atIndex:7]; // TARGET_PRIMARIES_IS_P3
             return create_pipeline_state(@"cell_vertex", @"cell_fragment", blend, cell_vertex_descriptor(), fmt, layered, att1_fmt, fc);
         }
         case 4: {
             MTLFunctionConstantValues *fc = [[MTLFunctionConstantValues alloc] init];
             [fc setConstantValue:&target_color_space type:MTLDataTypeInt atIndex:0]; // TARGET_COLOR_SPACE
+            [fc setConstantValue:&target_primaries_is_p3 type:MTLDataTypeBool atIndex:1]; // TARGET_PRIMARIES_IS_P3
             return create_pipeline_state(@"border_vertex", @"border_fragment", blend, nil, fmt, layered, att1_fmt, fc);
         }
         case 5: case 6: case 7: {
@@ -2137,7 +2162,9 @@ ensure_layers_resolve_pso(MTLPixelFormat att1_fmt) {
     // ROP encodes on store; the linear-stored ones want linear).
     MTLFunctionConstantValues *fc = [[MTLFunctionConstantValues alloc] init];
     const int resolve_target_space = target_color_space_for(att1_fmt, false);
+    const bool resolve_primaries_is_p3 = target_primaries_is_p3_for(att1_fmt, false);
     [fc setConstantValue:&resolve_target_space type:MTLDataTypeInt atIndex:0]; // TARGET_COLOR_SPACE
+    [fc setConstantValue:&resolve_primaries_is_p3 type:MTLDataTypeBool atIndex:1]; // TARGET_PRIMARIES_IS_P3
     id<MTLFunction> v = [mtl_default_library newFunctionWithName:@"layers_resolve_vertex"];
     id<MTLFunction> f = [mtl_default_library newFunctionWithName:@"layers_resolve_fragment"
                                                  constantValues:fc error:&error];
@@ -2257,6 +2284,15 @@ drawable_clear_color(MTLPixelFormat fmt) {
     for (int i = 0; i < 3; i++) {
         const double v = c[i] <= 0.04045 ? c[i] / 12.92 : pow((c[i] + 0.055) / 1.055, 2.4);
         c[i] = v * a;  // back to premultiplied, which is what CA composites
+    }
+    // W27 P3.5: the clear is also the one non-shader consumer of the primaries
+    // conversion — same rule as the fragments (matrix on linear values;
+    // commutes with the premultiplication above).
+    if (target_primaries_is_p3_for(fmt, false)) {
+        double p3[3];
+        for (int i = 0; i < 3; i++)
+            p3[i] = MAX(0.0, srgb_to_p3_matrix[i][0] * c[0] + srgb_to_p3_matrix[i][1] * c[1] + srgb_to_p3_matrix[i][2] * c[2]);
+        memcpy(c, p3, sizeof(c));
     }
     return MTLClearColorMake(c[0], c[1], c[2], a);
 }

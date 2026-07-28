@@ -20,6 +20,10 @@ using namespace metal;
 // (output stays linear in the working surface; the resolve draw encodes) and on
 // a linear-stored wide drawable; ROP_ENCODES when the raster op applies it.
 constant int TARGET_COLOR_SPACE [[function_constant(0)]];
+// W27 P3.5: ON when the attachment is tagged Display P3 (wide drawable arms);
+// the one primaries conversion happens at the fragment exit, before any
+// transfer encode. See kitty/color_transfer.metal.h.
+constant bool TARGET_PRIMARIES_IS_P3 [[function_constant(1)]];
 
 inline float zero_or_one(float x) { return step(1.0f, x); }
 inline float if_one_then(float cond, float t, float e) { return mix(e, t, cond); }
@@ -102,6 +106,8 @@ vertex BorderVertexOut border_vertex(
 
 fragment float4 border_fragment(BorderVertexOut in [[stage_in]]) {
     float4 c = in.color_premul;
+    // Primaries before transfer (linear-space matrix; commutes with premul).
+    if (TARGET_PRIMARIES_IS_P3) c.rgb = srgb_to_p3(c.rgb);
     if (target_encodes_in_shader(TARGET_COLOR_SPACE)) {
         // Opaque borders draw with blend disabled, so encode the premultiplied
         // channels 1:1 (matching a BGRA8Unorm_sRGB attachment write).

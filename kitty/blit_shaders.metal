@@ -163,6 +163,11 @@ fragment float4 screenshot_fragment(
 // candidates, which both mean "write the linear value the working surface
 // already holds". See kitty/color_transfer.metal.h.
 constant int TARGET_COLOR_SPACE [[function_constant(0)]];
+// W27 P3.5: ON when att1 is tagged Display P3 (wide drawable arms). The
+// layered working surface holds linear sRGB-primaries premultiplied values;
+// this resolve is the single primaries-conversion point for the whole layered
+// stack. See kitty/color_transfer.metal.h.
+constant bool TARGET_PRIMARIES_IS_P3 [[function_constant(1)]];
 
 struct LayersResolveOut {
     float4 work [[color(0)]];   // working surface, passthrough (discarded)
@@ -178,6 +183,9 @@ vertex float4 layers_resolve_vertex(uint vid [[vertex_id]]) {
 fragment LayersResolveOut layers_resolve_fragment(float4 work [[color(0)]]) {
     LayersResolveOut o;
     o.work = work;
+    // Primaries before transfer: one linear-space matrix for the whole layered
+    // stack (commutes with the premultiplied alpha, so no unpremul needed).
+    if (TARGET_PRIMARIES_IS_P3) work.rgb = srgb_to_p3(work.rgb);
     // work is linear premultiplied (same contents the RGBA16 layers FBO held).
     if (target_encodes_in_shader(TARGET_COLOR_SPACE)) {
         float3 rgb = work.a > 0.0f ? work.rgb / work.a : float3(0.0f);

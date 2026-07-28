@@ -66,6 +66,12 @@ constant bool TEXT_NEW_GAMMA [[function_constant(5)]];
 // linear-stored wide drawable; ROP_ENCODES when the raster op applies it.
 // See kitty/color_transfer.metal.h.
 constant int TARGET_COLOR_SPACE [[function_constant(6)]];
+// W27 P3.5: ON when the attachment's colourspace tag declares Display P3
+// primaries (the wide drawable arms). The pipeline works in linear sRGB
+// primaries; the one conversion happens at the exit below, before any
+// transfer encode. OFF for layered draws (the working surface stays
+// sRGB-primaries; the resolve converts) and for every BGRA8 target.
+constant bool TARGET_PRIMARIES_IS_P3 [[function_constant(7)]];
 
 // ---- utils.glsl ----
 static inline float zero_or_one(float x) { return step(1.0f, x); }
@@ -537,6 +543,9 @@ fragment float4 cell_fragment(
             ans_premul = alpha_blend_premul(text_fg_premul, ans_premul);
         }
     }
+    // Primaries before transfer: the matrix operates on linear values, and it
+    // commutes with the premultiplied alpha and with the ROP's linear blend.
+    if (TARGET_PRIMARIES_IS_P3) ans_premul.rgb = srgb_to_p3(ans_premul.rgb);
     if (target_encodes_in_shader(TARGET_COLOR_SPACE)) {
         // Blend is disabled for the opaque cell draw, so the written
         // premultiplied channels are sRGB-encoded 1:1 here, matching what a

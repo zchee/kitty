@@ -31,7 +31,25 @@ _LIGATURE_TRIGGERS = "-> => != === <= >= && || :: ++ -- <<< >>>"
 _EMOJI = "\U0001F600 \U0001F389 \U0001F680 ❤️ \U0001F44D \U0001F525"
 
 
+def _disable_tty_echo() -> None:
+    # W27 P3.5 finding: capture windows take keyboard focus, and any key the
+    # operator happens to press while a capture is settling is ECHOED by the
+    # tty into the frame (observed as caret-notation arrow keys rendered at
+    # the parked cursor — the true mechanism behind the "204-class" golden
+    # flakes). The helper never reads input, so turning ECHO off makes the
+    # painted content deterministic even when keys arrive mid-capture.
+    try:
+        import termios
+        fd = sys.stdin.fileno()
+        attrs = termios.tcgetattr(fd)
+        attrs[3] &= ~termios.ECHO  # lflags
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    except Exception:
+        pass  # not a tty (or no termios): nothing to echo, nothing to do
+
+
 def main() -> int:
+    _disable_tty_echo()
     out = sys.stdout
     out.write(_CLEAR_HOME)
 
