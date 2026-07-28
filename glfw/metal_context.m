@@ -12,6 +12,13 @@
 #import <QuartzCore/CAMetalDisplayLink.h>
 #import <Cocoa/Cocoa.h>
 
+// W27 P3.2: the KITTY_METAL_DRAWABLE_FORMAT probe. Shared with kitty/metal.m
+// (which resolves the same candidate for attachment formats and the shader
+// encode) so the layer and the render pipeline can never disagree. Included
+// before internal.h, whose MAX/MIN redefinition would otherwise leak into the
+// system headers this header pulls in.
+#include "../kitty/metal_drawable_format.h"
+
 // Undefine system MAX/MIN before internal.h redefines them
 #undef MAX
 #undef MIN
@@ -361,11 +368,16 @@ bool _glfwCreateContextMetal(_GLFWwindow* window)
 
     // Configure the layer
     layer.device = (id<MTLDevice>)_glfw.metal.device;
-    // Plain (non-sRGB) BGRA8Unorm base. C1: sRGB is now encoded in-shader — the
-    // opaque cell/border fragments via the SRGB_ENCODE_OUTPUT function constant,
-    // and layered content in the single-pass resolve draw (kitty/metal.m) — so
-    // no per-frame sRGB texture view of the drawable is created any more.
-    layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    // Plain (non-sRGB) BGRA8Unorm base by default. C1: sRGB is then encoded
+    // in-shader — the opaque cell/border fragments via the SRGB_ENCODE_OUTPUT
+    // function constant, and layered content in the single-pass resolve draw
+    // (kitty/metal.m) — so no per-frame sRGB texture view of the drawable is
+    // created any more.
+    // W27 P3.2: KITTY_METAL_DRAWABLE_FORMAT can select a wide candidate
+    // instead; kitty/metal_drawable_format.h holds the candidate table and
+    // kitty/metal.m resolves the SAME candidate for the attachment formats and
+    // the encode, so the two can never disagree.
+    layer.pixelFormat = kitty_drawable_pixel_format();
     // C4a: framebufferOnly=YES lets Core Animation optimize the drawable for
     // display (lossless framebuffer compression). Safe now that nothing creates a
     // texture view of the drawable (that per-frame view creation was the Wave-1
@@ -390,14 +402,31 @@ bool _glfwCreateContextMetal(_GLFWwindow* window)
     // stored interval defaults to 1 (sync_to_monitor default yes) until
     // kitty applies the real option via swapIntervalMetal.
     window->context.metal.sync_interval = 1;
-    // layer.colorspace is intentionally left at its default, nil. Per Apple
-    // docs a nil colorspace means the drawable's content "isn't
-    // color-matched" -- Core Animation performs no colorspace transform at
-    // composite time, which is the fast, GL-parity path. kitty already does
-    // its own sRGB handling in the render pipeline (texture views selected
-    // per pass in metal.m), so a CA-side conversion would be redundant work
-    // at best and a double-conversion bug at worst. Never set a colorspace
-    // here.
+    // layer.colorspace is intentionally left at its default, nil, on the
+    // bgra8 arm. Per Apple docs a nil colorspace means the drawable's content
+    // "isn't color-matched" -- Core Animation performs no colorspace transform
+    // at composite time, which is the fast, GL-parity path. kitty already does
+    // its own sRGB handling in the render pipeline (the in-shader encode), so
+    // a CA-side conversion would be redundant work at best and a
+    // double-conversion bug at worst.
+    // W27 P3.2: the wide candidates OVERRIDE that -- their pixel values are
+    // meaningless without a tag (extended-range sRGB for the _srgb ROP-encoded
+    // format, extended-range LINEAR sRGB for the two linear-stored ones), so
+    // the probe pins the colourspace half of the coupling table here. See the
+    // table in kitty/metal_drawable_format.h (plan P3.3). Setting it costs the
+    // CA colour-matching the nil path avoids: that cost is exactly what the
+    // probe exists to price.
+    CFStringRef colorspace_name = kitty_drawable_colorspace_name();
+    if (colorspace_name) {
+        CGColorSpaceRef cs = CGColorSpaceCreateWithName(colorspace_name);
+        if (cs) {
+            layer.colorspace = cs;  // CA retains it
+            CGColorSpaceRelease(cs);
+        } else {
+            _glfwInputError(GLFW_PLATFORM_ERROR,
+                            "Metal: failed to create the drawable colorspace");
+        }
+    }
     // Allow nextDrawable to return nil instead of blocking indefinitely
     // when all drawables are in-flight. This prevents deadlock when
     // the main thread blocks in nextDrawable while the GPU needs the

@@ -11,6 +11,12 @@
 #import <Cocoa/Cocoa.h>
 #import <os/signpost.h>
 
+// W27 P3.2: the KITTY_METAL_DRAWABLE_FORMAT probe's candidate table, shared
+// with glfw/metal_context.m (which builds the CAMetalLayer from the same
+// resolver). Included with the system headers, before data-types.h redefines
+// MAX/MIN.
+#include "metal_drawable_format.h"
+
 // Undefine system MAX/MIN before data-types.h redefines them
 #undef MAX
 #undef MIN
@@ -22,6 +28,7 @@
 #include <string.h>
 #include <stdatomic.h>
 #include <stddef.h>
+#include <math.h> // pow: sRGB->linear for the wide-drawable clear colour
 #include <sched.h> // sched_yield: ring-exhaustion safety valve (ring_acquire_slot)
 
 // Dev/debug tracing, enabled by setting KITTY_METAL_LOG to a file path.
@@ -98,6 +105,18 @@ metal_capture_to_offscreen(void) {
     return metal_dump_frame_path() != NULL || global_state.thumbnail_callback.os_window != 0;
 }
 
+// The pixel format of the frame's final colour target: the CAMetalLayer's
+// drawable (the W27 P3.2 candidate, default BGRA8Unorm) or, in capture mode,
+// the readable BGRA8 offscreen that stands in for it. Keeping the capture
+// target at BGRA8 keeps the golden dump and the thumbnail read-back on their
+// 8-bit assumption under every candidate, and — because the shader encode is
+// selected per attachment format, not per process — makes the capture path a
+// permanently correct sRGB control arm even while the real drawable is wide.
+static MTLPixelFormat
+drawable_attachment_format(void) {
+    return metal_capture_to_offscreen() ? MTLPixelFormatBGRA8Unorm : kitty_drawable_pixel_format();
+}
+
 // Metal global state
 static id<MTLDevice> mtl_device = nil;
 static id<MTLCommandQueue> mtl_command_queue = nil;
@@ -159,11 +178,12 @@ static MTLPixelFormat mtl_current_enc_fmt = MTLPixelFormatInvalid;
 // pass — replacing the old RGBA16 DRAM FBO + separate BLIT pass. RGBA16Unorm
 // matches the old FBO exactly so blending precision (issue #8953) is preserved.
 #define LAYERED_WORK_FMT MTLPixelFormatRGBA16Unorm      // att0: memoryless working surface
-#define LAYERED_DRAWABLE_FMT MTLPixelFormatBGRA8Unorm   // att1: drawable / dump target
 static bool layered_pass_active = false;                // inside a layered pass? (per window: saved with the slot)
 static id<MTLTexture> layered_work_surface = nil;       // memoryless att0, grown to the drawable size
 static NSUInteger layered_work_w = 0, layered_work_h = 0;
-static id<MTLRenderPipelineState> layers_resolve_pso = nil;  // built once
+// One resolve PSO per att1 format: at most two ever exist in a process — the
+// drawable's (the W27 P3.2 candidate) and the BGRA8 capture offscreen's.
+static struct { MTLPixelFormat att1_fmt; id<MTLRenderPipelineState> pso; } layers_resolve_psos[2];
 
 // Active texture unit tracking. GL keeps an independent binding per
 // (unit, target) pair — upload paths freely bind GL_TEXTURE_2D on whatever
@@ -270,11 +290,17 @@ static int current_program = -1;
 typedef struct {
     id<MTLRenderPipelineState> pso;
     MTLPixelFormat fmt;
+    // W27 P3.2: att1's format is baked into a layered PSO (Metal requires the
+    // pipeline's attachment formats to match the render pass'), and att1 is the
+    // drawable — which is the probe candidate on a normal frame and BGRA8 on a
+    // capture frame. So it is part of the cache key, not a constant.
+    MTLPixelFormat att1_fmt;      // layered only; MTLPixelFormatInvalid otherwise
     bool blend, layered, in_use;  // layered: M1 two-attachment (att0 work + att1 drawable) variant
 } PSOCacheEntry;
 static PSOCacheEntry pso_cache[NUM_PROGRAMS * PSO_VARIANTS_PER_PROGRAM];
-static id<MTLRenderPipelineState> build_pso(int program, bool blend, MTLPixelFormat fmt, bool layered);
-static id<MTLRenderPipelineState> ensure_layers_resolve_pso(void);  // M1: att0->att1 resolve PSO
+static id<MTLRenderPipelineState> build_pso(int program, bool blend, MTLPixelFormat fmt, bool layered,
+                                            MTLPixelFormat att1_fmt);
+static id<MTLRenderPipelineState> ensure_layers_resolve_pso(MTLPixelFormat att1_fmt);  // M1: att0->att1 resolve PSO
 
 // Drop the cell-program variants so the next pso_get rebuilds them with the
 // current cell_shader_opts (config change / live reload).
@@ -294,20 +320,25 @@ invalidate_cell_pipeline_states(void) {
 static id<MTLRenderPipelineState>
 pso_get(int program, bool blend, MTLPixelFormat fmt, bool layered) {
     if (program < 0 || program >= NUM_PROGRAMS) return nil;
+    // Resolved here rather than passed in, so every call site keeps its
+    // signature and can never disagree with the pass being encoded.
+    const MTLPixelFormat att1_fmt = layered ? drawable_attachment_format() : MTLPixelFormatInvalid;
     size_t base = (size_t)program * PSO_VARIANTS_PER_PROGRAM;
     size_t free_slot = SIZE_MAX;
     for (size_t i = base; i < base + PSO_VARIANTS_PER_PROGRAM; i++) {
         if (pso_cache[i].in_use) {
-            if (pso_cache[i].blend == blend && pso_cache[i].fmt == fmt && pso_cache[i].layered == layered) return pso_cache[i].pso;
+            if (pso_cache[i].blend == blend && pso_cache[i].fmt == fmt && pso_cache[i].layered == layered &&
+                pso_cache[i].att1_fmt == att1_fmt) return pso_cache[i].pso;
         } else if (free_slot == SIZE_MAX) free_slot = i;
     }
     if (free_slot == SIZE_MAX) {
         log_error("Metal: pipeline state cache overflow for program %d", program);
         return nil;
     }
-    id<MTLRenderPipelineState> pso = build_pso(program, blend, fmt, layered);
+    id<MTLRenderPipelineState> pso = build_pso(program, blend, fmt, layered, att1_fmt);
     if (!pso) return nil;
-    pso_cache[free_slot] = (PSOCacheEntry){.pso = pso, .fmt = fmt, .blend = blend, .layered = layered, .in_use = true};
+    pso_cache[free_slot] = (PSOCacheEntry){.pso = pso, .fmt = fmt, .att1_fmt = att1_fmt, .blend = blend,
+                                           .layered = layered, .in_use = true};
     return pso;
 }
 
@@ -315,7 +346,7 @@ pso_get(int program, bool blend, MTLPixelFormat fmt, bool layered) {
 static id<MTLRenderPipelineState>
 create_pipeline_state(NSString *vertex_fn, NSString *fragment_fn, bool enable_blend,
                       MTLVertexDescriptor *vertex_desc, MTLPixelFormat pixel_format,
-                      bool layered, MTLFunctionConstantValues *constants) {
+                      bool layered, MTLPixelFormat att1_fmt, MTLFunctionConstantValues *constants) {
     if (!mtl_default_library) return nil;
     NSError *error = nil;
 
@@ -344,8 +375,9 @@ create_pipeline_state(NSString *vertex_fn, NSString *fragment_fn, bool enable_bl
     if (layered) {
         // M1: two-attachment layered pass. att1 is the drawable, written only by
         // the resolve draw (its own PSO), so every compositing PSO masks it out
-        // (it still writes att0 = the RGBA16Unorm working surface).
-        desc.colorAttachments[1].pixelFormat = LAYERED_DRAWABLE_FMT;
+        // (it still writes att0 = the RGBA16Unorm working surface). Its format
+        // must still match the pass (W27 P3.2: candidate, or BGRA8 in capture).
+        desc.colorAttachments[1].pixelFormat = att1_fmt;
         desc.colorAttachments[1].writeMask = MTLColorWriteMaskNone;
     }
     if (vertex_desc) desc.vertexDescriptor = vertex_desc;
@@ -402,8 +434,15 @@ cell_vertex_descriptor(void) {
 // GRAPHICS_ALPHA_MASK=7, BGIMAGE=8, TINT=9, TRAIL=10, BLIT=11,
 // SCREENSHOT=12, ROUNDED_RECT=13.
 static id<MTLRenderPipelineState>
-build_pso(int program, bool blend, MTLPixelFormat fmt, bool layered) {
+build_pso(int program, bool blend, MTLPixelFormat fmt, bool layered, MTLPixelFormat att1_fmt) {
     if (!mtl_default_library) return nil;
+    // C1: the opaque path encodes sRGB in the fragment because the drawable is a
+    // plain BGRA8Unorm. W27 P3.2: a wide candidate moves that responsibility off
+    // the shader — the _srgb XR format encodes in the ROP, the linear-stored
+    // formats want linear values — so the encode follows the ATTACHMENT format.
+    // Every non-drawable attachment (the layered working surface, the BGRA8
+    // capture offscreen, FBO targets) therefore keeps its pre-probe behaviour.
+    const bool srgb_encode_output = !layered && !kitty_drawable_format_is_wide(fmt);
     switch (program) {
         case 0: case 1: case 2: {
             MTLFunctionConstantValues *fc = [[MTLFunctionConstantValues alloc] init];
@@ -415,15 +454,15 @@ build_pso(int program, bool blend, MTLPixelFormat fmt, bool layered) {
             [fc setConstantValue:&cell_shader_opts.fg_override_algo type:MTLDataTypeInt atIndex:3]; // FG_OVERRIDE_ALGO
             [fc setConstantValue:&cell_shader_opts.fg_override_threshold type:MTLDataTypeFloat atIndex:4]; // FG_OVERRIDE_THRESHOLD
             [fc setConstantValue:&cell_shader_opts.text_new_gamma type:MTLDataTypeBool atIndex:5]; // TEXT_NEW_GAMMA
-            bool cell_srgb_encode = !layered; // C1: opaque path (drawable) encodes sRGB in-shader
+            bool cell_srgb_encode = srgb_encode_output;
             [fc setConstantValue:&cell_srgb_encode type:MTLDataTypeBool atIndex:6]; // SRGB_ENCODE_OUTPUT
-            return create_pipeline_state(@"cell_vertex", @"cell_fragment", blend, cell_vertex_descriptor(), fmt, layered, fc);
+            return create_pipeline_state(@"cell_vertex", @"cell_fragment", blend, cell_vertex_descriptor(), fmt, layered, att1_fmt, fc);
         }
         case 4: {
             MTLFunctionConstantValues *fc = [[MTLFunctionConstantValues alloc] init];
-            bool border_srgb_encode = !layered; // C1: opaque borders encode sRGB in-shader
+            bool border_srgb_encode = srgb_encode_output;
             [fc setConstantValue:&border_srgb_encode type:MTLDataTypeBool atIndex:0]; // SRGB_ENCODE_OUTPUT
-            return create_pipeline_state(@"border_vertex", @"border_fragment", blend, nil, fmt, layered, fc);
+            return create_pipeline_state(@"border_vertex", @"border_fragment", blend, nil, fmt, layered, att1_fmt, fc);
         }
         case 5: case 6: case 7: {
             MTLFunctionConstantValues *fc = [[MTLFunctionConstantValues alloc] init];
@@ -431,14 +470,14 @@ build_pso(int program, bool blend, MTLPixelFormat fmt, bool layered) {
             bool is_premult = (program == 6);
             [fc setConstantValue:&is_alpha_mask type:MTLDataTypeBool atIndex:0];
             [fc setConstantValue:&is_premult type:MTLDataTypeBool atIndex:1];
-            return create_pipeline_state(@"graphics_vertex", @"graphics_fragment", blend, nil, fmt, layered, fc);
+            return create_pipeline_state(@"graphics_vertex", @"graphics_fragment", blend, nil, fmt, layered, att1_fmt, fc);
         }
-        case 8: return create_pipeline_state(@"bgimage_vertex", @"bgimage_fragment", blend, nil, fmt, layered, nil);
-        case 9: return create_pipeline_state(@"tint_vertex", @"tint_fragment", blend, nil, fmt, layered, nil);
-        case 10: return create_pipeline_state(@"trail_vertex", @"trail_fragment", blend, nil, fmt, layered, nil);
-        case 11: return create_pipeline_state(@"blit_vertex", @"blit_fragment", blend, nil, fmt, layered, nil);
-        case 12: return create_pipeline_state(@"screenshot_vertex", @"screenshot_fragment", blend, nil, fmt, layered, nil);
-        case 13: return create_pipeline_state(@"rounded_rect_vertex", @"rounded_rect_fragment", blend, nil, fmt, layered, nil);
+        case 8: return create_pipeline_state(@"bgimage_vertex", @"bgimage_fragment", blend, nil, fmt, layered, att1_fmt, nil);
+        case 9: return create_pipeline_state(@"tint_vertex", @"tint_fragment", blend, nil, fmt, layered, att1_fmt, nil);
+        case 10: return create_pipeline_state(@"trail_vertex", @"trail_fragment", blend, nil, fmt, layered, att1_fmt, nil);
+        case 11: return create_pipeline_state(@"blit_vertex", @"blit_fragment", blend, nil, fmt, layered, att1_fmt, nil);
+        case 12: return create_pipeline_state(@"screenshot_vertex", @"screenshot_fragment", blend, nil, fmt, layered, att1_fmt, nil);
+        case 13: return create_pipeline_state(@"rounded_rect_vertex", @"rounded_rect_fragment", blend, nil, fmt, layered, att1_fmt, nil);
         default: return nil; // 3 == CELL_PROGRAM_SENTINEL, never drawn
     }
 }
@@ -449,13 +488,15 @@ static void
 create_all_pipeline_states(void) {
     if (!mtl_default_library) return;
     int count = 0;
-    // C1: the drawable is now a single format — plain BGRA8Unorm. sRGB is encoded
-    // in-shader (opaque cells/borders) or in the resolve (layered), so the
+    // C1: the drawable is a single format — plain BGRA8Unorm by default, or the
+    // W27 P3.2 candidate. sRGB is encoded in-shader (opaque cells/borders, only
+    // when that format wants it) or in the resolve (layered), so the
     // BGRA8Unorm_sRGB drawable-view variant is gone.
+    const MTLPixelFormat drawable_fmt = drawable_attachment_format();
     for (int p = 0; p < NUM_PROGRAMS; p++) {
         if (p == 3) continue; // CELL_PROGRAM_SENTINEL
-        if (pso_get(p, false, MTLPixelFormatBGRA8Unorm, false)) count++;
-        if (pso_get(p, true, MTLPixelFormatBGRA8Unorm, false)) count++;
+        if (pso_get(p, false, drawable_fmt, false)) count++;
+        if (pso_get(p, true, drawable_fmt, false)) count++;
     }
     // M1: pre-warm the layered two-attachment variants (att0 = RGBA16Unorm working
     // surface + att1 = drawable) for the programs that draw in the layered pass, so
@@ -466,7 +507,7 @@ create_all_pipeline_states(void) {
         if (pso_get(p, false, LAYERED_WORK_FMT, true)) count++;
         if (pso_get(p, true, LAYERED_WORK_FMT, true)) count++;
     }
-    if (ensure_layers_resolve_pso()) count++;
+    if (ensure_layers_resolve_pso(drawable_fmt)) count++;
     if (global_state.debug_rendering) {
         NSLog(@"[Metal] Pre-warmed %d pipeline states", count);
     }
@@ -1218,7 +1259,7 @@ gl_init(void) {
         log_error("[Metal] Initialized device: %s, library: %s, pipelines: %d",
             mtl_device ? [mtl_device.name UTF8String] : "nil",
             mtl_default_library ? "loaded" : "MISSING",
-            pso_get(0, false, MTLPixelFormatBGRA8Unorm, false) ? NUM_PROGRAMS : 0);
+            pso_get(0, false, drawable_attachment_format(), false) ? NUM_PROGRAMS : 0);
     }
 }
 
@@ -1933,11 +1974,15 @@ current_drawable_texture(void) {
 }
 
 // C4a/e: persistent offscreen render target used only in KITTY_METAL_DUMP_FRAME
-// mode. It mirrors the drawable exactly (plain BGRA8Unorm; C1: sRGB is encoded
-// in-shader, so no sRGB view is needed), so the final frame lands here
+// mode. It mirrors the default drawable exactly (plain BGRA8Unorm; C1: sRGB is
+// encoded in-shader, so no sRGB view is needed), so the final frame lands here
 // byte-identically to how it would on the drawable — the harness reads THIS
 // readable texture instead of drawable.texture, which lets the drawable be
 // framebufferOnly=YES. Not on any production path.
+// W27 P3.2: deliberately pinned to BGRA8 even when a wide candidate is selected
+// — the golden harness and the thumbnail read-back both decode 4 bytes/pixel,
+// and because the encode is chosen per attachment format this stays a correct
+// sRGB render rather than a mis-tagged one.
 static id<MTLTexture> dump_offscreen_base = nil;
 static NSUInteger dump_offscreen_w = 0, dump_offscreen_h = 0;
 
@@ -1966,9 +2011,10 @@ ensure_dump_offscreen(void) {
 }
 
 // The attachment format the next render pass must use, given the bound
-// framebuffer. C1: the drawable is a single plain BGRA8Unorm format — sRGB is
-// encoded in-shader (opaque cells/borders) or in the resolve draw (layered), so
-// GL_FRAMEBUFFER_SRGB no longer selects a drawable view.
+// framebuffer. C1: the drawable is a single format — plain BGRA8Unorm, or the
+// W27 P3.2 candidate — and sRGB is encoded in-shader (opaque cells/borders) or
+// in the resolve draw (layered), so GL_FRAMEBUFFER_SRGB no longer selects a
+// drawable view.
 static MTLPixelFormat
 wanted_attachment_format(bool for_clear) {
     (void)for_clear;
@@ -1979,7 +2025,7 @@ wanted_attachment_format(bool for_clear) {
         framebuffers[bound_framebuffer].in_use && framebuffers[bound_framebuffer].render_target) {
         return framebuffers[bound_framebuffer].render_target.pixelFormat;
     }
-    return MTLPixelFormatBGRA8Unorm;
+    return drawable_attachment_format();
 }
 
 // M1: the memoryless RGBA16Unorm working surface (att0), grown to the drawable
@@ -2003,24 +2049,46 @@ ensure_layered_work_surface(NSUInteger w, NSUInteger h) {
 }
 
 // M1: the resolve PSO (fullscreen; reads att0 via [[color(0)]], writes att1).
-// Built once; committed command buffers retain it.
+// Built once per att1 format; committed command buffers retain it.
 static id<MTLRenderPipelineState>
-ensure_layers_resolve_pso(void) {
-    if (layers_resolve_pso) return layers_resolve_pso;
+ensure_layers_resolve_pso(MTLPixelFormat att1_fmt) {
+    for (size_t i = 0; i < arraysz(layers_resolve_psos); i++) {
+        if (layers_resolve_psos[i].pso && layers_resolve_psos[i].att1_fmt == att1_fmt)
+            return layers_resolve_psos[i].pso;
+    }
     if (!mtl_default_library) return nil;
     NSError *error = nil;
+    // W27 P3.2: the resolve is where layered frames get their sRGB encode, so it
+    // obeys the same rule as the opaque fragments — encode only when att1 is the
+    // plain 8-bit target. A wide candidate writes linear (the _srgb XR format's
+    // ROP encodes on store; the linear-stored ones want linear).
+    MTLFunctionConstantValues *fc = [[MTLFunctionConstantValues alloc] init];
+    bool resolve_srgb_encode = !kitty_drawable_format_is_wide(att1_fmt);
+    [fc setConstantValue:&resolve_srgb_encode type:MTLDataTypeBool atIndex:0]; // SRGB_ENCODE_OUTPUT
     id<MTLFunction> v = [mtl_default_library newFunctionWithName:@"layers_resolve_vertex"];
-    id<MTLFunction> f = [mtl_default_library newFunctionWithName:@"layers_resolve_fragment"];
+    id<MTLFunction> f = [mtl_default_library newFunctionWithName:@"layers_resolve_fragment"
+                                                 constantValues:fc error:&error];
     if (!v || !f) { log_error("Metal: layers_resolve shader functions missing from metallib"); return nil; }
     MTLRenderPipelineDescriptor *d = [[MTLRenderPipelineDescriptor alloc] init];
     d.vertexFunction = v;
     d.fragmentFunction = f;
-    d.colorAttachments[0].pixelFormat = LAYERED_WORK_FMT;      // att0: read + passthrough (discarded)
-    d.colorAttachments[1].pixelFormat = LAYERED_DRAWABLE_FMT;  // att1: the drawable
-    layers_resolve_pso = [mtl_device newRenderPipelineStateWithDescriptor:d error:&error];
-    if (!layers_resolve_pso) log_error("Metal: failed to build layers resolve PSO: %s",
-            error ? [[error localizedDescription] UTF8String] : "unknown");
-    return layers_resolve_pso;
+    d.colorAttachments[0].pixelFormat = LAYERED_WORK_FMT;  // att0: read + passthrough (discarded)
+    d.colorAttachments[1].pixelFormat = att1_fmt;          // att1: the drawable / capture offscreen
+    id<MTLRenderPipelineState> pso = [mtl_device newRenderPipelineStateWithDescriptor:d error:&error];
+    if (!pso) {
+        log_error("Metal: failed to build layers resolve PSO: %s",
+                error ? [[error localizedDescription] UTF8String] : "unknown");
+        return nil;
+    }
+    for (size_t i = 0; i < arraysz(layers_resolve_psos); i++) {
+        if (!layers_resolve_psos[i].pso) {
+            layers_resolve_psos[i].pso = pso; layers_resolve_psos[i].att1_fmt = att1_fmt;
+            return pso;
+        }
+    }
+    log_error("Metal: layers resolve PSO cache overflow");  // unreachable: at most 2 att1 formats
+    [pso release];
+    return nil;
 }
 
 // M1: open the single layered render pass. att0 = memoryless RGBA16Unorm working
@@ -2044,7 +2112,7 @@ metal_begin_layered_frame(void) {
         att1 = dump_offscreen_base;
     } else {
         if (!ensure_drawable()) return;
-        att1 = current_drawable_texture();  // plain BGRA8Unorm base
+        att1 = current_drawable_texture();  // plain BGRA8Unorm base, or the P3.2 candidate
     }
     if (!att1) return;
     if (!ensure_layered_work_surface(att1.width, att1.height)) return;
@@ -2077,7 +2145,10 @@ void
 metal_resolve_layered_frame(void) {
     if (!layered_pass_active) return;
     if (mtl_current_encoder) {
-        id<MTLRenderPipelineState> pso = ensure_layers_resolve_pso();
+        // att1's real format, straight from the pass being resolved (drawable or
+        // capture offscreen), so the PSO can never disagree with it.
+        id<MTLRenderPipelineState> pso = ensure_layers_resolve_pso(
+                mtl_current_render_pass.colorAttachments[1].texture.pixelFormat);
         if (pso) {
             MTLViewport full = {0, 0, (double)layered_work_w, (double)layered_work_h, 0, 1};
             MTLScissorRect fullsr = {0, 0, layered_work_w, layered_work_h};
@@ -2089,6 +2160,26 @@ metal_resolve_layered_frame(void) {
     }
     end_current_encoder();          // stores att1 (drawable); att0 (memoryless) discarded
     layered_pass_active = false;
+}
+
+// W27 P3.2: kitty hands the drawable's clear colour over sRGB-ENCODED and
+// premultiplied (blank_canvas(..., for_final_output=true), kitty/shaders.c),
+// which is exactly right for the plain BGRA8Unorm arm — the bytes go straight
+// out. Every wide candidate's pipeline is linear instead (the _srgb XR format's
+// ROP encodes on store, the other two store linear), so the clear must be
+// linearized to match, or the padding kitty clears lands a whole gamma away
+// from the cells that abut it.
+static MTLClearColor
+drawable_clear_color(MTLPixelFormat fmt) {
+    if (!kitty_drawable_format_is_wide(fmt)) return MTLClearColorMake(clear_r, clear_g, clear_b, clear_a);
+    const double a = clear_a;
+    const double inv = a > 0 ? 1.0 / a : 0.0;  // the transfer curve is defined on
+    double c[3] = {clear_r * inv, clear_g * inv, clear_b * inv};  // UNpremultiplied colour
+    for (int i = 0; i < 3; i++) {
+        const double v = c[i] <= 0.04045 ? c[i] / 12.92 : pow((c[i] + 0.055) / 1.055, 2.4);
+        c[i] = v * a;  // back to premultiplied, which is what CA composites
+    }
+    return MTLClearColorMake(c[0], c[1], c[2], a);
 }
 
 static id<MTLRenderCommandEncoder>
@@ -2115,7 +2206,7 @@ begin_render_pass_to_drawable(bool clear) {
         targeting_drawable = true;
     } else {
         if (!ensure_drawable()) return nil;
-        target_texture = current_drawable_texture();  // plain BGRA8Unorm; sRGB in-shader
+        target_texture = current_drawable_texture();  // plain BGRA8Unorm (sRGB in-shader), or the P3.2 candidate
         targeting_drawable = true;
     }
     if (!target_texture) return nil;
@@ -2124,7 +2215,7 @@ begin_render_pass_to_drawable(bool clear) {
     rpd.colorAttachments[0].texture = target_texture;
     if (clear) {
         rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
-        rpd.colorAttachments[0].clearColor = MTLClearColorMake(clear_r, clear_g, clear_b, clear_a);
+        rpd.colorAttachments[0].clearColor = drawable_clear_color(target_texture.pixelFormat);
     } else if (targeting_drawable && !drawable_pass_opened) {
         // M3: first drawable pass of the frame. The drawable is recycled from a
         // pool so its prior contents are meaningless, and kitty repaints 100% of

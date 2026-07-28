@@ -175,6 +175,13 @@ fragment float4 screenshot_fragment(
 // the ~123 MB/frame RGBA16 round trip and the second pass are eliminated. The
 // att0 value is written back unchanged so both attachments have a defined write
 // (att0 is storeAction=DontCare, so the write is discarded). Apple-GPU only.
+// W27 P3.2: set when att1 is the plain 8-bit target (the default drawable, or
+// the BGRA8 capture offscreen) and the resolve must therefore encode linear->
+// sRGB itself. Unset for the wide drawable candidates: BGRA10_XR_sRGB has the
+// ROP encode on store, and BGRA10_XR / RGBA16Float store the linear value the
+// working surface already holds. See kitty/metal_drawable_format.h.
+constant bool SRGB_ENCODE_OUTPUT [[function_constant(0)]];
+
 struct LayersResolveOut {
     float4 work [[color(0)]];   // working surface, passthrough (discarded)
     float4 drawable [[color(1)]];
@@ -190,8 +197,15 @@ fragment LayersResolveOut layers_resolve_fragment(float4 work [[color(0)]]) {
     LayersResolveOut o;
     o.work = work;
     // work is linear premultiplied (same contents the RGBA16 layers FBO held).
-    float3 rgb = work.a > 0.0f ? work.rgb / work.a : float3(0.0f);
-    float3 srgb = linear2srgb_v(rgb);
-    o.drawable = float4(srgb * work.a, work.a);
+    if (SRGB_ENCODE_OUTPUT) {
+        float3 rgb = work.a > 0.0f ? work.rgb / work.a : float3(0.0f);
+        float3 srgb = linear2srgb_v(rgb);
+        o.drawable = float4(srgb * work.a, work.a);
+    } else {
+        // Linear premultiplied straight through: that is what an
+        // extended-LINEAR-tagged drawable stores, and what the _srgb XR ROP
+        // expects to encode.
+        o.drawable = work;
+    }
     return o;
 }
