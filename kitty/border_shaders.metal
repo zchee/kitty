@@ -10,16 +10,16 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// C1: set on the opaque path so the fragment encodes linear->sRGB itself (the
-// drawable is a plain BGRA8Unorm with no sRGB view). Unset on the layered path
-// (output stays linear in the working surface; the resolve draw encodes).
-constant bool SRGB_ENCODE_OUTPUT [[function_constant(0)]];
+// W27 P3.4: the sRGB transfer pair and the target-space vocabulary are shared
+// (kitty/color_transfer.metal.h), so this file no longer carries its own copy.
+#include "color_transfer.metal.h"
 
-inline float linear2srgb(float x) {
-    float lower = 12.92f * x;
-    float upper = 1.055f * pow(x, 1.0f / 2.4f) - 0.055f;
-    return mix(lower, upper, step(0.0031308f, x));
-}
+// C1/P3.4: the target space of the attachment this PSO renders to. ENCODE_SRGB
+// on the opaque path so the fragment applies the transfer itself (the default
+// drawable is a plain BGRA8Unorm with no sRGB view); LINEAR on the layered path
+// (output stays linear in the working surface; the resolve draw encodes) and on
+// a linear-stored wide drawable; ROP_ENCODES when the raster op applies it.
+constant int TARGET_COLOR_SPACE [[function_constant(0)]];
 
 inline float zero_or_one(float x) { return step(1.0f, x); }
 inline float if_one_then(float cond, float t, float e) { return mix(e, t, cond); }
@@ -102,7 +102,7 @@ vertex BorderVertexOut border_vertex(
 
 fragment float4 border_fragment(BorderVertexOut in [[stage_in]]) {
     float4 c = in.color_premul;
-    if (SRGB_ENCODE_OUTPUT) {
+    if (target_encodes_in_shader(TARGET_COLOR_SPACE)) {
         // Opaque borders draw with blend disabled, so encode the premultiplied
         // channels 1:1 (matching a BGRA8Unorm_sRGB attachment write).
         float3 lin = clamp(c.rgb, 0.0f, 1.0f);

@@ -1638,9 +1638,10 @@ call_cell_program(int program, const UIRenderData *ui, ssize_t vao_idx, bool for
     bind_vao_uniform_buffer(vao_idx, color_table_buffer, COLOR_TABLE_BINDING_POINT);
     glUniform1ui(cell_program_layouts[program].uniforms.draw_bg_bitfield, draw_bg_bitfield);
     // C1: on the Metal backend the drawable is a plain BGRA8Unorm and the cell
-    // fragment sRGB-encodes its output in-shader (SRGB_ENCODE_OUTPUT function
-    // constant, set for the opaque/drawable path), so GL_FRAMEBUFFER_SRGB is a
-    // no-op there. The GL backend keeps the sRGB framebuffer toggle.
+    // fragment sRGB-encodes its output in-shader (the TARGET_COLOR_SPACE
+    // function constant resolves to ENCODE_SRGB for that attachment), so
+    // GL_FRAMEBUFFER_SRGB is a no-op there. The GL backend keeps the sRGB
+    // framebuffer toggle.
 #ifndef KITTY_BACKEND_METAL
     if (for_final_output) glEnable(GL_FRAMEBUFFER_SRGB);
 #endif
@@ -1796,8 +1797,9 @@ draw_borders(ssize_t vao_idx, unsigned int num_border_rects, BorderRect *rect_bu
     };
     glUniform1uiv(border_program_layout.uniforms.colors, arraysz(colors), colors);
     glUniform1f(border_program_layout.uniforms.background_opacity, background_opacity);
-    // C1: Metal sRGB-encodes in the border fragment (SRGB_ENCODE_OUTPUT) for the
-    // opaque/drawable path, so the framebuffer toggle is a no-op there.
+    // C1: Metal sRGB-encodes in the border fragment (TARGET_COLOR_SPACE ==
+    // ENCODE_SRGB) for the opaque/drawable path, so the framebuffer toggle is a
+    // no-op there.
 #ifndef KITTY_BACKEND_METAL
     if (!w->needs_layers) glEnable(GL_FRAMEBUFFER_SRGB);
 #endif

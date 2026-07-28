@@ -16,6 +16,10 @@
 // resolver). Included with the system headers, before data-types.h redefines
 // MAX/MIN.
 #include "metal_drawable_format.h"
+// W27 P3.4: the TARGET_SPACE_* values the shaders branch on. Same header the
+// .metal files include; the MSL-only half is behind __METAL_VERSION__, so from
+// here it is just the three integer values — one definition, no drift.
+#include "color_transfer.metal.h"
 
 // Undefine system MAX/MIN before data-types.h redefines them
 #undef MAX
@@ -429,6 +433,70 @@ cell_vertex_descriptor(void) {
 }
 
 // Build one pipeline state for (program, blend, attachment format).
+// W27 P3.4: the target space the fragments must emit for a given attachment —
+// i.e. who applies the linear->sRGB transfer. The values are defined once, in
+// kitty/color_transfer.metal.h, which both this file and the shaders include,
+// so the C side and the MSL cannot drift (a mismatch here would be a
+// whole-gamma error that still compiles).
+static int
+target_color_space_for(MTLPixelFormat fmt, bool layered) {
+    // Layered compositing draws target att0, the memoryless RGBA16Unorm working
+    // surface, which is linear by construction. The resolve draw is the one that
+    // faces the drawable and it resolves its own target space from att1.
+    if (layered) return TARGET_SPACE_LINEAR;
+    if (fmt == MTLPixelFormatBGRA10_XR_sRGB) return TARGET_SPACE_ROP_ENCODES;
+    if (fmt == MTLPixelFormatBGRA10_XR || fmt == MTLPixelFormatRGBA16Float) return TARGET_SPACE_LINEAR;
+    // Plain BGRA8Unorm: the default drawable, the capture offscreen, FBO targets.
+    return TARGET_SPACE_ENCODE_SRGB;
+}
+
+// Programs that composite in LINEAR space and depend on the layered resolve to
+// apply the transfer. They carry no target-space constant, so one of them
+// rendering straight to the drawable would write linear values into an
+// sRGB-encoded target — a whole-gamma error that still compiles and still runs.
+static bool
+program_is_layered_only(int program) {
+    switch (program) {
+        case 5: case 6: case 7:  // GRAPHICS, GRAPHICS_PREMULT, GRAPHICS_ALPHA_MASK
+        case 8:                  // BGIMAGE
+        case 9:                  // TINT
+        case 10:                 // TRAIL
+        case 13:                 // ROUNDED_RECT
+            return true;
+        default: return false;
+    }
+}
+
+// W27 P3.4 invariant check. Today the layered-only property holds structurally:
+// screen_needs_rendering_in_layers() (kitty/shaders.c) enumerates — term for
+// term — exactly the UI that draw_cells_with_layers() draws with these
+// programs (visual bell, drag overlay, scrollbar, progress bar, hyperlink
+// target, window number, window logo, images), plus the background-image and
+// cursor-trail terms in prepare_to_render_os_window(). draw_cells_without_
+// layers() draws the cell program and nothing else. That pairing lives two
+// files away from these shaders and nothing enforces it, so it is CHECKED here
+// rather than assumed: build_pso sees every (program, layered) combination
+// regardless of which call path produced it.
+static void
+layered_only_program_check(int program, bool layered) {
+    if (layered || !program_is_layered_only(program)) return;
+    if (global_state.debug_rendering) {
+        fatal("Metal: program %d composites in linear space but a non-layered pipeline "
+              "state was requested for it — screen_needs_rendering_in_layers() and "
+              "draw_cells_with_layers() (kitty/shaders.c) have drifted apart", program);
+    }
+    // Not fatal in a normal build: a mis-encoded overlay is a cosmetic
+    // degradation and killing the user's terminal over it would be worse. Once
+    // per program — this runs per PSO build, not per frame, but a cache flush
+    // (config reload) rebuilds them.
+    static uint32_t reported = 0;
+    if (program >= 0 && program < 32 && !(reported & (1u << program))) {
+        reported |= 1u << program;
+        log_error("Metal: program %d composites in linear space but is being built for a "
+                  "non-layered pass; its output will be un-encoded on the drawable", program);
+    }
+}
+
 // Program indices follow the enum in kitty/shaders.c: CELL=0, CELL_FG=1,
 // CELL_BG=2, (sentinel)=3, BORDERS=4, GRAPHICS=5, GRAPHICS_PREMULT=6,
 // GRAPHICS_ALPHA_MASK=7, BGIMAGE=8, TINT=9, TRAIL=10, BLIT=11,
@@ -436,13 +504,8 @@ cell_vertex_descriptor(void) {
 static id<MTLRenderPipelineState>
 build_pso(int program, bool blend, MTLPixelFormat fmt, bool layered, MTLPixelFormat att1_fmt) {
     if (!mtl_default_library) return nil;
-    // C1: the opaque path encodes sRGB in the fragment because the drawable is a
-    // plain BGRA8Unorm. W27 P3.2: a wide candidate moves that responsibility off
-    // the shader — the _srgb XR format encodes in the ROP, the linear-stored
-    // formats want linear values — so the encode follows the ATTACHMENT format.
-    // Every non-drawable attachment (the layered working surface, the BGRA8
-    // capture offscreen, FBO targets) therefore keeps its pre-probe behaviour.
-    const bool srgb_encode_output = !layered && !kitty_drawable_format_is_wide(fmt);
+    layered_only_program_check(program, layered);
+    const int target_color_space = target_color_space_for(fmt, layered);
     switch (program) {
         case 0: case 1: case 2: {
             MTLFunctionConstantValues *fc = [[MTLFunctionConstantValues alloc] init];
@@ -454,14 +517,12 @@ build_pso(int program, bool blend, MTLPixelFormat fmt, bool layered, MTLPixelFor
             [fc setConstantValue:&cell_shader_opts.fg_override_algo type:MTLDataTypeInt atIndex:3]; // FG_OVERRIDE_ALGO
             [fc setConstantValue:&cell_shader_opts.fg_override_threshold type:MTLDataTypeFloat atIndex:4]; // FG_OVERRIDE_THRESHOLD
             [fc setConstantValue:&cell_shader_opts.text_new_gamma type:MTLDataTypeBool atIndex:5]; // TEXT_NEW_GAMMA
-            bool cell_srgb_encode = srgb_encode_output;
-            [fc setConstantValue:&cell_srgb_encode type:MTLDataTypeBool atIndex:6]; // SRGB_ENCODE_OUTPUT
+            [fc setConstantValue:&target_color_space type:MTLDataTypeInt atIndex:6]; // TARGET_COLOR_SPACE
             return create_pipeline_state(@"cell_vertex", @"cell_fragment", blend, cell_vertex_descriptor(), fmt, layered, att1_fmt, fc);
         }
         case 4: {
             MTLFunctionConstantValues *fc = [[MTLFunctionConstantValues alloc] init];
-            bool border_srgb_encode = srgb_encode_output;
-            [fc setConstantValue:&border_srgb_encode type:MTLDataTypeBool atIndex:0]; // SRGB_ENCODE_OUTPUT
+            [fc setConstantValue:&target_color_space type:MTLDataTypeInt atIndex:0]; // TARGET_COLOR_SPACE
             return create_pipeline_state(@"border_vertex", @"border_fragment", blend, nil, fmt, layered, att1_fmt, fc);
         }
         case 5: case 6: case 7: {
@@ -493,8 +554,15 @@ create_all_pipeline_states(void) {
     // when that format wants it) or in the resolve (layered), so the
     // BGRA8Unorm_sRGB drawable-view variant is gone.
     const MTLPixelFormat drawable_fmt = drawable_attachment_format();
-    for (int p = 0; p < NUM_PROGRAMS; p++) {
-        if (p == 3) continue; // CELL_PROGRAM_SENTINEL
+    // W27 P3.4: only the cell programs and the borders ever render to the
+    // drawable in a NON-layered pass (draw_cells_without_layers draws the cell
+    // program and nothing else; draw_borders runs before the layered pass
+    // opens). Every other program is layered-only — see
+    // program_is_layered_only() — so pre-warming a drawable-format variant for
+    // it built a pipeline state that could never be bound, and now would trip
+    // the layered-only check. BLIT/SCREENSHOT target FBOs and build lazily.
+    for (int p = 0; p <= 4; p++) {  // CELL, CELL_FG, CELL_BG, (sentinel), BORDERS
+        if (p == 3) continue;       // CELL_PROGRAM_SENTINEL
         if (pso_get(p, false, drawable_fmt, false)) count++;
         if (pso_get(p, true, drawable_fmt, false)) count++;
     }
@@ -2063,8 +2131,8 @@ ensure_layers_resolve_pso(MTLPixelFormat att1_fmt) {
     // plain 8-bit target. A wide candidate writes linear (the _srgb XR format's
     // ROP encodes on store; the linear-stored ones want linear).
     MTLFunctionConstantValues *fc = [[MTLFunctionConstantValues alloc] init];
-    bool resolve_srgb_encode = !kitty_drawable_format_is_wide(att1_fmt);
-    [fc setConstantValue:&resolve_srgb_encode type:MTLDataTypeBool atIndex:0]; // SRGB_ENCODE_OUTPUT
+    const int resolve_target_space = target_color_space_for(att1_fmt, false);
+    [fc setConstantValue:&resolve_target_space type:MTLDataTypeInt atIndex:0]; // TARGET_COLOR_SPACE
     id<MTLFunction> v = [mtl_default_library newFunctionWithName:@"layers_resolve_vertex"];
     id<MTLFunction> f = [mtl_default_library newFunctionWithName:@"layers_resolve_fragment"
                                                  constantValues:fc error:&error];
@@ -2169,9 +2237,15 @@ metal_resolve_layered_frame(void) {
 // ROP encodes on store, the other two store linear), so the clear must be
 // linearized to match, or the padding kitty clears lands a whole gamma away
 // from the cells that abut it.
+// W27 P3.4: the clear is the ONE consumer of the transfer that is not a shader,
+// so it deliberately asks the SAME predicate the fragments are specialized with
+// (target_color_space_for) instead of testing formats itself. If a future
+// target space needs different clear handling this is where it shows up: a
+// shader-side change alone would silently leave the cleared padding behind.
 static MTLClearColor
 drawable_clear_color(MTLPixelFormat fmt) {
-    if (!kitty_drawable_format_is_wide(fmt)) return MTLClearColorMake(clear_r, clear_g, clear_b, clear_a);
+    if (target_color_space_for(fmt, false) == TARGET_SPACE_ENCODE_SRGB)
+        return MTLClearColorMake(clear_r, clear_g, clear_b, clear_a);
     const double a = clear_a;
     const double inv = a > 0 ? 1.0 / a : 0.0;  // the transfer curve is defined on
     double c[3] = {clear_r * inv, clear_g * inv, clear_b * inv};  // UNpremultiplied colour

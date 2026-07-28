@@ -1507,6 +1507,34 @@ def compile_metal_shaders() -> Optional[str]:
         return None
     metallib_path = 'kitty/default.metallib'
 
+    def local_header_deps(sources: Iterable[str]) -> List[str]:
+        '''Headers under kitty/ that the MSL sources #include.
+
+        `xcrun metal -c` is invoked without -MMD, so the mtime comparison below
+        is the ONLY dependency tracking this build has. Without this, editing a
+        header the shaders include (color_transfer.metal.h, metal_uniforms.h)
+        leaves every .metal file older than the metallib and the stale library
+        is silently reused -- i.e. a gate run against shaders that were never
+        recompiled. Resolved transitively and by basename, which is what the
+        quoted-include form means for files that all live in kitty/.
+        '''
+        seen: Set[str] = set()
+        pending = list(sources)
+        while pending:
+            try:
+                with open(pending.pop(), encoding='utf-8') as f:
+                    text = f.read()
+            except OSError:
+                continue
+            for m in re.finditer(r'^\s*#\s*include\s+"([^"]+)"', text, re.MULTILINE):
+                dep = os.path.join('kitty', os.path.basename(m.group(1)))
+                if dep not in seen and os.path.exists(dep):
+                    seen.add(dep)
+                    pending.append(dep)
+        return sorted(seen)
+
+    metal_deps = metal_files + local_header_deps(metal_files)
+
     def install_metallib_to_bundle(src: str) -> None:
         for bundle_resources in (
             os.path.join('kitty.app', 'Contents', 'Resources'),
@@ -1521,7 +1549,7 @@ def compile_metal_shaders() -> Optional[str]:
 
     if os.path.exists(metallib_path):
         metallib_mtime = os.path.getmtime(metallib_path)
-        if all(os.path.getmtime(f) < metallib_mtime for f in metal_files):
+        if all(os.path.getmtime(f) < metallib_mtime for f in metal_deps):
             install_metallib_to_bundle(metallib_path)
             return metallib_path
     air_files = []

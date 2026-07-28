@@ -51,12 +51,27 @@ backend reproduces this by encoding sRGB in the shaders, not with a drawable vie
   deleting it (C1) is what unblocks the compression win (C4a).
 - **Opaque path** (cells/borders drawn straight to the drawable): the cell and
   border fragments encode linear→sRGB on their premultiplied output when the
-  `SRGB_ENCODE_OUTPUT` function constant is set (`build_pso` sets it `= !layered`).
-  These draws have blending disabled, so the encoded channels are written 1:1 —
-  exactly what a `BGRA8Unorm_sRGB` attachment would do on write.
+  `TARGET_COLOR_SPACE` function constant resolves to `ENCODE_SRGB`
+  (`build_pso` sets it from `target_color_space_for(fmt, layered)`, i.e. from the
+  ATTACHMENT format — W27 P3.2/P3.4). These draws have blending disabled, so the
+  encoded channels are written 1:1 — exactly what a `BGRA8Unorm_sRGB` attachment
+  would do on write.
 - **Layered path**: compositing draws output linear into the RGBA16Unorm working
-  surface (`SRGB_ENCODE_OUTPUT` unset); the resolve draw encodes (see
-  “Single-pass layered rendering”).
+  surface (`TARGET_COLOR_SPACE == LINEAR`); the resolve draw encodes (see
+  “Single-pass layered rendering”), itself specialized from att1's format.
+- **Target spaces** (`kitty/color_transfer.metal.h`, shared by the MSL and the C
+  side that specializes it): `ENCODE_SRGB` — the fragment applies the transfer
+  (plain `BGRA8Unorm` targets); `LINEAR` — the target stores linear (the layered
+  working surface, `BGRA10_XR`, `RGBA16Float`); `ROP_ENCODES` — the raster op
+  applies it on store (`BGRA10_XR_sRGB`). The last two take the same shader
+  branch but are distinct states: their ceilings differ, which is what the EDR
+  work has to reason about.
+- Programs that composite in linear space and rely on the resolve — GRAPHICS,
+  BGIMAGE, TINT, TRAIL, ROUNDED_RECT — carry no target-space constant and must
+  never render to the drawable outside a layered pass. That is structurally true
+  (`screen_needs_rendering_in_layers()` forces the layered path for every UI
+  element that draws them) and checked in `build_pso` via
+  `layered_only_program_check()`.
 - The `GL_FRAMEBUFFER_SRGB` toggles in `kitty/shaders.c` are compiled out on the
   Metal backend (`#ifndef KITTY_BACKEND_METAL`); the shim still tracks the flag as
   vestigial GL state but no longer selects any drawable format from it.

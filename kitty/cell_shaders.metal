@@ -17,6 +17,9 @@
 
 #include <metal_stdlib>
 #include "metal_uniforms.h"
+// W27 P3.4: the sRGB transfer pair and the target-space vocabulary are shared
+// (previously copy-pasted into three .metal files).
+#include "color_transfer.metal.h"
 using namespace metal;
 
 // ---- Baked cell_defines.glsl values ----
@@ -55,11 +58,14 @@ constant bool DO_FG_OVERRIDE [[function_constant(2)]];
 constant int FG_OVERRIDE_ALGO [[function_constant(3)]];
 constant float FG_OVERRIDE_THRESHOLD [[function_constant(4)]];
 constant bool TEXT_NEW_GAMMA [[function_constant(5)]];
-// C1: set on the opaque path (drawable is a plain BGRA8Unorm, no sRGB view) so
-// the fragment encodes linear->sRGB itself, exactly as the old sRGB drawable
-// view did on write. Unset on the layered path (output stays linear in the
-// RGBA16Unorm working surface; the resolve draw encodes).
-constant bool SRGB_ENCODE_OUTPUT [[function_constant(6)]];
+// C1/P3.4: the target space of the attachment this PSO renders to. ENCODE_SRGB
+// on the opaque path (drawable is a plain BGRA8Unorm, no sRGB view) so the
+// fragment applies the transfer itself, exactly as the old sRGB drawable view
+// did on write. LINEAR on the layered path (output stays linear in the
+// RGBA16Unorm working surface; the resolve draw encodes) and on a
+// linear-stored wide drawable; ROP_ENCODES when the raster op applies it.
+// See kitty/color_transfer.metal.h.
+constant int TARGET_COLOR_SPACE [[function_constant(6)]];
 
 // ---- utils.glsl ----
 static inline float zero_or_one(float x) { return step(1.0f, x); }
@@ -445,18 +451,8 @@ vertex CellVertexOut cell_vertex(
 }
 
 // ---- Fragment shader helpers (linear2srgb.glsl / alpha_blend.glsl) ----
-
-static inline float srgb2linear(float x) {
-    float lower = x / 12.92f;
-    float upper = pow((x + 0.055f) / 1.055f, 2.4f);
-    return mix(lower, upper, step(0.04045f, x));
-}
-
-static inline float linear2srgb(float x) {
-    float lower = 12.92f * x;
-    float upper = 1.055f * pow(x, 1.0f / 2.4f) - 0.055f;
-    return mix(lower, upper, step(0.0031308f, x));
-}
+// W27 P3.4: srgb2linear/linear2srgb are shared now (color_transfer.metal.h,
+// included at the top of this file), not redefined per shader.
 
 static inline float4 alpha_blend(float4 over, float4 under) {
     // Alpha blend two colors returning the resulting color pre-multiplied by
@@ -541,7 +537,7 @@ fragment float4 cell_fragment(
             ans_premul = alpha_blend_premul(text_fg_premul, ans_premul);
         }
     }
-    if (SRGB_ENCODE_OUTPUT) {
+    if (target_encodes_in_shader(TARGET_COLOR_SPACE)) {
         // Blend is disabled for the opaque cell draw, so the written
         // premultiplied channels are sRGB-encoded 1:1 here, matching what a
         // BGRA8Unorm_sRGB attachment would do on write. Clamp first (the unorm

@@ -369,7 +369,7 @@ bool _glfwCreateContextMetal(_GLFWwindow* window)
     // Configure the layer
     layer.device = (id<MTLDevice>)_glfw.metal.device;
     // Plain (non-sRGB) BGRA8Unorm base by default. C1: sRGB is then encoded
-    // in-shader — the opaque cell/border fragments via the SRGB_ENCODE_OUTPUT
+    // in-shader — the opaque cell/border fragments via the TARGET_COLOR_SPACE
     // function constant, and layered content in the single-pass resolve draw
     // (kitty/metal.m) — so no per-frame sRGB texture view of the drawable is
     // created any more.

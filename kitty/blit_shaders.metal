@@ -11,28 +11,10 @@
 #include <metal_stdlib>
 using namespace metal;
 
-
-inline float srgb2linear_f(float x) {
-    float lower = x / 12.92f;
-    float upper = pow((x + 0.055f) / 1.055f, 2.4f);
-    return mix(lower, upper, step(0.04045f, x));
-}
-
-inline float linear2srgb_f(float x) {
-    float lower = 12.92f * x;
-    float upper = 1.055f * pow(x, 1.0f / 2.4f) - 0.055f;
-    return mix(lower, upper, step(0.0031308f, x));
-}
-
-inline float3 linear2srgb_v(float3 x) {
-    float3 lower = 12.92f * x;
-    float3 upper = 1.055f * pow(x, float3(1.0f / 2.4f)) - 0.055f;
-    return mix(lower, upper, step(0.0031308f, x));
-}
-
-inline float3 srgb2linear_v(float3 c) {
-    return float3(srgb2linear_f(c.r), srgb2linear_f(c.g), srgb2linear_f(c.b));
-}
+// W27 P3.4: the sRGB transfer pair and the target-space vocabulary now live in
+// one place, shared with cell_shaders.metal, border_shaders.metal and the C
+// side that specializes these fragments.
+#include "color_transfer.metal.h"
 
 // ---- Blit uniforms ----
 
@@ -102,7 +84,7 @@ fragment float4 blit_fragment(
     float4 color_premul = image.sample(s, in.texcoord);
     // Unpremultiply, convert linear→sRGB, re-premultiply
     float3 rgb = color_premul.a > 0.0f ? color_premul.rgb / color_premul.a : float3(0.0f);
-    float3 srgb = linear2srgb_v(rgb);
+    float3 srgb = linear2srgb(rgb);
     return float4(srgb * color_premul.a, color_premul.a);
 }
 
@@ -147,10 +129,10 @@ fragment float4 screenshot_fragment(
     float4 s11 = image.sample(s, tc + float2( 0.25f,  0.25f) * texel_size);
 
     // Unpremultiply and convert to linear for each sample
-    float3 linear00 = s00.a > 0.0f ? srgb2linear_v(s00.rgb / s00.a) : float3(0.0f);
-    float3 linear10 = s10.a > 0.0f ? srgb2linear_v(s10.rgb / s10.a) : float3(0.0f);
-    float3 linear01 = s01.a > 0.0f ? srgb2linear_v(s01.rgb / s01.a) : float3(0.0f);
-    float3 linear11 = s11.a > 0.0f ? srgb2linear_v(s11.rgb / s11.a) : float3(0.0f);
+    float3 linear00 = s00.a > 0.0f ? srgb2linear(s00.rgb / s00.a) : float3(0.0f);
+    float3 linear10 = s10.a > 0.0f ? srgb2linear(s10.rgb / s10.a) : float3(0.0f);
+    float3 linear01 = s01.a > 0.0f ? srgb2linear(s01.rgb / s01.a) : float3(0.0f);
+    float3 linear11 = s11.a > 0.0f ? srgb2linear(s11.rgb / s11.a) : float3(0.0f);
 
     float avg_alpha = (s00.a + s10.a + s01.a + s11.a) * 0.25f;
 
@@ -159,7 +141,7 @@ fragment float4 screenshot_fragment(
     float total_weight = s00.a + s10.a + s01.a + s11.a;
     float3 avg_linear = total_weight > 0.0f ? weighted_sum / total_weight : float3(0.0f);
 
-    float3 srgb_color = linear2srgb_v(avg_linear);
+    float3 srgb_color = linear2srgb(avg_linear);
     return float4(srgb_color, avg_alpha);
 }
 
@@ -175,12 +157,12 @@ fragment float4 screenshot_fragment(
 // the ~123 MB/frame RGBA16 round trip and the second pass are eliminated. The
 // att0 value is written back unchanged so both attachments have a defined write
 // (att0 is storeAction=DontCare, so the write is discarded). Apple-GPU only.
-// W27 P3.2: set when att1 is the plain 8-bit target (the default drawable, or
-// the BGRA8 capture offscreen) and the resolve must therefore encode linear->
-// sRGB itself. Unset for the wide drawable candidates: BGRA10_XR_sRGB has the
-// ROP encode on store, and BGRA10_XR / RGBA16Float store the linear value the
-// working surface already holds. See kitty/metal_drawable_format.h.
-constant bool SRGB_ENCODE_OUTPUT [[function_constant(0)]];
+// W27 P3.2/P3.4: att1's target space. ENCODE_SRGB when att1 is the plain 8-bit
+// target (the default drawable, or the BGRA8 capture offscreen) and the resolve
+// must apply the transfer itself; LINEAR or ROP_ENCODES for the wide drawable
+// candidates, which both mean "write the linear value the working surface
+// already holds". See kitty/color_transfer.metal.h.
+constant int TARGET_COLOR_SPACE [[function_constant(0)]];
 
 struct LayersResolveOut {
     float4 work [[color(0)]];   // working surface, passthrough (discarded)
@@ -197,9 +179,9 @@ fragment LayersResolveOut layers_resolve_fragment(float4 work [[color(0)]]) {
     LayersResolveOut o;
     o.work = work;
     // work is linear premultiplied (same contents the RGBA16 layers FBO held).
-    if (SRGB_ENCODE_OUTPUT) {
+    if (target_encodes_in_shader(TARGET_COLOR_SPACE)) {
         float3 rgb = work.a > 0.0f ? work.rgb / work.a : float3(0.0f);
-        float3 srgb = linear2srgb_v(rgb);
+        float3 srgb = linear2srgb(rgb);
         o.drawable = float4(srgb * work.a, work.a);
     } else {
         // Linear premultiplied straight through: that is what an

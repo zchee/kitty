@@ -27,7 +27,7 @@
 //
 //   value            layer.pixelFormat   layer.colorspace                  transfer applied by
 //   ---------------  ------------------  --------------------------------  -------------------------------
-//   bgra8 (default)  BGRA8Unorm          nil (not colour-matched)          the shaders (SRGB_ENCODE_OUTPUT)
+//   bgra8 (default)  BGRA8Unorm          nil (not colour-matched)          the shaders (TARGET_COLOR_SPACE)
 //   bgra10_xr_srgb   BGRA10_XR_sRGB      kCGColorSpaceExtendedSRGB         the ROP (sRGB encode on store)
 //   bgra10_xr        BGRA10_XR           kCGColorSpaceExtendedLinearSRGB   nobody (linear stored; XR mapping
 //                                                                          shader_float = (xr10 - 384)/510)
@@ -108,13 +108,10 @@ kitty_drawable_colorspace_name(void) {
     return NULL;
 }
 
-// True for the wide candidates, i.e. exactly the drawable formats whose render
-// pipeline must emit LINEAR values. Deliberately an explicit allowlist rather
-// than "!= BGRA8Unorm": every other attachment format in the backend (the
-// RGBA16Unorm layered working surface, the BGRA8 dump offscreen, FBO targets)
-// keeps its pre-probe encode behaviour by construction.
-static inline bool
-kitty_drawable_format_is_wide(MTLPixelFormat fmt) {
-    return fmt == MTLPixelFormatBGRA10_XR_sRGB || fmt == MTLPixelFormatBGRA10_XR ||
-           fmt == MTLPixelFormatRGBA16Float;
-}
+// NOTE (W27 P3.4): the "which formats want linear values" question used to be
+// answered by a kitty_drawable_format_is_wide() predicate here. It is now
+// target_color_space_for() in kitty/metal.m, which has to distinguish
+// BGRA10_XR_sRGB (the ROP encodes) from the linear-stored formats anyway and is
+// the single classifier for BOTH consumers — the shader function constants and
+// the deferred clear colour. Keeping a second format allowlist here would be a
+// place for the two to disagree.
