@@ -2167,6 +2167,27 @@ compile_program(PyObject UNUSED *self, PyObject *args) {
     return Py_BuildValue("I", program->id);
 }
 
+// W27 P3.4 (chain 2). The cell-program options Python resolves from the config.
+// The GL backend needs nothing here — cell_defines.glsl already carries them in
+// the source Python is about to compile. The Metal backend takes them as
+// pipeline function constants, so it is told directly instead of recovering
+// them by scraping the preprocessed GLSL back apart (which made kitty/*.glsl
+// load-bearing for Metal rendering config). Defined for both backends so the
+// Python caller stays backend-agnostic.
+static PyObject*
+set_cell_shader_opts(PyObject UNUSED *self, PyObject *args) {
+    int do_fg_override, fg_override_algo, text_new_gamma;
+    float fg_override_threshold;
+    if (!PyArg_ParseTuple(args, "pifp", &do_fg_override, &fg_override_algo,
+                          &fg_override_threshold, &text_new_gamma)) return NULL;
+#ifdef KITTY_BACKEND_METAL
+    metal_set_cell_shader_opts(do_fg_override, fg_override_algo, fg_override_threshold, text_new_gamma);
+#else
+    (void)do_fg_override; (void)fg_override_algo; (void)fg_override_threshold; (void)text_new_gamma;
+#endif
+    Py_RETURN_NONE;
+}
+
 #define PYWRAP0(name) static PyObject* py##name(PYNOARG)
 #define PYWRAP1(name) static PyObject* py##name(PyObject UNUSED *self, PyObject *args)
 #define PA(fmt, ...) if(!PyArg_ParseTuple(args, fmt, __VA_ARGS__)) return NULL;
@@ -2203,6 +2224,7 @@ sprite_map_set_limits(PyObject UNUSED *self, PyObject *args) {
 #define MW(name, arg_type) {#name, (PyCFunction)py##name, arg_type, NULL}
 static PyMethodDef module_methods[] = {
     M(compile_program, METH_VARARGS),
+    M(set_cell_shader_opts, METH_VARARGS),
     M(sprite_map_set_limits, METH_VARARGS),
     MW(create_vao, METH_NOARGS),
     MW(gpu_driver_version_string, METH_NOARGS),

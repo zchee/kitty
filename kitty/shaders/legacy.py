@@ -38,6 +38,7 @@ from kitty.fast_data_types import (
     compile_program,
     get_options,
     init_cell_program,
+    set_cell_shader_opts,
 )
 from kitty.options.types import Options, defaults
 
@@ -161,6 +162,23 @@ class LoadShaderPrograms:
         self.text_old_gamma = opts.text_composition_strategy == 'legacy'
         self.text_fg_override_threshold = opts.text_fg_override_threshold
 
+        # Resolved once, consumed twice: baked into the GLSL below for the GL
+        # backend, and handed to the Metal backend directly (it takes them as
+        # pipeline function constants). Computing them in one place is the point
+        # -- the Metal side used to recover these by parsing the `#define`s back
+        # out of the preprocessed GLSL, so the two channels could not be seen to
+        # agree from any single spot in the code.
+        text_fg_override_threshold: float = opts.text_fg_override_threshold[0]
+        match opts.text_fg_override_threshold[1]:
+            case '%':
+                text_fg_override_threshold = max(0, min(text_fg_override_threshold, 100.0)) * 0.01
+            case 'ratio':
+                text_fg_override_threshold = max(0, min(text_fg_override_threshold, 21.0))
+        do_fg_override = bool(text_fg_override_threshold)
+        fg_override_algo = 1 if opts.text_fg_override_threshold[1] == '%' else 2
+        text_new_gamma = not self.text_old_gamma
+        set_cell_shader_opts(do_fg_override, fg_override_algo, text_fg_override_threshold, text_new_gamma)
+
         cell = program_for('cell')
         if self.cell_program_replacer is null_replacer:
             self.cell_program_replacer = MultiReplacer(
@@ -179,14 +197,11 @@ class LoadShaderPrograms:
             )
 
         def resolve_cell_defines(only_fg: int, only_bg: int, src: str) -> str:
-            algo = '1' if self.text_fg_override_threshold[1] == '%' else '2'
-            if not self.text_fg_override_threshold[0]:
-                algo = '0'
             r = self.cell_program_replacer.replacements
             r['ONLY_FOREGROUND'] = str(only_fg)
             r['ONLY_BACKGROUND'] = str(only_bg)
-            r['FG_OVERRIDE_ALGO'] = algo
-            r['TEXT_NEW_GAMMA'] = '0' if self.text_old_gamma else '1'
+            r['FG_OVERRIDE_ALGO'] = str(fg_override_algo) if do_fg_override else '0'
+            r['TEXT_NEW_GAMMA'] = '1' if text_new_gamma else '0'
             return self.cell_program_replacer(src)
         for prog, (only_fg, only_bg) in {
                 CELL_PROGRAM: (0, 0), CELL_FG_PROGRAM: (1, 0), CELL_BG_PROGRAM: (0, 1),

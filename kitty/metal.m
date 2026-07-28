@@ -321,6 +321,27 @@ invalidate_cell_pipeline_states(void) {
     }
 }
 
+// W27 P3.4 (chain 2). Python resolves these from the config
+// (text_composition_strategy, text_fg_override_threshold) and hands them over
+// directly. Before this they were recovered by string-scraping the `#define`s
+// out of the preprocessed GLSL that Python passed to compile_shaders() — a
+// graft-era channel that only worked because the Metal backend was wired into a
+// GL API, and that made kitty/*.glsl load-bearing for Metal rendering config.
+// Rebuilds the cell pipeline states only when a value actually changed: this is
+// called on every config reload, and the old scrape invalidated unconditionally.
+void
+metal_set_cell_shader_opts(bool do_fg_override, int fg_override_algo, float fg_override_threshold, bool text_new_gamma) {
+    if (cell_shader_opts.do_fg_override == do_fg_override &&
+        cell_shader_opts.fg_override_algo == fg_override_algo &&
+        cell_shader_opts.fg_override_threshold == fg_override_threshold &&
+        cell_shader_opts.text_new_gamma == text_new_gamma) return;
+    cell_shader_opts.do_fg_override = do_fg_override;
+    cell_shader_opts.fg_override_algo = fg_override_algo;
+    cell_shader_opts.fg_override_threshold = fg_override_threshold;
+    cell_shader_opts.text_new_gamma = text_new_gamma;
+    invalidate_cell_pipeline_states();
+}
+
 static id<MTLRenderPipelineState>
 pso_get(int program, bool blend, MTLPixelFormat fmt, bool layered) {
     if (program < 0 || program >= NUM_PROGRAMS) return nil;
@@ -1785,32 +1806,16 @@ save_texture_as_png(uint32_t texture_id, const char *filename) {
 
 // ----- Shader Compilation -----
 
-static bool
-parse_define_value(const char *source, const char *name, float *val) {
-    const char *p = strstr(source, name);
-    if (!p) return false;
-    p += strlen(name);
-    *val = strtof(p, NULL);
-    return true;
-}
-
-static void invalidate_cell_pipeline_states(void);
-
 GLuint
 compile_shaders(GLenum shader_type, GLsizei count, const GLchar * const *source) {
-    (void)shader_type;
-    // The MSL equivalents live pre-compiled in the metallib; this call only
-    // harvests the option defines Python substituted into the GLSL source.
-    for (GLsizei i = 0; i < count; i++) {
-        if (!source[i] || !strstr(source[i], "#define TEXT_NEW_GAMMA")) continue;
-        float v;
-        if (parse_define_value(source[i], "#define TEXT_NEW_GAMMA ", &v)) cell_shader_opts.text_new_gamma = v != 0.f;
-        if (parse_define_value(source[i], "#define DO_FG_OVERRIDE ", &v)) cell_shader_opts.do_fg_override = v != 0.f;
-        if (parse_define_value(source[i], "#define FG_OVERRIDE_ALGO ", &v)) cell_shader_opts.fg_override_algo = (int)v;
-        if (parse_define_value(source[i], "#define FG_OVERRIDE_THRESHOLD ", &v)) cell_shader_opts.fg_override_threshold = v;
-        invalidate_cell_pipeline_states();
-        break;
-    }
+    // The MSL equivalents live pre-compiled in the metallib, so there is nothing
+    // to compile. W27 P3.4 (chain 2): this used to scrape the cell option
+    // `#define`s back out of the GLSL source Python had just preprocessed —
+    // kitty/*.glsl was therefore load-bearing for Metal rendering config, not
+    // just for the GL backend. Those values now arrive through
+    // metal_set_cell_shader_opts() before the programs are compiled, so all that
+    // remains here is handing back a unique id for the GL shim's bookkeeping.
+    (void)shader_type; (void)count; (void)source;
     static GLuint next_shader_id = 1;
     return next_shader_id++;
 }

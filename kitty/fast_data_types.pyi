@@ -521,6 +521,13 @@ def compile_program(which: int, vertex_shaders: Tuple[str, ...], fragment_shader
 def init_cell_program() -> None:
     pass
 
+
+def set_cell_shader_opts(
+    do_fg_override: bool, fg_override_algo: int, fg_override_threshold: float, text_new_gamma: bool
+) -> None:
+    pass
+
+
 def set_os_window_chrome(os_window_id: int) -> bool:
     pass
 

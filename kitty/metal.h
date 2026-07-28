@@ -230,6 +230,14 @@ void metal_forget_layer(void *layer);       // window teardown: free the per-win
 void metal_begin_layered_frame(void);
 void metal_resolve_layered_frame(void);
 
+// W27 P3.4 (chain 2): the cell-program options Python resolves from the config
+// (text_composition_strategy, text_fg_override_threshold). GL bakes them into
+// the GLSL via cell_defines.glsl; Metal takes them as function constants, so
+// they are handed over directly instead of being scraped back out of the
+// preprocessed shader source. Rebuilds the cell pipeline states iff a value
+// actually changed. Routed from set_cell_shader_opts() in kitty/shaders.c.
+void metal_set_cell_shader_opts(bool do_fg_override, int fg_override_algo, float fg_override_threshold, bool text_new_gamma);
+
 // Stub GL functions called directly in shaders.c — these become no-ops or
 // map to Metal equivalents in metal.m
 // Note: glUniform* calls are used extensively in shaders.c; in Metal these
