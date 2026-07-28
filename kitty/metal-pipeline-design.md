@@ -2898,3 +2898,30 @@ T5' 0.9812 (band 1.006407); F1-F6 all PASS; E1 UNRUN (deferral,
 daytime-session validity failure; re-run allowance retained). Fix
 commit 2b629d194 stays; default remains OFF. Freeze hash re-verified
 at M4. Record: .omc/verify/wave26b/W26B-VERDICT.md, ADR-0019.
+
+## Phase 26c (W26c): resolve-default re-flip adjudication — M0 freeze
+
+The W26c gate table (plan §F,
+plan-2026-07-28-w26c-share-default-reflip.md v3, ralplan consensus
+complete) is frozen at sha256
+
+ebc582616a3f6d6c3fbd19c6ee1167d3c5f5dec07f6db3d1e7545dbfa892db9b
+
+(the region from the "## F." heading line through the line before the
+next "## " heading — 72 lines, 10572 bytes — LF endings, no
+normalization). All constants are inherited numerics (energy bar 1.03
+per cell, CPU guard 1.02, RSS 1.05, idle parity 0.01 s, >= 50 trimmed
+samples, loadavg < 8, A-block n=6, cells n=3, confirm n=6, closure
+0.5, MAD x 1.4826): no new pilots, no new bootstrap constants — the
+E1-family statistics never used aa_hw bands. Executed under the frozen
+W26b §3b SPLIT contract (sha 928f9746..., unchanged): flood-first
+early-abort substitution, arms rebound to HEAD 078471c99 builds per
+the ratified §D-1 INTERPRETATION (post-rebase; C1 present by patch-id
+identity 35c52667...). C-harness 916e50b4f landed before this hash;
+its analyzer reproduces the retained W26b M3 analysis exactly
+(selfcheck-retained: 232 field comparisons, incl. r_E_base_n4 0.6131
+and pooled MAD 0.3508). This tracked entry is the PRIMARY freeze
+carrier (the plan file lives under gitignored .omc/);
+.omc/verify/wave26c/M0-FREEZE.md carries the secondary copy and the
+two operator-ratified INTERPRETATIONS (§D-1 arm rebinding; §F S1
+fail-action). The verdict line will be appended here at close.
