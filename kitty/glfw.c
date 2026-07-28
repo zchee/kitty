@@ -183,7 +183,7 @@ set_layer_shell_config_for(OSWindow *w, GLFWLayerShellConfig *lsc) {
     if (lsc) {
         lsc->related.background_opacity = effective_os_window_alpha(w);
         lsc->related.background_blur = OPT(background_blur);
-        lsc->related.color_space = OPT(macos_colorspace);
+        lsc->related.color_space = MACOS_COLORSPACE_SRGB;
         lsc->related.use_physical_screen_frame = OPT(macos_use_physical_screen_frame);
         if (OPT(macos_ns_window_layer)) snprintf(lsc->related.ns_window_layer, sizeof(lsc->related.ns_window_layer), "%s", OPT(macos_ns_window_layer));
         else lsc->related.ns_window_layer[0] = '\0';
@@ -1609,7 +1609,7 @@ init_window_chrome_state(WindowChromeState *s, color_type active_window_bg, floa
         unsigned long val = OPT(macos_titlebar_color);
         SET_TCOL(val);
     }
-    s->macos_colorspace = OPT(macos_colorspace);
+    s->macos_colorspace = MACOS_COLORSPACE_SRGB;
     s->resizable = OPT(macos_window_resizable);
 #else
     if (global_state.is_wayland) { SET_TCOL(OPT(wayland_titlebar_color)); }
@@ -1894,7 +1894,7 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
     const bool set_blur = OPT(background_blur) > 0 && OPT(background_opacity) < 1.f;
     glfwWindowHint(GLFW_BLUR_RADIUS, set_blur ? OPT(background_blur) : 0);
 #ifdef __APPLE__
-    glfwWindowHint(GLFW_COCOA_COLOR_SPACE, OPT(macos_colorspace));
+    glfwWindowHint(GLFW_COCOA_COLOR_SPACE, MACOS_COLORSPACE_SRGB);
 #else
     glfwWindowHintString(GLFW_X11_INSTANCE_NAME, wm_class_name);
     glfwWindowHintString(GLFW_X11_CLASS_NAME, wm_class_class);

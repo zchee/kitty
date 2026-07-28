@@ -24,7 +24,6 @@ choices_for_background_image_layout = typing.Literal['mirror-tiled', 'scaled', '
 choices_for_default_pointer_shape = typing.Literal['arrow', 'beam', 'text', 'pointer', 'hand', 'help', 'wait', 'progress', 'crosshair', 'cell', 'vertical-text', 'move', 'e-resize', 'ne-resize', 'nw-resize', 'n-resize', 'se-resize', 'sw-resize', 's-resize', 'w-resize', 'ew-resize', 'ns-resize', 'nesw-resize', 'nwse-resize', 'zoom-in', 'zoom-out', 'alias', 'copy', 'not-allowed', 'no-drop', 'grab', 'grabbing']
 choices_for_focus_follows_mouse = typing.Literal['no', 'n', 'false', 'y', 'yes', 'true', 'drop']
 choices_for_linux_display_server = typing.Literal['auto', 'wayland', 'x11']
-choices_for_macos_colorspace = typing.Literal['srgb', 'default', 'displayp3']
 choices_for_macos_show_window_title_in = typing.Literal['all', 'menubar', 'none', 'window']
 choices_for_palette_generate = typing.Literal['fixed', 'semantic', 'legacy']
 choices_for_placement_strategy = typing.Literal['top-left', 'top', 'top-right', 'left', 'center', 'right', 'bottom-left', 'bottom', 'bottom-right']
@@ -385,7 +384,6 @@ option_names = (
     'linux_bell_theme',
     'linux_display_server',
     'listen_on',
-    'macos_colorspace',
     'macos_custom_beam_cursor',
     'macos_dock_badge_on_bell',
     'macos_fullscreen_ignore_safe_area_insets',
@@ -603,7 +601,6 @@ class Options:
     linux_bell_theme: str = '__custom'
     linux_display_server: choices_for_linux_display_server = 'auto'
     listen_on: str = 'none'
-    macos_colorspace: choices_for_macos_colorspace = 'srgb'
     macos_custom_beam_cursor: bool = False
     macos_dock_badge_on_bell: bool = True
     macos_fullscreen_ignore_safe_area_insets: bool = False

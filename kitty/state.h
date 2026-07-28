@@ -137,7 +137,6 @@ typedef struct Options {
         double outer, inner;
     } tab_bar_margin_height;
     long macos_menubar_title_max_length;
-    int macos_colorspace;
     struct {
         float val; AdjustmentUnit unit;
     } underline_position, underline_thickness, strikethrough_position, strikethrough_thickness, cell_width, cell_height, baseline;
@@ -392,6 +391,16 @@ typedef struct LiveResizeInfo {
     bool os_says_resize_complete;
     unsigned int width, height, num_of_resize_events;
 } LiveResizeInfo;
+
+// W27 P3.3: the retired macos_colorspace option's pinned value. The option set
+// NSWindow.colorSpace (the window backing store + AppKit chrome) — a surface
+// DISTINCT from the CAMetalLayer.colorspace leg the drawable-format coupling
+// table owns — and was INERT for Metal drawable content (P3.1 re-adjudication).
+// The user knob is retired with behaviour pinned at its old default (srgb = 1,
+// the to-c mapping); the remaining plumbing below (chrome-state field, GLFW
+// hint, glfwCocoaSetWindowChrome parameter) is deferred to the P3.6
+// window-capture gate, where a chrome-visible check exists.
+#define MACOS_COLORSPACE_SRGB 1
 
 typedef struct WindowChromeState {
     color_type color;
