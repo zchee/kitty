@@ -335,6 +335,13 @@ static void
 window_occlusion_callback(GLFWwindow *window, bool occluded) {
     if (!set_callback_window(window)) return;
     debug("OSWindow %llu occlusion state changed, occluded: %d\n", global_state.callback_os_window->id, occluded);
+    // W27 P2.4b diagnostic (env-gated; pairs with should_os_window_be_rendered's).
+    {
+        static int dbg = -1;
+        if (dbg < 0) dbg = getenv("KITTY_RENDER_GATE_DEBUG") ? 1 : 0;
+        if (UNLIKELY(dbg)) fprintf(stderr, "occlusion_cb: win=%llu occluded=%d\n",
+                                   global_state.callback_os_window->id, (int)occluded);
+    }
     global_state.callback_os_window->is_occluded = occluded;
     if (!occluded) {
         global_state.check_for_active_animated_images = true;
@@ -2726,12 +2733,41 @@ is_os_window_potentially_visible(OSWindow* w) {
     return (
             w->is_iconified
             || !glfwGetWindowAttrib(w->handle, GLFW_VISIBLE)
-            || w->is_occluded
+            // W27 (ADR-0021): forced redraws render even while "occluded". A
+            // never-presented CAMetalLayer window is transparent to the window
+            // server and reports occluded until its FIRST present — with the
+            // occlusion cache gating renders, a background-spawned window
+            // deadlocks (renders 0 frames forever; the IOSurface arm never hit
+            // this because a plain CALayer counts as visible content even when
+            // empty). redraw_count > 0 breaks the bootstrap cycle — the same
+            // mechanism the un-occlusion force-repaint uses (window_occlusion_
+            // callback above) — and stays bounded: the count decrements per
+            // rendered frame.
+            || (w->is_occluded && !w->redraw_count)
        ) ? false : true;
 }
 
 bool
 should_os_window_be_rendered(OSWindow* w) {
+    // W27 P2.4b diagnostic (env-gated, zero cost unset): print the gate inputs
+    // once per second so a total render blackout can be attributed.
+    {
+        static int dbg = -1;
+        if (dbg < 0) dbg = getenv("KITTY_RENDER_GATE_DEBUG") ? 1 : 0;
+        if (UNLIKELY(dbg)) {
+            static monotonic_t last = 0;
+            monotonic_t now_ = monotonic();
+            if (now_ - last > s_double_to_monotonic_t(1.0)) {
+                last = now_;
+                fprintf(stderr, "render_gate: icon=%d vis=%d occl=%d swaps=%d redraw=%u\n",
+                        (int)w->is_iconified,
+                        (int)glfwGetWindowAttrib(w->handle, GLFW_VISIBLE),
+                        (int)w->is_occluded,
+                        (int)glfwAreSwapsAllowed(w->handle),
+                        w->redraw_count);
+            }
+        }
+    }
     return is_os_window_potentially_visible(w) && glfwAreSwapsAllowed(w->handle);
 }
 

@@ -1059,7 +1059,15 @@ cocoa_cursor_blink_interval(void) {
 
 void
 cocoa_set_activation_policy(bool hide_from_tasks) {
-    [NSApp setActivationPolicy:(hide_from_tasks ? NSApplicationActivationPolicyAccessory : NSApplicationActivationPolicyRegular)];
+    // KITTY_NO_INITIAL_ACTIVATE (harness knob): keep the Accessory policy chosen
+    // at launch regardless of macos_hide_from_tasks, so a test-harness window can
+    // never re-enter the Dock/app-switcher/activation set after startup.
+    static int no_activate = -1;
+    if (no_activate < 0) {
+        const char *v = getenv("KITTY_NO_INITIAL_ACTIVATE");
+        no_activate = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    [NSApp setActivationPolicy:((hide_from_tasks || no_activate) ? NSApplicationActivationPolicyAccessory : NSApplicationActivationPolicyRegular)];
 }
 
 static PyObject*

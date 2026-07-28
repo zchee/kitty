@@ -126,9 +126,48 @@ link_trace(const char *event, _GLFWwindow *w, double extra) {
 // with metal_iosurface_enabled() in kitty/metal.m (same env var, same default).
 static bool
 iosurface_present_mode(void) {
+    // W27 (ADR-0021): default flipped — the CAMetalLayer arm won the
+    // consolidation (EDR eligibility). =1 is the transition-period kill switch
+    // back to the IOSurface host; the host is deleted at P2.4b completion.
     static int state = -1;
-    if (state < 0) { const char *v = getenv("KITTY_METAL_IOSURFACE"); state = (v && v[0] && strcmp(v, "0") == 0) ? 0 : 1; }
+    if (state < 0) { const char *v = getenv("KITTY_METAL_IOSURFACE"); state = (v && v[0] && strcmp(v, "1") == 0) ? 1 : 0; }
     return state == 1;
+}
+
+// W27 P2.4a (ADR-0021): timer-paced drawable arm — drive the CAMetalLayer arm
+// with the plain-CADisplayLink pace timer (KittyIOSurfacePaceLinkTarget) so no
+// CAMetalDisplayLink owns the drawable pool and kitty's L2 immediate-encode is
+// safe there. Must agree with metal_timer_pace_enabled() in kitty/metal.m
+// (same env var, same default).
+static bool
+timer_paced_mode(void) {
+    // W27 (ADR-0021): default ON — the winner arm ships timer-paced (the
+    // echo-immediate port). =0 restores the CAMetalDisplayLink driver.
+    static int state = -1;
+    if (state < 0) { const char *v = getenv("KITTY_METAL_TIMER_PACE"); state = (v && v[0] && v[0] == '0') ? 0 : 1; }
+    return state == 1;
+}
+
+// W27 (ADR-0021 addendum): displaySync policy for the winner arm. Windowed/
+// composited presents immediately — operator-verified tear-free (whole-surface
+// composition cannot shear) and the fastest photon ever measured here (typing
+// p50 20.0 ms vs 42.4 vsync-queued). Fullscreen keeps vsync: direct scanout
+// can genuinely tear; P5 owns any scanout-mode work. sync_to_monitor still
+// wins downward: interval 0 forces immediate everywhere.
+static void
+apply_display_sync_policy(_GLFWwindow *window) {
+    if (!window || !window->context.metal.layer) return;
+    if (iosurface_present_mode()) return;  // mirror-flag arm keeps its own path
+    NSWindow *nswin = (NSWindow*)window->ns.object;
+    const bool fullscreen = window->monitor != NULL
+        || window->ns.in_traditional_fullscreen
+        || (nswin && ([nswin styleMask] & NSWindowStyleMaskFullScreen) != 0);
+    const bool sync = window->context.metal.sync_interval != 0 && fullscreen;
+    ((CAMetalLayer*)window->context.metal.layer).displaySyncEnabled = sync ? YES : NO;
+}
+
+void _glfwCocoaApplyMetalDisplaySyncPolicy(_GLFWwindow* window) {
+    apply_display_sync_policy(window);
 }
 
 // Wave-5 governor: under the IOSurface model the render driver is a plain
@@ -187,7 +226,7 @@ static void create_metal_display_link(_GLFWwindow *window)
     // (the DEFECT-1 flicker). [NSEvent pressedMouseButtons] is AppKit ground truth;
     // a genuine drag keeps the transaction, a stuck/programmatic resize clears it.
     if (!([NSEvent pressedMouseButtons] & 1)) layer.presentsWithTransaction = NO;
-    if (iosurface_present_mode()) {
+    if (iosurface_present_mode() || timer_paced_mode()) {
         // IOSurface default: a plain CADisplayLink paces render frames (see
         // KittyIOSurfacePaceLinkTarget above). NSWindow-vended so it tracks
         // the display the window is actually on (macOS 14+; build floor 15.3).
@@ -237,7 +276,7 @@ static void destroy_metal_display_link(_GLFWwindow *window)
 {
     if (window->context.metal.display_link) link_trace("DESTROY", window, 0);
     if (window->context.metal.display_link) {
-        if (iosurface_present_mode()) {
+        if (iosurface_present_mode() || timer_paced_mode()) {
             CADisplayLink *dl = (CADisplayLink*)window->context.metal.display_link;
             [dl invalidate];  // removes it from all runloops (and drops its own target retain)
             [dl release];
@@ -303,7 +342,15 @@ static void swapIntervalMetal(int interval)
     // Runs on the CURRENT context's window (glfwMakeContextCurrent set the TLS).
     _GLFWwindow *window = _glfwPlatformGetTls(&_glfw.contextSlot);
     if (window && window->context.metal.layer) {
-        ((CAMetalLayer*)window->context.metal.layer).displaySyncEnabled = interval != 0 ? YES : NO;
+        window->context.metal.sync_interval = interval;
+        if (iosurface_present_mode()) {
+            // Mirror-flag arm (transition-period only): direct mapping as before.
+            ((CAMetalLayer*)window->context.metal.layer).displaySyncEnabled = interval != 0 ? YES : NO;
+        } else {
+            // W27 winner arm: interval feeds the windowed-immediate /
+            // fullscreen-vsync policy instead of mapping 1:1.
+            apply_display_sync_policy(window);
+        }
     }
 }
 
@@ -419,6 +466,10 @@ bool _glfwCreateContextMetal(_GLFWwindow* window)
         // more frame of queue depth). The old 2-pass-era "60 ms tail stall at 2" is
         // gone. So 2 is optimal: shallowest presentation queue == lowest latency.
         layer.maximumDrawableCount = 2;
+        // W27: seed the sync policy (windowed at creation => immediate). The
+        // stored interval defaults to 1 (sync_to_monitor default yes) until
+        // kitty applies the real option via swapIntervalMetal.
+        window->context.metal.sync_interval = 1;
         // layer.colorspace is intentionally left at its default, nil. Per Apple
         // docs a nil colorspace means the drawable's content "isn't
         // color-matched" -- Core Animation performs no colorspace transform at

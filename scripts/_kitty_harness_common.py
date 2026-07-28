@@ -53,7 +53,18 @@ def _sanitized_env() -> dict[str, str]:
     """Minimal launch environment: only allowlisted keys pass through, so a
     spawned kitty (and any Instruments trace of it) never carries the user's
     ambient secrets. Extra needs are added explicitly by the caller."""
-    return {k: os.environ[k] for k in _ENV_ALLOWLIST if k in os.environ}
+    env = {k: os.environ[k] for k in _ENV_ALLOWLIST if k in os.environ}
+    # W27: explicit opt-in passthrough for probe A/B levers. KITTY_HARNESS_PASS
+    # names the ONLY additional variables forwarded (comma-separated, e.g.
+    # "KITTY_METAL_IOSURFACE,KITTY_METAL_TIMER_PACE") — never a blanket
+    # inherit, so the secrets posture is unchanged. Lets probe scripts with
+    # hardcoded spawn calls (typing_photon.py, metal-latency.py) run arm/lever
+    # A/Bs without per-script plumbing.
+    for k in filter(None, (os.environ.get("KITTY_HARNESS_PASS") or "").split(",")):
+        k = k.strip()
+        if k and k in os.environ:
+            env[k] = os.environ[k]
+    return env
 
 # metal_present line format (kitty/metal.m:2097 IOSurface path + :2676 drawable
 # path). Both shapes share the frame=/presented_time= prefix and are matched:
@@ -295,6 +306,13 @@ def spawn_kitty(
     ]
     for opt in (extra_kitty_opts or []):
         argv += ["-o", opt]
+    # W27 probe lever (paired with KITTY_HARNESS_PASS above): additional -o
+    # overrides for A/B runs of probes whose spawn calls are hardcoded, e.g.
+    # KITTY_HARNESS_PASS_OPTS="sync_to_monitor=no". Appended last so they win.
+    for opt in filter(None, (os.environ.get("KITTY_HARNESS_PASS_OPTS") or "").split(";")):
+        opt = opt.strip()
+        if opt:
+            argv += ["-o", opt]
     if argv_command:
         argv += ["--", *argv_command]
     run_env = _sanitized_env()

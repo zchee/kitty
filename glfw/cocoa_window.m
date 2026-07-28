@@ -813,6 +813,11 @@ static void _glfwUpdateNotchCover(_GLFWwindow*);
         // deactivates the content view's inputContext and breaks IME (pre-edit)
         // input. Restore it so input methods keep working in fullscreen.
         [window->ns.object makeFirstResponder:window->ns.view];
+#ifdef KITTY_USE_METAL
+        // W27 (ADR-0021 addendum): fullscreen => vsync-locked presents
+        // (direct scanout can tear; windowed-immediate resumes on exit).
+        _glfwCocoaApplyMetalDisplaySyncPolicy(window);
+#endif
     }
     [self performSelector:@selector(request_delayed_cursor_update:) withObject:nil afterDelay:0.3];
 }
@@ -828,6 +833,10 @@ static void _glfwUpdateNotchCover(_GLFWwindow*);
     (void)notification;
     if (window) {
         window->ns.in_fullscreen_transition = false;
+#ifdef KITTY_USE_METAL
+        // W27: windowed again => immediate presents (tear-free composited).
+        _glfwCocoaApplyMetalDisplaySyncPolicy(window);
+#endif
         if (window->ns.in_traditional_fullscreen) {
             // macOS finished its Cocoa exit (cleared NSWindowStyleMaskFullScreen).
             // Defer restoration to the next run loop iteration because calling
@@ -3153,6 +3162,17 @@ int _glfwPlatformWindowBell(_GLFWwindow* window UNUSED)
     return true;
 }
 
+// Shared harness-knob check (env read once): see _glfwPlatformFocusWindow.
+static bool kitty_no_initial_activate(void)
+{
+    static int no_activate = -1;
+    if (no_activate < 0) {
+        const char *v = getenv("KITTY_NO_INITIAL_ACTIVATE");
+        no_activate = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return no_activate == 1;
+}
+
 void _glfwPlatformFocusWindow(_GLFWwindow* window)
 {
     if (_glfwPlatformWindowIconified(window)) {
@@ -3165,14 +3185,12 @@ void _glfwPlatformFocusWindow(_GLFWwindow* window)
     // focus / become the active window. Wave-4 test-harness knob (spawn_kitty) so
     // rapidly spawned test windows stay backgrounded — a visible-but-inactive window
     // still renders on damage (verified: the CAMetalDisplayLink is not
-    // activation-throttled). When UNSET this is a strict no-op: behavior is byte-for-byte
-    // the activateIgnoringOtherApps + makeKeyAndOrderFront path below, unchanged.
-    static int no_activate = -1;
-    if (no_activate < 0) {
-        const char *v = getenv("KITTY_NO_INITIAL_ACTIVATE");
-        no_activate = (v && v[0] && v[0] != '0') ? 1 : 0;
-    }
-    if (no_activate) {
+    // activation-throttled). W27 hardening: the same knob also selects
+    // NSApplicationActivationPolicyAccessory at launch (cocoa_init.m) and gates the
+    // window-cycle makeKey below, closing every activation path. When UNSET this is a
+    // strict no-op: behavior is byte-for-byte the activateIgnoringOtherApps +
+    // makeKeyAndOrderFront path below, unchanged.
+    if (kitty_no_initial_activate()) {
         [window->ns.object orderFront:nil];
         return;
     }
@@ -3734,6 +3752,9 @@ bool _glfwPlatformToggleFullscreen(_GLFWwindow* w, unsigned int flags) {
                 [window setFrame:screenFrame display:YES];
                 w->ns.in_traditional_fullscreen = true;
                 if (!ignore_safe_area_insets) _glfwUpdateNotchCover(w);
+#ifdef KITTY_USE_METAL
+                _glfwCocoaApplyMetalDisplaySyncPolicy(w);  // W27: fullscreen => vsync
+#endif
             } else {
                 made_fullscreen = false;
                 if (sm & NSWindowStyleMaskFullScreen) {
@@ -3752,6 +3773,9 @@ bool _glfwPlatformToggleFullscreen(_GLFWwindow* w, unsigned int flags) {
                     [[NSApplication sharedApplication] setPresentationOptions: NSApplicationPresentationDefault];
                     w->ns.in_traditional_fullscreen = false;
                     _glfwUpdateNotchCover(w);
+#ifdef KITTY_USE_METAL
+                    _glfwCocoaApplyMetalDisplaySyncPolicy(w);  // W27: windowed => immediate
+#endif
                 }
             }
         } else {
@@ -4491,7 +4515,10 @@ glfwCocoaCycleThroughOSWindows(bool backwards) {
         } else nextIndex = (index + 1) % filteredWindows.count;
     }
     NSWindow *nextWindow = filteredWindows[nextIndex];
-    [nextWindow makeKeyAndOrderFront:nil];
+    // Under the harness knob a window may order front but never become key
+    // (matches _glfwPlatformFocusWindow) — window cycling must not re-activate.
+    if (kitty_no_initial_activate()) [nextWindow orderFront:nil];
+    else [nextWindow makeKeyAndOrderFront:nil];
 }
 
 

@@ -1918,11 +1918,13 @@ metal_sync_immediate_enabled(void) {
 
 bool
 metal_iosurface_enabled(void) {
-    // Wave-5 default: the IOSurface model IS the Metal presentation path.
-    // KITTY_METAL_IOSURFACE=0 is the kill switch back to the legacy
-    // CAMetalDisplayLink + drawable-pool path.
+    // W27 (ADR-0021): default flipped — the CAMetalLayer arm won the
+    // consolidation (EDR eligibility; timer-paced echo-immediate ported).
+    // =1 is the transition-period switch back to the IOSurface host (must
+    // agree with iosurface_present_mode() in glfw/metal_context.m); the host
+    // is deleted at P2.4b completion.
     static int state = -1;
-    if (state < 0) { const char *v = getenv("KITTY_METAL_IOSURFACE"); state = (v && v[0] && strcmp(v, "0") == 0) ? 0 : 1; }
+    if (state < 0) { const char *v = getenv("KITTY_METAL_IOSURFACE"); state = (v && v[0] && strcmp(v, "1") == 0) ? 1 : 0; }
     return state == 1;
 }
 
@@ -2833,6 +2835,23 @@ metal_end_frame(void) {
     metal_frame_link_driven = false; // pace: re-marked per link-tick render
 }
 
+// W27 P2.4a (ADR-0021): timer-paced CAMetalLayer opt-in. When set, the legacy
+// drawable arm is driven by the plain-CADisplayLink pace timer instead of a
+// CAMetalDisplayLink (glfw/metal_context.m must agree — same env var, same
+// default), so NO link ever owns the layer's drawable pool and the L2
+// immediate-encode path is safe on the drawable arm too: nextDrawable is the
+// pool's sole consumer. This is the echo-immediate port the arm consolidation
+// requires (the winner arm lacked it; per-arm battery: typing presents 32 vs
+// ~1100 per 30 s).
+bool
+metal_timer_pace_enabled(void) {
+    // W27 (ADR-0021): default ON (the winner arm ships timer-paced); =0
+    // restores the CAMetalDisplayLink driver for diagnosis.
+    static int state = -1;
+    if (state < 0) { const char *v = getenv("KITTY_METAL_TIMER_PACE"); state = (v && v[0] && v[0] == '0') ? 0 : 1; }
+    return state == 1;
+}
+
 bool
 metal_immediate_encode_enabled(void) {
     // Under the IOSurface presentation model (the default) there is no drawable
@@ -2842,6 +2861,10 @@ metal_immediate_encode_enabled(void) {
     // PTY-write→present), and render_prepared_os_window's request_frame_render
     // resumes the pace link so sustained damage collapses to refresh-rate ticks.
     if (metal_iosurface_enabled()) return true;
+    // W27: under timer pace the drawable arm has no CAMetalDisplayLink either —
+    // the pool is unowned, nextDrawable-at-any-instant is the pre-Wave-4 proven
+    // path, and L2 is safe (the SIGSEGV below was pool ownership, not the layer).
+    if (metal_timer_pace_enabled()) return true;
     // Legacy (KITTY_METAL_IOSURFACE=0) drawable path: rendering an input frame
     // via nextDrawable while the CAMetalDisplayLink is attached corrupts the
     // drawable pool (SIGSEGV — see the "L2 ... DEFERRED" note in

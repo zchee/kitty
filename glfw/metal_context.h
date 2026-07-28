@@ -43,6 +43,12 @@ typedef struct _GLFWcontextMetal
     // so sync_to_monitor=no (which renders inline via nextDrawable + immediate
     // present) REMOVES the link from the runloop; sync_to_monitor=yes keeps it.
     bool            link_in_runloop;
+    // W27 (ADR-0021 addendum): the swap interval kitty last applied
+    // (sync_to_monitor). Stored so the display-sync POLICY can be re-evaluated
+    // on fullscreen transitions: windowed presents immediately (composited =
+    // tear-free, photon p50 20.0 vs 42.4 vsync-queued), fullscreen keeps vsync
+    // (direct scanout can genuinely tear). interval 0 forces immediate everywhere.
+    int             sync_interval;
 } _GLFWcontextMetal;
 
 // Metal-specific global data (replaces _GLFWlibraryNSGL)
@@ -74,5 +80,12 @@ void _glfwCocoaSetMetalLinkEnabled(_GLFWwindow* window, bool enabled);
 // main runloop? Arbitrates H1 (link in-runloop but starved) vs H2 (link removed)
 // at a stall. Main/render-thread only, no lock; false when the window has no link.
 bool _glfwCocoaIsMetalLinkInRunloop(_GLFWwindow* window);
+
+// W27 (ADR-0021 addendum): re-evaluate the winner arm's displaySync policy
+// (windowed = immediate/tear-free-composited, fullscreen = vsync) from the
+// stored sync_interval + the window's CURRENT fullscreen state. Called from
+// layer creation, swapIntervalMetal, and the fullscreen transition handlers
+// in cocoa_window.m. No-op on the IOSurface arm and for windows without a layer.
+void _glfwCocoaApplyMetalDisplaySyncPolicy(_GLFWwindow* window);
 
 #endif // KITTY_USE_METAL

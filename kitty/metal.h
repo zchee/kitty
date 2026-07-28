@@ -214,8 +214,9 @@ void* metal_get_device(void);
 // keep the nextDrawable path.
 void metal_set_link_drawable(void *drawable);
 
-bool metal_immediate_encode_enabled(void);  // true on the IOSurface path (L2 is intrinsic there); neutered on legacy
+bool metal_immediate_encode_enabled(void);  // true on the IOSurface path (L2 intrinsic) AND under timer pace on the drawable arm (W27)
 bool metal_iosurface_enabled(void);         // IOSurface presentation model (the default; KITTY_METAL_IOSURFACE=0 = legacy kill switch)
+bool metal_timer_pace_enabled(void);        // W27 P2.4a: drive the drawable arm with the plain pace timer (no CAMetalDisplayLink)
 void metal_set_frame_link_driven(bool v);   // pace attribution: bracketed around link-tick renders
 void metal_forget_layer(void *layer);       // window teardown: free the surface ring + state slot
 

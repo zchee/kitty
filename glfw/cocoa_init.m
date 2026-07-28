@@ -377,8 +377,17 @@ static GLFWapplicationwillfinishlaunchingfun finish_launching_callback = NULL;
     (void)notification;
     if (_glfw.hints.init.ns.menubar)
     {
-        // In case we are unbundled, make us a proper UI application
-        [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+        // In case we are unbundled, make us a proper UI application.
+        // KITTY_NO_INITIAL_ACTIVATE (harness knob, see _glfwPlatformFocusWindow in
+        // cocoa_window.m): an Accessory-policy process can never activate itself,
+        // never appears in the Dock or app switcher, and is ignored by
+        // focus-follows-mouse window managers — so a throwaway measurement window
+        // cannot steal focus through any path, while still rendering normally.
+        const char *no_activate = getenv("KITTY_NO_INITIAL_ACTIVATE");
+        if (no_activate && no_activate[0] && no_activate[0] != '0')
+            [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+        else
+            [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
 
         // Menu bar setup must go between sharedApplication and finishLaunching
         // in order to properly emulate the behavior of NSApplicationMain
