@@ -30,7 +30,7 @@
 #define OPENGL_REQUIRED_VERSION_MAJOR 3
 #define OPENGL_REQUIRED_VERSION_MINOR 3
 #else
-// OpenGL backend (Linux, or macOS without KITTY_USE_METAL)
+// OpenGL backend (Linux only; macOS is Metal-only as of W27)
 #define KITTY_BACKEND_OPENGL 1
 // Required minimum OpenGL version
 #define OPENGL_REQUIRED_VERSION_MAJOR 3

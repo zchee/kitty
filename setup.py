@@ -783,7 +783,11 @@ def kitty_env(args: Options) -> Env:
         cflags.extend(pkg_config('simde', '--cflags-only-I', fatal=False))
     libcrypto_cflags, libcrypto_ldflags = libcrypto_flags()
     cflags.extend(libcrypto_cflags)
-    use_metal = is_macos and os.environ.get('KITTY_USE_METAL', '') == '1'
+    if is_macos and os.environ.get('KITTY_USE_METAL') not in (None, '', '1'):
+        raise SystemExit(
+            'KITTY_USE_METAL is no longer a build input: macOS is Metal-only as of W27. '
+            'Unset it. There is no GL build on darwin.')
+    use_metal = is_macos
     if is_macos:
         platform_libs = [
             '-framework', 'Carbon', '-framework', 'CoreText', '-framework', 'CoreGraphics',
@@ -814,8 +818,6 @@ def kitty_env(args: Options) -> Env:
     pylib = get_python_flags(args, cflags)
     if use_metal:
         gl_libs = ['-framework', 'Metal', '-framework', 'QuartzCore', '-framework', 'IOSurface']
-    elif is_macos:
-        gl_libs = ['-framework', 'OpenGL']
     else:
         gl_libs = pkg_config('gl', '--libs')
     libpng = [f'{homebrew_prefix()}/opt/libpng/lib/libpng16.a']
@@ -1171,7 +1173,7 @@ def find_c_files() -> Tuple[List[str], List[str]]:
     } if is_macos else {
         'core_text.m', 'cocoa_window.m', 'macos_process_info.c'
     }
-    if is_macos and os.environ.get('KITTY_USE_METAL', '') == '1':
+    if is_macos:
         # The Metal backend replaces the OpenGL loader and wrapper
         exclude.update({'gl.c', 'gl-wrapper.c'})
     else:
@@ -1249,13 +1251,12 @@ def glfw_init_env(
         ans.ldflags.append(f'-F{homebrew_prefix()}/Frameworks')
         ans.cppflags.append('-DGL_SILENCE_DEPRECATION')
         frameworks = 'Cocoa IOKit CoreFoundation CoreVideo QuartzCore UniformTypeIdentifiers'
-        if os.environ.get('KITTY_USE_METAL', '') == '1':
-            ans.cppflags.append('-DKITTY_USE_METAL')
-            # The Metal backend replaces the NSGL context implementation
-            if 'nsgl_context.m' in ans.sources:
-                ans.sources.remove('nsgl_context.m')
-            ans.sources.append('metal_context.m')
-            frameworks += ' Metal'
+        ans.cppflags.append('-DKITTY_USE_METAL')
+        # The Metal backend replaces the NSGL context implementation
+        if 'nsgl_context.m' in ans.sources:
+            ans.sources.remove('nsgl_context.m')
+        ans.sources.append('metal_context.m')
+        frameworks += ' Metal'
         for f_ in frameworks.split():
             ans.ldpaths.extend(('-framework', f_))
 
@@ -1560,7 +1561,7 @@ def build_shaders(args: Options, kitty_exe: str, for_freeze: bool) -> None:
 
 def compile_metal_shaders() -> Optional[str]:
     '''Compile kitty/*.metal into the metallib used by the Metal rendering backend.'''
-    if not (is_macos and os.environ.get('KITTY_USE_METAL', '') == '1'):
+    if not is_macos:
         return None
     metal_files = sorted(glob.glob('kitty/*.metal'))
     if not metal_files:
