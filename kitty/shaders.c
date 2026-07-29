@@ -2139,6 +2139,7 @@ pygpu_driver_version_string(PyObject *self UNUSED, PyObject *args UNUSED) {
     return PyUnicode_FromString(global_state.gl_version ? gl_version_string() : "");
 }
 
+#ifndef KITTY_BACKEND_METAL
 static bool
 attach_shaders(PyObject *sources, GLuint program_id, GLenum shader_type) {
     RAII_ALLOC(const GLchar*, c_sources, calloc(PyTuple_GET_SIZE(sources), sizeof(GLchar*)));
@@ -2153,20 +2154,30 @@ attach_shaders(PyObject *sources, GLuint program_id, GLenum shader_type) {
     glDeleteShader(shader_id);
     return true;
 }
+#endif
 
 static PyObject*
 compile_program(PyObject UNUSED *self, PyObject *args) {
-    PyObject *vertex_shaders, *fragment_shaders;
     int which, allow_recompile = 0;
+#ifdef KITTY_BACKEND_METAL
+    // W27 GLSL freeze-out (stage 3): the Metal backend has nothing to
+    // compile -- the MSL equivalents are pre-compiled into default.metallib
+    // (see compile_shaders() in metal.m). kitty/shaders.py therefore never
+    // reads kitty/*.glsl on this backend and has no source tuples to pass.
+    if (!PyArg_ParseTuple(args, "i|p", &which, &allow_recompile)) return NULL;
+#else
+    PyObject *vertex_shaders, *fragment_shaders;
     if (!PyArg_ParseTuple(args, "iO!O!|p", &which, &PyTuple_Type, &vertex_shaders, &PyTuple_Type, &fragment_shaders, &allow_recompile)) return NULL;
+#endif
     if (which < 0 || which >= NUM_PROGRAMS) { PyErr_Format(PyExc_ValueError, "Unknown program: %d", which); return NULL; }
     Program *program = program_ptr(which);
     if (program->id != 0) {
         if (allow_recompile) { glDeleteProgram(program->id); program->id = 0; }
         else { PyErr_SetString(PyExc_ValueError, "program already compiled"); return NULL; }
     }
-#define fail_compile() { glDeleteProgram(program->id); return NULL; }
     program->id = glCreateProgram();
+#ifndef KITTY_BACKEND_METAL
+#define fail_compile() { glDeleteProgram(program->id); return NULL; }
     if (!attach_shaders(vertex_shaders, program->id, GL_VERTEX_SHADER)) fail_compile();
     if (!attach_shaders(fragment_shaders, program->id, GL_FRAGMENT_SHADER)) fail_compile();
     glLinkProgram(program->id);
@@ -2180,6 +2191,7 @@ compile_program(PyObject UNUSED *self, PyObject *args) {
         fail_compile();
     }
 #undef fail_compile
+#endif
     init_uniforms(which);
     return Py_BuildValue("I", program->id);
 }
@@ -2262,6 +2274,15 @@ finalize(void) {
 
 bool
 init_shaders(PyObject *module) {
+    // W27 GLSL freeze-out (stage 3): lets kitty/shaders.py decide, once, at
+    // import time, whether to read kitty/*.glsl off disk at all. The Metal
+    // backend never needs GLSL source (see compile_program() below), so
+    // Program() must not touch the filesystem when this is true.
+#ifdef KITTY_BACKEND_METAL
+    if (PyModule_AddObject(module, "BACKEND_IS_METAL", Py_NewRef(Py_True)) != 0) { PyErr_NoMemory(); return false; }
+#else
+    if (PyModule_AddObject(module, "BACKEND_IS_METAL", Py_NewRef(Py_False)) != 0) { PyErr_NoMemory(); return false; }
+#endif
 #define C(x) if (PyModule_AddIntConstant(module, #x, x) != 0) { PyErr_NoMemory(); return false; }
     C(CELL_PROGRAM); C(CELL_FG_PROGRAM); C(CELL_BG_PROGRAM); C(BORDERS_PROGRAM);
     C(GRAPHICS_PROGRAM); C(GRAPHICS_PREMULT_PROGRAM); C(GRAPHICS_ALPHA_MASK_PROGRAM);

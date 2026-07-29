@@ -2356,7 +2356,11 @@ def package(args: Options, bundle_type: str, do_build_all: bool = True) -> None:
     shutil.copy2('logo/beam-cursor@2x.png', os.path.join(libdir, 'logo'))
     shutil.copytree('shell-integration', os.path.join(libdir, 'shell-integration'), dirs_exist_ok=True)
     shutil.copytree('fonts', os.path.join(libdir, 'fonts'), dirs_exist_ok=True)
-    allowed_extensions = frozenset('py slang glsl so'.split())
+    # .glsl is the GL backend's shader source, read at runtime by
+    # kitty/shaders/legacy.py. On darwin the Metal backend loads pre-compiled
+    # MSL from default.metallib and never opens a .glsl, so they are not
+    # shipped there (W27 GLSL freeze-out, stage 3). Linux still needs them.
+    allowed_extensions = frozenset(('py', 'slang', 'so') if is_macos else ('py', 'slang', 'glsl', 'so'))
 
     def src_ignore(parent: str, entries: Iterable[str]) -> List[str]:
         return [

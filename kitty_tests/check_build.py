@@ -12,6 +12,7 @@ import tempfile
 import textwrap
 import unittest
 from functools import partial
+from unittest.mock import patch
 
 from .base import BaseTest
 
@@ -40,9 +41,23 @@ class TestBuild(BaseTest):
         test_slang_build()
 
     def test_loading_shaders(self) -> None:
+        from kitty.constants import extensions_dir, is_macos
+        from kitty.fast_data_types import BACKEND_IS_METAL
         from kitty.shaders.legacy import Program
-        for name in 'cell border bgimage tint graphics'.split():
-            Program(name)
+        names = 'cell border bgimage tint graphics'.split()
+        if is_macos:
+            # W27 GLSL freeze-out (stage 3): macOS is Metal-only, the
+            # metallib must exist, and Program() must never touch kitty/*.glsl.
+            self.assertTrue(BACKEND_IS_METAL, 'macOS must build the Metal backend')
+            metallib = os.path.join(extensions_dir, 'default.metallib')
+            self.assertTrue(os.path.isfile(metallib), f'Metal shader library missing: {metallib}')
+            with patch('kitty.shaders.legacy.read_kitty_resource', side_effect=AssertionError(
+                    'Program() read a .glsl resource on the Metal backend')):
+                for name in names:
+                    Program(name)
+        else:
+            for name in names:
+                Program(name)
 
     def test_macos_dictation_forwarding(self) -> None:
         from kitty.constants import glfw_path, is_macos

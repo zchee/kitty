@@ -9,6 +9,7 @@ from typing import Any, Literal, Optional
 
 from kitty.constants import read_kitty_resource
 from kitty.fast_data_types import (
+    BACKEND_IS_METAL,
     BGIMAGE_PROGRAM,
     BLINK,
     BLIT_PROGRAM,
@@ -64,8 +65,15 @@ class Program:
             Program.include_pat = re.compile(r'^#pragma\s+kitty_include_shader\s+<(.+?)>', re.MULTILINE)
         self.vertex_name = vertex_name or f'{name}_vertex.glsl'
         self.fragment_name = fragment_name or f'{name}_fragment.glsl'
-        self.original_vertex_sources = tuple(self._load_sources(self.vertex_name, set()))
-        self.original_fragment_sources = tuple(self._load_sources(self.fragment_name, set()))
+        if BACKEND_IS_METAL:
+            # W27 GLSL freeze-out (stage 3): the Metal backend renders from
+            # pre-compiled MSL in default.metallib and never opens a .glsl
+            # (see compile() below), so there is nothing to read here.
+            self.original_vertex_sources: tuple[str, ...] = ()
+            self.original_fragment_sources: tuple[str, ...] = ()
+        else:
+            self.original_vertex_sources = tuple(self._load_sources(self.vertex_name, set()))
+            self.original_fragment_sources = tuple(self._load_sources(self.fragment_name, set()))
         self.vertex_sources = self.original_vertex_sources
         self.fragment_sources = self.original_fragment_sources
 
@@ -97,7 +105,10 @@ class Program:
 
     def compile(self, program_id: int, allow_recompile: bool = False) -> None:
         try:
-            compile_program(program_id, self.vertex_sources, self.fragment_sources, allow_recompile)
+            if BACKEND_IS_METAL:
+                compile_program(program_id, allow_recompile)
+            else:
+                compile_program(program_id, self.vertex_sources, self.fragment_sources, allow_recompile)
             return
         except ValueError as err:
             lines = str(err).splitlines()
