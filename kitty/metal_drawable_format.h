@@ -31,13 +31,13 @@
 // All three must move together or the frame is double-encoded (gamma-sized
 // error) or never encoded at all:
 //
-//   value            layer.pixelFormat   layer.colorspace                     transfer applied by
-//   ---------------  ------------------  -----------------------------------  -------------------------------
-//   bgra8 (default)  BGRA8Unorm          nil (not colour-matched)             the shaders (TARGET_COLOR_SPACE)
-//   bgra10_xr_srgb   BGRA10_XR_sRGB      kCGColorSpaceExtendedDisplayP3       the ROP (sRGB encode on store)
-//   bgra10_xr        BGRA10_XR           kCGColorSpaceExtendedLinearDisplayP3 nobody (linear stored; XR mapping
-//                                                                             shader_float = (xr10 - 384)/510)
-//   rgba16f          RGBA16Float         kCGColorSpaceExtendedLinearDisplayP3 nobody (linear float end to end)
+//   value             layer.pixelFormat   layer.colorspace                     transfer applied by
+//   ----------------  ------------------  -----------------------------------  -------------------------------
+//   bgra8 (control)   BGRA8Unorm          nil (not colour-matched)             the shaders (TARGET_COLOR_SPACE)
+//   bgra10_xr_srgb    BGRA10_XR_sRGB      kCGColorSpaceExtendedDisplayP3       the ROP (sRGB encode on store)
+//   bgra10_xr         BGRA10_XR           kCGColorSpaceExtendedLinearDisplayP3 nobody (linear stored; XR mapping
+//                                                                              shader_float = (xr10 - 384)/510)
+//   rgba16f (default) RGBA16Float         kCGColorSpaceExtendedLinearDisplayP3 nobody (linear float end to end)
 //
 // So for every candidate except bgra8 the render pipeline emits LINEAR values:
 // the in-shader encode is off, the layered resolve's encode is off, and the
@@ -74,10 +74,17 @@ typedef enum {
 // The selected candidate. Read from the environment once, cached: the drawable
 // format is fixed for the process lifetime (PSOs and the layer are built
 // against it), so a mid-run change must not be observable.
+//
+// W27 P3.6 FLIP: the default is rgba16f — the P3.2 selection (FORMAL
+// 2026-07-29: only EDR-LIVE format, alpha-capable, gpu p50 wall-compliant
+// windowed and FASTER than bgra8 at 6K fullscreen on every scenario; the
+// linear pipeline deletes the per-pixel sRGB encode). bgra8 remains the
+// explicit control arm via KITTY_METAL_DRAWABLE_FORMAT=bgra8 and stays the
+// permanent capture-offscreen format. Revert point: tag w27-pre-format-flip.
 static inline KittyDrawableFormatId
 kitty_drawable_format_id(void) {
     static bool checked = false;
-    static KittyDrawableFormatId id = DRAWABLE_FORMAT_BGRA8;
+    static KittyDrawableFormatId id = DRAWABLE_FORMAT_RGBA16F;
     if (!checked) {
         checked = true;
         const char *s = getenv("KITTY_METAL_DRAWABLE_FORMAT");
@@ -88,7 +95,7 @@ kitty_drawable_format_id(void) {
             else if (strcmp(s, "rgba16f") == 0) id = DRAWABLE_FORMAT_RGBA16F;
             else fprintf(stderr, "[kitty] unknown KITTY_METAL_DRAWABLE_FORMAT=%s"
                                  " (expected one of: bgra8 bgra10_xr_srgb bgra10_xr rgba16f);"
-                                 " using bgra8\n", s);
+                                 " using the default (rgba16f)\n", s);
         }
     }
     return id;
