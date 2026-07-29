@@ -397,7 +397,15 @@ bool _glfwCreateContextMetal(_GLFWwindow* window)
     // (no smoothness gain) while adding ~2 ms of PTY-write->present latency (one
     // more frame of queue depth). The old 2-pass-era "60 ms tail stall at 2" is
     // gone. So 2 is optimal: shallowest presentation queue == lowest latency.
-    layer.maximumDrawableCount = 2;
+    // W27 P5.2 (LEVER-DRAWABLE, the AC5-binding adjudication): that Wave-4
+    // verdict predates the winner mechanism (timer pace, no link owning the
+    // pool) and the rgba16f flip, so the depth is re-adjudicated on the current
+    // pipeline. KITTY_METAL_DRAWABLE_COUNT=3 opts the pool back to the layer
+    // default for the A/B battery; anything else keeps the measured 2.
+    {
+        const char *v = getenv("KITTY_METAL_DRAWABLE_COUNT");
+        layer.maximumDrawableCount = (v && v[0] == '3' && !v[1]) ? 3 : 2;
+    }
     // W27: seed the sync policy (windowed at creation => immediate). The
     // stored interval defaults to 1 (sync_to_monitor default yes) until
     // kitty applies the real option via swapIntervalMetal.
