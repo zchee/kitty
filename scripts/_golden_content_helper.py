@@ -30,6 +30,22 @@ _TRUECOLOR_SAMPLE = (
 _LIGATURE_TRIGGERS = "-> => != === <= >= && || :: ++ -- <<< >>>"
 _EMOJI = "\U0001F600 \U0001F389 \U0001F680 ❤️ \U0001F44D \U0001F525"
 
+# W27 P3.6 / GLSL-freeze-out stage 0: two additional scenes close the golden
+# coverage hole over the GRAPHICS and ROUNDED_RECT programs (risk R4 in
+# GLSL-FREEZEOUT-DESIGN.md). Scene selection rides argv[1]; NO argument means
+# the legacy scene, byte-for-byte identical to the pre-P3.6 content, so the
+# four existing golden configs keep their baselines.
+#
+# An 8x8 RGBA PNG, generated deterministically (four R/G/B/W quadrants plus
+# two mid-tone pixels) and embedded so the scene needs no filesystem asset.
+# Displayed via the graphics protocol APC directly (a=T transmit+display,
+# f=100 PNG, c/r scale to cells) -- no kitten involved, stdlib only.
+_GRAPHICS_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAYAAADED76LAAAAMklEQVR4nGP8z8DwnwEJ"
+    "MKJyGZhQeFgAaQoaHQ5gUfIfFTocaPiPDEBuQnEVGpcKjgQAJbEe80vcVQEAAAAASUVO"
+    "RK5CYII="
+)
+
 
 def _disable_tty_echo() -> None:
     # W27 P3.5 finding: capture windows take keyboard focus, and any key the
@@ -67,6 +83,36 @@ def main() -> int:
 
     out.write(_EMOJI)
     out.write("\r\n")
+
+    scene = sys.argv[1] if len(sys.argv) > 1 else "legacy"
+    if scene == "graphics":
+        # GRAPHICS program coverage: transmit + display the embedded PNG at a
+        # fixed cell rect below the text content. Nearest-sampled upscale of
+        # flat quadrants stays flat, so the block is pixel-deterministic.
+        out.write("\x1b[7;1H")
+        out.write(f"\x1b_Ga=T,f=100,c=16,r=4;{_GRAPHICS_PNG_B64}\x1b\\")
+    elif scene == "progress":
+        # ROUNDED_RECT program coverage: a determinate OSC 9;4 progress report
+        # (state 1, 50 %) makes kitty draw the progress-bar overlay (option
+        # progress_bar, default 'top'); determinate bars do not animate, so
+        # the held frame is static.
+        out.write("\x1b]9;4;1;50\x1b\\")
+    elif scene == "palette":
+        # W27 P3.6: OKLCH palette entries through kitty's own parser (OSC 4 →
+        # Color.parse_color) painted as SGR 48;5 swatches — the golden twin of
+        # the .omc accuracy-gate palette rows. On the BGRA8 capture control arm
+        # this locks the dump-channel rendering of wide-capable palette
+        # entries across the format flip (baselined at the P3.6 re-baseline).
+        specs = (
+            "oklch(0.62 0.26 29)", "oklch(0.87 0.22 110)", "oklch(0.86 0.30 142)",
+            "oklch(0.80 0.16 195)", "oklch(0.70 0.40 25)", "oklch(0.55 0.30 264)",
+            "oklch(0.80 0.20 150)", "oklch(0.50 0.28 290)",
+        )
+        for i, spec in enumerate(specs):
+            out.write(f"\x1b]4;{16 + i};{spec}\x1b\\")
+        out.write("\x1b[7;1H")
+        for i in range(len(specs)):
+            out.write(f"\x1b[48;5;{16 + i}m    \x1b[0m")
 
     # Fixed final cursor position, deterministic across every config in the
     # matrix, so cursor rendering itself is part of the reproducible frame.

@@ -74,6 +74,22 @@ CONFIG_MATRIX: dict[str, list[str]] = {
     # trail animation itself).
     "cursor_trail": ["cursor_trail=20"],
     "bgimage": [f"background_image={BGIMAGE_ASSET}"],
+    # W27 P3.6 / GLSL-freeze-out stage 0 (risk R4): coverage for the GRAPHICS
+    # and ROUNDED_RECT programs, previously exercised by no golden config, and
+    # the OKLCH-palette scene that locks the dump channel's rendering of
+    # wide-capable palette entries. Content varies per scene (CONFIG_SCENE);
+    # the four legacy configs keep the byte-identical legacy scene.
+    "graphics": [],
+    "progress-bar": ["progress_bar=top"],
+    "palette-oklch": [],
+}
+
+# Scene argument handed to the content helper (argv[1]); configs not listed
+# here run the legacy scene, whose bytes are pinned by the existing baselines.
+CONFIG_SCENE: dict[str, str] = {
+    "graphics": "graphics",
+    "progress-bar": "progress",
+    "palette-oklch": "palette",
 }
 
 
@@ -105,8 +121,12 @@ def capture_config(name: str, opts: list[str], output_dir: Path, timeout: float,
     # silently produces nothing — or, at a display-attach boundary, a single
     # empty (all-black) frame. The Wave-2/3 reference driver pinned focus for
     # the same reason ("golden_capture_focus_pinned").
+    helper_argv = [sys.executable, str(CONTENT_HELPER)]
+    scene = CONFIG_SCENE.get(name)
+    if scene:
+        helper_argv.append(scene)
     proc = spawn_kitty(
-        [sys.executable, str(CONTENT_HELPER)],
+        helper_argv,
         extra_env={"KITTY_METAL_DUMP_FRAME": str(png_path), **(env or {})},
         extra_kitty_opts=full_opts,
         take_focus=True,
