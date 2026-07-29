@@ -664,6 +664,14 @@ def safe_pipe(nonblock: bool = True) -> Tuple[int, int]:
 def patch_global_colors(spec: Dict[str, Optional[int]], configured: bool) -> None:
     pass
 
+
+def set_wide_color_output_override(val: Optional[bool]) -> bool:
+    # W27 P3.5b: test/gate-oracle only. Force wide-gamut colour output on
+    # (True), off (False), or clear the override (None) to follow the
+    # drawable format. Returns the resulting active state.
+    pass
+
+
 class Color:
     @classmethod
     def parse_color(cls, spec: str) -> Color | None: ...
@@ -697,6 +705,13 @@ class Color:
 
     @property
     def is_dark(self) -> bool:
+        pass
+
+    @property
+    def wide_linear_p3(self) -> Optional[Tuple[float, float, float]]:
+        # W27 P3.5b: linear Display-P3 payload, present only when this Color
+        # was parsed from oklch()/lab() while a wide drawable arm (or the
+        # set_wide_color_output_override test hook) was active.
         pass
 
     @property
@@ -765,7 +780,7 @@ class ColorProfile:
     def as_color(self, val: int) -> Optional[Color]:
         pass
 
-    def set_color(self, num: int, val: int) -> None:
+    def set_color(self, num: int, val: Union[int, Color]) -> None:
         pass
 
     def reset_color_table(self) -> None:

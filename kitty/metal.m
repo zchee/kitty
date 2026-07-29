@@ -880,10 +880,16 @@ block_index(int program, const char *name) {
     return 0; // CellRenderData (and any other block)
 }
 
+// W27 P3.5b: the wide-gamut colour carrier's GPU-side float4 table rides
+// alongside the packed uint ColorTable in the SAME MTLBuffer (bound a second
+// time at a fixed byte offset -- see the ColorTable bind site below), so the
+// buffer this size drives must be grown to fit both regions.
+#define METAL_WIDE_COLOR_TABLE_BYTES (METAL_COLOR_TABLE_ENTRIES * 4u * sizeof(float))
+
 GLint
 block_size(int program, GLuint bidx) {
     (void)program;
-    if (bidx == 1) return (GLint)(METAL_COLOR_TABLE_ENTRIES * sizeof(uint32_t));
+    if (bidx == 1) return (GLint)(METAL_COLOR_TABLE_ENTRIES * sizeof(uint32_t) + METAL_WIDE_COLOR_TABLE_BYTES);
     return sizeof(MetalCellRenderData);
 }
 
@@ -1609,6 +1615,12 @@ draw_quad(bool blend, unsigned instance_count) {
                 ssize_t buf_idx = vao->buffers[3];
                 if (buffers[buf_idx].mtl_buffer) {
                     [mtl_current_encoder setVertexBuffer:buffers[buf_idx].mtl_buffer offset:0 atIndex:4];
+                    // W27 P3.5b: the wide-gamut colour carrier's float4 table
+                    // shares this same MTLBuffer, at the fixed byte offset
+                    // just past the packed uint region (see block_size() /
+                    // METAL_WIDE_COLOR_TABLE_BYTES above) -> Metal buffer
+                    // index 6.
+                    [mtl_current_encoder setVertexBuffer:buffers[buf_idx].mtl_buffer offset:1056 atIndex:6];
                 }
             }
         }

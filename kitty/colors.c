@@ -9,6 +9,11 @@
 #include <structmember.h>
 #include "colors.h"
 #include "color-names.h"
+// W27 P3.5b: kitty_drawable_primaries_wide() (plain-C safe as of P3.5b) and
+// the shared sRGB<->P3 matrix macros (KITTY_SRGB_TO_P3_R*/KITTY_P3_TO_SRGB_R*,
+// plain #defines outside the __METAL_VERSION__ guard).
+#include "metal_drawable_format.h"
+#include "color_transfer.metal.h"
 #if defined(__APPLE__) || defined(__FreeBSD__)
 // Needed for strtod_l
 #include <xlocale.h>
@@ -595,6 +600,9 @@ as_color(ColorProfile *self, PyObject *val) {
     if (ans) {
         ans->color.val = 0;
         ans->color.rgb = col;
+        // W27 P3.5b: PyObject_New (unlike tp_alloc) does not zero the object,
+        // so the new wide-payload field must be set explicitly here too.
+        ans->wide = false;
     }
     return (PyObject*)ans;
 }
@@ -603,6 +611,7 @@ static PyObject*
 reset_color_table(ColorProfile *self, PyObject *a UNUSED) {
 #define reset_color_table_doc "Reset all customized colors back to defaults"
     memcpy(self->color_table, self->orig_color_table, sizeof(FG_BG_256));
+    memset(self->wide_color_present, 0, sizeof(self->wide_color_present));
     self->dirty = true;
     Py_RETURN_NONE;
 }
@@ -612,6 +621,7 @@ reset_color(ColorProfile *self, PyObject *val) {
 #define reset_color_doc "Reset the specified color"
     uint8_t i = PyLong_AsUnsignedLong(val) & 0xff;
     self->color_table[i] = self->orig_color_table[i];
+    self->wide_color_present[i] = false;
     self->dirty = true;
     Py_RETURN_NONE;
 }
@@ -619,14 +629,30 @@ reset_color(ColorProfile *self, PyObject *val) {
 static PyObject*
 set_color(ColorProfile *self, PyObject *args) {
 #define set_color_doc "Set the specified color"
-    unsigned char i;
-    unsigned long val;
-    if (!PyArg_ParseTuple(args, "Bk", &i, &val)) return NULL;
+    unsigned char i; PyObject *val_obj;
+    if (!PyArg_ParseTuple(args, "BO", &i, &val_obj)) return NULL;
     self->dirty = true;
-    if (val == NULL_COLOR_VALUE && i >= 16) {
-        bool semantic, dynamic = palette_generation_is_dynamic(global_state.options_object, &semantic);
-        self->color_table[i] = dynamic ? generate_256_palette_color(self, self->color_table, i, semantic) : GENERATED_COLOR_MASK | FG_BG_256[i];
-    } else self->color_table[i] = val;
+    if (PyObject_TypeCheck(val_obj, &Color_Type)) {
+        // W27 P3.5b: a Color instance can carry a wide-gamut payload (see
+        // parse_oklch/parse_lab); NULL_COLOR_VALUE handling is int-only, a
+        // Color object is never that sentinel.
+        Color *color = (Color*)val_obj;
+        self->color_table[i] = color->color.rgb;
+        if (color->wide) {
+            self->wide_color_table[i][0] = color->wide_linear_p3[0];
+            self->wide_color_table[i][1] = color->wide_linear_p3[1];
+            self->wide_color_table[i][2] = color->wide_linear_p3[2];
+            self->wide_color_present[i] = true;
+        } else self->wide_color_present[i] = false;
+    } else {
+        unsigned long val = PyLong_AsUnsignedLongMask(val_obj);
+        if (val == (unsigned long)-1 && PyErr_Occurred()) return NULL;
+        self->wide_color_present[i] = false;
+        if (val == NULL_COLOR_VALUE && i >= 16) {
+            bool semantic, dynamic = palette_generation_is_dynamic(global_state.options_object, &semantic);
+            self->color_table[i] = dynamic ? generate_256_palette_color(self, self->color_table, i, semantic) : GENERATED_COLOR_MASK | FG_BG_256[i];
+        } else self->color_table[i] = val;
+    }
     Py_RETURN_NONE;
 }
 
@@ -658,6 +684,12 @@ copy_from_color_stack_at(ColorProfile *self, unsigned int i) {
     self->overridden = self->color_stack[i].dynamic_colors;
     memcpy(self->color_table, self->color_stack[i].color_table, sizeof(self->color_table));
     memcpy(self->overriden_transparent_colors, self->color_stack[i].transparent_colors, sizeof(self->overriden_transparent_colors));
+    // W27 P3.5b: push_onto_color_stack_at() only snapshots the 24-bit
+    // color_table (XTPUSHCOLORS/XTPOPCOLORS is a 24-bit wire format), so a
+    // wide payload does not survive a palette push/pop round-trip -- popping
+    // must drop it rather than leave a stale entry pointing at the wrong
+    // palette index. Recorded for ADR-0022.
+    memset(self->wide_color_present, 0, sizeof(self->wide_color_present));
 }
 
 bool
@@ -876,6 +908,7 @@ alloc_color(unsigned char r, unsigned char g, unsigned char b, unsigned a) {
     Color *self = (Color *)(&Color_Type)->tp_alloc(&Color_Type, 0);
     if (self != NULL) {
         self->color.r = r; self->color.g = g; self->color.b = b; self->color.a = a;
+        self->wide = false;  // tp_alloc already zeroes this; explicit for clarity
     }
     return self;
 }
@@ -971,6 +1004,16 @@ is_dark_get(Color *self, void *closure UNUSED) {
 }
 
 static PyObject*
+wide_linear_p3_get(Color *self, void *closure UNUSED) {
+    // W27 P3.5b: the full-precision wide-gamut payload (linear Display-P3,
+    // gamut-mapped to the P3 boundary), present only when this Color was
+    // parsed from oklch()/lab() while a wide drawable arm (or the test
+    // override) was active. See parse_oklch/parse_lab.
+    if (!self->wide) Py_RETURN_NONE;
+    return Py_BuildValue("fff", self->wide_linear_p3[0], self->wide_linear_p3[1], self->wide_linear_p3[2]);
+}
+
+static PyObject*
 sgr_get(Color* self, void *closure UNUSED) {
     char buf[32];
     int sz = snprintf(buf, sizeof(buf), ":2:%u:%u:%u", self->color.r, self->color.g, self->color.b);
@@ -1016,6 +1059,7 @@ static PyGetSetDef color_getsetters[] = {
     {"as_sgr", (getter) sgr_get, NULL, "as_sgr", NULL},
     {"as_sharp", (getter) sharp_get, NULL, "as_sharp", NULL},
     {"is_dark", (getter) is_dark_get, NULL, "is_dark", NULL},
+    {"wide_linear_p3", (getter) wide_linear_p3_get, NULL, "wide_linear_p3", NULL},
     {NULL}  /* Sentinel */
 };
 
@@ -1130,8 +1174,12 @@ linear_to_srgb(double c) { return c <= 0.0031308 ? c * 12.92 : (1.055 * pow(c, (
 static double degrees_to_radians(double degrees) { return degrees * (M_PI / 180); }
 static double radians_to_degrees(double radians) { return 180 * radians / M_PI; }
 
+// W27 P3.5b: the unclamped OKLCH->linear-sRGB math, split out of
+// oklch_to_srgb() (verbatim -- same operations, same order) so
+// oklch_to_p3_gamut_map() below can reuse it without duplicating the
+// transform or risking the two copies drifting apart.
 static void
-oklch_to_srgb(double l, double c, double h, double *r, double *g, double *b) {
+oklch_to_linear_srgb(double l, double c, double h, double out[3]) {
     // Convert OKLCH to OKLab
     const double h_rad = degrees_to_radians(h);
     const double a = c * cos(h_rad);
@@ -1146,27 +1194,29 @@ oklch_to_srgb(double l, double c, double h, double *r, double *g, double *b) {
     const double m_lin = m_ * m_ * m_;
     const double s_lin = s_ * s_ * s_;
 
-    const double r_lin = +4.0767416621 * l_lin - 3.3077115913 * m_lin + 0.2309699292 * s_lin;
-    const double g_lin = -1.2684380046 * l_lin + 2.6097574011 * m_lin - 0.3413193965 * s_lin;
-    const double b_lin = -0.0041960863 * l_lin - 0.7034186147 * m_lin + 1.7076147010 * s_lin;
+    out[0] = +4.0767416621 * l_lin - 3.3077115913 * m_lin + 0.2309699292 * s_lin;
+    out[1] = -1.2684380046 * l_lin + 2.6097574011 * m_lin - 0.3413193965 * s_lin;
+    out[2] = -0.0041960863 * l_lin - 0.7034186147 * m_lin + 1.7076147010 * s_lin;
+}
 
-    *r = linear_to_srgb(clamp(r_lin)); *g = linear_to_srgb(clamp(g_lin)); *b = linear_to_srgb(clamp(b_lin));
+static void
+oklch_to_srgb(double l, double c, double h, double *r, double *g, double *b) {
+    double lin[3];
+    oklch_to_linear_srgb(l, c, h, lin);
+    *r = linear_to_srgb(clamp(lin[0])); *g = linear_to_srgb(clamp(lin[1])); *b = linear_to_srgb(clamp(lin[2]));
 }
 
 static double srgb_to_linear(double c) { return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4); }
 
 
+// W27 P3.5b: the linear-sRGB->OKLab math, split out of srgb_to_oklab()
+// (verbatim) for the same reason as oklch_to_linear_srgb() above.
 static void
-srgb_to_oklab(double r, double g, double b, double *l, double *a, double *lb) {
-    // Convert sRGB to linear sRGB
-    const double r_lin = srgb_to_linear(r);
-    const double g_lin = srgb_to_linear(g);
-    const double b_lin = srgb_to_linear(b);
-
+oklab_from_linear_srgb(const double rgb[3], double *l, double *a, double *lb) {
     // Convert Linear sRGB to OKLab (inverse of oklch_to_srgb)
-    const double l_lin = 0.4122214708 * r_lin + 0.5363325363 * g_lin + 0.0514459929 * b_lin;
-    const double m_lin = 0.2119034982 * r_lin + 0.6806995451 * g_lin + 0.1073969566 * b_lin;
-    const double s_lin = 0.0883024619 * r_lin + 0.2817188376 * g_lin + 0.6299787005 * b_lin;
+    const double l_lin = 0.4122214708 * rgb[0] + 0.5363325363 * rgb[1] + 0.0514459929 * rgb[2];
+    const double m_lin = 0.2119034982 * rgb[0] + 0.6806995451 * rgb[1] + 0.1073969566 * rgb[2];
+    const double s_lin = 0.0883024619 * rgb[0] + 0.2817188376 * rgb[1] + 0.6299787005 * rgb[2];
 
     const double l_ = l_lin != 0 ? copysign(pow(fabs(l_lin), 1./3.), l_lin) : 0;
     const double m_ = m_lin != 0 ? copysign(pow(fabs(m_lin), 1./3.), m_lin) : 0;
@@ -1176,6 +1226,13 @@ srgb_to_oklab(double r, double g, double b, double *l, double *a, double *lb) {
     *l = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_;
     *a = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_;
     *lb = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_;
+}
+
+static void
+srgb_to_oklab(double r, double g, double b, double *l, double *a, double *lb) {
+    // Convert sRGB to linear sRGB
+    const double rgb[3] = { srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b) };
+    oklab_from_linear_srgb(rgb, l, a, lb);
 }
 
 static double
@@ -1238,6 +1295,121 @@ oklch_to_srgb_gamut_map(double l, double c, double h, double *r, double *g, doub
 #undef in_gamut
 }
 
+// W27 P3.5b: linear sRGB-primaries <-> linear Display-P3-primaries, the same
+// matrices the Metal fragments use (kitty/color_transfer.metal.h), applied in
+// plain double-precision C. No floor/ceiling clamp here -- both call sites
+// (the gamut mapper below, and colorprofile_fill_wide_gpu()'s GPU fill) do
+// their own clamping exactly where each needs it.
+static const double srgb_to_p3_m[3][3] = {{KITTY_SRGB_TO_P3_R0}, {KITTY_SRGB_TO_P3_R1}, {KITTY_SRGB_TO_P3_R2}};
+static const double p3_to_srgb_m[3][3] = {{KITTY_P3_TO_SRGB_R0}, {KITTY_P3_TO_SRGB_R1}, {KITTY_P3_TO_SRGB_R2}};
+
+static void
+mat3_apply(const double m[3][3], const double in[3], double out[3]) {
+    out[0] = m[0][0] * in[0] + m[0][1] * in[1] + m[0][2] * in[2];
+    out[1] = m[1][0] * in[0] + m[1][1] * in[1] + m[1][2] * in[2];
+    out[2] = m[2][0] * in[0] + m[2][1] * in[1] + m[2][2] * in[2];
+}
+
+// W27 P3.5b: CSS Color Module 4 gamut mapping against the Display P3 gamut --
+// the wide-colour-carrier counterpart to oklch_to_srgb_gamut_map() above,
+// same binary-search structure and constants, targeting the P3 primaries and
+// returning UNENCODED linear P3 (the carrier stores linear values; see
+// kitty/colors.h Color.wide_linear_p3 and the parse_oklch/parse_lab call
+// sites below).
+static void
+oklch_to_p3_gamut_map(double l, double c, double h, double out_linear_p3[3]) {
+    // Edge cases: pure black or white don't need gamut mapping. White and
+    // grey are identical in sRGB-primaries and P3-primaries linear light (the
+    // sRGB<->P3 matrices are white-preserving), so these outputs are exact.
+    if (!isfinite(l) || !isfinite(c) || !isfinite(h) || l <= 0) { out_linear_p3[0] = 0; out_linear_p3[1] = 0; out_linear_p3[2] = 0; return; }
+    if (l >= 1) { out_linear_p3[0] = 1; out_linear_p3[1] = 1; out_linear_p3[2] = 1; return; }
+    // Constants from CSS Color Module Level 4 (same values as the sRGB mapper).
+    static const double JND = 0.02;
+    static const double MIN_CONVERGENCE = 0.0001;
+    static const double EPSILON = 0.00001;
+
+    // If chroma is very small, color is essentially achromatic.
+    if (c < EPSILON) { out_linear_p3[0] = l; out_linear_p3[1] = l; out_linear_p3[2] = l; return; }
+
+    double srgb_lin[3], p3[3];
+    oklch_to_linear_srgb(l, c, h, srgb_lin);
+    mat3_apply(srgb_to_p3_m, srgb_lin, p3);
+#define in_gamut(r,g,b) (0. <= r && r <= 1. && 0. <= g && g <= 1. && 0. <= b && b <= 1.)
+    if (in_gamut(p3[0], p3[1], p3[2])) { out_linear_p3[0] = p3[0]; out_linear_p3[1] = p3[1]; out_linear_p3[2] = p3[2]; return; }
+
+    // Binary search for maximum in-P3-gamut chroma.
+    double low_chroma = 0, high_chroma = c;
+    while ((high_chroma - low_chroma) > MIN_CONVERGENCE) {
+        double mid_chroma = (high_chroma + low_chroma) * 0.5;
+        double test_srgb_lin[3], test_p3[3];
+        oklch_to_linear_srgb(l, mid_chroma, h, test_srgb_lin);
+        mat3_apply(srgb_to_p3_m, test_srgb_lin, test_p3);
+        if (in_gamut(test_p3[0], test_p3[1], test_p3[2])) {
+            low_chroma = mid_chroma;
+        } else {
+            double clipped_p3[3] = { clamp(test_p3[0]), clamp(test_p3[1]), clamp(test_p3[2]) };
+            double clipped_srgb_lin[3];
+            mat3_apply(p3_to_srgb_m, clipped_p3, clipped_srgb_lin);
+
+            double l_test, a_test, lb_test, l_clipped, a_clipped, lb_clipped;
+            oklab_from_linear_srgb(test_srgb_lin, &l_test, &a_test, &lb_test);
+            oklab_from_linear_srgb(clipped_srgb_lin, &l_clipped, &a_clipped, &lb_clipped);
+            double de = distance(l_test, a_test, lb_test, l_clipped, a_clipped, lb_clipped);
+
+            if (de < JND) low_chroma = mid_chroma;
+            else high_chroma = mid_chroma;
+        }
+    }
+    double final_srgb_lin[3], final_p3[3];
+    oklch_to_linear_srgb(l, low_chroma, h, final_srgb_lin);
+    mat3_apply(srgb_to_p3_m, final_srgb_lin, final_p3);
+    out_linear_p3[0] = clamp(final_p3[0]); out_linear_p3[1] = clamp(final_p3[1]); out_linear_p3[2] = clamp(final_p3[2]);
+#undef in_gamut
+}
+
+// -1: follow kitty_drawable_primaries_wide() (the drawable format's env var);
+// 0/1: forced, test/gate-oracle only (set_wide_color_output_override below).
+static int wide_color_output_override = -1;
+
+static bool
+wide_color_output_active(void) {
+    if (wide_color_output_override >= 0) return wide_color_output_override;
+    return kitty_drawable_primaries_wide();
+}
+
+void
+colorprofile_fill_wide_gpu(ColorProfile *self, uint32_t *table, float *wide_float4s, size_t n_float4s) {
+    // Metal-only, packed uint[] layout (stride 1) -- see
+    // cell_update_uniform_block() in kitty/shaders.c and block_size() in
+    // kitty/metal.m. Zero the float region first so entries without a wide
+    // payload read as (0,0,0,0) rather than stale ring-buffer bytes.
+    memset(wide_float4s, 0, n_float4s * 4 * sizeof(float));
+    for (size_t i = 0; i < arraysz(self->wide_color_present) && i < n_float4s; i++) {
+        if (!self->wide_color_present[i]) continue;
+        table[i] = 0x01000000u | (uint32_t)i;
+        double payload[3] = { self->wide_color_table[i][0], self->wide_color_table[i][1], self->wide_color_table[i][2] };
+        double work[3];
+        mat3_apply(p3_to_srgb_m, payload, work);
+        wide_float4s[i * 4 + 0] = (float)work[0];
+        wide_float4s[i * 4 + 1] = (float)work[1];
+        wide_float4s[i * 4 + 2] = (float)work[2];
+        wide_float4s[i * 4 + 3] = 1.0f;
+    }
+}
+
+static PyObject*
+set_wide_color_output_override(PyObject *module UNUSED, PyObject *val) {
+#define set_wide_color_output_override_doc "Test/gate-oracle only: force wide-gamut colour output on (True), off (False), or clear the override (None) to follow the drawable format. Returns the resulting active state."
+    if (val == Py_None) wide_color_output_override = -1;
+    else {
+        int truth = PyObject_IsTrue(val);
+        if (truth < 0) return NULL;
+        wide_color_output_override = truth;
+    }
+    if (wide_color_output_active()) Py_RETURN_TRUE;
+    Py_RETURN_FALSE;
+}
+
 static double
 f_inv(double t) {
     static const double delta = 6. / 29.;
@@ -1289,7 +1461,14 @@ parse_oklch(const char *spec, size_t len) {
     h = fmod(h, 360);  // Wrap hue to 0-360
     double r, g, b;
     oklch_to_srgb_gamut_map(l, c, h, &r, &g, &b);
-    return (PyObject*)alloc_color(as8bit(r), as8bit(g), as8bit(b), 0);
+    Color *ans = alloc_color(as8bit(r), as8bit(g), as8bit(b), 0);
+    if (ans && wide_color_output_active()) {
+        double p3[3];
+        oklch_to_p3_gamut_map(l, c, h, p3);
+        ans->wide = true;
+        ans->wide_linear_p3[0] = (float)p3[0]; ans->wide_linear_p3[1] = (float)p3[1]; ans->wide_linear_p3[2] = (float)p3[2];
+    }
+    return (PyObject*)ans;
 }
 
 static PyObject*
@@ -1307,7 +1486,14 @@ parse_lab(const char *spec, size_t len) {
     double okl, c, h, r, g, bb;
     lab_to_oklch(MAX(0., MIN(l, 100.)), a, b, &okl, &c, &h);
     oklch_to_srgb_gamut_map(okl, c, h, &r, &g, &bb);
-    return (PyObject*)alloc_color(as8bit(r), as8bit(g), as8bit(bb), 0);
+    Color *ans = alloc_color(as8bit(r), as8bit(g), as8bit(bb), 0);
+    if (ans && wide_color_output_active()) {
+        double p3[3];
+        oklch_to_p3_gamut_map(okl, c, h, p3);
+        ans->wide = true;
+        ans->wide_linear_p3[0] = (float)p3[0]; ans->wide_linear_p3[1] = (float)p3[1]; ans->wide_linear_p3[2] = (float)p3[2];
+    }
+    return (PyObject*)ans;
 }
 
 static const char*
@@ -1419,6 +1605,7 @@ static PyMethodDef module_methods[] = {
     METHODB(default_color_table, METH_NOARGS),
     METHODB(patch_color_profiles, METH_VARARGS),
     METHODB(all_color_names, METH_NOARGS),
+    METHODB(set_wide_color_output_override, METH_O),
     {NULL, NULL, 0, NULL}        /* Sentinel */
 };
 

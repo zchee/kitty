@@ -16,6 +16,11 @@
 #include "srgb_gamma.h"
 #include "uniforms_generated.h"
 #include "state.h"
+#ifdef KITTY_BACKEND_METAL
+// W27 P3.5b: kitty_drawable_primaries_wide() gates the packed colour-table
+// wide-region fill below to the Metal wide arms.
+#include "metal_drawable_format.h"
+#endif
 
 // D2: per-line dirty upload helpers. On Metal these bridge to the persistent
 // ring (metal.m): D2_TAKE_FRESH reports whether the just-mapped cell ring slot
@@ -719,6 +724,18 @@ cell_update_uniform_block(ssize_t vao_idx, Screen *screen, int uniform_buffer, i
     if (cp->dirty || screen->reload_all_gpu_data) {
         GLuint *ct_buf = (GLuint*)map_vao_buffer_for_write_only(vao_idx, color_table_buf, 0, cell_program_layouts[CELL_PROGRAM].color_table.size);
         copy_color_table_to_buffer(cp, ct_buf, 0, cell_program_layouts[CELL_PROGRAM].color_table_stride / sizeof(GLuint));
+#ifdef KITTY_BACKEND_METAL
+        // W27 P3.5b: the wide-gamut colour carrier's GPU-side table. Metal
+        // packed layout only (color_table_stride is 1 there): 264 uints
+        // (1056 B, see METAL_COLOR_TABLE_ENTRIES in kitty/metal.m) followed
+        // by 264 float4s that block_size() grows the buffer to fit. Gated on
+        // the compile-time Metal backend selector (not just the runtime
+        // drawable-format probe) so a real-GL macOS build with the env var
+        // set for some other reason never overwrites its own colour table.
+        if (kitty_drawable_primaries_wide()) {
+            colorprofile_fill_wide_gpu(cp, (uint32_t*)ct_buf, (float*)(ct_buf + 264), 264);
+        }
+#endif
         unmap_vao_buffer(vao_idx, color_table_buf);
         D2_NOTE_BYTES(cell_program_layouts[CELL_PROGRAM].color_table.size);
     }

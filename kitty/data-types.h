@@ -284,6 +284,13 @@ typedef struct {
     unsigned int color_stack_idx, color_stack_sz;
     DynamicColors configured, overridden;
     color_type mark_foregrounds[MARK_MASK+1], mark_backgrounds[MARK_MASK+1];
+    // W27 P3.5b: wide-gamut colour carrier sidecar. wide_color_table holds the
+    // linear Display-P3 payload for palette entries set from a wide Color
+    // (colorprofile_fill_wide_gpu() in kitty/colors.c); wide_color_present
+    // marks which of the 256 palette entries carry one. Never populated for
+    // mark_foregrounds/mark_backgrounds or the dynamic colours.
+    float wide_color_table[256][3];
+    bool wide_color_present[256];
 } ColorProfile;
 
 typedef struct {
@@ -340,6 +347,12 @@ bool colorprofile_to_transparent_color(const ColorProfile *self, unsigned index,
 color_type
 colorprofile_to_color_with_fallback(ColorProfile *self, DynamicColor entry, DynamicColor defval, DynamicColor fallback, DynamicColor falback_defval);
 void copy_color_table_to_buffer(ColorProfile *self, color_type *address, int offset, size_t stride);
+// W27 P3.5b: overwrite wide-flagged palette entries in the packed uint table
+// with 0x01000000|index markers and write their working-space values (linear
+// EXTENDED sRGB = P3->sRGB matrix of the linear-P3 payload; components may
+// exit [0,1], that is the point) into the float4 wide table. Only called on
+// the Metal wide arms -- the marker byte must never reach a GL shader.
+void colorprofile_fill_wide_gpu(ColorProfile *self, uint32_t *table, float *wide_float4s, size_t n_float4s);
 bool colorprofile_push_colors(ColorProfile*, unsigned int);
 bool colorprofile_pop_colors(ColorProfile*, unsigned int);
 void colorprofile_report_stack(ColorProfile*, unsigned int*, unsigned int*);

@@ -135,6 +135,17 @@ static inline float3 color_to_vec(uint c, constant float *gamma_lut) {
     return float3(gamma_lut[r], gamma_lut[g], gamma_lut[b]);
 }
 
+// W27 P3.5b: a colour that came out of the colour table may be a wide-gamut
+// carrier: 0x01000000|index marks "the real value lives in the float table"
+// (linear EXTENDED sRGB working space -- may exit [0,1]; the attachment-exit
+// primaries conversion maps it back inside P3). Only table-derived values can
+// carry the marker (cell-direct RGB is a 24-bit value with a zero top byte;
+// rd.* defaults are plain packed RGB), so only table-fed decode sites use this.
+static inline float3 table_color_to_vec(uint c, constant float *gamma_lut, constant float4 *wide_color_table) {
+    if ((c >> 24) == 1u) return wide_color_table[c & 0xFFu].rgb;
+    return color_to_vec(c, gamma_lut);
+}
+
 static inline float one_if_equal_zero_otherwise(float a, float b) { return 1.0f - zero_or_one(abs(a - b)); }
 static inline uint one_if_equal_zero_otherwise(uint a, uint b) { return 1u - uint(zero_or_one(abs(float(a) - float(b)))); }
 static inline uint one_if_equal_zero_otherwise(int a, int b) { return 1u - uint(zero_or_one(abs(float(a) - float(b)))); }
@@ -148,15 +159,15 @@ static inline uint resolve_color(uint c, uint defval, constant uint32 *color_tab
     return is_one * color_table[(c >> 8) & BYTE_MASK] + is_two * (c >> 8) + is_neither_one_nor_two * defval;
 }
 
-static inline float3 to_color(uint c, uint defval, constant uint32 *color_table, constant float *gamma_lut) {
-    return color_to_vec(resolve_color(c, defval, color_table), gamma_lut);
+static inline float3 to_color(uint c, uint defval, constant uint32 *color_table, constant float *gamma_lut, constant float4 *wide_color_table) {
+    return table_color_to_vec(resolve_color(c, defval, color_table), gamma_lut, wide_color_table);
 }
 
-static inline float3 resolve_dynamic_color(uint c, float3 special_val, float3 defval, constant uint32 *color_table, constant float *gamma_lut) {
+static inline float3 resolve_dynamic_color(uint c, float3 special_val, float3 defval, constant uint32 *color_table, constant float *gamma_lut, constant float4 *wide_color_table) {
     float type = float((c >> 24) & BYTE_MASK);
 #define q(which, val) one_if_equal_zero_otherwise(type, float(which)) * (val)
     return (
-        q(COLOR_IS_RGB, color_to_vec(c, gamma_lut)) + q(COLOR_IS_INDEX, color_to_vec(color_table[c & BYTE_MASK], gamma_lut)) +
+        q(COLOR_IS_RGB, color_to_vec(c, gamma_lut)) + q(COLOR_IS_INDEX, table_color_to_vec(color_table[c & BYTE_MASK], gamma_lut, wide_color_table)) +
         q(COLOR_IS_SPECIAL, special_val) + q(COLOR_NOT_SET, defval)
     );
 #undef q
@@ -201,10 +212,11 @@ static inline ColorPair resolve_extra_cursor_colors_for_special_cursor(
 
 static inline ColorPair resolve_extra_cursor_colors(
         float3 cell_bg, float3 cell_fg, ColorPair main_cursor,
-        constant MetalCellRenderData& rd, constant uint32 *color_table, constant float *gamma_lut) {
+        constant MetalCellRenderData& rd, constant uint32 *color_table, constant float *gamma_lut,
+        constant float4 *wide_color_table) {
     ColorPair ans;
-    ans.bg = resolve_dynamic_color(rd.extra_cursor_bg, main_cursor.bg, main_cursor.bg, color_table, gamma_lut);
-    ans.fg = resolve_dynamic_color(rd.extra_cursor_fg, cell_bg, main_cursor.fg, color_table, gamma_lut);
+    ans.bg = resolve_dynamic_color(rd.extra_cursor_bg, main_cursor.bg, main_cursor.bg, color_table, gamma_lut, wide_color_table);
+    ans.fg = resolve_dynamic_color(rd.extra_cursor_fg, cell_bg, main_cursor.fg, color_table, gamma_lut, wide_color_table);
     ColorPair special = resolve_extra_cursor_colors_for_special_cursor(cell_bg, cell_fg, rd, gamma_lut);
     return if_one_then_pair(zero_or_one(abs(float(rd.extra_cursor_bg & BYTE_MASK) - float(COLOR_IS_SPECIAL))), ans, special);
 }
@@ -311,6 +323,9 @@ vertex CellVertexOut cell_vertex(
     constant MetalCellDrawUniforms& du [[buffer(2)]],
     constant float *gamma_lut [[buffer(3)]],
     constant uint32 *color_table [[buffer(4)]],
+    // W27 P3.5b: the wide-gamut colour carrier's float4 table (see
+    // table_color_to_vec above; bound at metal.m's ColorTable bind site).
+    constant float4 *wide_color_table [[buffer(6)]],
     texture2d<uint, access::read> sprite_decorations_map [[texture(2)]],
     texture2d<uint, access::read> color_sprite_decorations_map [[texture(3)]]  // F1
 ) {
@@ -340,10 +355,10 @@ vertex CellVertexOut cell_vertex(
     uint bg_as_uint = resolve_color(in.colors[bg_index], default_colors[bg_index], color_table);
     bg_as_uint = has_mark * color_table[NUM_COLORS + uint(mark) - 1u] + (BIT_MASK - has_mark) * bg_as_uint;
     float cell_has_default_bg = 1.f - step(1.f, abs(float(bg_as_uint) - float(rd.bg_colors0))); // 1 if has default bg else 0
-    float3 bg = color_to_vec(bg_as_uint, gamma_lut);
+    float3 bg = table_color_to_vec(bg_as_uint, gamma_lut, wide_color_table);
     uint fg_as_uint = resolve_color(in.colors[fg_index], default_colors[fg_index], color_table);
     fg_as_uint = has_mark * color_table[NUM_COLORS + MARK_MASK_C + uint(mark)] + (1u - has_mark) * fg_as_uint;
-    float3 foreground = color_to_vec(fg_as_uint, gamma_lut);
+    float3 foreground = table_color_to_vec(fg_as_uint, gamma_lut, wide_color_table);
     // }}}
 
     // set_vertex_position() {{{
@@ -374,7 +389,7 @@ vertex CellVertexOut cell_vertex(
     float has_cursor = zero_or_one(final_cursor_shape);
     float has_block_cursor = has_cursor * one_if_equal_zero_otherwise(final_cursor_shape, 1.0f);
     ColorPair main_cursor = {color_to_vec(rd.main_cursor_bg, gamma_lut), color_to_vec(rd.main_cursor_fg, gamma_lut)};
-    ColorPair extra_cursor = resolve_extra_cursor_colors(bg, foreground, main_cursor, rd, color_table, gamma_lut);
+    ColorPair extra_cursor = resolve_extra_cursor_colors(bg, foreground, main_cursor, rd, color_table, gamma_lut, wide_color_table);
     ColorPair cursor = if_one_then_pair(has_main_cursor, main_cursor, extra_cursor);
     uint cursor_fg_sprite_idx = cursor_shape_map[int(final_cursor_shape)];
     // }}}
@@ -385,7 +400,7 @@ vertex CellVertexOut cell_vertex(
         out.effective_text_alpha = rd.inactive_text_alpha * if_one_then(has_dim, rd.dim_opacity, 1.0f) * if_one_then(
                 has_blink, rd.blink_opacity, 1.0f);
         float in_url = float((in.is_selected >> 1) & BIT_MASK);
-        out.decoration_fg = if_one_then(in_url, color_to_vec(rd.url_color, gamma_lut), to_color(in.colors[2], fg_as_uint, color_table, gamma_lut));
+        out.decoration_fg = if_one_then(in_url, color_to_vec(rd.url_color, gamma_lut), to_color(in.colors[2], fg_as_uint, color_table, gamma_lut, wide_color_table));
         // Selection
         float3 selection_color = if_one_then(rd.use_cell_bg_for_selection_fg, bg, color_to_vec(rd.highlight_fg, gamma_lut));
         selection_color = if_one_then(rd.use_cell_fg_for_selection_fg, foreground, selection_color);
@@ -430,7 +445,7 @@ vertex CellVertexOut cell_vertex(
     // Selection and cursor
     bg_alpha = if_one_then(has_block_cursor, effective_cursor_opacity, bg_alpha);
     bg = if_one_then(float(in.is_selected & BIT_MASK),
-            if_one_then(rd.use_cell_for_selection_bg, color_to_vec(fg_as_uint, gamma_lut), color_to_vec(rd.highlight_bg, gamma_lut)), bg);
+            if_one_then(rd.use_cell_for_selection_bg, table_color_to_vec(fg_as_uint, gamma_lut, wide_color_table), color_to_vec(rd.highlight_bg, gamma_lut)), bg);
     float3 background_rgb = if_one_then(has_block_cursor, mix(bg, cursor.bg, rd.cursor_opacity), bg);
     out.background = background_rgb;
     // }}}

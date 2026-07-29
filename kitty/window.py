@@ -1667,7 +1667,7 @@ class Window:
         value = str(bvalue or b'', 'utf-8', 'replace')
         cp = self.screen.color_profile
 
-        def parse_color_set(raw: str) -> Generator[tuple[int, int | None], None, None]:
+        def parse_color_set(raw: str) -> Generator[tuple[int, Color | None], None, None]:
             parts = raw.split(';')
             lp = len(parts)
             if lp % 2 != 0:
@@ -1682,7 +1682,11 @@ class Window:
                     else:
                         q = to_color(spec)
                         if q is not None:
-                            yield c, color_as_int(q)
+                            # W27 P3.5b: pass the Color object through, not its
+                            # 24-bit int, so a wide-gamut oklch()/lab() spec's
+                            # wide_linear_p3 payload survives into
+                            # ColorProfile.set_color() (kitty/colors.c).
+                            yield c, q
                 except Exception:
                     continue
 

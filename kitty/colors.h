@@ -57,6 +57,12 @@ typedef struct {
     PyObject_HEAD
 
     ARGB32 color;
+    // W27 P3.5b: full-precision payload for wide-gamut colour specs (oklch/lab)
+    // parsed while a wide drawable arm is active. Linear Display-P3 primaries,
+    // gamut-mapped at the P3 boundary. Invisible to Python except via the
+    // wide_linear_p3 property; alloc_color() leaves it absent.
+    bool wide;
+    float wide_linear_p3[3];
 } Color;
 
 extern PyTypeObject ColorProfile_Type;

@@ -7,8 +7,14 @@
 
 #pragma once
 
+// W27 P3.5b: the ObjC-only parts (Metal/CoreGraphics types) are guarded so
+// this header can be included from plain-C translation units (kitty/colors.c,
+// kitty/shaders.c) that need kitty_drawable_format_id()/
+// kitty_drawable_primaries_wide() but are never compiled as Objective-C.
+#ifdef __OBJC__
 #import <Metal/Metal.h>
 #import <CoreGraphics/CoreGraphics.h>
+#endif
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -88,6 +94,7 @@ kitty_drawable_format_id(void) {
     return id;
 }
 
+#ifdef __OBJC__
 static inline MTLPixelFormat
 kitty_drawable_pixel_format(void) {
     switch (kitty_drawable_format_id()) {
@@ -114,6 +121,22 @@ kitty_drawable_colorspace_name(void) {
         case DRAWABLE_FORMAT_BGRA8:          break;
     }
     return NULL;
+}
+#endif  // __OBJC__
+
+// W27 P3.5b: plain-C classifier ("does this drawable format carry P3
+// primaries") for translation units that need the wide/non-wide split but
+// cannot include Metal.h -- kitty/colors.c (the wide-gamut colour carrier)
+// and kitty/shaders.c (the packed colour-table wide-region fill). One
+// resolver for the env var: colors.c and shaders.c include this header rather
+// than reparsing the KITTY_METAL_DRAWABLE_FORMAT name list themselves.
+static inline bool
+kitty_drawable_primaries_wide(void) {
+    switch (kitty_drawable_format_id()) {
+        case DRAWABLE_FORMAT_BGRA10_XR_SRGB: case DRAWABLE_FORMAT_BGRA10_XR: case DRAWABLE_FORMAT_RGBA16F: return true;
+        case DRAWABLE_FORMAT_BGRA8: break;
+    }
+    return false;
 }
 
 // NOTE (W27 P3.4): the "which formats want linear values" question used to be
