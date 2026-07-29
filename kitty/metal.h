@@ -47,6 +47,10 @@ typedef float GLfloat;
 #define GL_SRGB_ALPHA       0x8C42
 #define GL_SRGB8_ALPHA8     0x8C43
 #define GL_RGBA16           0x805B
+// W27 P4.2: the internal format for an f=3232 (float RGBA) graphics image --
+// MTLPixelFormatRGBA32Float. The only image storage in this pipeline that can
+// carry the >1.0 components EDR content is made of.
+#define GL_RGBA32F          0x8814
 #define GL_NEAREST          0x2600
 #define GL_LINEAR           0x2601
 #define GL_CLAMP_TO_EDGE    0x812F
@@ -229,6 +233,10 @@ void metal_forget_layer(void *layer);       // window teardown: free the per-win
 // keeps the FBO+blit path.
 void metal_begin_layered_frame(void);
 void metal_resolve_layered_frame(void);
+// W27 P4.2: publish the OS window's EDR state for the frame about to be encoded.
+// Selects the layered working-surface format (RGBA16Float while engaged, so
+// >1.0 components survive to the drawable; RGBA16Unorm otherwise).
+void metal_set_edr_frame_state(bool engaged, float headroom);
 
 // W27 P3.4 (chain 2): the cell-program options Python resolves from the config
 // (text_composition_strategy, text_fg_override_threshold). GL bakes them into

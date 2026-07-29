@@ -185,13 +185,28 @@ static MTLPixelFormat mtl_current_enc_fmt = MTLPixelFormatInvalid;
 // via framebuffer fetch and writes the sRGB drawable (attachment 1), all in ONE
 // pass — replacing the old RGBA16 DRAM FBO + separate BLIT pass. RGBA16Unorm
 // matches the old FBO exactly so blending precision (issue #8953) is preserved.
-#define LAYERED_WORK_FMT MTLPixelFormatRGBA16Unorm      // att0: memoryless working surface
+#define LAYERED_WORK_FMT MTLPixelFormatRGBA16Unorm      // att0: memoryless working surface (SDR)
+// W27 P4.2: RGBA16Unorm CLAMPS at 1.0, so while EDR is engaged it would eat the
+// >1.0 components before they could reach the (rgba16f) drawable — images are
+// layered-only, so this surface is on the path of every HDR pixel. The att0
+// format therefore becomes per-frame: half-float while this window has EDR
+// engaged, the unchanged RGBA16Unorm otherwise. Unorm stays the default so
+// nothing about SDR rendering (blending precision, issue #8953) moves.
+#define LAYERED_WORK_FMT_EDR MTLPixelFormatRGBA16Float
+// Set once per prepare, per OS window, from child-monitor's lazy-engagement
+// block (metal_set_edr_frame_state) — i.e. always before that window's frame is
+// encoded, which is the only ordering this needs.
+static bool edr_frame_engaged = false;
+static float edr_frame_headroom = 1.0f;
+static inline MTLPixelFormat layered_work_fmt(void) { return edr_frame_engaged ? LAYERED_WORK_FMT_EDR : LAYERED_WORK_FMT; }
 static bool layered_pass_active = false;                // inside a layered pass? (per window: saved with the slot)
 static id<MTLTexture> layered_work_surface = nil;       // memoryless att0, grown to the drawable size
 static NSUInteger layered_work_w = 0, layered_work_h = 0;
-// One resolve PSO per att1 format: at most two ever exist in a process — the
-// drawable's (the W27 P3.2 candidate) and the BGRA8 capture offscreen's.
-static struct { MTLPixelFormat att1_fmt; id<MTLRenderPipelineState> pso; } layers_resolve_psos[2];
+static MTLPixelFormat layered_work_surface_fmt = MTLPixelFormatInvalid;  // what layered_work_surface was created as
+// One resolve PSO per (att0, att1) format pair. att1 is the drawable's (the W27
+// P3.2 candidate) or the BGRA8 capture offscreen's — two; att0 is the SDR or the
+// EDR working-surface format (P4.2) — two. Four in the worst case.
+static struct { MTLPixelFormat att0_fmt, att1_fmt; id<MTLRenderPipelineState> pso; } layers_resolve_psos[4];
 
 // Active texture unit tracking. GL keeps an independent binding per
 // (unit, target) pair — upload paths freely bind GL_TEXTURE_2D on whatever
@@ -292,7 +307,13 @@ static int current_program = -1;
 // parity, and the layers FBO is RGBA16Unorm, so a single PSO per program
 // cannot cover all render passes (see kitty/metal-pipeline-design.md).
 #define NUM_PROGRAMS 14
-#define PSO_VARIANTS_PER_PROGRAM 8
+// W27 P4.2 raised this from 8: att0 for a layered pass is now per-frame (SDR
+// RGBA16Unorm / EDR RGBA16Float), which doubles the layered variants. A cell
+// program can now want 2 (drawable, non-layered) + 2 (thumbnail-capture FBO,
+// non-layered) + 4 (layered x2 formats x2 blend) = 8, i.e. exactly the old
+// ceiling with zero slack; overflow degrades to dropped draws (pso_get returns
+// nil), so the headroom is worth the few hundred bytes.
+#define PSO_VARIANTS_PER_PROGRAM 12
 typedef struct {
     id<MTLRenderPipelineState> pso;
     MTLPixelFormat fmt;
@@ -306,7 +327,7 @@ typedef struct {
 static PSOCacheEntry pso_cache[NUM_PROGRAMS * PSO_VARIANTS_PER_PROGRAM];
 static id<MTLRenderPipelineState> build_pso(int program, bool blend, MTLPixelFormat fmt, bool layered,
                                             MTLPixelFormat att1_fmt);
-static id<MTLRenderPipelineState> ensure_layers_resolve_pso(MTLPixelFormat att1_fmt);  // M1: att0->att1 resolve PSO
+static id<MTLRenderPipelineState> ensure_layers_resolve_pso(MTLPixelFormat att0_fmt, MTLPixelFormat att1_fmt);  // M1: att0->att1 resolve PSO
 
 // Drop the cell-program variants so the next pso_get rebuilds them with the
 // current cell_shader_opts (config change / live reload).
@@ -618,12 +639,21 @@ create_all_pipeline_states(void) {
     // surface + att1 = drawable) for the programs that draw in the layered pass, so
     // MSL/PSO errors surface at startup and the first layered frame does not hitch.
     // BLIT (11, replaced by the native resolve) and SCREENSHOT (12) are never layered.
+    // W27 P4.2: att0 is now per-frame (SDR RGBA16Unorm / EDR RGBA16Float), and
+    // engagement can flip mid-session on any frame, so BOTH variants pre-warm —
+    // otherwise the first frame after an HDR image appears pays the whole PSO
+    // build inline, which is exactly the hitch this pre-warm exists to prevent.
+    const MTLPixelFormat layered_fmts[2] = {LAYERED_WORK_FMT, LAYERED_WORK_FMT_EDR};
     for (int p = 0; p < NUM_PROGRAMS; p++) {
         if (p == 3 || p == 11 || p == 12) continue;
-        if (pso_get(p, false, LAYERED_WORK_FMT, true)) count++;
-        if (pso_get(p, true, LAYERED_WORK_FMT, true)) count++;
+        for (size_t f = 0; f < arraysz(layered_fmts); f++) {
+            if (pso_get(p, false, layered_fmts[f], true)) count++;
+            if (pso_get(p, true, layered_fmts[f], true)) count++;
+        }
     }
-    if (ensure_layers_resolve_pso(drawable_fmt)) count++;
+    for (size_t f = 0; f < arraysz(layered_fmts); f++) {
+        if (ensure_layers_resolve_pso(layered_fmts[f], drawable_fmt)) count++;
+    }
     if (global_state.debug_rendering) {
         NSLog(@"[Metal] Pre-warmed %d pipeline states", count);
     }
@@ -727,6 +757,14 @@ fill_graphics_uniforms(int program, MetalGraphicsUniforms *u) {
     u->extra_alpha = slot_f(program, GRAPHICS_U_extra_alpha, 0);
     slot_fv(program, GRAPHICS_U_amask_fg, u->amask_fg, 3);
     slot_fv(program, GRAPHICS_U_amask_bg_premult, u->amask_bg_premult, 4);
+    // W27 P4.2 tone-map inputs. The floor at 1.0 is load-bearing rather than
+    // cosmetic: edr_headroom is the shader's hard ceiling, so an unset (0.0)
+    // slot would clamp the image to black. Every real draw sets it, and this
+    // makes a draw that somehow did not merely SDR rather than broken.
+    const float hr = slot_f(program, GRAPHICS_U_edr_headroom, 0);
+    u->edr_headroom = hr >= 1.f ? hr : 1.f;
+    u->src_is_hdr = slot_f(program, GRAPHICS_U_src_is_hdr, 0);
+    u->src_max_component = slot_f(program, GRAPHICS_U_src_max_component, 0);
 }
 
 static void
@@ -2060,7 +2098,7 @@ wanted_attachment_format(bool for_clear) {
     (void)for_clear;
     // M1: during a layered pass every compositing draw targets att0 (the working
     // surface), so the encoder must never be torn down by a format mismatch.
-    if (layered_pass_active) return LAYERED_WORK_FMT;
+    if (layered_pass_active) return layered_work_surface_fmt;
     if (bound_framebuffer && bound_framebuffer < MAX_FRAMEBUFFERS &&
         framebuffers[bound_framebuffer].in_use && framebuffers[bound_framebuffer].render_target) {
         return framebuffers[bound_framebuffer].render_target.pixelFormat;
@@ -2073,27 +2111,53 @@ wanted_attachment_format(bool for_clear) {
 // DRAM, so a resize just recreates a zero-cost descriptor (no allocs= impact —
 // that counter tracks MTLBuffer allocations only). Same RGBA16Unorm format as
 // the old DRAM layers FBO, so blending precision (#8953) is unchanged.
+// W27 P4.2: the format is part of the cache key now, not just the size — an EDR
+// engagement flip must rebuild the surface, not silently keep rendering >1.0
+// content into a texture that clamps it. Memoryless RGBA16Float (with blending)
+// is supported on Apple GPUs, so the tile-only storage mode survives the flip.
 static bool
 ensure_layered_work_surface(NSUInteger w, NSUInteger h) {
     if (w < 1 || h < 1) return false;
-    if (layered_work_surface && layered_work_w == w && layered_work_h == h) return true;
+    const MTLPixelFormat want = layered_work_fmt();
+    if (layered_work_surface && layered_work_w == w && layered_work_h == h && layered_work_surface_fmt == want) return true;
     [layered_work_surface release]; layered_work_surface = nil;
-    MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:LAYERED_WORK_FMT
+    MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:want
                                                                                     width:w height:h mipmapped:NO];
     desc.usage = MTLTextureUsageRenderTarget;    // framebuffer-fetch read+write; never sampled
     desc.storageMode = MTLStorageModeMemoryless; // tile memory only, never DRAM
     layered_work_surface = [mtl_device newTextureWithDescriptor:desc];
-    if (!layered_work_surface) { layered_work_w = layered_work_h = 0; return false; }
-    layered_work_w = w; layered_work_h = h;
+    if (!layered_work_surface) {
+        layered_work_w = layered_work_h = 0; layered_work_surface_fmt = MTLPixelFormatInvalid; return false;
+    }
+    if (global_state.debug_rendering && layered_work_surface_fmt != want) {
+        NSLog(@"[Metal] layered working surface -> %s (%lux%lu, EDR %s, headroom %.3f)",
+              want == LAYERED_WORK_FMT_EDR ? "RGBA16Float" : "RGBA16Unorm",
+              (unsigned long)w, (unsigned long)h, edr_frame_engaged ? "engaged" : "off",
+              (double)edr_frame_headroom);
+    }
+    layered_work_w = w; layered_work_h = h; layered_work_surface_fmt = want;
     return true;
+}
+
+// W27 P4.2: the current OS window's EDR state, published by child-monitor's
+// lazy-engagement block (prepare_to_render_os_window) once per prepare, before
+// that window's frame is encoded. It selects the working-surface format for the
+// frame; the headroom is recorded for diagnostics and to keep the two halves of
+// the tone-map policy (shader clamp target vs layer capability) reading from one
+// source. Idempotent, so the caller can invoke it unconditionally.
+void
+metal_set_edr_frame_state(bool engaged, float headroom) {
+    edr_frame_engaged = engaged;
+    edr_frame_headroom = headroom >= 1.0f ? headroom : 1.0f;
 }
 
 // M1: the resolve PSO (fullscreen; reads att0 via [[color(0)]], writes att1).
 // Built once per att1 format; committed command buffers retain it.
 static id<MTLRenderPipelineState>
-ensure_layers_resolve_pso(MTLPixelFormat att1_fmt) {
+ensure_layers_resolve_pso(MTLPixelFormat att0_fmt, MTLPixelFormat att1_fmt) {
     for (size_t i = 0; i < arraysz(layers_resolve_psos); i++) {
-        if (layers_resolve_psos[i].pso && layers_resolve_psos[i].att1_fmt == att1_fmt)
+        if (layers_resolve_psos[i].pso && layers_resolve_psos[i].att0_fmt == att0_fmt &&
+                layers_resolve_psos[i].att1_fmt == att1_fmt)
             return layers_resolve_psos[i].pso;
     }
     if (!mtl_default_library) return nil;
@@ -2114,7 +2178,7 @@ ensure_layers_resolve_pso(MTLPixelFormat att1_fmt) {
     MTLRenderPipelineDescriptor *d = [[MTLRenderPipelineDescriptor alloc] init];
     d.vertexFunction = v;
     d.fragmentFunction = f;
-    d.colorAttachments[0].pixelFormat = LAYERED_WORK_FMT;  // att0: read + passthrough (discarded)
+    d.colorAttachments[0].pixelFormat = att0_fmt;          // att0: read + passthrough (discarded)
     d.colorAttachments[1].pixelFormat = att1_fmt;          // att1: the drawable / capture offscreen
     id<MTLRenderPipelineState> pso = [mtl_device newRenderPipelineStateWithDescriptor:d error:&error];
     if (!pso) {
@@ -2124,11 +2188,12 @@ ensure_layers_resolve_pso(MTLPixelFormat att1_fmt) {
     }
     for (size_t i = 0; i < arraysz(layers_resolve_psos); i++) {
         if (!layers_resolve_psos[i].pso) {
-            layers_resolve_psos[i].pso = pso; layers_resolve_psos[i].att1_fmt = att1_fmt;
+            layers_resolve_psos[i].pso = pso;
+            layers_resolve_psos[i].att0_fmt = att0_fmt; layers_resolve_psos[i].att1_fmt = att1_fmt;
             return pso;
         }
     }
-    log_error("Metal: layers resolve PSO cache overflow");  // unreachable: at most 2 att1 formats
+    log_error("Metal: layers resolve PSO cache overflow");  // unreachable: at most 2 att0 x 2 att1 formats
     [pso release];
     return nil;
 }
@@ -2173,7 +2238,10 @@ metal_begin_layered_frame(void) {
 
     mtl_current_encoder = [mtl_current_command_buffer renderCommandEncoderWithDescriptor:rpd];
     if (!mtl_current_encoder) return;
-    mtl_current_enc_fmt = LAYERED_WORK_FMT;  // draw_quad picks the layered (2-attachment) PSOs
+    // draw_quad picks the layered (2-attachment) PSOs; the DYNAMIC att0 format
+    // (W27 P4.2) flows through here into pso_get's cache key, so the SDR and EDR
+    // working-surface variants can never be confused for one another.
+    mtl_current_enc_fmt = layered_work_surface_fmt;
     layered_pass_active = true;
     drawable_pass_opened = true;
     metal_pass_count++;  // the whole layered frame is this one encoder (acceptance criterion 2)
@@ -2190,6 +2258,7 @@ metal_resolve_layered_frame(void) {
         // att1's real format, straight from the pass being resolved (drawable or
         // capture offscreen), so the PSO can never disagree with it.
         id<MTLRenderPipelineState> pso = ensure_layers_resolve_pso(
+                mtl_current_render_pass.colorAttachments[0].texture.pixelFormat,
                 mtl_current_render_pass.colorAttachments[1].texture.pixelFormat);
         if (pso) {
             MTLViewport full = {0, 0, (double)layered_work_w, (double)layered_work_h, 0, 1};
@@ -2649,6 +2718,10 @@ pixel_format_for_gl(int internalformat) {
         // GL_RGBA16 is unsigned-normalized in GL; RGBA16Float would change
         // blending/rounding semantics of the layers FBO (issue #8953 path).
         case GL_RGBA16: return MTLPixelFormatRGBA16Unorm;
+        // W27 P4.2: f=3232 graphics images. Sampling RGBA32Float with the
+        // nearest/linear samplers the graphics fragment uses is supported on
+        // Apple silicon (filterable float32 textures).
+        case GL_RGBA32F: return MTLPixelFormatRGBA32Float;
         case GL_RGBA: return MTLPixelFormatRGBA8Unorm;
         case GL_RED: case GL_R8: return MTLPixelFormatR8Unorm;
         case GL_R32UI: return MTLPixelFormatR32Uint;
@@ -2665,7 +2738,7 @@ mtl_bytes_per_pixel(MTLPixelFormat f) {
         case MTLPixelFormatR8Unorm: return 1;
         case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB: case MTLPixelFormatR32Uint: return 4;
         case MTLPixelFormatRGBA16Unorm: return 8;
-        case MTLPixelFormatRGBA32Uint: return 16;
+        case MTLPixelFormatRGBA32Uint: case MTLPixelFormatRGBA32Float: return 16;
         default: return 4;
     }
 }

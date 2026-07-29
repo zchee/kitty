@@ -44,9 +44,43 @@ struct GraphicsUniforms {
     float extra_alpha;
     float3 amask_fg;
     float4 amask_bg_premult;
+    // W27 P4.2 tone-map inputs (see MetalGraphicsUniforms).
+    float edr_headroom;
+    float src_is_hdr;
+    float src_max_component;
 };
 static_assert(sizeof(GraphicsUniforms) == sizeof(MetalGraphicsUniforms),
               "GraphicsUniforms drifted from MetalGraphicsUniforms");
+
+// W27 P4.2 tone map (ADR-0022 decision 5). `c` is linear extended-sRGB, `hr` is
+// the screen's current EDR headroom, `src_max` the image's largest component.
+//
+//   policy (b), soft knee -- taken iff the source actually exceeds the headroom:
+//     a piecewise-linear shoulder hinged at k = 0.8*hr. Below k the mapping is
+//     the identity, so the whole SDR range and the bottom of the EDR range are
+//     reproduced exactly; above k the remaining source range [k, src_max] is
+//     compressed linearly onto [k, hr]. Monotone by construction (both segments
+//     have positive slope and they meet at k), which is what the ramp gate
+//     checks -- a knee that inverted anywhere would read as banding.
+//   policy (a), hard clamp -- when the source already fits, nothing is gained by
+//     compressing it, so it passes through and only the ceiling applies.
+//
+// The final min() is the ceiling in both branches: correct-beyond-clamp. Values
+// are clamped to kitty's own idea of the headroom rather than left for the
+// system's screen-wide clamp, so behaviour at the limit is kitty-defined.
+inline float3 tone_map_hdr(float3 c, float hr, float src_max) {
+    if (src_max > hr) {
+        const float k = 0.8f * hr;
+        const float denom = src_max - k;
+        // denom > 0 whenever src_max > hr >= k/0.8 > k, so the divide is safe;
+        // the guard covers a degenerate hr <= 0 that should be impossible.
+        if (denom > 0.0f) {
+            const float slope = (hr - k) / denom;
+            c = select(c, k + (c - k) * slope, c > float3(k));
+        }
+    }
+    return min(c, float3(hr));
+}
 
 struct GraphicsVertexOut {
     float4 position [[position]];
@@ -89,6 +123,12 @@ fragment float4 graphics_fragment(
         color = alpha_blend_premul(color, uniforms.amask_bg_premult);
     } else {
         color.a *= uniforms.extra_alpha;
+        // W27 P4.2 tone map (ADR-0022 decision 5), applied to the LINEAR colour
+        // BEFORE premultiplication and only for f=3232 sources -- an SDR image
+        // takes the identical path it always did, byte for byte.
+        if (uniforms.src_is_hdr > 0.5f) {
+            color.rgb = tone_map_hdr(color.rgb, uniforms.edr_headroom, uniforms.src_max_component);
+        }
         if (!IS_PREMULTIPLIED) {
             color = vec4_premul(color);
         }

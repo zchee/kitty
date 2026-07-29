@@ -19,6 +19,7 @@
 #include <stdlib.h>
 
 #include <zlib.h>
+#include <math.h>          // isfinite(), for the f=3232 max-component scan
 #include <structmember.h>
 #include "png-reader.h"
 PyTypeObject GraphicsManager_Type;
@@ -550,7 +551,42 @@ get_free_client_id(const GraphicsManager *self) {
 #define ABRT(code, ...) { set_command_failed_response(code, __VA_ARGS__); self->currently_loading.loading_completed_successfully = false; free_load_data(&self->currently_loading); return NULL; }
 
 #define MAX_DATA_SZ (4u * 100000000u)
-enum FORMATS { RGB=24, RGBA=32, PNG=100 };
+// W27 P4.2 (fork-local extension): RGBA_F32 transmits raw little-endian
+// IEEE-754 float32 RGBA quadruplets -- 16 bytes/px, non-premultiplied alpha in
+// [0,1], colour components in LINEAR EXTENDED sRGB primaries. Components above
+// 1.0 are legal and are what makes an image EDR content; the attachment-exit
+// primaries matrix (ADR-0022 decision 2) takes care of P3. The numeric value
+// spells out the layout the way the existing members do (24 = 3x8, 32 = 4x8,
+// 3232 = 4x32).
+enum FORMATS { RGB=24, RGBA=32, PNG=100, RGBA_F32=3232 };
+
+// Bytes per transmitted pixel for a completed/in-flight load. is_opaque only
+// distinguishes the two 8-bit layouts; an f=3232 transfer is always 4 channels
+// wide at 4 bytes each, so it has to be asked about first.
+static inline size_t
+transmitted_bytes_per_pixel(bool is_hdr, bool is_opaque) {
+    return is_hdr ? 16 : (is_opaque ? 3 : 4);
+}
+
+// The largest R/G/B component anywhere in a completed f=3232 transfer (alpha is
+// excluded: it is an opacity, not a light level, and is clamped to [0,1] by the
+// protocol). This is the value the shader's soft-knee shoulder is fitted
+// against, so it must describe the pixels that will actually be sampled.
+// Non-finite components are ignored rather than allowed to poison the maximum
+// into NaN/inf, which would collapse the knee to a divide-by-zero.
+static float
+max_rgb_component_f32(const uint8_t *data, size_t width, size_t height) {
+    const float *p = (const float*)(const void*)data;
+    const size_t n = width * height;
+    float m = 0.f;
+    for (size_t i = 0; i < n; i++) {
+        for (unsigned c = 0; c < 3; c++) {
+            const float v = p[i * 4 + c];
+            if (isfinite(v) && v > m) m = v;
+        }
+    }
+    return m;
+}
 
 static Image*
 load_image_data(GraphicsManager *self, Image *img, const GraphicsCommand *g, const unsigned char transmission_type, const uint32_t data_fmt, const uint8_t *payload) {
@@ -678,6 +714,16 @@ initialize_load_data(GraphicsManager *self, const GraphicsCommand *g, Image *img
             self->currently_loading.is_4byte_aligned = data_fmt == RGBA || (self->currently_loading.width % 4 == 0);
             self->currently_loading.is_opaque = data_fmt == RGB;
             break;
+        case RGBA_F32:
+            // Same shape as RGBA (4 channels, alpha present, rows are always a
+            // multiple of 4 bytes because a single pixel is 16), 4x as wide.
+            self->currently_loading.data_sz = (size_t)g->data_width * g->data_height * 16u;
+            if (!self->currently_loading.data_sz) ABRT("EINVAL", "Zero width/height not allowed");
+            if (self->currently_loading.data_sz > MAX_DATA_SZ) ABRT("EFBIG", "Too much data");
+            self->currently_loading.is_4byte_aligned = true;
+            self->currently_loading.is_opaque = false;
+            self->currently_loading.is_hdr = true;
+            break;
         default:
             ABRT("EINVAL", "Unknown image format: %u", data_fmt);
     }
@@ -789,9 +835,9 @@ upload_to_gpu(GraphicsManager *self, Image *img, const bool is_opaque, const boo
         // it under async present. send_image_to_gpu allocates a NEW texture; Metal
         // retains the old one for the committed frame until it completes.
         if (persistent_image_texture_enabled() && t->id && t->alloc_width == img->width && t->alloc_height == img->height && !texture_upload_in_flight(t->id)) {
-            update_image_on_gpu(t->id, data, img->width, img->height, is_opaque, is_4byte_aligned);
+            update_image_on_gpu(t->id, data, img->width, img->height, is_opaque, is_4byte_aligned, img->is_hdr);
         } else {
-            send_image_to_gpu(&t->id, data, img->width, img->height, is_opaque, is_4byte_aligned, true, REPEAT_CLAMP);
+            send_image_to_gpu(&t->id, data, img->width, img->height, is_opaque, is_4byte_aligned, true, REPEAT_CLAMP, img->is_hdr);
             t->alloc_width = img->width; t->alloc_height = img->height;
         }
     }
@@ -814,6 +860,7 @@ handle_add_command(GraphicsManager *self, const GraphicsCommand *g, const uint8_
             img->texture = new_texture_ref();
             img->last_uploaded_frame_id = 0;  // G3-lite: fresh texture holds no frame yet
             img->root_frame_data_loaded = false;
+            img->is_hdr = false; img->max_component = 0.f;  // W27 P4.2: re-set below iff this transfer completes
             img->is_drawn = false;
             img->current_frame_shown_at = 0;
             img->extra_framecnt = 0;
@@ -847,11 +894,18 @@ handle_add_command(GraphicsManager *self, const GraphicsCommand *g, const uint8_
         self->currently_loading.loading_for = (const ImageAndFrame){0};
     img = process_image_data(self, img, g, tt, fmt);
     if (!img) return NULL;
-    size_t required_sz = (size_t)(self->currently_loading.is_opaque ? 3 : 4) * self->currently_loading.width * self->currently_loading.height;
+    size_t required_sz = transmitted_bytes_per_pixel(self->currently_loading.is_hdr, self->currently_loading.is_opaque) * self->currently_loading.width * self->currently_loading.height;
     if (self->currently_loading.data_sz != required_sz) ABRT("EINVAL", "Image dimensions: %ux%u do not match data size: %zu, expected size: %zu", self->currently_loading.width, self->currently_loading.height, self->currently_loading.data_sz, required_sz);
     if (self->currently_loading.loading_completed_successfully) {
         img->width = self->currently_loading.width;
         img->height = self->currently_loading.height;
+        // W27 P4.2: the tone-map inputs are properties of the pixels, so they are
+        // measured once here, off the completed transfer, and then ride the Image
+        // for as long as it lives. A re-transmit to the same id lands here again
+        // and overwrites both, including back to SDR.
+        img->is_hdr = self->currently_loading.is_hdr;
+        img->max_component = img->is_hdr ? max_rgb_component_f32(
+                self->currently_loading.data, img->width, img->height) : 0.f;
         if (img->root_frame.id) remove_from_cache(self, (const ImageAndFrame){.image_id=img->internal_id, .frame_id=img->root_frame.id});
         img->root_frame = (const Frame){
             .id = ++img->frame_id_counter,
@@ -1306,6 +1360,7 @@ grman_update_layers(GraphicsManager *self, unsigned int scrolled_by, float scrol
     self->num_of_below_refs = 0;
     self->num_of_negative_refs = 0;
     self->num_of_positive_refs = 0;
+    self->has_hdr_refs = false;  // W27 P4.2: recomputed below alongside the ref counts
     ImageRect r;
     float screen_width = dx * num_cols, screen_height = dy * num_rows;
     float screen_bottom = screen_top - screen_height;
@@ -1370,6 +1425,14 @@ grman_update_layers(GraphicsManager *self, unsigned int scrolled_by, float scrol
             self->render_data.count++;
             rd->z_index = ref->z_index; rd->image_id = img->internal_id; rd->ref_id = ref->internal_id;
             rd->texture_id = texture_id_for_img(img);
+            // W27 P4.2: carry the tone-map inputs with the ref. This ref is
+            // visible by construction (the off-screen test above already
+            // continued), so an HDR image reaching here is exactly the "HDR
+            // content is onscreen" signal lazy EDR engagement keys off.
+            if (img->is_hdr) {
+                rd->src_is_hdr = 1.f; rd->src_max_component = img->max_component;
+                self->has_hdr_refs = true;
+            }
             img->is_drawn = true;
             refitr = vt_next(refitr);
         }
@@ -1675,6 +1738,13 @@ frame_chain_is_transient(Image *img, const Frame *frame) {
 static Image*
 handle_animation_frame_load_command(GraphicsManager *self, GraphicsCommand *g, Image *img, const uint8_t *payload, bool *is_dirty) {
     uint32_t frame_number = g->frame_number, fmt = g->format ? g->format : RGBA;
+    // W27 P4.2: animation frames are composited, cached and delta-uploaded as
+    // 3/4-byte pixels throughout (get_coalesced_frame_data, update_image_sub_
+    // region, the compose paths). Rather than widen all of that for a case with
+    // no demand, an f=3232 frame is refused outright -- an explicit error beats
+    // a silent 4x size mismatch. The same refusal covers an SDR frame arriving
+    // for an HDR root image, whose texture is RGBA32Float.
+    if (fmt == RGBA_F32 || img->is_hdr) ABRT("EINVAL", "Animation frames are not supported for f=%u (HDR) images", RGBA_F32);
     if (!frame_number || frame_number > img->extra_framecnt + 2) frame_number = img->extra_framecnt + 2;
     bool is_new_frame = frame_number == img->extra_framecnt + 2;
     g->frame_number = frame_number;
@@ -2437,7 +2507,7 @@ image_as_dict(GraphicsManager *self, Image *img) {
     }
     CoalescedFrameData cfd = get_coalesced_frame_data(self, img, &img->root_frame);
     if (!cfd.buf) { PyErr_SetString(PyExc_RuntimeError, "Failed to get data for root frame"); return NULL; }
-    PyObject *ans = Py_BuildValue("{sI sI sI sI sI sI sI " "sO sI sO " "sI sI sI " "sI sy# sN}",
+    PyObject *ans = Py_BuildValue("{sI sI sI sI sI sI sI " "sO sI sO " "sI sI sI " "sI sy# sN " "sO sf}",
         "texture_id", texture_id_for_img(img), U(client_id), U(width), U(height), U(internal_id),
         "refs.count", (unsigned int)vt_size(&img->refs_by_internal_id), U(client_number),
 
@@ -2445,7 +2515,13 @@ image_as_dict(GraphicsManager *self, Image *img) {
 
         U(current_frame_index), "root_frame_gap", img->root_frame.gap, U(current_frame_index),
 
-        U(animation_duration), "data", cfd.buf, (Py_ssize_t)((cfd.is_opaque ? 3 : 4) * img->width * img->height), "extra_frames", frames
+        U(animation_duration), "data", cfd.buf,
+        (Py_ssize_t)(transmitted_bytes_per_pixel(img->is_hdr, cfd.is_opaque) * img->width * img->height),
+        "extra_frames", frames,
+
+        // W27 P4.2: the transmitted-format facts, so the f=3232 decode path is
+        // checkable from Python without a bespoke C test entry point.
+        B(is_hdr), "max_component", (double)img->max_component
     );
     free(cfd.buf);
     return ans;
@@ -2596,6 +2672,7 @@ init_graphics(PyObject *module) {
 void grman_mark_layers_dirty(GraphicsManager *self) { set_layers_dirty(self); }
 void grman_set_window_id(GraphicsManager *self, id_type id) { self->window_id = id; }
 bool grman_has_images(GraphicsManager *self) { return self->num_of_below_refs + self->num_of_negative_refs + self->num_of_positive_refs > 0; }
+bool grman_has_hdr_refs(GraphicsManager *self) { return self->has_hdr_refs; }
 GraphicsRenderData grman_render_data(GraphicsManager *self) {
     GraphicsRenderData ans = {
         .count=self->render_data.count, .capacity=self->render_data.capacity, .images=self->render_data.item,

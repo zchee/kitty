@@ -445,9 +445,16 @@ typedef struct OSWindow {
     float edr_headroom;
     // W27 P4.1: whether the CAMetalLayer's EDR pipeline is currently engaged
     // (glfwCocoaSetEDREnabled). LAZY by policy: engaged only while a frame
-    // contains >1.0 content (P4.2 wires the content signal; until then only
-    // the KITTY_METAL_FORCE_EDR=1 debug override engages it).
+    // contains >1.0 content -- i.e. while has_hdr_content below is true (P4.2),
+    // or under the KITTY_METAL_FORCE_EDR=1 debug override.
     bool edr_engaged;
+    // W27 P4.2: does this OS window currently show at least one visible f=3232
+    // (HDR) image? Cleared and re-accumulated over every screen in
+    // prepare_to_render_os_window each tick (send_cell_data_to_gpu ORs it in
+    // right after that screen's visible refs are refreshed), so it is the live
+    // content signal lazy EDR engagement keys off -- true while such an image is
+    // onscreen, false again the moment it is scrolled away or deleted.
+    bool has_hdr_content;
     unsigned keep_rendering_till_swap;
     WindowRenderData tab_bar_render_data;
     struct {
@@ -601,6 +608,7 @@ void* metal_get_device(void);
 void metal_set_link_drawable(void *drawable);  // Phase 4 (L1): link-delivered drawable for this frame (CAMetalDisplayLink driver)
 bool metal_immediate_encode_enabled(void);      // true under timer pace (L2 intrinsic); neutered under the CAMetalDisplayLink driver
 void metal_forget_layer(void *layer);           // window teardown: free the per-window state slot
+void metal_set_edr_frame_state(bool engaged, float headroom);  // W27 P4.2: EDR-capable layered working surface
 #endif
 void remove_vao(ssize_t vao_idx);
 bool remove_os_window(id_type os_window_id);
@@ -645,10 +653,12 @@ void free_framebuffer(uint32_t*);
 // kitty/graphics_shaders.metal, and fit the Metal array-uniform 16-slot stride
 // (ARRAY_UNIFORM_BASE) in kitty/metal.m. Larger groups are drawn in chunks.
 #define MAX_IMAGE_INSTANCES 16
-void send_image_to_gpu(uint32_t*, const void*, int32_t, int32_t, bool, bool, bool, RepeatStrategy);
+// Trailing bool is W27 P4.2's is_hdr: an f=3232 (float RGBA) source, uploaded to
+// a GL_RGBA32F texture instead of the 8-bit GL_SRGB_ALPHA one.
+void send_image_to_gpu(uint32_t*, const void*, int32_t, int32_t, bool, bool, bool, RepeatStrategy, bool);
 // G1: update an already-allocated image texture in place (no realloc). Caller
 // guarantees the texture exists at these exact dimensions.
-void update_image_on_gpu(uint32_t tex_id, const void* data, int32_t width, int32_t height, bool is_opaque, bool is_4byte_aligned);
+void update_image_on_gpu(uint32_t tex_id, const void* data, int32_t width, int32_t height, bool is_opaque, bool is_4byte_aligned, bool is_hdr);
 // G3-lite: update only a sub-rectangle of an already-allocated image texture.
 void update_image_sub_region(uint32_t tex_id, const void* data, int32_t x, int32_t y, int32_t width, int32_t height, bool is_opaque, bool is_4byte_aligned);
 // US-307: true when the newest committed frame that drew this image texture may

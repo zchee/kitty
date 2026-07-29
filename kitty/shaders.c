@@ -444,8 +444,15 @@ send_sprite_to_gpu(FONTS_DATA_HANDLE fg, sprite_index idx, pixel *buf, sprite_in
     }
 }
 
+// W27 P4.2: the source layout for an image upload. An HDR (f=3232) image is
+// four float32 components per pixel and its texture is GL_RGBA32F, which is the
+// only internal format in this pipeline that can hold the >1.0 components EDR
+// needs; every other image keeps the GL_SRGB_ALPHA 8-bit storage unchanged.
+#define IMAGE_UPLOAD_SRC_FORMAT(is_hdr, is_opaque) ((is_hdr) ? GL_RGBA : ((is_opaque) ? GL_RGB : GL_RGBA))
+#define IMAGE_UPLOAD_SRC_TYPE(is_hdr) ((is_hdr) ? GL_FLOAT : GL_UNSIGNED_BYTE)
+
 void
-send_image_to_gpu(GLuint *tex_id, const void* data, GLsizei width, GLsizei height, bool is_opaque, bool is_4byte_aligned, bool linear, RepeatStrategy repeat) {
+send_image_to_gpu(GLuint *tex_id, const void* data, GLsizei width, GLsizei height, bool is_opaque, bool is_4byte_aligned, bool linear, RepeatStrategy repeat, bool is_hdr) {
     if (!(*tex_id)) { glGenTextures(1, tex_id);  }
     glBindTexture(GL_TEXTURE_2D, *tex_id);
     glPixelStorei(GL_UNPACK_ALIGNMENT, is_4byte_aligned ? 4 : 1);
@@ -466,11 +473,12 @@ send_image_to_gpu(GLuint *tex_id, const void* data, GLsizei width, GLsizei heigh
     }
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, r);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, r);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_SRGB_ALPHA, width, height, 0, is_opaque ? GL_RGB : GL_RGBA, GL_UNSIGNED_BYTE, data);
+    glTexImage2D(GL_TEXTURE_2D, 0, is_hdr ? GL_RGBA32F : GL_SRGB_ALPHA, width, height, 0,
+                 IMAGE_UPLOAD_SRC_FORMAT(is_hdr, is_opaque), IMAGE_UPLOAD_SRC_TYPE(is_hdr), data);
 }
 
 void
-update_image_on_gpu(GLuint tex_id, const void* data, GLsizei width, GLsizei height, bool is_opaque, bool is_4byte_aligned) {
+update_image_on_gpu(GLuint tex_id, const void* data, GLsizei width, GLsizei height, bool is_opaque, bool is_4byte_aligned, bool is_hdr) {
     // G1: in-place pixel update of an already-allocated GL_SRGB_ALPHA texture
     // (filter/wrap/storage were set by send_image_to_gpu at allocation time and
     // survive a SubImage). On Metal this maps to replaceRegion -- no MTLTexture
@@ -480,7 +488,8 @@ update_image_on_gpu(GLuint tex_id, const void* data, GLsizei width, GLsizei heig
     // between frames needs no reallocation.
     glBindTexture(GL_TEXTURE_2D, tex_id);
     glPixelStorei(GL_UNPACK_ALIGNMENT, is_4byte_aligned ? 4 : 1);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, is_opaque ? GL_RGB : GL_RGBA, GL_UNSIGNED_BYTE, data);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height,
+                    IMAGE_UPLOAD_SRC_FORMAT(is_hdr, is_opaque), IMAGE_UPLOAD_SRC_TYPE(is_hdr), data);
 }
 
 void
@@ -949,17 +958,31 @@ instanced_image_draws_enabled(void) {
 }
 
 static void
-draw_graphics(int program, ImageRenderData *data, GLuint start, GLuint count, float extra_alpha) {
+draw_graphics(int program, ImageRenderData *data, GLuint start, GLuint count, float extra_alpha, float edr_headroom) {
     bind_program(program);
-    if (program != GRAPHICS_ALPHA_MASK_PROGRAM) glUniform1f(graphics_program_layouts[program].uniforms.extra_alpha, extra_alpha);
-    glActiveTexture(GL_TEXTURE0 + GRAPHICS_UNIT);
     GraphicsUniforms *u = &graphics_program_layouts[program].uniforms;
+    const bool is_alpha_mask = program == GRAPHICS_ALPHA_MASK_PROGRAM;
+    if (!is_alpha_mask) {
+        glUniform1f(u->extra_alpha, extra_alpha);
+        // W27 P4.2: the tone map's ceiling. Floored at 1.0 because a headroom
+        // below that is not a dimmer screen, it is an unread/absent value (the
+        // GL backend has no EDR at all), and the shader would clamp to it.
+        glUniform1f(u->edr_headroom, edr_headroom >= 1.f ? edr_headroom : 1.f);
+    }
+    glActiveTexture(GL_TEXTURE0 + GRAPHICS_UNIT);
     const GLuint max_chunk = instanced_image_draws_enabled() ? MAX_IMAGE_INSTANCES : 1;
     for (GLuint i=0; i < count;) {
         ImageRenderData *group = data + start + i;
         glBindTexture(GL_TEXTURE_2D, group->texture_id);
         if (group->group_count == 0) { i++; continue; }
         const GLuint g = group->group_count;
+        // Per source image, so a mixed SDR/HDR screen tone-maps each image
+        // against its own range. Refs are grouped by image, so this is one pair
+        // of uniform writes per texture, not per instance.
+        if (!is_alpha_mask) {
+            glUniform1f(u->src_is_hdr, group->src_is_hdr);
+            glUniform1f(u->src_max_component, group->src_max_component);
+        }
         // G2: draw the whole same-texture group as instanced quads -- one image
         // ref per instance -- chunked to MAX_IMAGE_INSTANCES. Refs are consumed in
         // their sorted order and chunks issue in sequence, so overlapping blends
@@ -1198,7 +1221,7 @@ render_a_bar(const UIRenderData *ui, WindowBarData *bar, PyObject *title, bool a
     // then draw the rendered text
     save_viewport_using_top_left_origin(
         border_rect.left + border_width, border_rect.top + border_width, bar_width, bar_height, sh);
-    draw_graphics(GRAPHICS_PROGRAM, &data, 0, 1, 1.f);
+    draw_graphics(GRAPHICS_PROGRAM, &data, 0, 1, 1.f, ui->os_window->edr_headroom);
     restore_viewport();
     free_texture(&data.texture_id);
     // finally draw border with transparent bg
@@ -1285,7 +1308,7 @@ draw_window_number(const UIRenderData *ui) {
     glUniform4f(graphics_program_layouts[GRAPHICS_ALPHA_MASK_PROGRAM].uniforms.amask_bg_premult, 0.f, 0.f, 0.f, 0.f);
     save_viewport_using_top_left_origin(
         ui->screen_left + letter_x, ui->screen_top + letter_y, lr.width_px, lr.height_px, ui->full_framebuffer_height);
-    draw_graphics(GRAPHICS_ALPHA_MASK_PROGRAM, ird, 0, 1, 1.f);
+    draw_graphics(GRAPHICS_ALPHA_MASK_PROGRAM, ird, 0, 1, 1.f, ui->os_window->edr_headroom);
     restore_viewport();
 #undef lr
 }
@@ -1628,7 +1651,7 @@ draw_window_logo(const UIRenderData *ui) {
     float left = gl_pos_x(w.left, ui->screen_width), top = gl_pos_y(w.top, ui->screen_height);
     ImageRenderData d = {.texture_id = wl->instance->texture_id};
     gpu_data_for_image(&d, left, top, left + gl_size(w.width, ui->screen_width), top - gl_size(w.height, ui->screen_height));
-    draw_graphics(GRAPHICS_PROGRAM, &d, 0, 1, ui->inactive_text_alpha * OPT(window_logo_alpha));
+    draw_graphics(GRAPHICS_PROGRAM, &d, 0, 1, ui->inactive_text_alpha * OPT(window_logo_alpha), ui->os_window->edr_headroom);
 }
 
 bool
@@ -1689,17 +1712,18 @@ draw_cells_with_layers(const UIRenderData *ui, ssize_t vao_idx) {
         if (!ui->has_background_image) call_cell_program(CELL_BG_PROGRAM, ui, vao_idx, false, DRAW_DEFAULT_BG);
         if (ui->window_logo != NULL) draw_window_logo(ui);
         if (ui->grd.num_of_below_refs > 0) draw_graphics(
-                GRAPHICS_PROGRAM, ui->grd.images, 0, ui->grd.num_of_below_refs, ui->inactive_text_alpha);
+                GRAPHICS_PROGRAM, ui->grd.images, 0, ui->grd.num_of_below_refs, ui->inactive_text_alpha,
+                ui->os_window->edr_headroom);
         call_cell_program(CELL_BG_PROGRAM, ui, vao_idx, false, DRAW_NON_DEFAULT_BG);
         if (ui->grd.num_of_negative_refs) draw_graphics(
                 GRAPHICS_PROGRAM, ui->grd.images, ui->grd.num_of_below_refs, ui->grd.num_of_negative_refs,
-                ui->inactive_text_alpha);
+                ui->inactive_text_alpha, ui->os_window->edr_headroom);
         call_cell_program(CELL_FG_PROGRAM, ui, vao_idx, false, DRAW_NEITHER_BG);
     } else call_cell_program(CELL_PROGRAM, ui, vao_idx, false, ui->has_background_image ? DRAW_NON_DEFAULT_BG : DRAW_BOTH_BG);
 
     if (ui->grd.num_of_positive_refs > 0) draw_graphics(
             GRAPHICS_PROGRAM, ui->grd.images, ui->grd.num_of_below_refs + ui->grd.num_of_negative_refs,
-            ui->grd.num_of_positive_refs, ui->inactive_text_alpha);
+            ui->grd.num_of_positive_refs, ui->inactive_text_alpha, ui->os_window->edr_headroom);
 
     draw_visual_bell(ui);
     draw_drag_preview_overlay(ui);
@@ -1731,6 +1755,16 @@ send_cell_data_to_gpu(ssize_t vao_idx, Screen *screen, OSWindow *os_window) {
     if (os_window->fonts_data) {
         if (cell_prepare_to_render(vao_idx, screen, os_window->fonts_data)) changed = true;
     }
+    // W27 P4.2: cell_prepare_to_render has just refreshed this screen's visible
+    // image refs (grman_update_layers), so this is the first moment the answer
+    // to "does this OS window show HDR content?" is current for this screen.
+    // Accumulate with OR across every screen prepared this tick; the caller
+    // (child-monitor's prepare_to_render_os_window) clears the flag before the
+    // sweep and reads it after, which is what makes engagement drop back to
+    // disengaged as soon as the last HDR image stops being visible.
+    GraphicsManager *grman = screen->paused_rendering.expires_at && screen->paused_rendering.grman ?
+        screen->paused_rendering.grman : screen->grman;
+    if (grman_has_hdr_refs(grman)) os_window->has_hdr_content = true;
     return changed;
 }
 
@@ -1924,7 +1958,9 @@ draw_centered_alpha_mask(size_t screen_width, size_t screen_height, size_t width
     glUniform1i(graphics_program_layouts[GRAPHICS_ALPHA_MASK_PROGRAM].uniforms.image, GRAPHICS_UNIT);
     color_vec3(graphics_program_layouts[GRAPHICS_ALPHA_MASK_PROGRAM].uniforms.amask_fg, OPT(foreground));
     color_vec4_premult(graphics_program_layouts[GRAPHICS_ALPHA_MASK_PROGRAM].uniforms.amask_bg_premult, OPT(background), background_opacity);
-    draw_graphics(GRAPHICS_ALPHA_MASK_PROGRAM, data, 0, 1, 1.0);
+    // No OS window in scope here (the live-resize / "resizing" overlay path) and
+    // the alpha-mask program does not tone-map, so an SDR headroom is exact.
+    draw_graphics(GRAPHICS_ALPHA_MASK_PROGRAM, data, 0, 1, 1.0, 1.f);
 }
 
 static void

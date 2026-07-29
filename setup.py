@@ -1466,6 +1466,10 @@ SHADER_UNIFORMS: Dict[str, Tuple[str, ...]] = {
         # graphics_vertex.glsl -- both are [MAX_IMAGE_INSTANCES] arrays; slot 5
         # (dest_rects) is pinned by the headroom _Static_assert in metal.m:232.
         'src_rects', 'dest_rects',
+        # W27 P4.2 tone-map inputs (graphics_fragment.glsl). APPENDED at the end
+        # so every pre-existing slot index is unchanged; edr_headroom is the
+        # window's current screen headroom, src_* describe the image being drawn.
+        'edr_headroom', 'src_is_hdr', 'src_max_component',
     ),
     'rounded_rect': (
         'rect', 'params', 'color', 'background_color',   # rounded_rect_fragment.glsl

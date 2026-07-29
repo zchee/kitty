@@ -75,6 +75,19 @@ typedef struct MetalGraphicsUniforms {
     float amask_fg[3];
     float _pad1;
     float amask_bg_premult[4];
+    // W27 P4.2 tone-map inputs, appended so every offset above is unchanged.
+    // edr_headroom is the window's screen headroom this frame; src_is_hdr is the
+    // GL-uniform-style bool for "this image was transmitted as f=3232"; and
+    // src_max_component is that image's largest R/G/B, which the soft knee's
+    // shoulder is fitted against.
+    float edr_headroom;
+    float src_is_hdr;
+    float src_max_component;
+    // MSL rounds a struct's size up to its alignment, and the float4 members
+    // above make that 16. The three floats land at 560..571, so MSL pads to 576
+    // — spell that padding out here or the static_assert in
+    // graphics_shaders.metal (sizeof parity) fails.
+    float _pad2;
 } MetalGraphicsUniforms;
 
 typedef struct MetalBgimageUniforms {
@@ -137,7 +150,8 @@ _Static_assert(sizeof(MetalBorderUniforms) == 1064, "MetalBorderUniforms layout 
 _Static_assert(offsetof(MetalBorderUniforms, background_opacity) == 36, "border colors[9] must occupy bytes 0-35");
 _Static_assert(offsetof(MetalBorderUniforms, gamma_lut) == 40, "border gamma_lut must start at 40");
 
-_Static_assert(sizeof(MetalGraphicsUniforms) == 560, "MetalGraphicsUniforms layout drifted");
+_Static_assert(sizeof(MetalGraphicsUniforms) == 576, "MetalGraphicsUniforms layout drifted");
+_Static_assert(offsetof(MetalGraphicsUniforms, edr_headroom) == 560, "graphics edr_headroom must follow amask_bg_premult at 560");
 _Static_assert(offsetof(MetalGraphicsUniforms, dest_rects) == 256, "graphics src_rects[16] must occupy bytes 0-255");
 _Static_assert(offsetof(MetalGraphicsUniforms, extra_alpha) == 512, "graphics dest_rects[16] must occupy bytes 256-511");
 _Static_assert(offsetof(MetalGraphicsUniforms, amask_fg) == 528, "graphics amask_fg (float3) must be 16-aligned at 528");

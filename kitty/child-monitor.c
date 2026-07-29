@@ -1364,23 +1364,14 @@ prepare_to_render_os_window(OSWindow *os_window, monotonic_t now, unsigned int *
             os_window->edr_headroom = edr_headroom;
             os_window->needs_render = true;
         }
-        // Lazy EDR engagement (ADR-0022): the layer joins the system EDR
-        // pipeline only while a frame actually needs >1.0 output — engaging
-        // it puts SDR content through the system tone-map (P4.1 pre-check:
-        // mean ~7.7 LSB shift), so idle means OFF, not merely unused. P4.2
-        // wires the real content signal (HDR image onscreen); until then the
-        // KITTY_METAL_FORCE_EDR=1 debug override is the only way to engage,
-        // which is what the P4 gates use to exercise this path end to end.
-        static int force_edr = -1;
-        if (force_edr < 0) { const char *s = getenv("KITTY_METAL_FORCE_EDR"); force_edr = (s && s[0] == '1') ? 1 : 0; }
-        bool want_edr = force_edr == 1;
-        if (want_edr != os_window->edr_engaged) {
-            glfwCocoaSetEDREnabled(os_window->handle, want_edr);
-            os_window->edr_engaged = want_edr;
-            os_window->needs_render = true;
-        }
     }
 #endif
+    // W27 P4.2: cleared here and re-accumulated by every send_cell_data_to_gpu
+    // below, so the EDR engagement decision at the end of this function sees
+    // this tick's content, not last tick's. Cleared on every platform because
+    // send_cell_data_to_gpu (kitty/shaders.c) sets it on every platform; only
+    // the macOS branch below consumes it.
+    os_window->has_hdr_content = false;
     bool needs_render = os_window->needs_render;
     os_window->needs_render = false;
     bool was_previously_rendered_with_layers = os_window->needs_layers;
@@ -1486,6 +1477,38 @@ prepare_to_render_os_window(OSWindow *os_window, monotonic_t now, unsigned int *
             }
         }
     }
+#ifdef __APPLE__
+    if (os_window->handle) {
+        // Lazy EDR engagement (ADR-0022): the layer joins the system EDR
+        // pipeline only while a frame actually needs >1.0 output — engaging it
+        // puts SDR content through the system tone-map (P4.1 pre-check: mean
+        // ~7.7 LSB shift), so idle means OFF, not merely unused.
+        //
+        // This sits at the END of prepare, after every visible screen has had
+        // its image refs refreshed, so has_hdr_content describes the frame that
+        // is about to be rendered rather than the previous one — engagement and
+        // the pixels it applies to land on the same tick. It also drops back to
+        // disengaged as soon as the last HDR image stops being visible.
+        // KITTY_METAL_FORCE_EDR=1 stays as the content-independent debug
+        // override the P4.1 gates use.
+        static int force_edr = -1;
+        if (force_edr < 0) { const char *s = getenv("KITTY_METAL_FORCE_EDR"); force_edr = (s && s[0] == '1') ? 1 : 0; }
+        bool want_edr = force_edr == 1 || os_window->has_hdr_content;
+        if (want_edr != os_window->edr_engaged) {
+            glfwCocoaSetEDREnabled(os_window->handle, want_edr);
+            os_window->edr_engaged = want_edr;
+            needs_render = true;
+        }
+#ifdef KITTY_BACKEND_METAL
+        // The renderer half of the same decision: while engaged, the layered
+        // working surface must be half-float or it clamps the >1.0 components
+        // away before they can reach the drawable. Unconditional (idempotent)
+        // so a format flip can never be missed on a frame where edr_engaged
+        // happened not to change.
+        metal_set_edr_frame_state(want_edr, os_window->edr_headroom);
+#endif
+    }
+#endif
     return needs_render || was_previously_rendered_with_layers != os_window->needs_layers;
 }
 

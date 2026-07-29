@@ -37,6 +37,12 @@ typedef struct {
     uint32_t texture_id, group_count;
     int z_index;
     id_type image_id, ref_id;
+    // W27 P4.2: tone-map inputs for the source image, copied here so the draw
+    // path never has to reach back into the Image. Floats because they go
+    // straight out as glUniform1f (GL-uniform style for the bool, matching how
+    // every other shader flag crosses this boundary). 0/0 for SDR images, which
+    // is exactly the no-op the shader keys off.
+    float src_is_hdr, src_max_component;
 } ImageRenderData;
 
 typedef struct {
@@ -119,6 +125,13 @@ typedef struct {
     uint32_t max_loops, current_loop;
     monotonic_t current_frame_shown_at;
     ref_map refs_by_internal_id;
+    // W27 P4.2: transmitted as f=3232 (RGBA_F32) -- linear extended-sRGB float
+    // components, so values above 1.0 are legal EDR content. max_component is
+    // the largest R/G/B seen anywhere in the image (alpha excluded), which is
+    // what the shader's soft-knee shoulder is fitted against. Both persist for
+    // the life of the image, like every other per-image metadata field.
+    bool is_hdr;
+    float max_component;
 } Image;
 
 typedef struct {
@@ -136,6 +149,10 @@ typedef struct {
     size_t data_sz;
     uint8_t *data;
     bool is_4byte_aligned;
+    // W27 P4.2: the in-flight transfer is f=3232 (16 bytes/px float RGBA). Set
+    // from the format at initialize_load_data() time, so every size check on the
+    // way in sizes itself from the transmitted format rather than from is_opaque.
+    bool is_hdr;
     bool is_opaque, loading_completed_successfully;
     uint32_t width, height;
     GraphicsCommand start_command;
@@ -165,6 +182,11 @@ typedef struct {
     size_t used_storage;
     PyObject *disk_cache;
     bool has_images_needing_animation, context_made_current_for_this_command;
+    // W27 P4.2: does the current render_data hold at least one visible ref to an
+    // f=3232 image? Recomputed on the same schedule as num_of_*_refs (only when
+    // the layers are dirty) and read every frame, so it stays in step with the
+    // render data it describes. Drives lazy EDR engagement (ADR-0022).
+    bool has_hdr_refs;
     id_type window_id;
     image_map images_by_internal_id;
 } GraphicsManager;
@@ -235,4 +257,5 @@ void grman_pause_rendering(GraphicsManager *self, GraphicsManager *dest);
 void grman_mark_layers_dirty(GraphicsManager *self);
 void grman_set_window_id(GraphicsManager *self, id_type id);
 bool grman_has_images(GraphicsManager *self);
+bool grman_has_hdr_refs(GraphicsManager *self);
 GraphicsRenderData grman_render_data(GraphicsManager *self);
