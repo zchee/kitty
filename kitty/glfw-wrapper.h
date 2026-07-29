@@ -2499,6 +2499,14 @@ typedef void (*glfwCocoaSetWindowLevel_func)(GLFWwindow*, const char*);
 GFW_EXTERN glfwCocoaSetWindowLevel_func glfwCocoaSetWindowLevel_impl;
 #define glfwCocoaSetWindowLevel glfwCocoaSetWindowLevel_impl
 
+typedef float (*glfwCocoaCurrentEDRHeadroom_func)(GLFWwindow*);
+GFW_EXTERN glfwCocoaCurrentEDRHeadroom_func glfwCocoaCurrentEDRHeadroom_impl;
+#define glfwCocoaCurrentEDRHeadroom glfwCocoaCurrentEDRHeadroom_impl
+
+typedef void (*glfwCocoaSetEDREnabled_func)(GLFWwindow*, bool);
+GFW_EXTERN glfwCocoaSetEDREnabled_func glfwCocoaSetEDREnabled_impl;
+#define glfwCocoaSetEDREnabled glfwCocoaSetEDREnabled_impl
+
 typedef void (*glfwCocoaSetWindowChrome_func)(GLFWwindow*, unsigned int, bool, unsigned int, int, unsigned int, bool, float, bool);
 GFW_EXTERN glfwCocoaSetWindowChrome_func glfwCocoaSetWindowChrome_impl;
 #define glfwCocoaSetWindowChrome glfwCocoaSetWindowChrome_impl

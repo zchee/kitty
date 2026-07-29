@@ -1351,6 +1351,36 @@ change_menubar_title(PyObject *title UNUSED) {
 static bool
 prepare_to_render_os_window(OSWindow *os_window, monotonic_t now, unsigned int *active_window_id, color_type *active_window_bg, unsigned int *num_visible_windows, bool *all_windows_have_same_bg, bool scan_for_animated_images) {
 #define TD os_window->tab_bar_render_data
+#ifdef __APPLE__
+    // W27 P4.1: track the screen's current EDR headroom every tick (a cheap
+    // property read; it moves with display brightness and screen hops). A
+    // change forces a full re-render — tone mapping is stateless by policy
+    // (ADR-0022), so re-rendering against the new headroom is the whole
+    // update. 0.0 init (fresh OSWindow) always differs from the >=1.0 read,
+    // seeding the field on the first frame without a special case.
+    if (os_window->handle) {
+        float edr_headroom = glfwCocoaCurrentEDRHeadroom(os_window->handle);
+        if (edr_headroom != os_window->edr_headroom) {
+            os_window->edr_headroom = edr_headroom;
+            os_window->needs_render = true;
+        }
+        // Lazy EDR engagement (ADR-0022): the layer joins the system EDR
+        // pipeline only while a frame actually needs >1.0 output — engaging
+        // it puts SDR content through the system tone-map (P4.1 pre-check:
+        // mean ~7.7 LSB shift), so idle means OFF, not merely unused. P4.2
+        // wires the real content signal (HDR image onscreen); until then the
+        // KITTY_METAL_FORCE_EDR=1 debug override is the only way to engage,
+        // which is what the P4 gates use to exercise this path end to end.
+        static int force_edr = -1;
+        if (force_edr < 0) { const char *s = getenv("KITTY_METAL_FORCE_EDR"); force_edr = (s && s[0] == '1') ? 1 : 0; }
+        bool want_edr = force_edr == 1;
+        if (want_edr != os_window->edr_engaged) {
+            glfwCocoaSetEDREnabled(os_window->handle, want_edr);
+            os_window->edr_engaged = want_edr;
+            os_window->needs_render = true;
+        }
+    }
+#endif
     bool needs_render = os_window->needs_render;
     os_window->needs_render = false;
     bool was_previously_rendered_with_layers = os_window->needs_layers;

@@ -146,6 +146,20 @@ kitty_drawable_primaries_wide(void) {
     return false;
 }
 
+// W27 P4.1: EDR opt-in eligibility. Only the linear-stored wide formats may
+// attach edrMetadata — its reference requires a colourspace with a linear
+// transfer function plus a >1.0-capable pixel format (apple-docs, verified at
+// P2.1), and ADR-0022 rules bgra10_xr_srgb EDR-INELIGIBLE on exactly that
+// ground. bgra8 is the SDR control arm by definition.
+static inline bool
+kitty_drawable_edr_eligible(void) {
+    switch (kitty_drawable_format_id()) {
+        case DRAWABLE_FORMAT_BGRA10_XR: case DRAWABLE_FORMAT_RGBA16F: return true;
+        case DRAWABLE_FORMAT_BGRA8: case DRAWABLE_FORMAT_BGRA10_XR_SRGB: break;
+    }
+    return false;
+}
+
 // NOTE (W27 P3.4): the "which formats want linear values" question used to be
 // answered by a kitty_drawable_format_is_wide() predicate here. It is now
 // target_color_space_for() in kitty/metal.m, which has to distinguish

@@ -29,6 +29,10 @@
 #include "../kitty/monotonic.h"
 #include "glfw3.h"
 #include "internal.h"
+#ifdef KITTY_USE_METAL
+// W27 P4.1: kitty_drawable_edr_eligible() for glfwCocoaSetEDREnabled below.
+#include "../kitty/metal_drawable_format.h"
+#endif
 
 #include <Availability.h>
 #import <CoreServices/CoreServices.h>
@@ -4326,6 +4330,45 @@ apply_window_corner_curve(_GLFWwindow *window) {
 GLFWAPI void glfwCocoaSetWindowLevel(GLFWwindow *w, const char *level_spec) { @autoreleasepool {
     _GLFWwindow* window = (_GLFWwindow*)w;
     apply_ns_window_layer(window, level_spec);
+}}
+
+// W27 P4.1: the window's screen's CURRENT EDR headroom (state-dependent; 1.0
+// on SDR panels and whenever the system reports no extended range). Cheap
+// property read — re-queried every render tick per Apple's own tone-mapping
+// guidance, since the value moves with display brightness; the caller
+// (kitty/child-monitor.c) compares successive reads and triggers a stateless
+// re-render on change, which also covers screen moves.
+GLFWAPI float glfwCocoaCurrentEDRHeadroom(GLFWwindow *w) { @autoreleasepool {
+    _GLFWwindow* window = (_GLFWwindow*)w;
+    NSWindow *nsw = window->ns.object;
+    NSScreen *screen = nsw ? [nsw screen] : nil;
+    if (!screen) screen = [NSScreen mainScreen];
+    if (!screen) return 1.0f;
+    float h = (float)screen.maximumExtendedDynamicRangeColorComponentValue;
+    return h >= 1.0f ? h : 1.0f;
+}}
+
+// W27 P4.1: engage/disengage the EDR pipeline on the window's CAMetalLayer,
+// LAZILY (content-driven, ADR-0022): the HDR10-metadata route is the only
+// EDR-LIVE configuration on macOS 27 (P2.2 sweep), but the system tone-map it
+// engages measurably remaps the SDR range too (P4.1 invariance pre-check:
+// mean ~7.7 LSB). So kitty keeps the layer in plain SDR compositing until a
+// frame actually contains >1.0 content, and drops back when it no longer
+// does. Idempotent; no-op for non-EDR-eligible drawable formats. The HDR10
+// parameters are the P2.2 empirically proven EDR-LIVE set.
+GLFWAPI void glfwCocoaSetEDREnabled(GLFWwindow *w, bool enabled) { @autoreleasepool {
+#ifdef KITTY_USE_METAL
+    _GLFWwindow* window = (_GLFWwindow*)w;
+    CAMetalLayer *layer = (CAMetalLayer*)window->ns.layer;
+    if (!layer || !kitty_drawable_edr_eligible()) return;
+    if (layer.wantsExtendedDynamicRangeContent == (BOOL)enabled) return;
+    layer.wantsExtendedDynamicRangeContent = enabled;
+    layer.EDRMetadata = enabled
+        ? [CAEDRMetadata HDR10MetadataWithMinLuminance:0.005f maxLuminance:1000.0f opticalOutputScale:100.0f]
+        : nil;
+#else
+    (void)w; (void)enabled;
+#endif
 }}
 
 

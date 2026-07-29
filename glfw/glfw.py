@@ -100,6 +100,8 @@ def generate_wrappers(glfw_header: str) -> None:
     void glfwSetPrimarySelectionString(GLFWwindow* window, const char* string)
     void glfwCocoaCycleThroughOSWindows(bool backwards)
     void glfwCocoaSetWindowLevel(GLFWwindow *w, const char *level_spec)
+    float glfwCocoaCurrentEDRHeadroom(GLFWwindow *w)
+    void glfwCocoaSetEDREnabled(GLFWwindow *w, bool enabled)
     void glfwCocoaSetWindowChrome(GLFWwindow* window, unsigned int color, bool use_system_color, unsigned int system_color,\
     int background_blur, unsigned int hide_window_decorations, bool show_text_in_titlebar, float background_opacity, bool resizable)
     void glfwCocoaRegisterMIMETypes(GLFWwindow *window, const char **mimes, size_t count)

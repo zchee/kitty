@@ -518,6 +518,12 @@ load_glfw(const char* path) {
     *(void **) (&glfwCocoaSetWindowLevel_impl) = dlsym(handle, "glfwCocoaSetWindowLevel");
     if (glfwCocoaSetWindowLevel_impl == NULL) dlerror(); // clear error indicator
 
+    *(void **) (&glfwCocoaCurrentEDRHeadroom_impl) = dlsym(handle, "glfwCocoaCurrentEDRHeadroom");
+    if (glfwCocoaCurrentEDRHeadroom_impl == NULL) dlerror(); // clear error indicator
+
+    *(void **) (&glfwCocoaSetEDREnabled_impl) = dlsym(handle, "glfwCocoaSetEDREnabled");
+    if (glfwCocoaSetEDREnabled_impl == NULL) dlerror(); // clear error indicator
+
     *(void **) (&glfwCocoaSetWindowChrome_impl) = dlsym(handle, "glfwCocoaSetWindowChrome");
     if (glfwCocoaSetWindowChrome_impl == NULL) dlerror(); // clear error indicator
 

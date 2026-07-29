@@ -437,6 +437,17 @@ typedef struct OSWindow {
     } indirect_output;
     unsigned int active_tab, num_tabs, capacity, last_active_tab, last_num_tabs, last_active_window_id;
     bool focused_at_last_render, needs_render, needs_layers;
+    // W27 P4.1: the window's screen's current EDR headroom (>=1.0; 1.0 = SDR
+    // or non-EDR-eligible drawable). Refreshed every render tick from
+    // glfwCocoaCurrentEDRHeadroom(); a change triggers a stateless re-render
+    // (plan P4.1: screen-move/headroom-change re-render). Consumed by the
+    // P4.2 HDR-image tone-map (ADR-0022 policy table).
+    float edr_headroom;
+    // W27 P4.1: whether the CAMetalLayer's EDR pipeline is currently engaged
+    // (glfwCocoaSetEDREnabled). LAZY by policy: engaged only while a frame
+    // contains >1.0 content (P4.2 wires the content signal; until then only
+    // the KITTY_METAL_FORCE_EDR=1 debug override engages it).
+    bool edr_engaged;
     unsigned keep_rendering_till_swap;
     WindowRenderData tab_bar_render_data;
     struct {

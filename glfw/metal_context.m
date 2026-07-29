@@ -427,6 +427,15 @@ bool _glfwCreateContextMetal(_GLFWwindow* window)
                             "Metal: failed to create the drawable colorspace");
         }
     }
+    // W27 P4.1: EDR is wired but NOT engaged at creation — see
+    // glfwMetalSetEDREnabled below. Engaging is LAZY (content-driven): the
+    // HDR10-metadata route is the only EDR-LIVE configuration on macOS 27
+    // (P2.2 17-variation sweep), but attaching that metadata puts the layer
+    // through the system tone-map, which measurably remaps the SDR range too
+    // (P4.1 invariance pre-check: content mean ~7.7 LSB, max 127, vs the
+    // un-engaged layer). So the layer stays in plain SDR compositing until a
+    // frame actually contains >1.0 content; AC8's "SDR content must not shift
+    // while the machinery is present but idle" holds by construction.
     // Allow nextDrawable to return nil instead of blocking indefinitely
     // when all drawables are in-flight. This prevents deadlock when
     // the main thread blocks in nextDrawable while the GPU needs the
