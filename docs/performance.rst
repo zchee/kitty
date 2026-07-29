@@ -142,7 +142,7 @@ admittedly biased, eyes).
 Apple Silicon / Metal backend
 --------------------------------
 
-The macOS Metal backend (``KITTY_USE_METAL=1`` builds) was optimized and
+The macOS Metal backend (all macOS builds since W27) was optimized and
 measured in 2026 on an Apple M3 Max (macOS 27, 60 Hz laptop display,
 default config and font, 100×30 cell window unless stated). Methodology:
 same-machine interleaved A/B arms, medians over repeated runs, load
@@ -209,7 +209,9 @@ rendering fully off *and* ``input_delay 0``, kitty's pty→parse drain
 interleave whose kitty anchors reproduce within 0.5% across the two
 measurement windows): the residual is the io-thread→main-tick
 handoff architecture itself, not any per-stage CPU. That is also why the
-Metal and OpenGL backends measure equal here. (An earlier revision of this table showed Metal ~13%
+Metal and OpenGL backends measure equal here. The OpenGL arm is no
+longer buildable on darwin as of W27, so this comparison is frozen at
+its measurement date. (An earlier revision of this table showed Metal ~13%
 ahead of OpenGL on devlog-006; that delta does not reproduce under
 same-window interleaving and is attributed to load-window confounding.
 The backend's wins are on the latency, CPU-per-frame, and memory axes

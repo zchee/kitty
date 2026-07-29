@@ -38,13 +38,8 @@ This harness never builds kitty itself -- build first, then benchmark the
 resulting `kitty/launcher/kitty`.
 
 ```sh
-# Metal backend
-PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/libpng/lib/pkgconfig:/opt/homebrew/opt/freetype/lib/pkgconfig \
-  KITTY_USE_METAL=1 python3.14 setup.py build
-
-# GL backend (use a separate checkout or `setup.py clean` between backends --
-# KITTY_USE_METAL is a compile-time #define baked into the binary; there is
-# no dual-backend build directory today)
+# Metal backend (the only macOS backend as of W27; KITTY_USE_METAL is no
+# longer a build input -- =1 is tolerated, anything else fails fast)
 PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/libpng/lib/pkgconfig:/opt/homebrew/opt/freetype/lib/pkgconfig \
   python3.14 setup.py build
 ```
@@ -59,14 +54,14 @@ alongside it at `kitty/launcher/kitty.app/Contents/MacOS/kitten`.
 make metal-baseline          # Metal-build JSON -> .omc/baselines/
 ```
 
-There is intentionally only **one** Makefile target. To baseline a GL build,
-build GL as shown above (over/instead of the Metal build) and run the script
-directly -- it auto-detects the backend from the built `.app` bundle (presence
-of `Contents/Resources/default.metallib`), so the label in the output JSON is
-always truthful regardless of which target invoked it:
+There is intentionally only **one** Makefile target. No GL build exists on
+darwin as of W27, so GL baselines can no longer be produced on macOS; the
+script's backend auto-detection (presence of `Contents/Resources/default.metallib`
+in the built `.app` bundle) remains for cross-platform and archived runs, so
+the label in the output JSON is always truthful:
 
 ```sh
-python3.14 scripts/metal-baseline.py --label gl-run1
+python3.14 scripts/metal-baseline.py --label metal-run1
 ```
 
 Useful flags (`python3.14 scripts/metal-baseline.py --help` for the full

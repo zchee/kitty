@@ -40,8 +40,8 @@ BUILD_LOCK = REPO_ROOT / ".omc" / "build.lock"
 # forensic metadata (xctrace export --toc dumps it back out as plaintext XML).
 # Inheriting the whole environment leaked exactly that during a Wave-2 profiling
 # attempt; a minimal allowlist removes the exposure without affecting rendering.
-# Callers pass anything extra (KITTY_METAL_*, KITTY_USE_METAL, ...) explicitly
-# via extra_env.
+# Callers pass anything extra (KITTY_METAL_*, KITTY_HARNESS_PASS, ...)
+# explicitly via extra_env.
 _ENV_ALLOWLIST = (
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL",
     "LC_CTYPE", "TERM", "TERMINFO", "SSH_AUTH_SOCK", "XPC_SERVICE_NAME",
@@ -107,8 +107,7 @@ def require_kitty_binary() -> None:
     if not KITTY_BINARY.exists():
         print(f"ERROR: built kitty binary not found at {KITTY_BINARY}", file=sys.stderr)
         print("This script does not build kitty -- build it first:", file=sys.stderr)
-        print("  KITTY_USE_METAL=1 python3.14 setup.py build   # Metal backend", file=sys.stderr)
-        print("  python3.14 setup.py build                     # GL backend (fresh checkout/build dir)", file=sys.stderr)
+        print("  python3.14 setup.py build   # Metal backend (macOS is Metal-only as of W27)", file=sys.stderr)
         sys.exit(1)
 
 

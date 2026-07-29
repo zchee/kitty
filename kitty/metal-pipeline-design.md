@@ -1967,8 +1967,8 @@ throughout; scroll_semantics goldens byte-identical in every arm.
   against the pace= suffix (silent 0-frame parses) — fixed at
   029ae4310. Build: `make`'s devel path runs a destructive
   `git rebase origin/master`; the dev build command is
-  `KITTY_USE_METAL=1 python3.14 setup.py build` (now a CLAUDE.md hard
-  rule).
+  `python3.14 setup.py build` (macOS is Metal-only as of W27; a
+  CLAUDE.md hard rule).
 
 Exit: hwm/eager < 1.0 and scrolling ≤ 26 ms **NOT MET** (best 1.42–1.45×
 across all bounds; eager 33 ms under light load) — closed measure-first
