@@ -82,6 +82,10 @@ CONFIG_MATRIX: dict[str, list[str]] = {
     "graphics": [],
     "progress-bar": ["progress_bar=top"],
     "palette-oklch": [],
+    # W27 P4.3: the EDR golden — an f=3232 float ramp rendered through the
+    # tone-map with the headroom PINNED (see CONFIG_ENV), so the dump-channel
+    # rendition is display-state-independent.
+    "hdr-ramp": [],
 }
 
 # Scene argument handed to the content helper (argv[1]); configs not listed
@@ -90,6 +94,14 @@ CONFIG_SCENE: dict[str, str] = {
     "graphics": "graphics",
     "progress-bar": "progress",
     "palette-oklch": "palette",
+    "hdr-ramp": "hdr-ramp",
+}
+
+# Extra environment for specific configs (merged into the sanitized spawn env).
+CONFIG_ENV: dict[str, dict[str, str]] = {
+    # Deterministic tone-map ceiling for the EDR golden (the live headroom
+    # moves with the panel and its brightness slider).
+    "hdr-ramp": {"KITTY_METAL_EDR_HEADROOM_OVERRIDE": "2.0"},
 }
 
 
@@ -127,7 +139,7 @@ def capture_config(name: str, opts: list[str], output_dir: Path, timeout: float,
         helper_argv.append(scene)
     proc = spawn_kitty(
         helper_argv,
-        extra_env={"KITTY_METAL_DUMP_FRAME": str(png_path), **(env or {})},
+        extra_env={"KITTY_METAL_DUMP_FRAME": str(png_path), **CONFIG_ENV.get(name, {}), **(env or {})},
         extra_kitty_opts=full_opts,
         take_focus=True,
     )

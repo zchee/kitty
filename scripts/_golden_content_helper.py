@@ -97,7 +97,32 @@ def main() -> int:
         # progress_bar, default 'top'); determinate bars do not animate, so
         # the held frame is static.
         out.write("\x1b]9;4;1;50\x1b\\")
-    elif scene == "palette":
+    elif scene == "hdr-ramp":
+        # W27 P4.3: the EDR golden scene. A float32 (f=3232) ramp image whose
+        # components rise 0.0 -> 4.0 left-to-right in 32 flat blocks, so with
+        # the harness pinning KITTY_METAL_EDR_HEADROOM_OVERRIDE=2.0 the left
+        # half is below the headroom (identity + knee region) and the right
+        # half exercises the shoulder and the ceiling. The dump channel renders
+        # the BGRA8 control-arm rendition of the tone-mapped result, which is
+        # deterministic BECAUSE the headroom is pinned (the live value moves
+        # with panel brightness). Payload built with stdlib struct/base64 and
+        # transmitted via the graphics-protocol APC in 4096-byte chunks.
+        import base64 as _b64
+        import struct as _struct
+        w_px, h_px, blocks = 256, 32, 32
+        row = bytearray()
+        for x in range(w_px):
+            v = (x * blocks // w_px) * (4.0 / (blocks - 1))
+            row += _struct.pack("<ffff", v, v, v, 1.0)
+        payload = _b64.standard_b64encode(bytes(row) * h_px).decode()
+        out.write("\x1b[7;1H")
+        first = True
+        while payload:
+            chunk, payload = payload[:4096], payload[4096:]
+            m = 1 if payload else 0
+            ctrl = f"a=T,f=3232,s={w_px},v={h_px},c=28,r=4,m={m}" if first else f"m={m}"
+            out.write(f"\x1b_G{ctrl};{chunk}\x1b\\")
+            first = False
         # W27 P3.6: OKLCH palette entries through kitty's own parser (OSC 4 →
         # Color.parse_color) painted as SGR 48;5 swatches — the golden twin of
         # the .omc accuracy-gate palette rows. On the BGRA8 capture control arm

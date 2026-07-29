@@ -11,6 +11,7 @@
 #include "threading.h"
 #include "screen.h"
 #include "monotonic.h"
+#include <math.h>  // isfinite(), W27 P4.3 headroom-override validation
 #include <termios.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -1360,6 +1361,21 @@ prepare_to_render_os_window(OSWindow *os_window, monotonic_t now, unsigned int *
     // seeding the field on the first frame without a special case.
     if (os_window->handle) {
         float edr_headroom = glfwCocoaCurrentEDRHeadroom(os_window->handle);
+        // W27 P4.3 (gate/debug only): pin the headroom to a fixed value so the
+        // EDR golden scene is deterministic — the live value moves with the
+        // panel and its brightness slider, which would make a pixel baseline
+        // rot with display state. Parsed once; ignored unless a finite value
+        // >= 1.0 is given.
+        static float headroom_override = -2.f;
+        if (headroom_override == -2.f) {
+            const char *s = getenv("KITTY_METAL_EDR_HEADROOM_OVERRIDE");
+            headroom_override = -1.f;
+            if (s && s[0]) {
+                char *end = NULL; float v = strtof(s, &end);
+                if (end && end != s && isfinite(v) && v >= 1.f) headroom_override = v;
+            }
+        }
+        if (headroom_override >= 1.f) edr_headroom = headroom_override;
         if (edr_headroom != os_window->edr_headroom) {
             os_window->edr_headroom = edr_headroom;
             os_window->needs_render = true;
