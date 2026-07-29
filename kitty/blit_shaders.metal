@@ -15,6 +15,10 @@ using namespace metal;
 // one place, shared with cell_shaders.metal, border_shaders.metal and the C
 // side that specializes these fragments.
 #include "color_transfer.metal.h"
+// W27 GLSL-freezeout stage 1 (D4): pins BlitUniforms/ScreenshotUniforms
+// (below) against the C-side MetalBlitUniforms/MetalScreenshotUniforms
+// (metal.m/metal_uniforms.h) at compile time.
+#include "metal_uniforms.h"
 
 // ---- Blit uniforms ----
 
@@ -22,6 +26,8 @@ struct BlitUniforms {
     float4 src_rect;   // left, top, right, bottom in texture coords
     float4 dest_rect;  // left, top, right, bottom in NDC
 };
+static_assert(sizeof(BlitUniforms) == sizeof(MetalBlitUniforms),
+              "BlitUniforms drifted from MetalBlitUniforms");
 
 struct BlitVertexOut {
     float4 position [[position]];
@@ -95,6 +101,8 @@ struct ScreenshotUniforms {
     float4 dest_rect;
     float2 src_size;
 };
+static_assert(sizeof(ScreenshotUniforms) == sizeof(MetalScreenshotUniforms),
+              "ScreenshotUniforms drifted from MetalScreenshotUniforms");
 
 // ---- Screenshot Vertex Shader ----
 

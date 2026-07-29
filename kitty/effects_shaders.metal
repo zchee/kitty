@@ -9,6 +9,11 @@
 
 #include <metal_stdlib>
 using namespace metal;
+// W27 GLSL-freezeout stage 1 (D4): pins TintUniforms/TrailUniforms/
+// RoundedRectUniforms (below) against the C-side MetalTintUniforms/
+// MetalTrailUniforms/MetalRoundedRectUniforms (metal.m/metal_uniforms.h) at
+// compile time.
+#include "metal_uniforms.h"
 
 inline float4 vec4_premul(float3 rgb, float a) { return float4(rgb * a, a); }
 
@@ -24,6 +29,8 @@ struct TintUniforms {
     float4 tint_color;
     float4 edges;
 };
+static_assert(sizeof(TintUniforms) == sizeof(MetalTintUniforms),
+              "TintUniforms drifted from MetalTintUniforms");
 
 struct TintVertexOut {
     float4 position [[position]];
@@ -64,6 +71,8 @@ struct TrailUniforms {
     float3 trail_color;
     float trail_opacity;
 };
+static_assert(sizeof(TrailUniforms) == sizeof(MetalTrailUniforms),
+              "TrailUniforms drifted from MetalTrailUniforms");
 
 struct TrailVertexOut {
     float4 position [[position]];
@@ -100,6 +109,8 @@ struct RoundedRectUniforms {
     float4 rect;     // x, y, w, h in pixels
     float2 params;   // thickness, corner_radius
 };
+static_assert(sizeof(RoundedRectUniforms) == sizeof(MetalRoundedRectUniforms),
+              "RoundedRectUniforms drifted from MetalRoundedRectUniforms");
 
 struct RoundedRectVertexOut {
     float4 position [[position]];

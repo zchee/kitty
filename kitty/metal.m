@@ -26,6 +26,10 @@
 #undef MIN
 
 #include "metal.h"
+// W27 GLSL-freezeout stage 1: the generated per-program uniform-slot enums
+// (<CLASS>_U_<name>), consumed by the fill_*_uniforms() functions below in
+// place of the old find_uniform_slot() string-literal lookups.
+#include "uniforms_generated.h"
 #include "state.h"
 #include "png-reader.h"
 
@@ -221,15 +225,13 @@ static struct {
 } uniform_stores[64];
 
 // US-307 (G2 minor): array uniforms pack at ARRAY_UNIFORM_BASE + slot*16, spanning
-// MAX_IMAGE_INSTANCES elements. The graphics program registers 6 uniforms
-// (get_uniform_locations_graphics: image, amask_fg, amask_bg_premult, extra_alpha,
-// src_rects, dest_rects), so dest_rects is slot 5 -> base 280, ending at slot 295
-// of MAX_UNIFORMS_PER_PROGRAM. Guard the headroom at compile time so growing
+// MAX_IMAGE_INSTANCES elements. Guard the headroom at compile time so growing
 // MAX_IMAGE_INSTANCES or shrinking the store fails the build instead of
-// metal_gl_uniform4fv silently clamping (base+i < MAX_UNIFORMS_PER_PROGRAM). Adding
-// a uniform ahead of dest_rects means bumping GRAPHICS_ARRAY_UNIFORM_MAX_SLOT.
-#define GRAPHICS_ARRAY_UNIFORM_MAX_SLOT 5  // dest_rects slot in get_uniform_locations_graphics
-_Static_assert(ARRAY_UNIFORM_BASE + GRAPHICS_ARRAY_UNIFORM_MAX_SLOT * 16 + MAX_IMAGE_INSTANCES <= MAX_UNIFORMS_PER_PROGRAM,
+// metal_gl_uniform4fv silently clamping (base+i < MAX_UNIFORMS_PER_PROGRAM).
+// W27 GLSL-freezeout stage 1: GRAPHICS_U_dest_rects is generated from
+// SHADER_UNIFORMS['graphics'] (setup.py) into uniforms_generated.h, so this
+// assert now tracks the manifest instead of a hand-maintained slot literal.
+_Static_assert(ARRAY_UNIFORM_BASE + GRAPHICS_U_dest_rects * 16 + MAX_IMAGE_INSTANCES <= MAX_UNIFORMS_PER_PROGRAM,
                "graphics dest_rects array overflows the uniform value store");
 
 // Gamma LUT — cached for binding to shaders
@@ -665,34 +667,23 @@ get_uniform_location(int program, const char *name) {
     return -1;
 }
 
-// Find an existing uniform slot by name without creating one. Slots are
-// assigned by get_uniform_location in whatever order the generated
-// uniforms_generated.h code calls it; resolving by name at draw time keeps
-// the shim independent of that order.
-static GLint
-find_uniform_slot(int program, const char *name) {
-    if (program < 0 || program >= 64) return -1;
-    Program *p = programs + program;
-    for (GLint i = 0; i < p->num_of_uniforms; i++) {
-        if (strcmp(p->uniforms[i].name, name) == 0) return p->uniforms[i].location;
-    }
-    return -1;
-}
-
 // C5: the graphics rect arrays in MetalGraphicsUniforms are sized [16*4]; pin the
 // instance count the shim marshals so a MAX_IMAGE_INSTANCES change can't silently
 // under/over-run them (metal_uniforms.h can't see this state.h macro).
 _Static_assert(MAX_IMAGE_INSTANCES == 16, "MetalGraphicsUniforms rect arrays are sized for 16 instances");
 
-// C5: direct MSL-layout uniform fills. Each program's name->slot map is resolved
-// once (function-static, -2 = unresolved), so the per-draw strcmp in
-// find_uniform_slot leaves the steady-state frame path (init/program-setup keeps
-// the GL-name shim). The fill then reads the value store by cached slot straight
-// into the MetalXxxUniforms struct whose layout is pinned by _Static_asserts in
-// metal_uniforms.h. Programs with variant siblings (cell 0-2, graphics 5-7)
-// register identical names in identical order via the same get_uniform_locations_*
-// call, so their slots match; VALUES are always read from the passed program's
-// store. The byte-identical golden set cross-checks the whole path.
+// C5: direct MSL-layout uniform fills. Each program's uniform slot is now the
+// generated <CLASS>_U_<name> enumerator (uniforms_generated.h, from
+// SHADER_UNIFORMS in setup.py) instead of a runtime find_uniform_slot() string
+// lookup cached per-program: since get_uniform_locations_<name>() calls
+// get_uniform_location() in exactly the enum's declaration order, the
+// enumerator IS the slot index get_uniform_location assigned, at compile time.
+// A renamed/reordered manifest entry now fails the build (undeclared
+// identifier / wrong index) instead of silently zero-filling at draw time.
+// Programs with variant siblings (cell 0-2, graphics 5-7) register identical
+// names in identical order via the same get_uniform_locations_* call, so their
+// slots match; VALUES are always read from the passed program's store. The
+// byte-identical golden set cross-checks the whole path.
 static inline float
 slot_f(int program, GLint s, int comp) {
     return s >= 0 ? uniform_stores[program].values[s].f[comp] : 0.f;
@@ -704,148 +695,87 @@ slot_fv(int program, GLint s, float *dest, int n) {
 
 static void
 fill_cell_draw_uniforms(int program, MetalCellDrawUniforms *u) {
-    static GLint s_tc = -2, s_tga, s_bg, s_ro;
-    if (s_tc == -2) {
-        s_tc = find_uniform_slot(program, "text_contrast");
-        s_tga = find_uniform_slot(program, "text_gamma_adjustment");
-        s_bg = find_uniform_slot(program, "draw_bg_bitfield");
-        s_ro = find_uniform_slot(program, "row_offset");
-    }
-    u->draw_bg_bitfield = s_bg >= 0 ? uniform_stores[program].values[s_bg].u[0] : 0u;
-    u->row_offset = slot_f(program, s_ro, 0);
-    u->text_contrast = slot_f(program, s_tc, 0);
-    u->text_gamma_adjustment = slot_f(program, s_tga, 0);
+    u->draw_bg_bitfield = uniform_stores[program].values[CELL_U_draw_bg_bitfield].u[0];
+    u->row_offset = slot_f(program, CELL_U_row_offset, 0);
+    u->text_contrast = slot_f(program, CELL_U_text_contrast, 0);
+    u->text_gamma_adjustment = slot_f(program, CELL_U_text_gamma_adjustment, 0);
 }
 
 static void
 fill_border_uniforms(int program, MetalBorderUniforms *u) {
-    static GLint s_colors = -2, s_bg;
-    if (s_colors == -2) {
-        s_colors = find_uniform_slot(program, "colors");
-        s_bg = find_uniform_slot(program, "background_opacity");
-    }
     memset(u, 0, sizeof(*u));
-    if (s_colors >= 0) {
-        int base = ARRAY_UNIFORM_BASE + s_colors * 16;
-        for (int i = 0; i < 9 && base + i < MAX_UNIFORMS_PER_PROGRAM; i++)
-            u->colors[i] = uniform_stores[program].values[base + i].u[0];
-    }
-    u->background_opacity = slot_f(program, s_bg, 0);
+    int base = ARRAY_UNIFORM_BASE + BORDER_U_colors * 16;
+    for (int i = 0; i < 9 && base + i < MAX_UNIFORMS_PER_PROGRAM; i++)
+        u->colors[i] = uniform_stores[program].values[base + i].u[0];
+    u->background_opacity = slot_f(program, BORDER_U_background_opacity, 0);
     if (cached_gamma_lut) memcpy(u->gamma_lut, cached_gamma_lut, sizeof(u->gamma_lut));
 }
 
 static void
 fill_graphics_uniforms(int program, MetalGraphicsUniforms *u) {
-    static GLint s_src = -2, s_dst, s_ea, s_afg, s_abg;
-    if (s_src == -2) {
-        s_src = find_uniform_slot(program, "src_rects");
-        s_dst = find_uniform_slot(program, "dest_rects");
-        s_ea = find_uniform_slot(program, "extra_alpha");
-        s_afg = find_uniform_slot(program, "amask_fg");
-        s_abg = find_uniform_slot(program, "amask_bg_premult");
-    }
     memset(u, 0, sizeof(*u));
-    if (s_src >= 0) {
-        int base = ARRAY_UNIFORM_BASE + s_src * 16;
+    {
+        int base = ARRAY_UNIFORM_BASE + GRAPHICS_U_src_rects * 16;
         for (int i = 0; i < MAX_IMAGE_INSTANCES && base + i < MAX_UNIFORMS_PER_PROGRAM; i++)
             for (int c = 0; c < 4; c++) u->src_rects[i * 4 + c] = uniform_stores[program].values[base + i].f[c];
     }
-    if (s_dst >= 0) {
-        int base = ARRAY_UNIFORM_BASE + s_dst * 16;
+    {
+        int base = ARRAY_UNIFORM_BASE + GRAPHICS_U_dest_rects * 16;
         for (int i = 0; i < MAX_IMAGE_INSTANCES && base + i < MAX_UNIFORMS_PER_PROGRAM; i++)
             for (int c = 0; c < 4; c++) u->dest_rects[i * 4 + c] = uniform_stores[program].values[base + i].f[c];
     }
-    u->extra_alpha = slot_f(program, s_ea, 0);
-    slot_fv(program, s_afg, u->amask_fg, 3);
-    slot_fv(program, s_abg, u->amask_bg_premult, 4);
+    u->extra_alpha = slot_f(program, GRAPHICS_U_extra_alpha, 0);
+    slot_fv(program, GRAPHICS_U_amask_fg, u->amask_fg, 3);
+    slot_fv(program, GRAPHICS_U_amask_bg_premult, u->amask_bg_premult, 4);
 }
 
 static void
 fill_bgimage_uniforms(int program, MetalBgimageUniforms *u) {
-    static GLint s_sizes = -2, s_pos, s_bg, s_tiled;
-    if (s_sizes == -2) {
-        s_sizes = find_uniform_slot(program, "sizes");
-        s_pos = find_uniform_slot(program, "positions");
-        s_bg = find_uniform_slot(program, "background");
-        s_tiled = find_uniform_slot(program, "tiled");
-    }
     memset(u, 0, sizeof(*u));
-    slot_fv(program, s_sizes, u->sizes, 4);
-    slot_fv(program, s_pos, u->positions, 4);
-    slot_fv(program, s_bg, u->background, 4);
-    u->tiled = slot_f(program, s_tiled, 0);
+    slot_fv(program, BGIMAGE_U_sizes, u->sizes, 4);
+    slot_fv(program, BGIMAGE_U_positions, u->positions, 4);
+    slot_fv(program, BGIMAGE_U_background, u->background, 4);
+    u->tiled = slot_f(program, BGIMAGE_U_tiled, 0);
 }
 
 static void
 fill_tint_uniforms(int program, MetalTintUniforms *u) {
-    static GLint s_color = -2, s_edges;
-    if (s_color == -2) {
-        s_color = find_uniform_slot(program, "tint_color");
-        s_edges = find_uniform_slot(program, "edges");
-    }
-    slot_fv(program, s_color, u->tint_color, 4);
-    slot_fv(program, s_edges, u->edges, 4);
+    slot_fv(program, TINT_U_tint_color, u->tint_color, 4);
+    slot_fv(program, TINT_U_edges, u->edges, 4);
 }
 
 static void
 fill_trail_uniforms(int program, MetalTrailUniforms *u) {
-    static GLint s_x = -2, s_y, s_cx, s_cy, s_col, s_op;
-    if (s_x == -2) {
-        s_x = find_uniform_slot(program, "x_coords");
-        s_y = find_uniform_slot(program, "y_coords");
-        s_cx = find_uniform_slot(program, "cursor_edge_x");
-        s_cy = find_uniform_slot(program, "cursor_edge_y");
-        s_col = find_uniform_slot(program, "trail_color");
-        s_op = find_uniform_slot(program, "trail_opacity");
-    }
     memset(u, 0, sizeof(*u));
-    slot_fv(program, s_x, u->x_coords, 4);
-    slot_fv(program, s_y, u->y_coords, 4);
-    slot_fv(program, s_cx, u->cursor_edge_x, 2);
-    slot_fv(program, s_cy, u->cursor_edge_y, 2);
-    slot_fv(program, s_col, u->trail_color, 3);
-    u->trail_opacity = slot_f(program, s_op, 0);
+    slot_fv(program, TRAIL_U_x_coords, u->x_coords, 4);
+    slot_fv(program, TRAIL_U_y_coords, u->y_coords, 4);
+    slot_fv(program, TRAIL_U_cursor_edge_x, u->cursor_edge_x, 2);
+    slot_fv(program, TRAIL_U_cursor_edge_y, u->cursor_edge_y, 2);
+    slot_fv(program, TRAIL_U_trail_color, u->trail_color, 3);
+    u->trail_opacity = slot_f(program, TRAIL_U_trail_opacity, 0);
 }
 
 static void
 fill_blit_uniforms(int program, MetalBlitUniforms *u) {
-    static GLint s_src = -2, s_dst;
-    if (s_src == -2) {
-        s_src = find_uniform_slot(program, "src_rect");
-        s_dst = find_uniform_slot(program, "dest_rect");
-    }
-    slot_fv(program, s_src, u->src_rect, 4);
-    slot_fv(program, s_dst, u->dest_rect, 4);
+    slot_fv(program, BLIT_U_src_rect, u->src_rect, 4);
+    slot_fv(program, BLIT_U_dest_rect, u->dest_rect, 4);
 }
 
 static void
 fill_screenshot_uniforms(int program, MetalScreenshotUniforms *u) {
-    static GLint s_src = -2, s_dst, s_size;
-    if (s_src == -2) {
-        s_src = find_uniform_slot(program, "src_rect");
-        s_dst = find_uniform_slot(program, "dest_rect");
-        s_size = find_uniform_slot(program, "src_size");
-    }
     memset(u, 0, sizeof(*u));
-    slot_fv(program, s_src, u->src_rect, 4);
-    slot_fv(program, s_dst, u->dest_rect, 4);
-    slot_fv(program, s_size, u->src_size, 2);
+    slot_fv(program, SCREENSHOT_U_src_rect, u->src_rect, 4);
+    slot_fv(program, SCREENSHOT_U_dest_rect, u->dest_rect, 4);
+    slot_fv(program, SCREENSHOT_U_src_size, u->src_size, 2);
 }
 
 static void
 fill_rounded_rect_uniforms(int program, MetalRoundedRectUniforms *u) {
-    static GLint s_color = -2, s_bg, s_rect, s_params;
-    if (s_color == -2) {
-        s_color = find_uniform_slot(program, "color");
-        s_bg = find_uniform_slot(program, "background_color");
-        s_rect = find_uniform_slot(program, "rect");
-        s_params = find_uniform_slot(program, "params");
-    }
     memset(u, 0, sizeof(*u));
-    slot_fv(program, s_color, u->color, 4);
-    slot_fv(program, s_bg, u->background_color, 4);
-    slot_fv(program, s_rect, u->rect, 4);
-    slot_fv(program, s_params, u->params, 2);
+    slot_fv(program, ROUNDED_RECT_U_color, u->color, 4);
+    slot_fv(program, ROUNDED_RECT_U_background_color, u->background_color, 4);
+    slot_fv(program, ROUNDED_RECT_U_rect, u->rect, 4);
+    slot_fv(program, ROUNDED_RECT_U_params, u->params, 2);
 }
 
 // Number of entries in the ColorTable UBO: NUM_COLORS + MARK_MASK + MARK_MASK + 2

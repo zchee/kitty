@@ -21,7 +21,7 @@ from contextlib import suppress
 from enum import Enum
 from functools import lru_cache, partial
 from pathlib import Path
-from typing import Any, Callable, Dict, FrozenSet, Iterable, Iterator, List, NamedTuple, Optional, Sequence, Set, Tuple, Union, cast
+from typing import Any, Callable, Dict, FrozenSet, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple, Union, cast
 
 src_base = os.path.dirname(os.path.abspath(__file__))
 glfw_base = os.path.join(src_base, 'glfw')
@@ -1420,33 +1420,83 @@ def build_cli_parser_specs(skip_generation: bool = False) -> str:
     return dest
 
 
+# Single source of truth for the GPU programs' uniform layouts. Was scraped
+# out of kitty/*.glsl by regex; the MSL shaders (kitty/*.metal) do not declare
+# GL-style `uniform` lines at all, so on a Metal-only darwin the scrape had no
+# source left to read.
+#
+# ORDER IS LOAD-BEARING, in two independent ways:
+#   1. get_uniform_location() in kitty/metal.m:621-640 assigns slots in call
+#      order, and the generated get_uniform_locations_<name>() calls it in this
+#      order.
+#   2. The array-uniform fills in kitty/metal.m index the value store at
+#      ARRAY_UNIFORM_BASE + slot*16 (metal.m:702,725,730), so reordering a
+#      program's entries silently relocates every array uniform in it.
+# Insert new entries at the END of a program's tuple unless you are also
+# re-deriving those offsets.
+#
+# Values below are byte-for-byte the current kitty/uniforms_generated.h
+# emission order (verified against that file at 4ff6b9a98).
+SHADER_UNIFORMS: Dict[str, Tuple[str, ...]] = {
+    'bgimage': (
+        # bgimage_fragment.glsl
+        'image', 'background',
+        # bgimage_vertex.glsl
+        'tiled', 'sizes', 'positions',
+    ),
+    'blit': (
+        'image',                                   # blit_fragment.glsl
+        'src_rect', 'dest_rect',                   # blit_vertex.glsl
+    ),
+    'border': (
+        # border_fragment.glsl declares no uniforms
+        'colors', 'background_opacity', 'gamma_lut',   # border_vertex.glsl
+    ),
+    'cell': (
+        # cell_fragment.glsl
+        'text_contrast', 'text_gamma_adjustment', 'sprites', 'color_sprites',
+        # cell_vertex.glsl
+        'gamma_lut', 'draw_bg_bitfield', 'sprite_decorations_map',
+        'color_sprite_decorations_map', 'row_offset',
+    ),
+    'graphics': (
+        # graphics_fragment.glsl
+        'image', 'amask_fg', 'amask_bg_premult', 'extra_alpha',
+        # graphics_vertex.glsl -- both are [MAX_IMAGE_INSTANCES] arrays; slot 5
+        # (dest_rects) is pinned by the headroom _Static_assert in metal.m:232.
+        'src_rects', 'dest_rects',
+    ),
+    'rounded_rect': (
+        'rect', 'params', 'color', 'background_color',   # rounded_rect_fragment.glsl
+        # rounded_rect_vertex.glsl declares no uniforms
+    ),
+    'screenshot': (
+        'image', 'src_size',                       # screenshot_fragment.glsl
+        'src_rect', 'dest_rect',                   # screenshot_vertex.glsl
+    ),
+    'tint': (
+        'tint_color',                              # tint_fragment.glsl
+        'edges',                                   # tint_vertex.glsl
+    ),
+    'trail': (
+        'cursor_edge_x', 'cursor_edge_y', 'trail_color', 'trail_opacity',  # trail_fragment.glsl
+        'x_coords', 'y_coords',                                            # trail_vertex.glsl
+    ),
+}
+
+
 def build_uniforms_header(skip_generation: bool = False) -> str:
     dest = 'kitty/uniforms_generated.h'
     if skip_generation:
         return dest
     lines: list[str] = []
     a = lines.append
-    uniform_names: Dict[str, Tuple[str, ...]] = {}
-    class_names = {}
-    function_names = {}
-
-    def find_uniform_names(raw: str) -> Iterator[str]:
-        for m in re.finditer(r'^uniform\s+\S+\s+(.+?);', raw, flags=re.MULTILINE):
-            for x in m.group(1).split(','):
-                yield x.strip().partition('[')[0]
-
-    for x in sorted(glob.glob('kitty/*.glsl')):
-        name = os.path.basename(x).partition('.')[0]
-        name, sep, shader_type = name.rpartition('_')
-        if not sep or shader_type not in ('fragment', 'vertex'):
-            continue
-        class_names[name] = f'{name.capitalize()}Uniforms'
-        function_names[name] = f'get_uniform_locations_{name}'
-        with open(x) as f:
-            raw = f.read()
-        uniform_names[name] = uniform_names.setdefault(name, ()) + tuple(find_uniform_names(raw))
-    for name in sorted(class_names):
-        class_name, function_name, uniforms = class_names[name], function_names[name], uniform_names[name]
+    for name in sorted(SHADER_UNIFORMS):
+        uniforms = SHADER_UNIFORMS[name]
+        class_name = f'{name.capitalize()}Uniforms'
+        function_name = f'get_uniform_locations_{name}'
+        slot_enum_name = f'{name.capitalize()}UniformSlot'
+        slot_prefix = name.upper()
         a(f'typedef struct {class_name} ''{')
         for n in uniforms:
             a(f'    int {n};')
@@ -1457,7 +1507,17 @@ def build_uniforms_header(skip_generation: bool = False) -> str:
             a(f'    ans->{n} = get_uniform_location(program, "{n}");')
         a('}')
         a('')
-    # }]]]))
+        # D2/D3 drift gate: a slot index into the metal.m uniform_stores value
+        # store, generated from the same tuple order as the struct/function
+        # above. Renaming or reordering an entry moves the compile-error site
+        # here instead of silently zero-filling at draw time (metal.m's
+        # find_uniform_slot() string-literal lookups did the latter).
+        a(f'enum {slot_enum_name} ''{')
+        for i, n in enumerate(uniforms):
+            a(f'    {slot_prefix}_U_{n} = {i},')
+        a(f'    {slot_prefix}_U_COUNT = {len(uniforms)}')
+        a('};')
+        a('')
     src = '\n'.join(lines)
     try:
         with open(dest) as f:

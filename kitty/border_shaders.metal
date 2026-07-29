@@ -13,6 +13,9 @@ using namespace metal;
 // W27 P3.4: the sRGB transfer pair and the target-space vocabulary are shared
 // (kitty/color_transfer.metal.h), so this file no longer carries its own copy.
 #include "color_transfer.metal.h"
+// W27 GLSL-freezeout stage 1 (D4): pins BorderUniforms (below) against the
+// C-side MetalBorderUniforms (metal.m/metal_uniforms.h) at compile time.
+#include "metal_uniforms.h"
 
 // C1/P3.4: the target space of the attachment this PSO renders to. ENCODE_SRGB
 // on the opaque path so the fragment applies the transfer itself (the default
@@ -35,6 +38,8 @@ struct BorderUniforms {
     float background_opacity;
     float gamma_lut[256];
 };
+static_assert(sizeof(BorderUniforms) == sizeof(MetalBorderUniforms),
+              "BorderUniforms drifted from MetalBorderUniforms");
 
 // The C-side BorderRect (kitty/state.h) is 56 bytes with natural C
 // alignment; an MSL struct containing float4 is padded to a 64-byte stride

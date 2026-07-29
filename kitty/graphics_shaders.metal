@@ -10,6 +10,10 @@
 
 #include <metal_stdlib>
 using namespace metal;
+// W27 GLSL-freezeout stage 1 (D4): pins GraphicsUniforms/BgimageUniforms
+// (below) against the C-side MetalGraphicsUniforms/MetalBgimageUniforms
+// (metal.m/metal_uniforms.h) at compile time.
+#include "metal_uniforms.h"
 
 inline float4 vec4_premul(float3 rgb, float a) { return float4(rgb * a, a); }
 inline float4 vec4_premul(float4 rgba) { return float4(rgba.rgb * rgba.a, rgba.a); }
@@ -41,6 +45,8 @@ struct GraphicsUniforms {
     float3 amask_fg;
     float4 amask_bg_premult;
 };
+static_assert(sizeof(GraphicsUniforms) == sizeof(MetalGraphicsUniforms),
+              "GraphicsUniforms drifted from MetalGraphicsUniforms");
 
 struct GraphicsVertexOut {
     float4 position [[position]];
@@ -98,6 +104,8 @@ struct BgimageUniforms {
     float4 background;  // r, g, b, a
     float tiled;
 };
+static_assert(sizeof(BgimageUniforms) == sizeof(MetalBgimageUniforms),
+              "BgimageUniforms drifted from MetalBgimageUniforms");
 
 struct BgimageVertexOut {
     float4 position [[position]];
