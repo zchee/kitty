@@ -323,7 +323,6 @@ struct _GLFWwndconfig
     int           blur_radius;
     struct {
         bool      retina;
-        int       color_space;
         char      frameName[256];
     } ns;
     struct {

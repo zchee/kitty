@@ -1065,15 +1065,6 @@ typedef struct GLFWScrollEvent {
  *  [window hint](@ref GLFW_COCOA_GRAPHICS_SWITCHING_hint).
  */
 #define GLFW_COCOA_GRAPHICS_SWITCHING 0x00023003
-/*! @brief macOS specific
- *  [window hint](@ref GLFW_COCOA_COLOR_SPACE_hint).
- */
-#define GLFW_COCOA_COLOR_SPACE 0x00023004
-typedef enum {
-    DEFAULT_COLORSPACE = 0,
-    SRGB_COLORSPACE = 1,
-    DISPLAY_P3_COLORSPACE = 2,
-} GlfwCocoaColorSpaces;
 /*! @brief Blur Radius. On macOS the actual radius is used. On Linux it is treated as a bool.
  *  [window hint](@ref GLFW_BLUR_RADIUS).
  */
@@ -1373,7 +1364,7 @@ typedef struct GLFWLayerShellConfig {
     void (*size_callback)(GLFWwindow *window, float xscale, float yscale, unsigned *cell_width, unsigned *cell_height, double *left_edge_spacing, double *top_edge_spacing, double *right_edge_spacing, double *bottom_edge_spacing);
     struct { float xscale, yscale; } expected;
     struct {
-        float background_opacity; int background_blur, color_space, use_physical_screen_frame;
+        float background_opacity; int background_blur, use_physical_screen_frame;
         char ns_window_layer[128];
     } related;
 } GLFWLayerShellConfig;

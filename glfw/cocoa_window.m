@@ -2573,11 +2573,9 @@ int _glfwPlatformCreateWindow(_GLFWwindow* window, const _GLFWwndconfig* wndconf
 
     if (!createNativeWindow(window, wndconfig, fbconfig))
         return false;
-    switch((GlfwCocoaColorSpaces)wndconfig->ns.color_space) {
-        case SRGB_COLORSPACE: [window->ns.object setColorSpace:[NSColorSpace sRGBColorSpace]]; break;
-        case DISPLAY_P3_COLORSPACE: [window->ns.object setColorSpace:[NSColorSpace displayP3ColorSpace]]; break;
-        case DEFAULT_COLORSPACE: break;
-    }
+    // W27 P3.6: the NSWindow.colorSpace plumbing (the retired macos_colorspace
+    // option's surface) is gone; windows keep AppKit's default. The drawable's
+    // colourspace is the CAMetalLayer tag (kitty/metal_drawable_format.h).
 
 #ifdef KITTY_USE_METAL
     // Metal: always create Metal context, regardless of GLFW_CLIENT_API setting
@@ -2815,13 +2813,6 @@ _glfwPlatformSetLayerShellConfig(_GLFWwindow* window, const GLFWLayerShellConfig
     [nswindow setTitlebarAppearsTransparent:false];
     [nswindow setHasShadow:false];
     [nswindow setTitleVisibility:NSWindowTitleHidden];
-    NSColorSpace *cs = nil;
-    switch (config.related.color_space) {
-        case SRGB_COLORSPACE: cs = [NSColorSpace sRGBColorSpace]; break;
-        case DISPLAY_P3_COLORSPACE: cs = [NSColorSpace displayP3ColorSpace]; break;
-        case DEFAULT_COLORSPACE: cs = nil; break;  // using deviceRGBColorSpace causes a hang when transitioning to fullscreen
-    }
-    [nswindow setColorSpace:cs];
     [[nswindow standardWindowButton: NSWindowCloseButton] setHidden:true];
     [[nswindow standardWindowButton: NSWindowMiniaturizeButton] setHidden:true];
     [[nswindow standardWindowButton: NSWindowZoomButton] setHidden:true];
@@ -4338,7 +4329,7 @@ GLFWAPI void glfwCocoaSetWindowLevel(GLFWwindow *w, const char *level_spec) { @a
 }}
 
 
-GLFWAPI void glfwCocoaSetWindowChrome(GLFWwindow *w, unsigned int color, bool use_system_color, unsigned int system_color, int background_blur, unsigned int hide_window_decorations, bool show_text_in_titlebar, int color_space, float background_opacity, bool resizable) { @autoreleasepool {
+GLFWAPI void glfwCocoaSetWindowChrome(GLFWwindow *w, unsigned int color, bool use_system_color, unsigned int system_color, int background_blur, unsigned int hide_window_decorations, bool show_text_in_titlebar, float background_opacity, bool resizable) { @autoreleasepool {
     _GLFWwindow* window = (_GLFWwindow*)w;
     if (window->ns.layer_shell.is_active) return;
     GLFWWindow *nsw = window->ns.object;
@@ -4419,26 +4410,18 @@ GLFWAPI void glfwCocoaSetWindowChrome(GLFWwindow *w, unsigned int color, bool us
     [nsw setTitlebarAppearsTransparent:window->ns.last_applied_titlebar_settings.transparent];
     [nsw setHasShadow:has_shadow];
     [nsw setTitleVisibility:(show_text_in_titlebar) ? NSWindowTitleVisible : NSWindowTitleHidden];
-    NSColorSpace *cs = nil;
-    switch (color_space) {
-        case SRGB_COLORSPACE: cs = [NSColorSpace sRGBColorSpace]; break;
-        case DISPLAY_P3_COLORSPACE: cs = [NSColorSpace displayP3ColorSpace]; break;
-        case DEFAULT_COLORSPACE: cs = nil; break;  // using deviceRGBColorSpace causes a hang when transitioning to fullscreen
-    }
     window->resizable = resizable;
     debug(
-        "Window Chrome state:\n\tbackground: %s\n\tappearance: %s color_space: %s\n\t"
+        "Window Chrome state:\n\tbackground: %s\n\tappearance: %s\n\t"
         "blur: %d has_shadow: %d resizable: %d decorations: %s (%d)\n\t"
         "titlebar_transparent: %d titlebar_color_set: %d title_visibility: %d hidden: %d buttons_hidden: %d"
         "\n",
         window_background ? [window_background.description UTF8String] : "<nil>",
         appearance ? [appearance.name UTF8String] : "<nil>",
-        cs ? (cs.localizedName ? [cs.localizedName UTF8String] : [cs.description UTF8String]) : "<nil>",
         background_blur, has_shadow, resizable, decorations_desc, window->decorated,
         window->ns.last_applied_titlebar_settings.transparent, tc.was_set,
         show_text_in_titlebar, window->ns.titlebar_hidden, hide_titlebar_buttons
     );
-    [nsw setColorSpace:cs];
     [[nsw standardWindowButton: NSWindowCloseButton] setHidden:hide_titlebar_buttons];
     [[nsw standardWindowButton: NSWindowMiniaturizeButton] setHidden:hide_titlebar_buttons];
     [[nsw standardWindowButton: NSWindowZoomButton] setHidden:hide_titlebar_buttons];

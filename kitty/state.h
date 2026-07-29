@@ -392,16 +392,10 @@ typedef struct LiveResizeInfo {
     unsigned int width, height, num_of_resize_events;
 } LiveResizeInfo;
 
-// W27 P3.3: the retired macos_colorspace option's pinned value. The option set
-// NSWindow.colorSpace (the window backing store + AppKit chrome) — a surface
-// DISTINCT from the CAMetalLayer.colorspace leg the drawable-format coupling
-// table owns — and was INERT for Metal drawable content (P3.1 re-adjudication).
-// The user knob is retired with behaviour pinned at its old default (srgb = 1,
-// the to-c mapping); the remaining plumbing below (chrome-state field, GLFW
-// hint, glfwCocoaSetWindowChrome parameter) is deferred to the P3.6
-// window-capture gate, where a chrome-visible check exists.
-#define MACOS_COLORSPACE_SRGB 1
-
+// W27 P3.6: the retired macos_colorspace option's plumbing is fully removed
+// (state field, GLFW hint, glfwCocoaSetWindowChrome parameter). NSWindow keeps
+// AppKit's default colourspace; the drawable's colourspace is owned entirely
+// by the CAMetalLayer tag (kitty/metal_drawable_format.h coupling table).
 typedef struct WindowChromeState {
     color_type color;
     bool use_system_color;
@@ -410,7 +404,6 @@ typedef struct WindowChromeState {
     unsigned hide_window_decorations;
     bool show_title_in_titlebar;
     bool resizable;
-    int macos_colorspace;
     float background_opacity;
 } WindowChromeState;
 
