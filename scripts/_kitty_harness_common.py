@@ -312,6 +312,15 @@ def spawn_kitty(
         opt = opt.strip()
         if opt:
             argv += ["-o", opt]
+    # W27 P5.1: the CLI-argument analog of KITTY_HARNESS_PASS_OPTS, for kitty
+    # flags with no -o equivalent — the fullscreen A/B needs
+    # KITTY_HARNESS_PASS_ARGS="--start-as=fullscreen" (the display-sync policy
+    # keys off NATIVE fullscreen; a borderless display-sized window does not
+    # qualify). Semicolon-separated, appended before any child command.
+    for arg in filter(None, (os.environ.get("KITTY_HARNESS_PASS_ARGS") or "").split(";")):
+        arg = arg.strip()
+        if arg:
+            argv.append(arg)
     if argv_command:
         argv += ["--", *argv_command]
     run_env = _sanitized_env()
