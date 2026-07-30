@@ -1873,12 +1873,22 @@ static MetalWindowSlot *current_window_slot = NULL;
 // thread, while the main thread memsets a MetalWindowSlot on window teardown and
 // on slot reuse -- and memset is not an atomic store.
 //
-// The pair is published consistently rather than merely atomically: the time
-// lands in a two-entry array indexed by frame parity, then the key naming that
-// frame is stored with release. A reader loads the key, reads the time the key
-// selects, and re-reads the key; a concurrent handler for the next frame writes
-// the OTHER array entry, so the value the reader took cannot be mutated
-// underneath it, and a key that moved between the two loads is rejected.
+// The pair is published as ONE 16-byte atomic: a single release store in the
+// handler, a single acquire load in the reader, and every check performed on
+// the reader's LOCAL copy. Nothing addresses a field of the atomic separately --
+// a partial-field store would silently reintroduce exactly the tear this
+// replaced. (An earlier attempt published the time into a parity-indexed array
+// and then the key: it was torn. A reader could load the key for frame N, and a
+// handler for frame N+2 -- the SAME parity -- could overwrite that array entry
+// before publishing its own key, so the reader took N+2's time under N's key and
+// the key re-read saw nothing wrong. Two frames of skew is not exotic under an
+// async present.)
+//
+// Handler arrival order is NOT serialised here: if Metal ever delivers presented
+// handlers for a window out of order, the last writer wins and the stamp can go
+// backwards by a frame. That behaviour is pre-existing and unchanged, and every
+// consumer already treats the frame index as the thing to judge freshness by, so
+// it is considered-and-deferred rather than fixed with a CAS loop.
 //
 // SLOT LIFECYCLE (the ordering argument). A slot index outlives the window that
 // owned it: metal_forget_layer memsets the slot and metal_set_current_layer
@@ -1896,18 +1906,29 @@ static MetalWindowSlot *current_window_slot = NULL;
 // window in which prev_present_* can read the previous window's stamp. The
 // epoch is compared, never trusted for ordering, so the main thread needs no
 // atomic on its side.
-// Packing (40-bit frame index, 24-bit epoch) keeps key publication a single
-// atomic store, which is what makes the reader's re-read check sufficient. The
-// bounds are not reachable in practice: 2^40 frames is ~34 years at 1000 fps,
-// and 2^24 is 16.7M window-identity changes. key == 0 means "never stamped"
-// (the first epoch handed out is 1, so a real key is always non-zero).
+// Packing (40-bit frame index, 24-bit epoch) puts the identity in one word so
+// the published pair fits a single 16-byte atomic. Both halves are masked
+// explicitly on the way in and compared masked on the way out, so a counter
+// that outgrows its field wraps into a defined value instead of corrupting its
+// neighbour. The bounds are not reachable in practice: 2^40 frames is ~34 years
+// at 1000 fps, and 2^24 is 16.7M window-identity changes. at == 0 means "never
+// stamped" (a real present time is never 0; see the no-op rule below).
 #define PRESENT_STAMP_FIDX_BITS 40
 #define PRESENT_STAMP_FIDX_MASK ((1ull << PRESENT_STAMP_FIDX_BITS) - 1)
+#define PRESENT_STAMP_EPOCH_MASK ((1ull << 24) - 1)
 typedef struct {
-    _Atomic int64_t at[2];   // presentedTime as monotonic_t, indexed by frame parity; 0 = no stamp
-    _Atomic uint64_t key;    // (epoch << 40) | frame index; 0 = nothing stamped
-} MetalPresentStamp;
-static MetalPresentStamp metal_present_stamps[MAX_METAL_WINDOWS];
+    uint64_t key;   // (epoch << 40) | frame index
+    int64_t at;     // presentedTime as monotonic_t; 0 = no stamp
+} MetalPresentPair;
+// 16-byte alignment is a precondition for the pair being lock-free, so the
+// assert is made against the aligned storage rather than a bare size/NULL query
+// (which can answer false for alignment reasons that do not apply here). A
+// libatomic lock taken on a Metal callback thread would be unacceptable, so
+// this is a hard compile-time requirement, not a runtime probe.
+static _Alignas(16) _Atomic MetalPresentPair metal_present_stamps[MAX_METAL_WINDOWS];
+_Static_assert(sizeof(MetalPresentPair) == 16, "present stamp pair must be exactly 16 bytes");
+_Static_assert(__atomic_always_lock_free(sizeof(MetalPresentPair), &metal_present_stamps[0]),
+               "present stamp pair must be lock-free: it is published from a Metal callback thread");
 // Current ownership epoch per slot index, and the counter it is handed out
 // from. Main thread only (assignment and teardown both run there); handlers
 // receive their epoch by value at registration and never read these.
@@ -1958,10 +1979,11 @@ window_slot_index(void) {
 static void
 stamp_present(int slot_idx, uint64_t epoch, uint64_t fidx, monotonic_t at) {
     if (slot_idx < 0 || slot_idx >= MAX_METAL_WINDOWS || at == 0) return;
-    MetalPresentStamp *s = &metal_present_stamps[slot_idx];
-    atomic_store_explicit(&s->at[fidx & 1], at, memory_order_relaxed);
-    atomic_store_explicit(&s->key, (epoch << PRESENT_STAMP_FIDX_BITS) | (fidx & PRESENT_STAMP_FIDX_MASK),
-                          memory_order_release);
+    const MetalPresentPair pair = {
+        .key = ((epoch & PRESENT_STAMP_EPOCH_MASK) << PRESENT_STAMP_FIDX_BITS) | (fidx & PRESENT_STAMP_FIDX_MASK),
+        .at = at,
+    };
+    atomic_store_explicit(&metal_present_stamps[slot_idx], pair, memory_order_release);
 }
 
 // Read a window's newest present stamp, rejecting anything published under a
@@ -1973,16 +1995,15 @@ stamp_present(int slot_idx, uint64_t epoch, uint64_t fidx, monotonic_t at) {
 static bool
 read_present_stamp(int slot_idx, uint64_t *fidx_out, monotonic_t *at_out) {
     if (slot_idx < 0 || slot_idx >= MAX_METAL_WINDOWS) return false;
-    const uint64_t epoch = metal_present_epochs[slot_idx];
+    const uint64_t epoch = metal_present_epochs[slot_idx] & PRESENT_STAMP_EPOCH_MASK;
     if (!epoch) return false;
-    MetalPresentStamp *s = &metal_present_stamps[slot_idx];
-    const uint64_t k0 = atomic_load_explicit(&s->key, memory_order_acquire);
-    if ((k0 >> PRESENT_STAMP_FIDX_BITS) != epoch) return false;
-    const uint64_t fidx = k0 & PRESENT_STAMP_FIDX_MASK;
-    const monotonic_t at = atomic_load_explicit(&s->at[fidx & 1], memory_order_relaxed);
-    if (at == 0) return false;
-    if (atomic_load_explicit(&s->key, memory_order_relaxed) != k0) return false;
-    *fidx_out = fidx; *at_out = at;
+    // One acquire load of the whole pair; every test below is on this local
+    // copy, so key and at are necessarily from the same publication.
+    const MetalPresentPair pair = atomic_load_explicit(&metal_present_stamps[slot_idx], memory_order_acquire);
+    if (pair.at == 0) return false;
+    if ((pair.key >> PRESENT_STAMP_FIDX_BITS) != epoch) return false;
+    *fidx_out = pair.key & PRESENT_STAMP_FIDX_MASK;
+    *at_out = pair.at;
     return true;
 }
 
