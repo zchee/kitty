@@ -1690,23 +1690,31 @@ immediate_encode_floor(OSWindow *w, monotonic_t now) {
 
 // Wave-20 L-TYPING lever (P3, plan §Phase 3): extend the L2 immediate-encode
 // fast path to keypress-echo frames that arrive while a pace-link frame
-// request is already outstanding. T1-TYPING-DECOMP measured that 197/300
-// echo frames classify gate=waiting and eat one full link-tick wait (S5
-// 18.4 ms p50) — the only stage holding the typing rank prize. Rendering
-// inline while RENDER_FRAME_REQUESTED is the Wave-14 stall-rescue's proven
-// operation (request_frame_render is idempotent; the post-render resync
-// re-syncs the link), and the immediate-encode floor still applies, so an
-// autorepeat storm cannot present above the refresh-capped fast-path rate.
-// Eligibility marker: a local key press within L5_KEY_RECENCY_WINDOW (the
-// same 50 ms recency the io-side echo fast path uses).
-// VERDICT (P2.1 re-adjudication, n=300/arm, GATE-ADJUDICATION.md): the
-// lever works mechanically — the gate=waiting echo class vanishes and S5
-// collapses 16.7→9.4 ms p50, the physical vsync-quantization floor — but
-// the photon recovers only Δp50 5.96 / Δp99 1.67 ms against thresholds
-// 9.32 / 10.04 (ABS floor 2.90): NO-CHARTER. The residual gap lives in S2
-// (io wake + echo turnaround), Wave-21 reader-thread territory. This stays
-// a measurement/reproduction lever ONLY: default OFF is byte-identical
-// (goldens 4/4 max_diff=0, idle 0.0%); never flip without a fresh gate.
+// request is already outstanding. Rendering inline while
+// RENDER_FRAME_REQUESTED is the Wave-14 stall-rescue's proven operation
+// (request_frame_render is idempotent; the post-render resync re-syncs the
+// link), and the immediate-encode floor still applies, so an autorepeat storm
+// cannot present above the refresh-capped fast-path rate. Eligibility marker:
+// a local key press within L5_KEY_RECENCY_WINDOW (the same 50 ms recency the
+// io-side echo fast path uses).
+//
+// MEASUREMENT WITHDRAWN (W28). The Wave-20/P2.1 case for this lever rested on
+// a decomposition and a gate-class census that two separate retirements have
+// invalidated, so the numbers are withdrawn rather than annotated -- quoting
+// them with a "superseded" qualifier invites a hurried reader to strip the
+// qualifier and keep the figure.
+//   - The S5 stage figures were taken against thresholds that no longer bind
+//     (WALLS has been re-based since), so they cannot be compared with
+//     anything measured now.
+//   - The gate-class claims -- that most echo frames classified gate=waiting,
+//     and that the class vanished under the lever -- were measured under the
+//     macOS-27 autofill-hook regime, which upstream 256e9eac5 retired. The
+//     census describes a machine that no longer exists.
+// What survives unqualified is the mechanism and the disposition: NO-CHARTER,
+// and the residual gap lives in S2 (io wake + echo turnaround). Default OFF
+// is byte-identical on the golden matrix at max_diff=0 with idle at 0.0%;
+// never flip without a fresh gate.
+// Post-rebase sizing numbers land here when W28.2 step 1 runs.
 static bool
 metal_echo_immediate_enabled(void) {
     static int cached = -1;

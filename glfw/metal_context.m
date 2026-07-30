@@ -143,11 +143,16 @@ timer_paced_mode(void) {
 }
 
 // W27 (ADR-0021 addendum): displaySync policy for the winner arm. Windowed/
-// composited presents immediately — operator-verified tear-free (whole-surface
-// composition cannot shear) and the fastest photon ever measured here (typing
-// p50 20.0 ms vs 42.4 vsync-queued). Fullscreen keeps vsync: direct scanout
-// can genuinely tear; P5 owns any scanout-mode work. sync_to_monitor still
-// wins downward: interval 0 forces immediate everywhere.
+// composited presents immediately, and the justification is the tear-free
+// posture, which is regime-independent: whole-surface composition cannot
+// shear, and the operator verified it directly. No photon figure is quoted
+// here on purpose — every number this policy was originally argued from is a
+// W27, macOS-27, pre-rebase input-lane measurement, and pasting one into a
+// permanent comment is how a contaminated figure outlives the regime that
+// produced it. Photon numbers live in the WALLS record, where they carry
+// their regime with them. Fullscreen keeps vsync: direct scanout can
+// genuinely tear; P5 owns any scanout-mode work. sync_to_monitor still wins
+// downward: interval 0 forces immediate everywhere.
 static void
 apply_display_sync_policy(_GLFWwindow *window) {
     if (!window || !window->context.metal.layer) return;
@@ -398,10 +403,16 @@ bool _glfwCreateContextMetal(_GLFWwindow* window)
     // more frame of queue depth). The old 2-pass-era "60 ms tail stall at 2" is
     // gone. So 2 is optimal: shallowest presentation queue == lowest latency.
     // W27 P5.2 (LEVER-DRAWABLE, the AC5-binding adjudication): that Wave-4
-    // verdict predates the winner mechanism (timer pace, no link owning the
-    // pool) and the rgba16f flip, so the depth is re-adjudicated on the current
-    // pipeline. KITTY_METAL_DRAWABLE_COUNT=3 opts the pool back to the layer
-    // default for the A/B battery; anything else keeps the measured 2.
+    // verdict predated the winner mechanism (timer pace, no link owning the
+    // pool) and the rgba16f flip, so the depth was flagged for
+    // re-adjudication on the current pipeline. That re-adjudication has since
+    // RUN and CLOSED — see the commit "w27-drawable: re-affirm the 2-deep pool
+    // on the timer-paced mechanism", which re-ran the A/B against the timer-
+    // paced arm and re-affirmed 2; depth 3 was worse, degrading typing wait
+    // p99 by more than an order of magnitude. So 2 stands on the CURRENT
+    // mechanism, not only on the Wave-4 measurement above.
+    // KITTY_METAL_DRAWABLE_COUNT=3 opts the pool back to the layer default for
+    // the A/B battery; anything else keeps the measured 2.
     {
         const char *v = getenv("KITTY_METAL_DRAWABLE_COUNT");
         layer.maximumDrawableCount = (v && v[0] == '3' && !v[1]) ? 3 : 2;
