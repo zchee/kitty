@@ -1849,6 +1849,98 @@ typedef struct {
 static MetalWindowSlot metal_windows[MAX_METAL_WINDOWS];
 static MetalWindowSlot *current_window_slot = NULL;
 
+// ----- W28.0c: S5 partition instrumentation -----
+// WALLS v1.2 puts S5 (gate->present) at 6.99 ms p50, of which encode + gpu
+// account for well under a millisecond -- a ~6.2-6.7 ms near-constant is
+// unattributed. Splitting it needs three stamps per frame:
+//     gate->commit         commit_time - the tick's gate stamp (ktrace gate_ms)
+//     commit->gpu-done     gpu_end - commit_time
+//     gpu-done->presented  presented_time - gpu_end
+// commit_time is taken on the CPU immediately after the commit, gpu_end is the
+// completion handler's cb.GPUEndTime and presented_time the drawable's
+// presentedTime. Apple documents the latter two as "host time, in seconds ...
+// relative to system mach time" -- the same timebase CACurrentMediaTime() reads,
+// so all three subtract directly and only the gate stamp (kitty's own
+// process-relative monotonic clock) needs the shift the ktrace_epoch line
+// already publishes. The three terms are emitted as tail fields on the stats
+// records and joined offline on frame=.
+//
+// The last present is ALSO kept in process, per window, because a present
+// timestamp is only usable as a pacing reference if the reader can tell frame
+// N's stamp from frame N-1's -- so the (frame, time) PAIR is stored, never the
+// bare time. This table is PARALLEL to metal_windows rather than a field in it:
+// the writer is the drawable's presented handler, which runs on a Metal callback
+// thread, while the main thread memsets a MetalWindowSlot on window teardown and
+// on slot reuse -- and memset is not an atomic store.
+//
+// The pair is published consistently rather than merely atomically: the time
+// lands in a two-entry array indexed by frame parity, then the frame index is
+// stored with release. A reader loads the index, reads the time that index
+// selects, and re-reads the index; a concurrent handler for the next frame
+// writes the OTHER array entry, so the value the reader took cannot be mutated
+// underneath it, and an index that moved between the two loads is rejected. A
+// recycled slot can only ever hand back a frame index the new window never
+// committed, which the same index check rejects.
+typedef struct {
+    _Atomic int64_t at[2];    // presentedTime as monotonic_t, indexed by frame parity; 0 = no stamp
+    _Atomic uint64_t fidx;    // frame index the newest stamp belongs to
+} MetalPresentStamp;
+static MetalPresentStamp metal_present_stamps[MAX_METAL_WINDOWS];
+
+// CACurrentMediaTime() and kitty's monotonic() both count mach-absolute
+// nanoseconds but differ in epoch (monotonic() is process-relative, see
+// kitty/monotonic.h), so a host-time seconds value becomes a monotonic_t by
+// adding a one-shot offset sampled from a back-to-back read of both clocks.
+// Sampling rather than assuming the two clocks share an origin keeps this
+// correct without depending on how clock_gettime is mapped on Darwin. Seeded
+// from the main thread and passed BY VALUE into the presented handler, so the
+// cache is never touched from a callback thread.
+static monotonic_t
+media_time_to_monotonic_offset(void) {
+    static monotonic_t offset = 0;
+    static bool sampled = false;
+    if (!sampled) {
+        const double media = CACurrentMediaTime();
+        offset = monotonic() - s_double_to_monotonic_t(media);
+        sampled = true;
+    }
+    return offset;
+}
+
+// Index of a window slot in metal_windows, or -1 when no window is current.
+static int
+window_slot_index(void) {
+    return current_window_slot ? (int)(current_window_slot - metal_windows) : -1;
+}
+
+// Publish frame fidx's present time for a window. `at` == 0 is the defined
+// no-op: Apple reports presentedTime 0.0 both for a drawable that was never
+// presented and for one whose frame was dropped, and neither is a photon, so
+// the previous stamp is left in place.
+static void
+stamp_present(int slot_idx, uint64_t fidx, monotonic_t at) {
+    if (slot_idx < 0 || slot_idx >= MAX_METAL_WINDOWS || at == 0) return;
+    MetalPresentStamp *s = &metal_present_stamps[slot_idx];
+    atomic_store_explicit(&s->at[fidx & 1], at, memory_order_relaxed);
+    atomic_store_explicit(&s->fidx, fidx, memory_order_release);
+}
+
+// Read a window's newest present stamp. False when nothing has been stamped yet
+// or the pair moved mid-read; callers must additionally compare *fidx_out
+// against the frame they care about -- a stamp that is real but older than the
+// caller's frame means "this frame has not reached the display yet".
+static bool
+read_present_stamp(int slot_idx, uint64_t *fidx_out, monotonic_t *at_out) {
+    if (slot_idx < 0 || slot_idx >= MAX_METAL_WINDOWS) return false;
+    MetalPresentStamp *s = &metal_present_stamps[slot_idx];
+    const uint64_t f0 = atomic_load_explicit(&s->fidx, memory_order_acquire);
+    const monotonic_t at = atomic_load_explicit(&s->at[f0 & 1], memory_order_relaxed);
+    if (at == 0) return false;
+    if (atomic_load_explicit(&s->fidx, memory_order_relaxed) != f0) return false;
+    *fidx_out = f0; *at_out = at;
+    return true;
+}
+
 static void
 save_current_window_state(void) {
     MetalWindowSlot *s = current_window_slot;
@@ -2491,21 +2583,41 @@ metal_end_frame(void) {
             const uint64_t bytes = metal_frame_bytes_uploaded; // D2: VAO-buffer bytes uploaded this frame
             [mtl_current_command_buffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
                 const double gpu_ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
-                char line[320];
+                char line[384];
                 // pace= is tail-appended (tolerant parsers, never $-anchored).
-                snprintf(line, sizeof line, "metal_stats frame=%llu encode_ms=%.3f gpu_ms=%.3f passes=%d allocs=%d tex_allocs=%d tex_bytes=%llu gfx_draws=%d bytes=%llu drawable_wait_ms=%.3f pace=%s\n",
-                         (unsigned long long)fidx, encode_ms, gpu_ms, passes, allocs, tex_allocs, (unsigned long long)tex_bytes, gfx_draws, (unsigned long long)bytes, drawable_wait_ms, pace);
+                // W28.0c: gpu_end= is the ABSOLUTE host time the GPU finished this
+                // command buffer (gpu_ms stays the unchanged duration). It closes
+                // the {commit->gpu-done} term of the S5 partition and opens
+                // {gpu-done->presented}; both neighbours (metal_commit's
+                // commit_time and metal_present's presented_time) are host time in
+                // the same mach timebase, so the terms subtract directly.
+                snprintf(line, sizeof line, "metal_stats frame=%llu encode_ms=%.3f gpu_ms=%.3f passes=%d allocs=%d tex_allocs=%d tex_bytes=%llu gfx_draws=%d bytes=%llu drawable_wait_ms=%.3f pace=%s gpu_end=%.9f\n",
+                         (unsigned long long)fidx, encode_ms, gpu_ms, passes, allocs, tex_allocs, (unsigned long long)tex_bytes, gfx_draws, (unsigned long long)bytes, drawable_wait_ms, pace, cb.GPUEndTime);
                 metal_stats_emit(line);
             }];
         }
-        // Present timestamp (photon-adjacent) for the latency harness. Emitted
-        // under stats OR signpost; one line per present, keyed to the frame id.
-        if ((st || sp) && mtl_current_drawable) {
+        // Present timestamp (photon-adjacent) for the latency harness. The line
+        // is still emitted under stats OR signpost only -- one line per present,
+        // keyed to the frame id.
+        // W28.0c: the HANDLER itself is now registered for every frame that has a
+        // drawable, because the (frame, presentedTime) pair it stamps is the only
+        // in-process record of when a frame actually reached the display, and a
+        // reader that can only see it in instrumented runs cannot use it. The
+        // per-frame block allocation is what battery 1 prices; the file write
+        // stays gated.
+        const int slot_idx = window_slot_index();
+        if (mtl_current_drawable) {
+            const bool emit_present = st || sp;
+            const monotonic_t media_offset = media_time_to_monotonic_offset();  // sampled here: main thread
             [mtl_current_drawable addPresentedHandler:^(id<MTLDrawable> d) {
-                char line[128];
-                snprintf(line, sizeof line, "metal_present frame=%llu presented_time=%.9f pace=%s\n",
-                         (unsigned long long)fidx, d.presentedTime, pace);
-                metal_stats_emit(line);
+                const double presented = d.presentedTime;
+                stamp_present(slot_idx, fidx, presented == 0.0 ? 0 : s_double_to_monotonic_t(presented) + media_offset);
+                if (emit_present) {
+                    char line[128];
+                    snprintf(line, sizeof line, "metal_present frame=%llu presented_time=%.9f pace=%s\n",
+                             (unsigned long long)fidx, presented, pace);
+                    metal_stats_emit(line);
+                }
             }];
         }
 
@@ -2527,7 +2639,33 @@ metal_end_frame(void) {
             }
             [mtl_current_command_buffer commit];
         }
+        // W28.0c: post-commit CPU stamp. Taken on the main thread the moment the
+        // commit returns, so it carries no handler-dispatch latency: it closes the
+        // {gate->commit} term of the S5 partition and opens {commit->gpu-done}.
+        // It cannot ride the metal_stats/metal_present lines -- both handlers are
+        // registered BEFORE the commit, so the value does not exist yet when they
+        // capture -- hence its own record.
+        const double commit_time = (st || sp) ? CACurrentMediaTime() : 0.0;
         if (sp) os_signpost_interval_end(slog, present_sid, "present", "");
+        if (st || sp) {
+            // prev_present_* is the newest present this window had stamped as of
+            // this commit. It is the freshness datum the plan's floor-reference
+            // question needs: a presentedTime-based pacing floor is only usable if
+            // the stamp visible at gate time belongs to a recent frame, and
+            // prev_present_frame vs frame= measures exactly that lag. Reported on
+            // kitty's monotonic clock -- the same one the ktrace gate_ms stamps
+            // use -- so the two subtract with no epoch shift, while commit_time
+            // stays on the mach host clock its partition neighbours use.
+            // -1 in either field means "no present stamped yet for this window".
+            uint64_t prev_fidx = 0; monotonic_t prev_at = 0;
+            const bool have_prev = read_present_stamp(slot_idx, &prev_fidx, &prev_at);
+            char line[192];
+            snprintf(line, sizeof line, "metal_commit frame=%llu commit_time=%.9f prev_present_frame=%lld prev_present_mono_ms=%.3f pace=%s\n",
+                     (unsigned long long)fidx, commit_time,
+                     have_prev ? (long long)prev_fidx : -1LL,
+                     have_prev ? monotonic_t_to_s_double(prev_at) * 1000.0 : -1.0, pace);
+            metal_stats_emit(line);
+        }
         mtl_current_command_buffer = nil;
         mtl_current_drawable = nil;
     }
