@@ -81,21 +81,30 @@ _DUR_UNIT_TO_MS = {
     "h": 3_600_000.0, "m": 60_000.0, "s": 1000.0, "ms": 1.0,
     "µs": 0.001, "μs": 0.001, "us": 0.001, "ns": 0.000_001,
 }
-# metal_stats line format (kitty/metal.m; Wave-2 final):
+# metal_stats line format (kitty/metal.m; current as of W28):
 #   metal_stats frame=<uint64> encode_ms=<float.3> gpu_ms=<float.3>
-#     passes=<int> allocs=<int> bytes=<uint64> drawable_wait_ms=<float.3>
-# The trailing three fields are optional here so pre-Wave-2 builds still
-# parse. encode_ms was REDEFINED in Wave 2: it now spans drawable-acquired ->
+#     passes=<int> allocs=<int> tex_allocs=<int> tex_bytes=<uint64>
+#     gfx_draws=<int> bytes=<uint64> drawable_wait_ms=<float.3> pace=<str>
+# encode_ms was REDEFINED in Wave 2: it now spans drawable-acquired ->
 # commit (encoding only); the drawable-pool wait that used to pollute it is
-# reported separately as drawable_wait_ms. Never anchor new fields with $ --
-# the format grows tail-first by design. (The companion metal_present line is
-# parsed by the shared parse_presented_lines() in _kitty_harness_common.)
-_STATS_LINE_RE = re.compile(
+# reported separately as drawable_wait_ms.
+# Only frame/encode_ms/gpu_ms/passes are required (matches
+# metal_stats_enabled()'s contract); every field after passes= is parsed
+# generically as a key=value token rather than positionally/optionally --
+# metal.m has repeatedly INSERTED new fields between existing ones
+# (tex_allocs=/tex_bytes=/gfx_draws= landed between allocs= and bytes=, not
+# after drawable_wait_ms), so a positional "$-anchored after N optional
+# groups" regex goes stale every time the C side grows a field anywhere but
+# the very end. Generic key=value lookup means a future additive field
+# (tail or mid-line, e.g. a W28.0c gpu_end=) needs no parser change here.
+# (The companion metal_present line is parsed by the shared
+# parse_presented_lines() in _kitty_harness_common.)
+_STATS_LINE_PREFIX_RE = re.compile(
     r"^metal_stats\s+frame=(?P<frame>\d+)\s+encode_ms=(?P<encode>[\d.]+)\s+gpu_ms=(?P<gpu>[\d.]+)"
-    r"\s+passes=(?P<passes>\d+)(?:\s+allocs=(?P<allocs>\d+))?(?:\s+bytes=(?P<bytes>\d+))?"
-    r"(?:\s+drawable_wait_ms=(?P<wait>[\d.]+))?\s*$",
+    r"\s+passes=(?P<passes>\d+)(?P<tail>.*)$",
     re.MULTILINE,
 )
+_KV_TOKEN_RE = re.compile(r"(\w+)=(\S+)")
 
 
 def strip_ansi(text: str) -> str:
@@ -307,20 +316,21 @@ def parse_metal_stats(text: str) -> dict[str, Any]:
     """Parse KITTY_METAL_STATS output for frame CPU/GPU ms and passes/frame.
 
     Line formats are fixed by task #1's metal.m instrumentation (see
-    _STATS_LINE_RE above and the shared parse_presented_lines() docstring in
-    _kitty_harness_common, which also drops presented_time==0.000000000
-    rows -- a known first-drawable quirk).
+    _STATS_LINE_PREFIX_RE above and the shared parse_presented_lines()
+    docstring in _kitty_harness_common, which also drops
+    presented_time==0.000000000 rows -- a known first-drawable quirk).
     """
     cpu_ms: list[float] = []
     gpu_ms: list[float] = []
     passes: list[float] = []
     wait_ms: list[float] = []
-    for m in _STATS_LINE_RE.finditer(text):
+    for m in _STATS_LINE_PREFIX_RE.finditer(text):
         cpu_ms.append(float(m.group("encode")))
         gpu_ms.append(float(m.group("gpu")))
         passes.append(float(m.group("passes")))
-        if m.group("wait") is not None:
-            wait_ms.append(float(m.group("wait")))
+        tail_kv = dict(_KV_TOKEN_RE.findall(m.group("tail")))
+        if "drawable_wait_ms" in tail_kv:
+            wait_ms.append(float(tail_kv["drawable_wait_ms"]))
     presented, dropped_zero = parse_presented_lines(text)
 
     available = bool(cpu_ms or gpu_ms or passes or presented)
