@@ -2715,32 +2715,43 @@ wakeup_main_loop(void) {
     glfwPostEmptyEvent();
 }
 
+// Shared predicate behind both gates below. ICONIFIED and OCCLUDED are cached on
+// the OSWindow (window_iconify_callback/window_occlusion_callback in this file
+// keep them in sync, seeded from a live query at window creation) instead of
+// live AppKit queries here, since this runs on the per-window render-gate hot
+// path (render_os_window(), kitty/child-monitor.c, via
+// should_os_window_be_rendered()). VISIBLE has no single GLFW callback covering
+// every way it can change (multiple glfwShowWindow/glfwHideWindow call sites, no
+// dedicated visibility-changed callback), so it stays a live query --
+// conservative: fall back to querying when unsure.
+static bool
+window_is_showable(OSWindow *w, bool allow_occluded_forced_redraw) {
+    if (w->is_iconified || !glfwGetWindowAttrib(w->handle, GLFW_VISIBLE)) return false;
+    // W27 (ADR-0021): forced redraws render even while "occluded". A
+    // never-presented CAMetalLayer window is transparent to the window server
+    // and reports occluded until its FIRST present — with the occlusion cache
+    // gating renders, a background-spawned window deadlocks (renders 0 frames
+    // forever; the IOSurface arm never hit this because a plain CALayer counts
+    // as visible content even when empty). redraw_count > 0 breaks the bootstrap
+    // cycle — the same mechanism the un-occlusion force-repaint uses
+    // (window_occlusion_callback above) — and stays bounded: the count
+    // decrements per rendered frame.
+    //
+    // This exception is deliberately scoped to RENDERING and must NOT reach the
+    // visibility-reports protocol. redraw_count is also bumped on resize
+    // (kitty/child-monitor.c), so an occluded window that is merely resized
+    // would otherwise report itself VISIBLE to its child and flip back on the
+    // next frame — a spurious event pair describing something that never
+    // happened on screen.
+    if (w->is_occluded && !(allow_occluded_forced_redraw && w->redraw_count)) return false;
+    return true;
+}
+
 bool
 is_os_window_potentially_visible(OSWindow* w) {
-    // ICONIFIED and OCCLUDED are cached on the OSWindow (window_iconify_callback/
-    // window_occlusion_callback in this file keep them in sync, seeded from a
-    // live query at window creation) instead of live AppKit queries here, since
-    // this runs on the per-window render-gate hot path (render_os_window(),
-    // kitty/child-monitor.c, via should_os_window_be_rendered()). VISIBLE has
-    // no single GLFW callback covering every way it can change (multiple
-    // glfwShowWindow/glfwHideWindow call sites, no dedicated visibility-changed
-    // callback), so it stays a live query -- conservative: fall back to
-    // querying when unsure.
-    return (
-            w->is_iconified
-            || !glfwGetWindowAttrib(w->handle, GLFW_VISIBLE)
-            // W27 (ADR-0021): forced redraws render even while "occluded". A
-            // never-presented CAMetalLayer window is transparent to the window
-            // server and reports occluded until its FIRST present — with the
-            // occlusion cache gating renders, a background-spawned window
-            // deadlocks (renders 0 frames forever; the IOSurface arm never hit
-            // this because a plain CALayer counts as visible content even when
-            // empty). redraw_count > 0 breaks the bootstrap cycle — the same
-            // mechanism the un-occlusion force-repaint uses (window_occlusion_
-            // callback above) — and stays bounded: the count decrements per
-            // rendered frame.
-            || (w->is_occluded && !w->redraw_count)
-       ) ? false : true;
+    // Pure on-screen visibility, as reported to the child: no forced-redraw
+    // exception.
+    return window_is_showable(w, false);
 }
 
 bool
@@ -2764,7 +2775,7 @@ should_os_window_be_rendered(OSWindow* w) {
             }
         }
     }
-    return is_os_window_potentially_visible(w) && glfwAreSwapsAllowed(w->handle);
+    return window_is_showable(w, true) && glfwAreSwapsAllowed(w->handle);
 }
 
 static PyObject*
