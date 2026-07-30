@@ -2324,14 +2324,19 @@ static uint64_t metal_tick_drain_violations = 0;  // ticks that had to force-cle
 // path. Between a dropped frame and a use-after-free, drop the frame.
 static bool
 metal_tick_drain_barrier(void) {
-    bool violated = false;
+    // Recorded per name rather than as one bool, because the violation COUNT
+    // cannot distinguish which of the four tripped: a tick that leaves two
+    // globals live is still one violation. Anything asserting that a specific
+    // branch runs needs this, not the count.
+    bool had_cb = false, had_drawable = false, had_enc = false, had_render_pass = false, had_slot = false;
     // Enumerated BY NAME, never as "the per-frame globals" as a class: the
     // fourth has no MetalWindowSlot mirror, so any check phrased against the
     // slot fields silently omits exactly the one nothing else would catch.
-    if (mtl_current_command_buffer) { mtl_current_command_buffer = nil; violated = true; }
-    if (mtl_current_drawable)       { mtl_current_drawable = nil;       violated = true; }
-    if (mtl_current_encoder)        { mtl_current_encoder = nil;        violated = true; }
-    if (mtl_current_render_pass)    { mtl_current_render_pass = nil;    violated = true; }
+    if (mtl_current_command_buffer) { mtl_current_command_buffer = nil; had_cb = true; }
+    if (mtl_current_drawable)       { mtl_current_drawable = nil;       had_drawable = true; }
+    if (mtl_current_encoder)        { mtl_current_encoder = nil;        had_enc = true; }
+    if (mtl_current_render_pass)    { mtl_current_render_pass = nil;    had_render_pass = true; }
+    bool violated = had_cb || had_drawable || had_enc || had_render_pass;
     // enc_fmt is a scalar, not an object, but it describes the encoder we just
     // dropped; leaving it set would let a fresh encoder inherit a stale format.
     if (violated) mtl_current_enc_fmt = MTLPixelFormatInvalid;
@@ -2343,9 +2348,10 @@ metal_tick_drain_barrier(void) {
         if (!s->in_use) continue;
         if (s->cb || s->drawable || s->enc) {
             s->cb = nil; s->drawable = nil; s->enc = nil;
-            violated = true;
+            had_slot = true;
         }
     }
+    violated = violated || had_slot;
     metal_tick_drains++;
     if (violated) {
         metal_tick_drain_violations++;
@@ -2353,8 +2359,12 @@ metal_tick_drain_barrier(void) {
         // their emission is). A silent force-clear would make the invariant
         // unfalsifiable, which is the exact failure this barrier exists to
         // prevent: the AC would go green whether or not the pool was safe.
+        // The name list is what makes a per-branch assertion possible at all.
         if (global_state.debug_rendering) {
-            log_error("[Metal] tick drain barrier force-cleared live per-frame state (%llu violations / %llu ticks)",
+            log_error("[Metal] tick drain cleared:%s%s%s%s%s (%llu violations / %llu ticks)",
+                      had_cb ? " cb" : "", had_drawable ? " drawable" : "",
+                      had_enc ? " encoder" : "", had_render_pass ? " render_pass" : "",
+                      had_slot ? " slot_fields" : "",
                       (unsigned long long)metal_tick_drain_violations, (unsigned long long)metal_tick_drains);
         }
     }
@@ -2372,13 +2382,24 @@ metal_tick_drain_barrier(void) {
 // code, and the natural arm cannot distinguish those. The production path pays
 // one getenv-cached int test per tick.
 //
-// It leaves a BARE command buffer rather than routing through
-// ensure_command_buffer(): no completion handlers are registered, so the
-// discarded buffer costs nothing and the arm stays a pure test of detect-and-
-// clear. This is the same shape the thumbnail path produces for real
-// (metal_gl_read_pixels installs a fresh buffer, then swap_window_buffers skips
-// metal_end_frame), which is why the forced arm is a stand-in for it and not a
-// different phenomenon.
+// It plants TWO globals, because that is what the real path leaves behind and
+// an arm that plants one would leave the render-pass branch -- the branch whose
+// existence is the whole reason the four globals are enumerated by name --
+// unexercised while still reporting a violation. On the genuine thumbnail path:
+// metal_gl_read_pixels installs a fresh command buffer at its tail, the render
+// pass descriptor was set when the pass opened and nothing clears it before the
+// metal_end_frame that swap_window_buffers skips, and the drawable is nil
+// throughout because an offscreen capture never acquires one. So: cb + render
+// pass, no drawable. That is the shape reproduced here.
+//
+// The command buffer is BARE rather than routed through ensure_command_buffer():
+// no completion handlers are registered, so the discarded buffer costs nothing
+// and the arm stays a pure test of detect-and-clear.
+//
+// Both are cleared by a SINGLE barrier call, so the violation count is one per
+// tick either way -- extending the lever does not change violations_match_lever,
+// and an unchanged count is therefore not evidence that the extension is
+// missing. The per-name debug log is what distinguishes them.
 static int
 metal_test_force_tick_leak(void) {
     static int n = -1;
@@ -2398,7 +2419,10 @@ metal_render_tick(void (*body)(void *), void *ctx) {
         if (forced_leaks_left < 0) forced_leaks_left = metal_test_force_tick_leak();
         if (forced_leaks_left > 0 && mtl_command_queue) {
             forced_leaks_left--;
-            mtl_current_command_buffer = [mtl_command_queue commandBuffer];  // autoreleased; dies with this pool
+            // Both autoreleased, both die with this pool -- which is the point:
+            // the barrier has to nil the NAMES before that happens.
+            mtl_current_command_buffer = [mtl_command_queue commandBuffer];
+            mtl_current_render_pass = [MTLRenderPassDescriptor renderPassDescriptor];
         }
         metal_tick_drain_barrier();  // last statement inside the pool, by design
     }
