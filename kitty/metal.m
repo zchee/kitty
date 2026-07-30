@@ -2557,6 +2557,15 @@ metal_begin_layered_frame(void) {
     if (!att1) return;
     if (!ensure_layered_work_surface(att1.width, att1.height)) return;
 
+    // Both slot dereferences in this function -- the att0 texture here and the
+    // encoder format below -- are safe on a LOCAL invariant, which is why they
+    // are not guarded the way metal_resolve_layered_frame's is: the ensure()
+    // above returns false on a NULL slot, and nothing between it and either use
+    // can change current_window_slot. Every slot-touching call in this function
+    // (end_current_encoder, ensure_command_buffer, ensure_drawable) already ran
+    // before that ensure(); what remains is descriptor field assignment and the
+    // encoder creation. The resolve path is guarded instead of commented because
+    // its invariant is not local -- it spans metal_forget_layer.
     MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
     rpd.colorAttachments[0].texture = current_window_slot->layered_work_surface;
     rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
@@ -2587,15 +2596,25 @@ metal_begin_layered_frame(void) {
 void
 metal_resolve_layered_frame(void) {
     if (!layered_pass_active) return;
-    if (mtl_current_encoder) {
+    // The working surface now lives in the slot, so the full-surface viewport
+    // needs the slot too. Checked explicitly rather than inferred, for the same
+    // reason ensure_layered_work_surface checks it: metal_forget_layer clears
+    // current_window_slot while LEAVING layered_pass_active set, and only its
+    // separate nil-ing of mtl_current_encoder keeps the dereference below
+    // unreachable today. That is one invariant spread across two functions,
+    // which stops holding the moment either half moves. A resolve with no slot
+    // skips the resolve draw and still ends the pass, exactly as a missing PSO
+    // does.
+    const MetalWindowSlot *slot = current_window_slot;
+    if (mtl_current_encoder && slot) {
         // att1's real format, straight from the pass being resolved (drawable or
         // capture offscreen), so the PSO can never disagree with it.
         id<MTLRenderPipelineState> pso = ensure_layers_resolve_pso(
                 mtl_current_render_pass.colorAttachments[0].texture.pixelFormat,
                 mtl_current_render_pass.colorAttachments[1].texture.pixelFormat);
         if (pso) {
-            MTLViewport full = {0, 0, (double)current_window_slot->layered_work_w, (double)current_window_slot->layered_work_h, 0, 1};
-            MTLScissorRect fullsr = {0, 0, current_window_slot->layered_work_w, current_window_slot->layered_work_h};
+            MTLViewport full = {0, 0, (double)slot->layered_work_w, (double)slot->layered_work_h, 0, 1};
+            MTLScissorRect fullsr = {0, 0, slot->layered_work_w, slot->layered_work_h};
             [mtl_current_encoder setViewport:full];
             [mtl_current_encoder setScissorRect:fullsr];
             [mtl_current_encoder setRenderPipelineState:pso];
@@ -2834,9 +2853,16 @@ metal_end_frame(void) {
             [mtl_current_command_buffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
                 const double gpu_ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
                 // Sized from the worst case, recomputed whenever a field is
-                // added: every counter at UINT64_MAX, every float at its widest,
-                // is 534 bytes. snprintf would truncate silently, which on a
-                // tail-appended format means the NEWEST field is the one lost.
+                // added. The model, stated so the next field can re-derive it:
+                // 263 literal chars, each %llu counter at UINT64_MAX (20), each
+                // %d at INT_MIN's width (11), pace= at its longest literal
+                // ("immediate", 9), and the three %.3f durations plus the %.9f
+                // host time each allowed a signed 10-integer-digit part (15, 21)
+                // -- 562 chars + NUL = 563. Deliberately NOT float-widest: %.3f
+                // of DBL_MAX is 313 chars alone, but these are uptime-bounded
+                // durations and a mach-timebase host time, not arbitrary doubles.
+                // snprintf would truncate silently, which on a tail-appended
+                // format means the NEWEST field is the one lost.
                 char line[640];
                 // pace= is tail-appended (tolerant parsers, never $-anchored).
                 // W28.0c: gpu_end= is the ABSOLUTE host time the GPU finished this
