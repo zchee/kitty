@@ -1424,7 +1424,15 @@ static int metal_frame_counter = 0;
 // metal_frame_drawable_wait accumulates time spent in nextDrawable this frame
 // (emitted as drawable_wait_ms); with maximumDrawableCount=2 this is where the
 // keypress-to-photon backpressure actually lives, so it is measured separately.
-static uint64_t metal_frame_index = 0;
+// H1 first-frame sentinel: frame indices start at 1, not 0, because
+// last_drawn_fidx == 0 is the "never drawn" sentinel. With a 0-based counter the
+// very first frame's binds stamped 0, which is indistinguishable from never
+// drawn, so every sprite texture read as unstamped for the whole of frame 0 and
+// the guard under-counted itself. Nothing depends on the absolute value: the
+// completion watermark starts at 0 and only ever compares >, a fresh texture is
+// still 0 and still reads "not in flight", and the US-307 fallback proof drives
+// KITTY_METAL_TEST_FORCE_INFLIGHT counts rather than frame numbers.
+static uint64_t metal_frame_index = 1;
 // US-307: ungated per-frame GPU-completion watermark. Advanced (monotonically) by
 // each committed frame's completed handler to that frame's metal_frame_index, so
 // the CPU can tell whether a texture a committed frame referenced is still in
@@ -1453,6 +1461,128 @@ texture_upload_in_flight(uint32_t tex_id) {
     }
     if (force_remaining > 0) { force_remaining--; return true; }
     return textures[tex_id].last_drawn_fidx > atomic_load_explicit(&metal_completed_fidx, memory_order_acquire);
+}
+
+// ----- H1 (W28.4a): sprite/decorations upload guard -----
+// The atlas and decorations maps are Shared, tracked textures written by a CPU
+// replaceRegion. Tracked mode orders GPU-vs-GPU accesses only, so it says
+// nothing about a CPU write landing in a region a committed frame is still
+// sampling. The in-tree argument for why that is safe (see the atlas-growth
+// blit) rests on the write being to a DISJOINT region, which holds on every
+// production path today -- sprite indices are allocated monotonically and never
+// recycled inside a live atlas, and a font-size change builds a new atlas
+// rather than resetting the old one. This guard is therefore defence-in-depth
+// against that invariant being broken later, and it closes two defects that are
+// real now: the watermark was stamped for the graphics unit only, and the 3D
+// recreate path never reset it.
+//
+// DELIBERATE RE-SCOPE of KITTY_METAL_TEST_FORCE_INFLIGHT: that lever
+// (texture_upload_in_flight above) forces the first N checks true from a single
+// process-wide counter, and the US-307 test drives a precise number of image
+// uploads through it. Routing the new sprite call sites through the same entry
+// point would silently eat those N checks and change what that test exercises,
+// so the sprite guard reads the watermark directly and the lever keeps meaning
+// exactly what it meant before: the first N IMAGE-texture checks.
+//
+// The completion watermark this upload must reach before it is safe, and
+// whether the stamp names the frame currently being ENCODED rather than a
+// committed one.
+//
+// The self-frame case cannot be waited out directly: that frame's command
+// buffer is not committed until metal_end_frame, so metal_completed_fidx can
+// never reach it from here and waiting on it would burn the full cap. The
+// earlier revision exempted it outright and returned "not in flight". That
+// exemption leaned on an unasserted cross-file assumption about WHEN uploads
+// happen relative to encoding, and it is also effectively dead: an upload
+// during cell prep sees the previous frame's stamp, so the ordinary path
+// already applies. It is replaced by the conservative target -- every frame
+// STRICTLY BEFORE the one being encoded -- which is the strongest guarantee
+// actually obtainable here, costs nothing when those frames have already
+// completed (the normal case), and needs no assumption about upload phase.
+static uint64_t
+sprite_wait_target(GLuint tex_id, bool *selfframe) {
+    *selfframe = false;
+    if (tex_id == 0 || tex_id >= MAX_TEXTURES) return 0;
+    const uint64_t drawn = textures[tex_id].last_drawn_fidx;
+    if (!drawn) return 0;
+    if (drawn >= metal_frame_index) {
+        *selfframe = true;
+        return metal_frame_index ? metal_frame_index - 1 : 0;
+    }
+    return drawn;
+}
+
+static bool
+sprite_wait_target_pending(uint64_t target) {
+    return target != 0 && target > atomic_load_explicit(&metal_completed_fidx, memory_order_acquire);
+}
+
+// Anti-vacuity instrumentation (W28.4a AC). Three distinct questions, because
+// one counter cannot answer them and a naive reading of `waits` alone is
+// actively misleading:
+//   checks   the guard runs at all.
+//   stamped  the guard saw a texture with a NON-ZERO last_drawn_fidx, i.e. the
+//            unit 0/2/3/4 stamps are firing. This is the real anti-vacuity
+//            signal. Before those stamps existed this would be 0 for every
+//            sprite-side texture and the predicate was constant-false -- a
+//            guard that reads as protection while never being able to fire.
+//   waits    the predicate actually found a committed, unfinished frame.
+//   selfframe entries into the conservative self-frame branch. Expected to be
+//            0: an upload during cell prep sees the PREVIOUS frame's stamp. A
+//            non-zero count is a discovery, not a failure -- it means some
+//            upload path runs after that frame's own binds, which is exactly
+//            the assumption the removed exemption used to depend on silently.
+// `waits == 0` alongside `stamped > 0` is a HEALTHY result, not a vacuous one:
+// it means the guarded race did not occur, which is expected when gpu is
+// 0.23 ms-class against a ~16 ms tick. Only `stamped == 0` proves vacuity.
+// All four are CUMULATIVE for the process, so a capture is judged on its LAST
+// emitted line, never on "some line showed a non-zero". Forced runs (the lever
+// below) and natural runs are reported separately and never summed.
+static uint64_t metal_sprite_guard_checks = 0;
+static uint64_t metal_sprite_guard_stamped = 0;
+static uint64_t metal_sprite_guard_waits = 0;
+static uint64_t metal_sprite_guard_timeouts = 0;
+static uint64_t metal_sprite_guard_selfframe = 0;
+
+// Verification lever, sprite-scoped on purpose: forces the first N guard calls
+// down the wait branch so that branch is provably reachable and counted, even
+// though the real race is rare in steady state. Deliberately SEPARATE from
+// KITTY_METAL_TEST_FORCE_INFLIGHT so neither lever consumes the other's budget
+// (see the re-scope note above). Inert when unset.
+static bool
+sprite_upload_force_inflight(void) {
+    static int remaining = -1;
+    if (remaining < 0) {
+        const char *v = getenv("KITTY_METAL_TEST_FORCE_SPRITE_INFLIGHT");
+        remaining = (v && v[0]) ? atoi(v) : 0;
+    }
+    if (remaining > 0) { remaining--; return true; }
+    return false;
+}
+
+// Bounded wait before a CPU write to a sprite-side texture. gpu p50 is
+// 0.23 ms-class, so when this blocks at all it is normally well under the cap.
+// On expiry the write proceeds anyway: the callers cache the sprite index the
+// moment they ask for the upload, so skipping or deferring the write leaves a
+// permanently blank glyph rather than a late one. Proceeding is exactly today's
+// behaviour, and the timeout counter makes the situation visible instead of
+// silent.
+#define SPRITE_UPLOAD_WAIT_CAP_MS 1.0
+static void
+guard_sprite_upload(GLuint tex_id) {
+    metal_sprite_guard_checks++;
+    if (tex_id && tex_id < MAX_TEXTURES && textures[tex_id].last_drawn_fidx) metal_sprite_guard_stamped++;
+    bool selfframe = false;
+    const uint64_t target = sprite_wait_target(tex_id, &selfframe);
+    if (selfframe) metal_sprite_guard_selfframe++;
+    const bool forced = sprite_upload_force_inflight();
+    if (!forced && !sprite_wait_target_pending(target)) return;
+    metal_sprite_guard_waits++;
+    const monotonic_t deadline = monotonic() + ms_double_to_monotonic_t(SPRITE_UPLOAD_WAIT_CAP_MS);
+    while (sprite_wait_target_pending(target)) {
+        if (monotonic() >= deadline) { metal_sprite_guard_timeouts++; return; }
+        sched_yield();
+    }
 }
 
 // M3: has any render pass targeted the drawable yet this frame? The first
@@ -1603,19 +1733,30 @@ draw_quad(bool blend, unsigned instance_count) {
         // tex 1), unit 4 = colored decorations map (vertex tex 3). ensure_sprite_map
         // keeps units 3/4 bound to a valid texture even under the kill switch, so
         // the fragment/vertex color samplers are always complete.
+        // H1 (W28.4a): record the frame that samples each sprite-side texture,
+        // exactly as the graphics unit already does below. Until this landed the
+        // watermark was stamped for unit 1 ONLY, so last_drawn_fidx stayed 0 for
+        // every atlas and decorations map and any in-flight predicate built on it
+        // was constant-false -- a guard that reads as protection while never
+        // firing. Stamped at bind time, when metal_frame_index still names the
+        // frame being encoded (it is post-incremented at commit).
         if (bound_tex_2d_array[0] && bound_tex_2d_array[0] < MAX_TEXTURES && textures[bound_tex_2d_array[0]].texture) {
             [mtl_current_encoder setFragmentTexture:textures[bound_tex_2d_array[0]].texture atIndex:0];
             [mtl_current_encoder setVertexTexture:textures[bound_tex_2d_array[0]].texture atIndex:0];
+            textures[bound_tex_2d_array[0]].last_drawn_fidx = metal_frame_index;
         }
         if (bound_tex_2d[2] && bound_tex_2d[2] < MAX_TEXTURES && textures[bound_tex_2d[2]].texture) {
             [mtl_current_encoder setVertexTexture:textures[bound_tex_2d[2]].texture atIndex:2];
+            textures[bound_tex_2d[2]].last_drawn_fidx = metal_frame_index;
         }
         if (bound_tex_2d_array[3] && bound_tex_2d_array[3] < MAX_TEXTURES && textures[bound_tex_2d_array[3]].texture) {
             [mtl_current_encoder setFragmentTexture:textures[bound_tex_2d_array[3]].texture atIndex:1];
             [mtl_current_encoder setVertexTexture:textures[bound_tex_2d_array[3]].texture atIndex:1];
+            textures[bound_tex_2d_array[3]].last_drawn_fidx = metal_frame_index;
         }
         if (bound_tex_2d[4] && bound_tex_2d[4] < MAX_TEXTURES && textures[bound_tex_2d[4]].texture) {
             [mtl_current_encoder setVertexTexture:textures[bound_tex_2d[4]].texture atIndex:3];
+            textures[bound_tex_2d[4]].last_drawn_fidx = metal_frame_index;
         }
     } else if (current_program == 4) {
         // Borders — bind rect buffer from VAO, uniforms as buffer
@@ -2653,9 +2794,17 @@ metal_end_frame(void) {
             const uint64_t tex_bytes = metal_frame_tex_upload_bytes; // G3-lite: image-texture upload bytes this frame (delta rect vs full image)
             const int gfx_draws = metal_frame_gfx_draw_count; // G2: graphics-program draw calls this frame (instancing collapses group refs)
             const uint64_t bytes = metal_frame_bytes_uploaded; // D2: VAO-buffer bytes uploaded this frame
+            // H1 anti-vacuity counters. Process-cumulative, not per-frame, and
+            // captured here because the handler runs on a Metal callback thread
+            // while these are plain main-thread counters.
+            const uint64_t guard_checks = metal_sprite_guard_checks;
+            const uint64_t guard_stamped = metal_sprite_guard_stamped;
+            const uint64_t guard_waits = metal_sprite_guard_waits;
+            const uint64_t guard_timeouts = metal_sprite_guard_timeouts;
+            const uint64_t guard_selfframe = metal_sprite_guard_selfframe;
             [mtl_current_command_buffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
                 const double gpu_ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
-                char line[384];
+                char line[512];
                 // pace= is tail-appended (tolerant parsers, never $-anchored).
                 // W28.0c: gpu_end= is the ABSOLUTE host time the GPU finished this
                 // command buffer (gpu_ms stays the unchanged duration). It closes
@@ -2663,8 +2812,11 @@ metal_end_frame(void) {
                 // {gpu-done->presented}; both neighbours (metal_commit's
                 // commit_time and metal_present's presented_time) are host time in
                 // the same mach timebase, so the terms subtract directly.
-                snprintf(line, sizeof line, "metal_stats frame=%llu encode_ms=%.3f gpu_ms=%.3f passes=%d allocs=%d tex_allocs=%d tex_bytes=%llu gfx_draws=%d bytes=%llu drawable_wait_ms=%.3f pace=%s gpu_end=%.9f\n",
-                         (unsigned long long)fidx, encode_ms, gpu_ms, passes, allocs, tex_allocs, (unsigned long long)tex_bytes, gfx_draws, (unsigned long long)bytes, drawable_wait_ms, pace, cb.GPUEndTime);
+                snprintf(line, sizeof line, "metal_stats frame=%llu encode_ms=%.3f gpu_ms=%.3f passes=%d allocs=%d tex_allocs=%d tex_bytes=%llu gfx_draws=%d bytes=%llu drawable_wait_ms=%.3f pace=%s gpu_end=%.9f sprite_guard_checks=%llu sprite_guard_stamped=%llu sprite_guard_waits=%llu sprite_guard_timeouts=%llu sprite_guard_selfframe=%llu\n",
+                         (unsigned long long)fidx, encode_ms, gpu_ms, passes, allocs, tex_allocs, (unsigned long long)tex_bytes, gfx_draws, (unsigned long long)bytes, drawable_wait_ms, pace, cb.GPUEndTime,
+                         (unsigned long long)guard_checks, (unsigned long long)guard_stamped,
+                         (unsigned long long)guard_waits, (unsigned long long)guard_timeouts,
+                         (unsigned long long)guard_selfframe);
                 metal_stats_emit(line);
             }];
         }
@@ -2908,6 +3060,12 @@ recycle_texture_id(GLuint id) {
     [textures[id].texture release];
     textures[id].texture = nil;
     textures[id].target = 0;
+    // H1: the object this watermark referred to is gone, so the stamp is
+    // meaningless. metal_gl_gen_textures memsets the slot when the id is handed
+    // out again, which made this redundant -- but only incidentally, and a
+    // recycled id inheriting a stale high watermark would make the guard wait
+    // on a frame that never bound the new texture. Clear it at the source.
+    textures[id].last_drawn_fidx = 0;
     if (num_free_texture_ids < MAX_TEXTURES) free_texture_ids[num_free_texture_ids++] = id;
 }
 
@@ -3025,6 +3183,11 @@ void metal_gl_tex_sub_image_2d(GLenum target, int level, int x, int y, int width
     MetalTexture *t = get_texture(tex_id);
     if (!t || !t->texture || !data) return;
 
+    // H1: the decorations maps reach the GPU through this 2D path (the atlases
+    // use the 3D array path below), so guarding only the 3D write would leave
+    // two of the four sprite-side textures uncovered.
+    guard_sprite_upload(tex_id);
+
     NSUInteger dst_bpp = mtl_bytes_per_pixel(t->texture.pixelFormat);
     // G3-lite: account image-texture upload bytes (RGB/RGBA source). A full-image
     // SubImage covers width*height==image; a delta upload covers only its rect.
@@ -3055,6 +3218,10 @@ void metal_gl_tex_sub_image_3d(GLenum target, int level, int x, int y, int z, in
     GLuint tex_id = get_bound_texture_for_target(target);
     MetalTexture *t = get_texture(tex_id);
     if (!t || !t->texture || !data) return;
+
+    // H1: the glyph atlases are written here. Wait, bounded, for any committed
+    // frame still sampling this atlas before overwriting a region of it.
+    guard_sprite_upload(tex_id);
 
     // F1: size bytesPerRow from the actual destination format. The mono atlas is
     // now single-channel R8 (GL_RED/GL_UNSIGNED_BYTE upload, bpp 1), while the
@@ -3124,6 +3291,13 @@ void metal_gl_tex_storage_3d(GLenum target, int levels, GLenum internalformat, i
     [t->texture release];
     t->texture = [mtl_device newTextureWithDescriptor:desc];
     t->target = GL_TEXTURE_2D_ARRAY;
+    // H1: this is an in-place release+recreate, so the watermark now refers to a
+    // texture object that no longer exists. The 2D sibling
+    // (metal_gl_tex_image_2d) has always reset it here; the 3D path omitted it,
+    // and the omission was survivable only because every caller happens to route
+    // through metal_gl_gen_textures first. A stale high watermark would make the
+    // guard wait for a frame that never bound this object.
+    t->last_drawn_fidx = 0;
     t->width = width;
     t->height = height;
     t->depth = depth;
