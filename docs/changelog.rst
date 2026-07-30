@@ -9,8 +9,21 @@ To update |kitty|, :doc:`follow the instructions <binary>`.
 Recent major new features
 ---------------------------
 
-Vertical tabs [0.48]
-~~~~~~~~~~~~~~~~~~~~~~~~~~
+Metal-only Display P3 and EDR rendering on macOS [this fork, W27]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Fork-local (not upstream): on macOS the renderer is now Metal-only — the
+OpenGL build arm is retired and a plain ``setup.py build`` produces the Metal
+backend. The default drawable is a linear half-float surface tagged
+Display P3, so ``oklch()``/``lab()`` palette colors reach the display's wide
+gamut (gamut-mapped against P3 instead of sRGB), at a measured cost of
+about +2 % keypress-to-photon latency. HDR images are supported through a
+fork-local graphics-protocol format (``f=3232``, float32 RGBA scRGB) with
+EDR engaged lazily — only while >1.0 content is on screen, so SDR rendering
+stays byte-identical. Fullscreen keeps vsync by default; in fullscreen
+:opt:`sync_to_monitor` ``no`` now opts into immediate presents (tearing
+accepted) and was measured at sub-vsync photon latency (p50 ≈ 15.2 ms).
+Windowed rendering was already tear-free-immediate and is unchanged.
 
 kitty now has support for :pull:`vertical tabs <9855>` along the left or right edge of the OS
 Window. Useful for people that have wide aspect ratio windows.
