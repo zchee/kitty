@@ -200,9 +200,16 @@ static bool edr_frame_engaged = false;
 static float edr_frame_headroom = 1.0f;
 static inline MTLPixelFormat layered_work_fmt(void) { return edr_frame_engaged ? LAYERED_WORK_FMT_EDR : LAYERED_WORK_FMT; }
 static bool layered_pass_active = false;                // inside a layered pass? (per window: saved with the slot)
-static id<MTLTexture> layered_work_surface = nil;       // memoryless att0, grown to the drawable size
-static NSUInteger layered_work_w = 0, layered_work_h = 0;
-static MTLPixelFormat layered_work_surface_fmt = MTLPixelFormatInvalid;  // what layered_work_surface was created as
+// H2 (W28.4a): the memoryless att0 working surface and its (w, h, fmt) cache key
+// live in MetalWindowSlot, not here. As file-scope globals they formed a single
+// slot keyed on the drawable size and format, so two OS windows of different
+// sizes -- or with different EDR engagement -- alternated keys and recreated the
+// texture EVERY frame, each one's lookup missing the other's entry.
+// H2 (W28.4a): counts successful creations of a layered working surface. Nothing
+// else observes this: allocs= tracks MTLBuffer only and tex_allocs= only counts
+// GL_SRGB_ALPHA image textures, so a memoryless-texture rebuild was invisible to
+// every existing counter. Steady state is 0 once the cache is per window.
+static uint64_t metal_layered_surface_creates = 0;
 // One resolve PSO per (att0, att1) format pair. att1 is the drawable's (the W27
 // P3.2 candidate) or the BGRA8 capture offscreen's — two; att0 is the SDR or the
 // EDR working-surface format (P4.2) — two. Four in the worst case.
@@ -1985,6 +1992,15 @@ typedef struct {
     double frame_drawable_wait; // p99: seconds spent in nextDrawable this frame
     bool drawable_pass_opened;  // M3: first drawable pass seen this frame?
     bool layered_pass_active;   // M1: mid single-pass layered render?
+    // H2 (W28.4a): per-window layered working-surface cache. Unlike cb/drawable/
+    // enc above -- which are UNRETAINED copies of autoreleased objects the queue
+    // owns -- this texture is +1 OWNED by the slot. It therefore has NO
+    // register-file mirror: one reference, one owner, so there is no way for a
+    // global and a slot field to both name the same +1 and double-release it.
+    // metal_forget_layer must release it before memsetting the slot.
+    id<MTLTexture> layered_work_surface;                 // memoryless att0, sized to this window's drawable
+    NSUInteger layered_work_w, layered_work_h;           // its cache key: size...
+    MTLPixelFormat layered_work_surface_fmt;             // ...and format (memset 0 == MTLPixelFormatInvalid)
 } MetalWindowSlot;
 #define MAX_METAL_WINDOWS 64
 static MetalWindowSlot metal_windows[MAX_METAL_WINDOWS];
@@ -2252,6 +2268,11 @@ metal_forget_layer(void *layer) {
             // W28.0c: retire this index's stamps here too, not only on re-issue --
             // a window can die without another ever taking its slot.
             metal_present_slot_reassigned(i);
+            // H2: the slot OWNS this texture (+1 from newTextureWithDescriptor),
+            // unlike the unretained cb/drawable/enc the memset below simply drops.
+            // Memoryless carries no DRAM, but the object and its tile-memory
+            // reservation still leak if the slot is zeroed without releasing.
+            [metal_windows[i].layered_work_surface release];
             memset(&metal_windows[i], 0, sizeof(metal_windows[i]));
             break;
         }
@@ -2403,7 +2424,7 @@ wanted_attachment_format(bool for_clear) {
     (void)for_clear;
     // M1: during a layered pass every compositing draw targets att0 (the working
     // surface), so the encoder must never be torn down by a format mismatch.
-    if (layered_pass_active) return layered_work_surface_fmt;
+    if (layered_pass_active && current_window_slot) return current_window_slot->layered_work_surface_fmt;
     if (bound_framebuffer && bound_framebuffer < MAX_FRAMEBUFFERS &&
         framebuffers[bound_framebuffer].in_use && framebuffers[bound_framebuffer].render_target) {
         return framebuffers[bound_framebuffer].render_target.pixelFormat;
@@ -2420,27 +2441,34 @@ wanted_attachment_format(bool for_clear) {
 // engagement flip must rebuild the surface, not silently keep rendering >1.0
 // content into a texture that clamps it. Memoryless RGBA16Float (with blending)
 // is supported on Apple GPUs, so the tile-only storage mode survives the flip.
+// H2: cached per window. current_window_slot is guarded explicitly rather than
+// inferred: metal_set_current_layer(NULL) leaves it NULL, and a layered frame
+// without a window to own the surface has nowhere to cache it.
 static bool
 ensure_layered_work_surface(NSUInteger w, NSUInteger h) {
-    if (w < 1 || h < 1) return false;
+    MetalWindowSlot *s = current_window_slot;
+    if (!s || w < 1 || h < 1) return false;
     const MTLPixelFormat want = layered_work_fmt();
-    if (layered_work_surface && layered_work_w == w && layered_work_h == h && layered_work_surface_fmt == want) return true;
-    [layered_work_surface release]; layered_work_surface = nil;
+    if (s->layered_work_surface && s->layered_work_w == w && s->layered_work_h == h && s->layered_work_surface_fmt == want) return true;
+    [s->layered_work_surface release]; s->layered_work_surface = nil;
     MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:want
                                                                                     width:w height:h mipmapped:NO];
     desc.usage = MTLTextureUsageRenderTarget;    // framebuffer-fetch read+write; never sampled
     desc.storageMode = MTLStorageModeMemoryless; // tile memory only, never DRAM
-    layered_work_surface = [mtl_device newTextureWithDescriptor:desc];
-    if (!layered_work_surface) {
-        layered_work_w = layered_work_h = 0; layered_work_surface_fmt = MTLPixelFormatInvalid; return false;
+    s->layered_work_surface = [mtl_device newTextureWithDescriptor:desc];
+    if (!s->layered_work_surface) {
+        s->layered_work_w = s->layered_work_h = 0; s->layered_work_surface_fmt = MTLPixelFormatInvalid; return false;
     }
-    if (global_state.debug_rendering && layered_work_surface_fmt != want) {
+    // Counted here, on the creation path only -- never on the cache-hit return
+    // above, which is the whole point of the measurement.
+    metal_layered_surface_creates++;
+    if (global_state.debug_rendering && s->layered_work_surface_fmt != want) {
         NSLog(@"[Metal] layered working surface -> %s (%lux%lu, EDR %s, headroom %.3f)",
               want == LAYERED_WORK_FMT_EDR ? "RGBA16Float" : "RGBA16Unorm",
               (unsigned long)w, (unsigned long)h, edr_frame_engaged ? "engaged" : "off",
               (double)edr_frame_headroom);
     }
-    layered_work_w = w; layered_work_h = h; layered_work_surface_fmt = want;
+    s->layered_work_w = w; s->layered_work_h = h; s->layered_work_surface_fmt = want;
     return true;
 }
 
@@ -2530,7 +2558,7 @@ metal_begin_layered_frame(void) {
     if (!ensure_layered_work_surface(att1.width, att1.height)) return;
 
     MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
-    rpd.colorAttachments[0].texture = layered_work_surface;
+    rpd.colorAttachments[0].texture = current_window_slot->layered_work_surface;
     rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
     rpd.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
     rpd.colorAttachments[0].storeAction = MTLStoreActionDontCare;  // tile-only
@@ -2546,7 +2574,7 @@ metal_begin_layered_frame(void) {
     // draw_quad picks the layered (2-attachment) PSOs; the DYNAMIC att0 format
     // (W27 P4.2) flows through here into pso_get's cache key, so the SDR and EDR
     // working-surface variants can never be confused for one another.
-    mtl_current_enc_fmt = layered_work_surface_fmt;
+    mtl_current_enc_fmt = current_window_slot->layered_work_surface_fmt;
     layered_pass_active = true;
     drawable_pass_opened = true;
     metal_pass_count++;  // the whole layered frame is this one encoder (acceptance criterion 2)
@@ -2566,8 +2594,8 @@ metal_resolve_layered_frame(void) {
                 mtl_current_render_pass.colorAttachments[0].texture.pixelFormat,
                 mtl_current_render_pass.colorAttachments[1].texture.pixelFormat);
         if (pso) {
-            MTLViewport full = {0, 0, (double)layered_work_w, (double)layered_work_h, 0, 1};
-            MTLScissorRect fullsr = {0, 0, layered_work_w, layered_work_h};
+            MTLViewport full = {0, 0, (double)current_window_slot->layered_work_w, (double)current_window_slot->layered_work_h, 0, 1};
+            MTLScissorRect fullsr = {0, 0, current_window_slot->layered_work_w, current_window_slot->layered_work_h};
             [mtl_current_encoder setViewport:full];
             [mtl_current_encoder setScissorRect:fullsr];
             [mtl_current_encoder setRenderPipelineState:pso];
@@ -2802,9 +2830,14 @@ metal_end_frame(void) {
             const uint64_t guard_waits = metal_sprite_guard_waits;
             const uint64_t guard_timeouts = metal_sprite_guard_timeouts;
             const uint64_t guard_selfframe = metal_sprite_guard_selfframe;
+            const uint64_t layered_creates = metal_layered_surface_creates;  // H2
             [mtl_current_command_buffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
                 const double gpu_ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
-                char line[512];
+                // Sized from the worst case, recomputed whenever a field is
+                // added: every counter at UINT64_MAX, every float at its widest,
+                // is 534 bytes. snprintf would truncate silently, which on a
+                // tail-appended format means the NEWEST field is the one lost.
+                char line[640];
                 // pace= is tail-appended (tolerant parsers, never $-anchored).
                 // W28.0c: gpu_end= is the ABSOLUTE host time the GPU finished this
                 // command buffer (gpu_ms stays the unchanged duration). It closes
@@ -2812,11 +2845,11 @@ metal_end_frame(void) {
                 // {gpu-done->presented}; both neighbours (metal_commit's
                 // commit_time and metal_present's presented_time) are host time in
                 // the same mach timebase, so the terms subtract directly.
-                snprintf(line, sizeof line, "metal_stats frame=%llu encode_ms=%.3f gpu_ms=%.3f passes=%d allocs=%d tex_allocs=%d tex_bytes=%llu gfx_draws=%d bytes=%llu drawable_wait_ms=%.3f pace=%s gpu_end=%.9f sprite_guard_checks=%llu sprite_guard_stamped=%llu sprite_guard_waits=%llu sprite_guard_timeouts=%llu sprite_guard_selfframe=%llu\n",
+                snprintf(line, sizeof line, "metal_stats frame=%llu encode_ms=%.3f gpu_ms=%.3f passes=%d allocs=%d tex_allocs=%d tex_bytes=%llu gfx_draws=%d bytes=%llu drawable_wait_ms=%.3f pace=%s gpu_end=%.9f sprite_guard_checks=%llu sprite_guard_stamped=%llu sprite_guard_waits=%llu sprite_guard_timeouts=%llu sprite_guard_selfframe=%llu layered_surface_creates=%llu\n",
                          (unsigned long long)fidx, encode_ms, gpu_ms, passes, allocs, tex_allocs, (unsigned long long)tex_bytes, gfx_draws, (unsigned long long)bytes, drawable_wait_ms, pace, cb.GPUEndTime,
                          (unsigned long long)guard_checks, (unsigned long long)guard_stamped,
                          (unsigned long long)guard_waits, (unsigned long long)guard_timeouts,
-                         (unsigned long long)guard_selfframe);
+                         (unsigned long long)guard_selfframe, (unsigned long long)layered_creates);
                 metal_stats_emit(line);
             }];
         }
