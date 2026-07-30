@@ -29,6 +29,13 @@
 #include "../kitty/monotonic.h"
 #include "glfw3.h"
 #include "internal.h"
+// W28.1: keyDown entry stamp (no-op off-Apple and off-tracer). MUST come after
+// internal.h: it pulls <os/signpost.h>, which transitively pulls <sys/param.h>,
+// and that defines MIN/MAX guarded by #ifndef -- so including it first wins the
+// definition and internal.h's own unguarded MIN/MAX then redefine under
+// -Werror=macro-redefined. After internal.h, glfw's definitions land first and
+// sys/param.h's guards defer to them.
+#include "../kitty/input_signpost.h"
 #ifdef KITTY_USE_METAL
 // W27 P4.1: kitty_drawable_edr_eligible() for glfwCocoaSetEDREnabled below.
 #include "../kitty/metal_drawable_format.h"
@@ -1342,6 +1349,11 @@ is_ascii_control_char(char x) {
 
 - (void)keyDown:(NSEvent *)event
 {
+    // W28.1 S1 split: the first instant kitty owns this keystroke. Everything
+    // before it -- HID, WindowServer, AppKit delivery -- is outside the
+    // process, and pairing this against the harness's own CGEventPost
+    // timestamp is what separates the OS-side share of S1 from ours.
+    INPUT_SIGNPOST_EVENT("key_down_entry");
 #define CLEAR_PRE_EDIT_TEXT glfw_keyevent.text = NULL; glfw_keyevent.ime_state = GLFW_IME_PREEDIT_CHANGED; _glfwInputKeyboard(window, &glfw_keyevent);
 #define UPDATE_PRE_EDIT_TEXT glfw_keyevent.text = [[markedText string] UTF8String]; glfw_keyevent.ime_state = GLFW_IME_PREEDIT_CHANGED; _glfwInputKeyboard(window, &glfw_keyevent);
 

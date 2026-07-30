@@ -9,6 +9,7 @@
 #include "keys.h"
 #include "screen.h"
 #include "glfw-wrapper.h"
+#include "input_signpost.h"  // W28.1: S1-split stamps (no-ops off Apple, and off-tracer)
 #include <structmember.h>
 
 #ifndef __APPLE__
@@ -184,12 +185,16 @@ send_key_to_child(id_type window_id, Screen *screen, const GLFWkeyevent *ev) {
     int size = encode_glfw_key_event(ev, screen->modes.mDECCKM, screen_current_key_encoding_flags(screen), encoded_key);
     if (size == SEND_TEXT_TO_CHILD) {
         schedule_write_to_child(window_id, 1, text, strlen(text));
+        // W28.1: key-processing exit. Stamped AFTER the scheduling call so the
+        // span ends where kitty's own work on this keystroke does.
+        INPUT_SIGNPOST_EVENT("key_to_child_text");
         debug("sent key as text to child (window_id: %llu): %s\n", window_id, text);
     } else if (size > 0) {
         if (size == 1 && screen->modes.mHANDLE_TERMIOS_SIGNALS) {
             if (screen_send_signal_for_key(screen, *encoded_key)) return;
         }
         schedule_write_to_child(window_id, 1, encoded_key, size);
+        INPUT_SIGNPOST_EVENT("key_to_child_encoded");  // W28.1: key-processing exit
         if (OPT(debug_keyboard)) {
             debug("sent encoded key to child (window_id: %llu): ", window_id);
             for (int ki = 0; ki < size; ki++) {
@@ -258,6 +263,11 @@ on_key_input(const GLFWkeyevent *ev) {
         case GLFW_IME_COMMIT_TEXT:
             if (*text) {
                 schedule_write_to_child(w->id, 1, text, strlen(text));
+                // W28.1: the IME-commit exit. A separate name from the two
+                // send_key_to_child exits because it is a different path with a
+                // different cost -- a block that mixed them would average an IME
+                // commit against a plain keypress.
+                INPUT_SIGNPOST_EVENT("key_to_child_ime_commit");
                 debug("committed pre-edit text: %s sent to child as text.\n", text);
             } else debug("committed pre-edit text: (null)\n");
             screen_update_overlay_text(screen, NULL);
@@ -273,12 +283,21 @@ on_key_input(const GLFWkeyevent *ev) {
             return;
     }
     bool dispatch_ok = true, consumed = false;
+// W28.1: the key_dispatch interval spans the WHOLE per-keystroke Python cost --
+// building the KeyEvent object AND the boss call -- because that pair is what
+// the plan's feasibility clause prices, not the call alone. It closes before
+// window_for_window_id() so a C-side window lookup is not billed to Python.
+// The !ke error path closes the interval before returning: an interval left
+// open would silently merge into the next keystroke's.
 #define dispatch_key_event(name) { \
     PyObject *ke = NULL, *ret = NULL; \
-    ke = convert_glfw_key_event_to_python(ev); if (!ke) { PyErr_Print(); return; }; \
+    INPUT_SIGNPOST_INTERVAL_BEGIN("key_dispatch"); \
+    ke = convert_glfw_key_event_to_python(ev); \
+    if (!ke) { INPUT_SIGNPOST_INTERVAL_END("key_dispatch"); PyErr_Print(); return; }; \
     ret = PyObject_CallMethod(global_state.boss, #name, "O", ke); Py_CLEAR(ke); \
     if (ret == NULL) { PyErr_Print(); dispatch_ok = false; } \
     else { consumed = ret == Py_True; Py_CLEAR(ret); } \
+    INPUT_SIGNPOST_INTERVAL_END("key_dispatch"); \
     w = window_for_window_id(active_window_id); \
 }
     if (action == GLFW_PRESS || action == GLFW_REPEAT) {
