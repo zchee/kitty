@@ -1874,18 +1874,55 @@ static MetalWindowSlot *current_window_slot = NULL;
 // on slot reuse -- and memset is not an atomic store.
 //
 // The pair is published consistently rather than merely atomically: the time
-// lands in a two-entry array indexed by frame parity, then the frame index is
-// stored with release. A reader loads the index, reads the time that index
-// selects, and re-reads the index; a concurrent handler for the next frame
-// writes the OTHER array entry, so the value the reader took cannot be mutated
-// underneath it, and an index that moved between the two loads is rejected. A
-// recycled slot can only ever hand back a frame index the new window never
-// committed, which the same index check rejects.
+// lands in a two-entry array indexed by frame parity, then the key naming that
+// frame is stored with release. A reader loads the key, reads the time the key
+// selects, and re-reads the key; a concurrent handler for the next frame writes
+// the OTHER array entry, so the value the reader took cannot be mutated
+// underneath it, and a key that moved between the two loads is rejected.
+//
+// SLOT LIFECYCLE (the ordering argument). A slot index outlives the window that
+// owned it: metal_forget_layer memsets the slot and metal_set_current_layer
+// hands the free slot to the next window, while a presented handler registered
+// by the DEAD window may still be in flight and about to write. Clearing the
+// entry on teardown does not fix this -- the main thread cannot order its clear
+// against a callback that has not run yet, so a late write would simply
+// resurrect the dead window's stamp under the new window's identity.
+// The published key therefore carries the slot's OWNERSHIP EPOCH alongside the
+// frame index: metal_present_slot_reassigned() bumps the epoch on every
+// identity change (teardown and re-issue both), each handler captures the epoch
+// it was registered under, and a reader accepts a key only when its epoch
+// equals the slot's current one. A late write from the dead window publishes
+// the OLD epoch and is rejected deterministically -- no clear, no undo, and no
+// window in which prev_present_* can read the previous window's stamp. The
+// epoch is compared, never trusted for ordering, so the main thread needs no
+// atomic on its side.
+// Packing (40-bit frame index, 24-bit epoch) keeps key publication a single
+// atomic store, which is what makes the reader's re-read check sufficient. The
+// bounds are not reachable in practice: 2^40 frames is ~34 years at 1000 fps,
+// and 2^24 is 16.7M window-identity changes. key == 0 means "never stamped"
+// (the first epoch handed out is 1, so a real key is always non-zero).
+#define PRESENT_STAMP_FIDX_BITS 40
+#define PRESENT_STAMP_FIDX_MASK ((1ull << PRESENT_STAMP_FIDX_BITS) - 1)
 typedef struct {
-    _Atomic int64_t at[2];    // presentedTime as monotonic_t, indexed by frame parity; 0 = no stamp
-    _Atomic uint64_t fidx;    // frame index the newest stamp belongs to
+    _Atomic int64_t at[2];   // presentedTime as monotonic_t, indexed by frame parity; 0 = no stamp
+    _Atomic uint64_t key;    // (epoch << 40) | frame index; 0 = nothing stamped
 } MetalPresentStamp;
 static MetalPresentStamp metal_present_stamps[MAX_METAL_WINDOWS];
+// Current ownership epoch per slot index, and the counter it is handed out
+// from. Main thread only (assignment and teardown both run there); handlers
+// receive their epoch by value at registration and never read these.
+static uint64_t metal_present_epochs[MAX_METAL_WINDOWS];
+static uint64_t metal_present_epoch_counter;
+
+// A slot index has changed owner: retire every stamp published under the old
+// identity. Called from both sides of the reuse -- teardown (metal_forget_layer)
+// and re-issue (metal_set_current_layer) -- so an index is never live under two
+// epochs even if a window dies without a matching re-issue.
+static void
+metal_present_slot_reassigned(int slot_idx) {
+    if (slot_idx < 0 || slot_idx >= MAX_METAL_WINDOWS) return;
+    metal_present_epochs[slot_idx] = ++metal_present_epoch_counter;
+}
 
 // CACurrentMediaTime() and kitty's monotonic() both count mach-absolute
 // nanoseconds but differ in epoch (monotonic() is process-relative, see
@@ -1913,31 +1950,39 @@ window_slot_index(void) {
     return current_window_slot ? (int)(current_window_slot - metal_windows) : -1;
 }
 
-// Publish frame fidx's present time for a window. `at` == 0 is the defined
-// no-op: Apple reports presentedTime 0.0 both for a drawable that was never
-// presented and for one whose frame was dropped, and neither is a photon, so
-// the previous stamp is left in place.
+// Publish frame fidx's present time for a window, under the ownership epoch the
+// handler was registered with. `at` == 0 is the defined no-op: Apple reports
+// presentedTime 0.0 both for a drawable that was never presented and for one
+// whose frame was dropped, and neither is a photon, so the previous stamp is
+// left in place. Runs on a Metal callback thread.
 static void
-stamp_present(int slot_idx, uint64_t fidx, monotonic_t at) {
+stamp_present(int slot_idx, uint64_t epoch, uint64_t fidx, monotonic_t at) {
     if (slot_idx < 0 || slot_idx >= MAX_METAL_WINDOWS || at == 0) return;
     MetalPresentStamp *s = &metal_present_stamps[slot_idx];
     atomic_store_explicit(&s->at[fidx & 1], at, memory_order_relaxed);
-    atomic_store_explicit(&s->fidx, fidx, memory_order_release);
+    atomic_store_explicit(&s->key, (epoch << PRESENT_STAMP_FIDX_BITS) | (fidx & PRESENT_STAMP_FIDX_MASK),
+                          memory_order_release);
 }
 
-// Read a window's newest present stamp. False when nothing has been stamped yet
-// or the pair moved mid-read; callers must additionally compare *fidx_out
-// against the frame they care about -- a stamp that is real but older than the
-// caller's frame means "this frame has not reached the display yet".
+// Read a window's newest present stamp, rejecting anything published under a
+// previous owner of this slot index. False when nothing has been stamped yet,
+// when the stamp belongs to a dead window, or when the key moved mid-read.
+// Callers must additionally compare *fidx_out against the frame they care
+// about -- a stamp that is real but older than the caller's frame means "this
+// frame has not reached the display yet". Main thread.
 static bool
 read_present_stamp(int slot_idx, uint64_t *fidx_out, monotonic_t *at_out) {
     if (slot_idx < 0 || slot_idx >= MAX_METAL_WINDOWS) return false;
+    const uint64_t epoch = metal_present_epochs[slot_idx];
+    if (!epoch) return false;
     MetalPresentStamp *s = &metal_present_stamps[slot_idx];
-    const uint64_t f0 = atomic_load_explicit(&s->fidx, memory_order_acquire);
-    const monotonic_t at = atomic_load_explicit(&s->at[f0 & 1], memory_order_relaxed);
+    const uint64_t k0 = atomic_load_explicit(&s->key, memory_order_acquire);
+    if ((k0 >> PRESENT_STAMP_FIDX_BITS) != epoch) return false;
+    const uint64_t fidx = k0 & PRESENT_STAMP_FIDX_MASK;
+    const monotonic_t at = atomic_load_explicit(&s->at[fidx & 1], memory_order_relaxed);
     if (at == 0) return false;
-    if (atomic_load_explicit(&s->fidx, memory_order_relaxed) != f0) return false;
-    *fidx_out = f0; *at_out = at;
+    if (atomic_load_explicit(&s->key, memory_order_relaxed) != k0) return false;
+    *fidx_out = fidx; *at_out = at;
     return true;
 }
 
@@ -1993,6 +2038,9 @@ metal_set_current_layer(void *layer) {
             if (!free_slot) { log_error("Metal: too many OS windows for per-window state table"); return; }
             slot = free_slot;
             memset(slot, 0, sizeof(*slot));
+            // W28.0c: this index now belongs to a new window -- retire any stamp
+            // a previous owner's in-flight presented handler may still publish.
+            metal_present_slot_reassigned((int)(slot - metal_windows));
             slot->in_use = true;
             slot->layer_ptr = layer;
             METAL_TRACE("new window layer=%p contentsScale=%.2f\n", layer, [(__bridge CAMetalLayer*)layer contentsScale]);
@@ -2039,6 +2087,9 @@ metal_forget_layer(void *layer) {
                 mtl_current_encoder = nil;
                 if (mtl_current_layer == (__bridge CAMetalLayer *)layer) mtl_current_layer = nil;
             }
+            // W28.0c: retire this index's stamps here too, not only on re-issue --
+            // a window can die without another ever taking its slot.
+            metal_present_slot_reassigned(i);
             memset(&metal_windows[i], 0, sizeof(metal_windows[i]));
             break;
         }
@@ -2609,9 +2660,14 @@ metal_end_frame(void) {
         if (mtl_current_drawable) {
             const bool emit_present = st || sp;
             const monotonic_t media_offset = media_time_to_monotonic_offset();  // sampled here: main thread
+            // Captured by value: the handler must publish under the epoch this
+            // slot index held at REGISTRATION, so that if the window dies before
+            // the present lands the write is rejected instead of resurfacing as
+            // the next window's stamp.
+            const uint64_t slot_epoch = (slot_idx >= 0) ? metal_present_epochs[slot_idx] : 0;
             [mtl_current_drawable addPresentedHandler:^(id<MTLDrawable> d) {
                 const double presented = d.presentedTime;
-                stamp_present(slot_idx, fidx, presented == 0.0 ? 0 : s_double_to_monotonic_t(presented) + media_offset);
+                stamp_present(slot_idx, slot_epoch, fidx, presented == 0.0 ? 0 : s_double_to_monotonic_t(presented) + media_offset);
                 if (emit_present) {
                     char line[128];
                     snprintf(line, sizeof line, "metal_present frame=%llu presented_time=%.9f pace=%s\n",
