@@ -2279,6 +2279,131 @@ metal_forget_layer(void *layer) {
     }
 }
 
+// ----- H3 (W28.4a): one autorelease pool per render() tick -----
+//
+// Every per-frame Metal object this file handles is AUTORELEASED: the drawable
+// from [layer nextDrawable], the command buffer from [queue commandBuffer], the
+// encoder from renderCommandEncoderWithDescriptor:, and the render-pass
+// descriptor from [MTLRenderPassDescriptor renderPassDescriptor]. Nothing in
+// kitty drained them; AppKit's runloop pool did, at whatever point after the
+// tick it happened to pop. Draining once per tick is strictly earlier and
+// bounds the high-water mark.
+//
+// The claim is deliberately narrow: per-tick FOR THE render() PATH. Two other
+// entry points reach render_os_window from outside render() --
+// cocoa_out_of_sequence_render (live resize, screen change) and
+// cocoa_metal_frame_callback_impl (the CAMetalDisplayLink driver, dormant while
+// KITTY_METAL_TIMER_PACE defaults on) -- and they keep the runloop pool's
+// timing. Neither is broken by this; neither is covered by it.
+//
+// The pool wraps the WHOLE per-window loop and never a single window. The
+// mtl_current_* globals are swapped in and out of MetalWindowSlot WITHOUT
+// retaining (save_current_window_state / load_window_state), so a per-window
+// drain would free window A's drawable while A's slot still names it, and the
+// next load_window_state would restore that dead pointer straight into
+// ensure_drawable's `if (mtl_current_drawable) return true;` fast path.
+//
+// That makes the state of those globals at the pop load-bearing. In an ordinary
+// tick metal_end_frame nils them for every window that rendered, so the
+// invariant holds for free. It does NOT hold universally: a pending thumbnail
+// renders a swaps-disallowed window (the thumbnail_callback exemption in
+// child-monitor.c), swap_window_buffers then SKIPS metal_end_frame, and
+// metal_gl_read_pixels has already installed a fresh command buffer through
+// ensure_command_buffer(). The barrier below therefore has a reachable caller
+// and is not defensive dressing.
+static uint64_t metal_tick_drains = 0;            // ticks that entered the pool
+static uint64_t metal_tick_drain_violations = 0;  // ticks that had to force-clear
+
+// Verify the drain invariant and, on violation, force-clear so the pop cannot
+// leave a dangling name behind. Returns true if anything had to be cleared.
+//
+// Clearing discards an uncommitted frame's encode. That is recoverable: the
+// window still has keep_rendering_till_swap set, so child-monitor re-renders
+// it. A dangling autoreleased pointer is not recoverable -- ensure_drawable's
+// early return would hand it to current_drawable_texture() and to the present
+// path. Between a dropped frame and a use-after-free, drop the frame.
+static bool
+metal_tick_drain_barrier(void) {
+    bool violated = false;
+    // Enumerated BY NAME, never as "the per-frame globals" as a class: the
+    // fourth has no MetalWindowSlot mirror, so any check phrased against the
+    // slot fields silently omits exactly the one nothing else would catch.
+    if (mtl_current_command_buffer) { mtl_current_command_buffer = nil; violated = true; }
+    if (mtl_current_drawable)       { mtl_current_drawable = nil;       violated = true; }
+    if (mtl_current_encoder)        { mtl_current_encoder = nil;        violated = true; }
+    if (mtl_current_render_pass)    { mtl_current_render_pass = nil;    violated = true; }
+    // enc_fmt is a scalar, not an object, but it describes the encoder we just
+    // dropped; leaving it set would let a fresh encoder inherit a stale format.
+    if (violated) mtl_current_enc_fmt = MTLPixelFormatInvalid;
+    // The three unretained slot fields, for every slot still in use. The
+    // layered working surface is NOT touched: it is +1 owned by the slot and
+    // deliberately outlives the tick (H2).
+    for (int i = 0; i < MAX_METAL_WINDOWS; i++) {
+        MetalWindowSlot *s = &metal_windows[i];
+        if (!s->in_use) continue;
+        if (s->cb || s->drawable || s->enc) {
+            s->cb = nil; s->drawable = nil; s->enc = nil;
+            violated = true;
+        }
+    }
+    metal_tick_drains++;
+    if (violated) {
+        metal_tick_drain_violations++;
+        // ALWAYS counted (the counters are plain statics, not stats-gated; only
+        // their emission is). A silent force-clear would make the invariant
+        // unfalsifiable, which is the exact failure this barrier exists to
+        // prevent: the AC would go green whether or not the pool was safe.
+        if (global_state.debug_rendering) {
+            log_error("[Metal] tick drain barrier force-cleared live per-frame state (%llu violations / %llu ticks)",
+                      (unsigned long long)metal_tick_drain_violations, (unsigned long long)metal_tick_drains);
+        }
+    }
+    return violated;
+}
+
+// Run one render tick's per-window loop inside a single autorelease pool.
+// Scoped lexically rather than through objc_autoreleasePoolPush/Pop so the pool
+// cannot be left unbalanced by any future early return inside `body`, and so
+// nothing here depends on a runtime header Apple does not publish.
+// TEST-ONLY forced arm, on the KITTY_METAL_TEST_FORCE_INFLIGHT precedent: for
+// the first N ticks, leave a real autoreleased command buffer in the globals so
+// the barrier has something to catch. Without it "violations=0" is
+// unfalsifiable -- it reads the same whether the detector works or is dead
+// code, and the natural arm cannot distinguish those. The production path pays
+// one getenv-cached int test per tick.
+//
+// It leaves a BARE command buffer rather than routing through
+// ensure_command_buffer(): no completion handlers are registered, so the
+// discarded buffer costs nothing and the arm stays a pure test of detect-and-
+// clear. This is the same shape the thumbnail path produces for real
+// (metal_gl_read_pixels installs a fresh buffer, then swap_window_buffers skips
+// metal_end_frame), which is why the forced arm is a stand-in for it and not a
+// different phenomenon.
+static int
+metal_test_force_tick_leak(void) {
+    static int n = -1;
+    if (n < 0) {
+        const char *v = getenv("KITTY_METAL_TEST_FORCE_TICK_LEAK");
+        n = (v && v[0]) ? atoi(v) : 0;
+        if (n < 0) n = 0;
+    }
+    return n;
+}
+
+void
+metal_render_tick(void (*body)(void *), void *ctx) {
+    @autoreleasepool {
+        body(ctx);
+        static int forced_leaks_left = -1;
+        if (forced_leaks_left < 0) forced_leaks_left = metal_test_force_tick_leak();
+        if (forced_leaks_left > 0 && mtl_command_queue) {
+            forced_leaks_left--;
+            mtl_current_command_buffer = [mtl_command_queue commandBuffer];  // autoreleased; dies with this pool
+        }
+        metal_tick_drain_barrier();  // last statement inside the pool, by design
+    }
+}
+
 static void
 end_current_encoder(void) {
     if (mtl_current_encoder) {
@@ -2850,20 +2975,28 @@ metal_end_frame(void) {
             const uint64_t guard_timeouts = metal_sprite_guard_timeouts;
             const uint64_t guard_selfframe = metal_sprite_guard_selfframe;
             const uint64_t layered_creates = metal_layered_surface_creates;  // H2
+            const uint64_t tick_drains = metal_tick_drains;                  // H3
+            const uint64_t tick_drain_violations = metal_tick_drain_violations;
             [mtl_current_command_buffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
                 const double gpu_ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
                 // Sized from the worst case, recomputed whenever a field is
-                // added. The model, stated so the next field can re-derive it:
-                // 263 literal chars, each %llu counter at UINT64_MAX (20), each
-                // %d at INT_MIN's width (11), pace= at its longest literal
+                // added -- and H3's two fields are what that recomputation is
+                // for: at 640 the bound had come within ONE byte. The model,
+                // stated so the next field can re-derive it rather than trust
+                // this number: 299 literal chars, each %llu counter at
+                // UINT64_MAX (20) and there are ELEVEN, each %d at INT_MIN's
+                // width (11) and there are four, pace= at its longest literal
                 // ("immediate", 9), and the three %.3f durations plus the %.9f
-                // host time each allowed a signed 10-integer-digit part (15, 21)
-                // -- 562 chars + NUL = 563. Deliberately NOT float-widest: %.3f
-                // of DBL_MAX is 313 chars alone, but these are uptime-bounded
-                // durations and a mach-timebase host time, not arbitrary doubles.
-                // snprintf would truncate silently, which on a tail-appended
-                // format means the NEWEST field is the one lost.
-                char line[640];
+                // host time each allowed a signed 10-integer-digit part
+                // (15, 21). 299 + 220 + 44 + 45 + 21 + 9 = 638 chars, + NUL
+                // = 639, inside 768 with 129 to spare. Deliberately NOT
+                // float-widest: %.3f of DBL_MAX is 313 chars alone, but these
+                // are uptime-bounded durations and a mach-timebase host time,
+                // not arbitrary doubles. snprintf would truncate silently,
+                // which on a tail-appended format means the NEWEST field is the
+                // one lost -- i.e. exactly the field whose author was least
+                // likely to check.
+                char line[768];
                 // pace= is tail-appended (tolerant parsers, never $-anchored).
                 // W28.0c: gpu_end= is the ABSOLUTE host time the GPU finished this
                 // command buffer (gpu_ms stays the unchanged duration). It closes
@@ -2871,11 +3004,12 @@ metal_end_frame(void) {
                 // {gpu-done->presented}; both neighbours (metal_commit's
                 // commit_time and metal_present's presented_time) are host time in
                 // the same mach timebase, so the terms subtract directly.
-                snprintf(line, sizeof line, "metal_stats frame=%llu encode_ms=%.3f gpu_ms=%.3f passes=%d allocs=%d tex_allocs=%d tex_bytes=%llu gfx_draws=%d bytes=%llu drawable_wait_ms=%.3f pace=%s gpu_end=%.9f sprite_guard_checks=%llu sprite_guard_stamped=%llu sprite_guard_waits=%llu sprite_guard_timeouts=%llu sprite_guard_selfframe=%llu layered_surface_creates=%llu\n",
+                snprintf(line, sizeof line, "metal_stats frame=%llu encode_ms=%.3f gpu_ms=%.3f passes=%d allocs=%d tex_allocs=%d tex_bytes=%llu gfx_draws=%d bytes=%llu drawable_wait_ms=%.3f pace=%s gpu_end=%.9f sprite_guard_checks=%llu sprite_guard_stamped=%llu sprite_guard_waits=%llu sprite_guard_timeouts=%llu sprite_guard_selfframe=%llu layered_surface_creates=%llu tick_drains=%llu tick_drain_violations=%llu\n",
                          (unsigned long long)fidx, encode_ms, gpu_ms, passes, allocs, tex_allocs, (unsigned long long)tex_bytes, gfx_draws, (unsigned long long)bytes, drawable_wait_ms, pace, cb.GPUEndTime,
                          (unsigned long long)guard_checks, (unsigned long long)guard_stamped,
                          (unsigned long long)guard_waits, (unsigned long long)guard_timeouts,
-                         (unsigned long long)guard_selfframe, (unsigned long long)layered_creates);
+                         (unsigned long long)guard_selfframe, (unsigned long long)layered_creates,
+                         (unsigned long long)tick_drains, (unsigned long long)tick_drain_violations);
                 metal_stats_emit(line);
             }];
         }

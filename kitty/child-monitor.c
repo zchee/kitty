@@ -2101,28 +2101,25 @@ render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images, bo
     return needs_render;
 }
 
+// H3 (W28.4a): the per-OS-window render loop, lifted out of render() verbatim
+// so the whole loop can run inside ONE autorelease pool per tick
+// (metal_render_tick, kitty/metal.m). It has to be the whole loop and not the
+// loop BODY: the Metal backend's per-frame objects are swapped between the
+// mtl_current_* globals and each window's slot without retaining, so draining
+// per window would free one window's drawable while another slot still names
+// it. On the GL backend this is called directly and nothing changes.
+typedef struct {
+    monotonic_t now;
+    bool scan_for_animated_images;
+    bool input_read;
+} RenderTickContext;
+
 static void
-render(monotonic_t now, bool input_read) {
-    EVDBG("input_read: %d, check_for_active_animated_images: %d\n", input_read, global_state.check_for_active_animated_images);
-#ifdef __APPLE__
-    const bool sp = child_monitor_signpost_enabled();
-    os_log_t slog = sp ? child_monitor_signpost_log() : NULL;
-    if (sp) os_signpost_interval_begin(slog, OS_SIGNPOST_ID_EXCLUSIVE, "render", "");
-#endif
-    static monotonic_t last_render_at = MONOTONIC_T_MIN;
-    monotonic_t time_since_last_render = last_render_at == MONOTONIC_T_MIN ? OPT(repaint_delay) : now - last_render_at;
-    if (!input_read && time_since_last_render < OPT(repaint_delay) && !global_state.thumbnail_callback.os_window) {
-        set_maximum_wait(OPT(repaint_delay) - time_since_last_render);
-#ifdef __APPLE__
-        if (sp) os_signpost_interval_end(slog, OS_SIGNPOST_ID_EXCLUSIVE, "render", "");
-#endif
-        return;
-    }
-
-    const bool scan_for_animated_images = global_state.check_for_active_animated_images;
-    global_state.check_for_active_animated_images = false;
-    call_boss(cache_process_data, "O", Py_True);
-
+render_all_os_windows(void *ctx_) {
+    RenderTickContext *ctx = (RenderTickContext*)ctx_;
+    const monotonic_t now = ctx->now;
+    const bool scan_for_animated_images = ctx->scan_for_animated_images;
+    const bool input_read = ctx->input_read;
     for (size_t i = 0; i < global_state.num_os_windows; i++) {
         OSWindow *w = global_state.os_windows + i;
 #ifdef __APPLE__
@@ -2170,6 +2167,42 @@ render(monotonic_t now, bool input_read) {
         }
 
     }
+}
+
+static void
+render(monotonic_t now, bool input_read) {
+    EVDBG("input_read: %d, check_for_active_animated_images: %d\n", input_read, global_state.check_for_active_animated_images);
+#ifdef __APPLE__
+    const bool sp = child_monitor_signpost_enabled();
+    os_log_t slog = sp ? child_monitor_signpost_log() : NULL;
+    if (sp) os_signpost_interval_begin(slog, OS_SIGNPOST_ID_EXCLUSIVE, "render", "");
+#endif
+    static monotonic_t last_render_at = MONOTONIC_T_MIN;
+    monotonic_t time_since_last_render = last_render_at == MONOTONIC_T_MIN ? OPT(repaint_delay) : now - last_render_at;
+    if (!input_read && time_since_last_render < OPT(repaint_delay) && !global_state.thumbnail_callback.os_window) {
+        set_maximum_wait(OPT(repaint_delay) - time_since_last_render);
+#ifdef __APPLE__
+        if (sp) os_signpost_interval_end(slog, OS_SIGNPOST_ID_EXCLUSIVE, "render", "");
+#endif
+        return;
+    }
+
+    const bool scan_for_animated_images = global_state.check_for_active_animated_images;
+    global_state.check_for_active_animated_images = false;
+    call_boss(cache_process_data, "O", Py_True);
+
+    RenderTickContext tick_ctx = {
+        .now = now, .scan_for_animated_images = scan_for_animated_images, .input_read = input_read };
+#ifdef KITTY_BACKEND_METAL
+    // H3: acquire->present for every window in this tick happens inside one
+    // autorelease pool, whose last statement is the drain barrier. Scoped to
+    // the render() path only -- cocoa_out_of_sequence_render and the
+    // CAMetalDisplayLink callback reach render_os_window from outside this
+    // function and keep the runloop pool's timing.
+    metal_render_tick(render_all_os_windows, &tick_ctx);
+#else
+    render_all_os_windows(&tick_ctx);
+#endif
     last_render_at = now;
     call_boss(cache_process_data, "O", Py_False);
 #ifdef __APPLE__

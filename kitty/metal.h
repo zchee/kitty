@@ -238,6 +238,12 @@ void metal_resolve_layered_frame(void);
 // >1.0 components survive to the drawable; RGBA16Unorm otherwise).
 void metal_set_edr_frame_state(bool engaged, float headroom);
 
+// H3 (W28.4a): run one render tick's per-window loop inside a single
+// autorelease pool, with the drain barrier as the pool's last statement. The
+// caller hands the loop over as a callback because @autoreleasepool is
+// lexically scoped and child-monitor.c is plain C.
+void metal_render_tick(void (*body)(void *), void *ctx);
+
 // W27 P3.4 (chain 2): the cell-program options Python resolves from the config
 // (text_composition_strategy, text_fg_override_threshold). GL bakes them into
 // the GLSL via cell_defines.glsl; Metal takes them as function constants, so
