@@ -97,6 +97,25 @@ def main() -> int:
         # progress_bar, default 'top'); determinate bars do not animate, so
         # the held frame is static.
         out.write("\x1b]9;4;1;50\x1b\\")
+    elif scene == "palette":
+        # W27 P3.6: OKLCH palette entries through kitty's own parser (OSC 4 →
+        # Color.parse_color) painted as SGR 48;5 swatches — the golden twin of
+        # the .omc accuracy-gate palette rows. On the BGRA8 capture control arm
+        # this locks the dump-channel rendering of wide-capable palette
+        # entries across the format flip (baselined at the P3.6 re-baseline).
+        # (P7.1 regression fix: the hdr-ramp scene addition accidentally
+        # RENAMED this branch instead of adding beside it, so palette-oklch
+        # silently fell through to legacy content — restored verbatim.)
+        specs = (
+            "oklch(0.62 0.26 29)", "oklch(0.87 0.22 110)", "oklch(0.86 0.30 142)",
+            "oklch(0.80 0.16 195)", "oklch(0.70 0.40 25)", "oklch(0.55 0.30 264)",
+            "oklch(0.80 0.20 150)", "oklch(0.50 0.28 290)",
+        )
+        for i, spec in enumerate(specs):
+            out.write(f"\x1b]4;{16 + i};{spec}\x1b\\")
+        out.write("\x1b[7;1H")
+        for i in range(len(specs)):
+            out.write(f"\x1b[48;5;{16 + i}m    \x1b[0m")
     elif scene == "hdr-ramp":
         # W27 P4.3: the EDR golden scene. A float32 (f=3232) ramp image whose
         # components rise 0.0 -> 4.0 left-to-right in 32 flat blocks, so with
