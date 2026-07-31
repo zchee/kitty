@@ -39,6 +39,45 @@ monotonic_t last_local_key_input_time(void) { return atomic_load_explicit(&last_
 #define L5_SMALL_READ_MAX ((size_t)128)
 #define L5_KEY_RECENCY_WINDOW (ms_to_monotonic_t(50ll))
 
+// W28.2 L-C — promote-only QoS lever (KITTY_THREAD_QOS_PROMOTE, default
+// OFF). A latency-lane thread promotes ITSELF to USER_INTERACTIVE the
+// first time it runs inside the 50 ms key-recency window; there is
+// deliberately NO demotion anywhere — the demotion half is what regressed
+// Q-paint p95 and sank the R5 assignment wave (ADR-0017). Promotion is
+// therefore sticky: a session that never sees a local key never promotes
+// (flood neutrality by construction), and after its first key window the
+// thread keeps the class. Returns true when the caller need never call
+// again (lever unarmed, promoted, or permanently failed); callers hold a
+// per-thread stack-local and stop once settled, so the OFF arm pays one
+// cached-bool call per thread lifetime. The stderr line is the lever's
+// mechanism proof (bundle attribution, plan §W28.2 template iii).
+static bool
+thread_qos_promote_enabled(void) {
+    static int cached = -1;
+    if (UNLIKELY(cached < 0)) {
+        const char *v = getenv("KITTY_THREAD_QOS_PROMOTE");
+        cached = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+bool
+promote_thread_qos_if_key_recent(const char *thread_name) {
+#if defined(__APPLE__)
+    if (!thread_qos_promote_enabled()) return true;
+    if (monotonic() - atomic_load_explicit(&last_local_key_input_at, memory_order_relaxed) > L5_KEY_RECENCY_WINDOW) return false;
+    const int err = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    // Promoted or permanently failed: either way the thread is settled —
+    // retrying a failing QoS syscall every wakeup would only spam.
+    if (err) log_error("qos_promote: thread=%s error=%s", thread_name, strerror(err));
+    else log_error("qos_promote: thread=%s qos=user_interactive", thread_name);
+    return true;
+#else
+    (void)thread_name;
+    return true;  // no macOS QoS classes to promote to
+#endif
+}
+
 #if defined(__APPLE__) || defined(__OpenBSD__)
 #define NO_SIGQUEUE 1
 #endif
@@ -3626,8 +3665,10 @@ io_loop(void *data) {
     ChildMonitor *self = (ChildMonitor*)data;
     set_thread_name("KittyChildMon");
     report_thread_qos("io");  // R4 M1d probe
+    bool qos_settled = false;  // W28.2 L-C: per-thread sticky promotion state
 
     while (LIKELY(!self->shutting_down)) {
+        if (UNLIKELY(!qos_settled)) qos_settled = promote_thread_qos_if_key_recent("io");
         children_mutex(lock);
         remove_children(self);
         add_children(self);

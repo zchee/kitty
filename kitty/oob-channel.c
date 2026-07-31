@@ -134,8 +134,10 @@ oob_read_loop(void *arg) {
     OOBChannel *c = arg;
     set_thread_name("KittyOOBRead");
     report_thread_qos("oob");  // R4 M1d probe
+    bool qos_settled = false;  // W28.2 L-C: per-thread sticky promotion state
     if (oob_read_handshake(c)) {
         for (;;) {
+            if (UNLIKELY(!qos_settled)) qos_settled = promote_thread_qos_if_key_recent("oob");
             pthread_mutex_lock(&c->mutex);
             bool stop = c->stop;
             bool parked = false;

@@ -715,6 +715,7 @@ void change_live_resize_state(OSWindow*, bool);
 bool render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images, bool input_driven);
 void note_local_key_input(void);  // Phase 4 (L5): stamp local key input for the echo fast-path
 monotonic_t last_local_key_input_time(void);  // W27 P6.2 L-A: read the stamp (main-thread relaxed load)
+bool promote_thread_qos_if_key_recent(const char *thread_name);  // W28.2 L-C: promote-only QoS self-promotion inside the key window
 void update_mouse_pointer_shape(void);
 void adjust_window_size_for_csd(OSWindow *w, int width, int height, int *adjusted_width, int *adjusted_height);
 void dispatch_buffered_keys(Window *w);
