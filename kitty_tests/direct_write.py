@@ -29,14 +29,22 @@ _monitor = None
 CHILD_ID = 1
 TOKEN_FMT = b'%08d\n'
 TOKEN_SZ = 9
-# 150_000 tokens ~ 1.3 MiB through a 1024-byte XNU pty queue: thousands of
-# EAGAIN/partial-write boundaries, both lanes exercised heavily.
-NUM_TOKENS = 150_000
+# Plan §3 AC5 (frozen): zero ordering violations across >= 10^6 INTERLEAVED
+# direct/queued write operations. 2.5M tokens at 41 write ops per 100-token
+# cycle = 1_025_000 ops (asserted below, not assumed), ~22 MiB through a
+# 1024-byte XNU pty queue: hundreds of thousands of EAGAIN/partial-write
+# boundaries, both lanes exercised heavily.
+NUM_TOKENS = 2_500_000
+MIN_WRITE_OPS = 1_000_000
 # Per 100-token cycle: 40 single-token writes (9 B <= 256, direct-eligible)
 # then one 60-token batch (540 B > 256, always the queued/fallback lane).
 SINGLES_PER_CYCLE = 40
 CYCLE = 100
-DEADLINE_S = 120.0
+# Drain window every DRAIN_EVERY cycles: lets the io thread empty the queue
+# so the next cycle's first singles hit the direct lane again — each window
+# is a queued->direct boundary crossing, the exact interleave AC5 is about.
+DRAIN_EVERY = 4
+DEADLINE_S = 600.0
 
 
 class TestDirectWrite(BaseTest):
@@ -101,33 +109,42 @@ class TestDirectWrite(BaseTest):
             rt = threading.Thread(target=reader, name='DirectWriteStressReader', daemon=True)
             rt.start()
 
+            # Deltas, not absolutes: the counters are cumulative and the
+            # process may some day run other direct-write work first.
+            direct0, fallbacks0 = direct_write_counters()
+
             deadline = time.monotonic() + DEADLINE_S
             seq = 0
+            write_ops = 0
+            cycles = 0
             while seq < NUM_TOKENS:
                 for _ in range(min(SINGLES_PER_CYCLE, NUM_TOKENS - seq)):
                     self.assertTrue(cm.needs_write(CHILD_ID, TOKEN_FMT % seq), f'needs_write refused token {seq}')
                     seq += 1
+                    write_ops += 1
                 batch_n = min(CYCLE - SINGLES_PER_CYCLE, NUM_TOKENS - seq)
                 if batch_n:
                     batch = b''.join(TOKEN_FMT % s for s in range(seq, seq + batch_n))
                     self.assertTrue(cm.needs_write(CHILD_ID, batch), f'needs_write refused batch at token {seq}')
                     seq += batch_n
-                # Brief drain window per cycle: lets the io thread empty the
-                # queue so the next cycle's first singles hit the direct lane
-                # again — every cycle crosses a queued->direct boundary, the
-                # exact interleave the ordering claim is about.
-                time.sleep(0.0003)
+                    write_ops += 1
+                cycles += 1
+                if cycles % DRAIN_EVERY == 0:
+                    time.sleep(0.0003)
                 if time.monotonic() > deadline:
                     self.fail(f'writer did not finish before deadline: queued {seq}/{NUM_TOKENS} tokens')
+            # AC5 magnitude is a denominator, asserted rather than assumed.
+            self.assertGreaterEqual(write_ops, MIN_WRITE_OPS, f'stress issued only {write_ops} write ops')
 
             while len(received) < expected_bytes and time.monotonic() < deadline:
                 time.sleep(0.01)
             stop_reading.set()
             rt.join(timeout=10)
 
-            direct, fallbacks = direct_write_counters()
+            direct1, fallbacks1 = direct_write_counters()
+            direct, fallbacks = direct1 - direct0, fallbacks1 - fallbacks0
             context = (
-                f'direct_writes={direct} direct_write_fallbacks={fallbacks}'
+                f'write_ops={write_ops} direct_writes={direct} direct_write_fallbacks={fallbacks}'
                 f' received={len(received)}/{expected_bytes} bytes'
             )
             self.assertEqual(len(received), expected_bytes, f'child did not receive the full stream: {context}')
