@@ -403,7 +403,76 @@ add_child(ChildMonitor *self, PyObject *args) {
 
 static const unsigned write_buf_limit = 100 * 1024 * 1024;
 
-#define schedule_write_to_child_generic(id, num, va_start, get_next_arg, va_end, found, too_much_data) \
+// W28.2 B2 — direct key write (KITTY_DIRECT_KEY_WRITE, default OFF). Skips
+// the io-thread hop (wakeup -> poll -> write_to_child) for keystroke-sized
+// payloads by issuing the nonblocking write(2) inline at the scheduling
+// site, under the same two locks. Sound because write_to_child holds the
+// screen write mutex across its entire write loop, so observing
+// write_buf_used == exactly this payload under that mutex means nothing
+// else was queued AND no io-thread write is in flight. Ordering is
+// preserved by construction: the direct path runs only when the buffer
+// held nothing before this payload, and a partial write leaves the tail
+// at the front of the buffer before unlock, so the io thread continues
+// mid-stream (asserted by the real-pty sequence stress in
+// kitty_tests/direct_write.py, not assumed). Disabled under KITTY_PTY_PUMP
+// (read_fd != fd) and the reader arm — the stress was not run with those
+// writers active (plan §W28.2) — and on the dnd path when keep_space > 0.
+// Counters are relaxed atomics, counted only while the gate is armed; the
+// OFF arm costs one cached-bool branch and counts nothing.
+#define DIRECT_WRITE_MAX_SZ 256u
+static _Atomic(uint64_t) direct_writes, direct_write_fallbacks;
+
+static bool
+direct_write_enabled(void) {
+    static int cached = -1;
+    if (UNLIKELY(cached < 0)) {
+        const char *v = getenv("KITTY_DIRECT_KEY_WRITE");
+        cached = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+// Called with children_mutex and the screen write mutex both held, after
+// the payload was appended to write_buf. Returns true iff the buffer was
+// fully drained (the io-thread wakeup can be skipped).
+static bool
+try_direct_write(Child *child, Screen *screen, bool allow_direct, size_t payload_sz) {
+    if (!allow_direct || !direct_write_enabled()) return false;
+    if (payload_sz > DIRECT_WRITE_MAX_SZ || screen->write_buf_used != payload_sz
+#ifdef KITTY_BACKEND_METAL
+            || child->reader
+#endif
+            || child->read_fd != child->fd) {
+        atomic_fetch_add_explicit(&direct_write_fallbacks, 1, memory_order_relaxed);
+        return false;
+    }
+    const int flags = fcntl(child->fd, F_GETFL);
+    if (flags == -1 || !(flags & O_NONBLOCK)) {
+        atomic_fetch_add_explicit(&direct_write_fallbacks, 1, memory_order_relaxed);
+        return false;
+    }
+    size_t written = 0;
+    while (written < screen->write_buf_used) {
+        const ssize_t ret = write(child->fd, screen->write_buf + written, screen->write_buf_used - written);
+        if (ret > 0) { written += (size_t)ret; continue; }
+        if (ret < 0 && errno == EINTR) continue;
+        // 0, EAGAIN or a hard error: leave the remainder queued so the io
+        // thread hits the uniform write_to_child error path.
+        break;
+    }
+    if (written) {
+        screen->write_buf_used -= written;
+        if (screen->write_buf_used) memmove(screen->write_buf, screen->write_buf + written, screen->write_buf_used);
+    }
+    if (screen->write_buf_used == 0) {
+        atomic_fetch_add_explicit(&direct_writes, 1, memory_order_relaxed);
+        return true;
+    }
+    atomic_fetch_add_explicit(&direct_write_fallbacks, 1, memory_order_relaxed);
+    return false;
+}
+
+#define schedule_write_to_child_generic(id, num, va_start, get_next_arg, va_end, found, too_much_data, allow_direct) \
     ChildMonitor *self = the_monitor; \
     const char *data; \
     size_t szval, sz = 0; \
@@ -442,7 +511,7 @@ static const unsigned write_buf_limit = 100 * 1024 * 1024;
                 screen->write_buf = PyMem_RawRealloc(screen->write_buf, screen->write_buf_sz); \
                 if (screen->write_buf == NULL) { fatal("Out of memory."); } \
             } \
-            if (screen->write_buf_used) wakeup_io_loop(self, false); \
+            if (screen->write_buf_used && !try_direct_write(&children[i], screen, allow_direct, sz)) wakeup_io_loop(self, false); \
             screen_mutex(unlock, write); \
             break; \
         } \
@@ -478,7 +547,9 @@ schedule_write_to_child_if_possible(id_type id, const char *data, size_t sz, boo
                 screen->write_buf = PyMem_RawRealloc(screen->write_buf, screen->write_buf_sz);
                 if (screen->write_buf == NULL) { fatal("Out of memory."); }
             }
-            if (screen->write_buf_used) wakeup_io_loop(self, false);
+            // keep_space > 0 signals deliberate back-pressure headroom, which
+            // the direct path must not race past (plan §W28.2 B2).
+            if (screen->write_buf_used && !try_direct_write(&children[i], screen, keep_space == 0, sz)) wakeup_io_loop(self, false);
             screen_mutex(unlock, write);
             break;
         }
@@ -491,7 +562,9 @@ schedule_write_to_child(id_type id, unsigned num, ...) {
     va_list ap;
     bool too_much_data = false, found = false;
 #define get_next_arg(ap) data = va_arg(ap, const char*); szval = va_arg(ap, size_t);
-    schedule_write_to_child_generic(id, num, va_start, get_next_arg, va_end, found, too_much_data);
+    // The key path (keys.c send_key_to_child and needs_write): the B2
+    // direct-write call site.
+    schedule_write_to_child_generic(id, num, va_start, get_next_arg, va_end, found, too_much_data, true);
 #undef get_next_arg
     if (too_much_data) log_error("Too much data being written to child with id: %llu dropping it", id);
     return found;
@@ -524,7 +597,9 @@ schedule_write_to_child_python(id_type id, const char *prefix, PyObject *ap, con
     } \
 }
     bool found = false, too_much_data = false;
-    schedule_write_to_child_generic(id, num, py_start, get_next_arg, py_end, found, too_much_data);
+    // Not the key path (terminal query responses, arbitrarily sized): the
+    // B2 lever stays scoped to the priced keystroke path.
+    schedule_write_to_child_generic(id, num, py_start, get_next_arg, py_end, found, too_much_data, false);
     if (too_much_data) log_error("Too much data being written to child with id: %llu dropping it", id);
     return found;
 #undef py_start
@@ -3763,6 +3838,12 @@ io_loop(void *data) {
     // all and only then close their fds.
     finish_reader_teardowns(self);
 #endif
+    // W28.2 B2: per-run totals, emitted only on the armed arm, and even at
+    // zero so "armed but never fired" stays visible (denominator rule).
+    if (direct_write_enabled())
+        log_error("direct_write: writes=%llu fallbacks=%llu",
+                  (unsigned long long)atomic_load_explicit(&direct_writes, memory_order_relaxed),
+                  (unsigned long long)atomic_load_explicit(&direct_write_fallbacks, memory_order_relaxed));
     return 0;
 }
 // }}}
@@ -4200,8 +4281,17 @@ send_data_to_peer(PyObject *self UNUSED, PyObject *args) {
     Py_RETURN_NONE;
 }
 
+static PyObject*
+direct_write_counters(PyObject *self UNUSED, PyObject *args UNUSED) {
+    // W28.2 B2 test surface: cumulative (direct_writes, direct_write_fallbacks).
+    return Py_BuildValue("KK",
+        (unsigned long long)atomic_load_explicit(&direct_writes, memory_order_relaxed),
+        (unsigned long long)atomic_load_explicit(&direct_write_fallbacks, memory_order_relaxed));
+}
+
 static PyMethodDef module_methods[] = {
     METHODB(safe_pipe, METH_VARARGS),
+    METHODB(direct_write_counters, METH_NOARGS),
     {"add_timer", (PyCFunction)add_python_timer, METH_VARARGS, ""},
     {"remove_timer", (PyCFunction)remove_python_timer, METH_VARARGS, ""},
     METHODB(monitor_pid, METH_VARARGS),

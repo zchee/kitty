@@ -670,6 +670,10 @@ def get_boss() -> Boss:  # this can return None but we ignore that for convenien
 def safe_pipe(nonblock: bool = True) -> Tuple[int, int]:
     pass
 
+def direct_write_counters() -> Tuple[int, int]:
+    # W28.2 B2 test surface: cumulative (direct_writes, direct_write_fallbacks)
+    pass
+
 def patch_global_colors(spec: Dict[str, Optional[int]], configured: bool) -> None:
     pass
 
