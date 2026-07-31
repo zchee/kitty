@@ -1710,11 +1710,30 @@ immediate_encode_floor(OSWindow *w, monotonic_t now) {
 //     and that the class vanished under the lever -- were measured under the
 //     macOS-27 autofill-hook regime, which upstream 256e9eac5 retired. The
 //     census describes a machine that no longer exists.
-// What survives unqualified is the mechanism and the disposition: NO-CHARTER,
-// and the residual gap lives in S2 (io wake + echo turnaround). Default OFF
-// is byte-identical on the golden matrix at max_diff=0 with idle at 0.0%;
+// What survives unqualified is the mechanism and the disposition: the
+// residual gap lives in S2 (io wake + echo turnaround). Default OFF is
+// byte-identical on the golden matrix at max_diff=0 with idle at 0.0%;
 // never flip without a fresh gate.
-// Post-rebase sizing numbers land here when W28.2 step 1 runs.
+//
+// Post-rebase sizing (W28.2 step 1, 2026-07-31, post-256e9eac5 regime,
+// macOS 27.0, main-display 60 Hz Aqua LaunchAgent blocks; records:
+// .omc/verify/w28/w281/EI-SIZING.md + w28/paprime/PAPRIME-VERDICT.md rider b):
+//   - Pure typing (n=295 keys): gate immediate 147 / waiting 81 / rescue 67.
+//     waiting = 27.5% -- the old "class vanishes, ~0" prior is REFUTED in
+//     this regime, so the A/B is CHARTERED per the pre-registered rule.
+//   - Priced ceiling (partition-corrected): 1.539 ms photon mean = waiting
+//     share 0.2746 x its 5.603 ms {gate->commit} deferral. The rescue class
+//     (22.7%) also converts under this lever but prices ~0: its entire S5
+//     excess is present-phase, which inline encode cannot move. The naive
+//     S5-excess form (2.9 ms) is an upper envelope, never the price.
+//   - Mixed typing-during-output (flood census, n=300): waiting+rescue
+//     SHRINKS to 33.0% (immediate 178 / waiting 39 / rescue 60 / nreq 12 /
+//     fallback 11) -- continuous presenting absorbs echoes, so the
+//     pure-typing ceiling above upper-bounds both regimes.
+// Adjudication happens ONLY inside the W28.2 bundle (all-ON vs all-OFF,
+// interleaved/paired -- the crude unpaired MDE ~2.2 ms exceeds the priced
+// 1.54). ON-arm predictions and the non-waivable ACs are registered in
+// EI-SIZING.md; a default flip owes this comment its full verdict rewrite.
 static bool
 metal_echo_immediate_enabled(void) {
     static int cached = -1;
