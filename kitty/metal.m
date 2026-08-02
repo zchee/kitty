@@ -178,133 +178,6 @@ static bool clear_srgb_flag = false;
 // Attachment state of the currently open encoder (kitty/metal-pipeline-design.md)
 static MTLPixelFormat mtl_current_enc_fmt = MTLPixelFormatInvalid;
 
-// W28.4b M1: per-encoder bind shadow. draw_quad used to re-push every piece of
-// encoder state (~16-18 msgSends) on every draw; most of it is identical
-// between consecutive draws, so the helpers below compare against this shadow
-// and skip redundant sets. Correctness rests on three guards, not on call-site
-// discipline alone:
-//   1. `owner` pins the shadow to ONE encoder object — a swapped/restored
-//      encoder (load_window_state, drain barrier, forget_layer) mismatches at
-//      the next draw_quad and the shadow resets itself;
-//   2. `resource_gen` is bumped at every MTLBuffer/MTLTexture release site, so
-//      a release+realloc landing at the same address (ABA) can never satisfy
-//      the pointer comparison across the bump;
-//   3. every encoder CREATION runs enc_shadow_creation_check() (reset +
-//      fail-visible log if the end_current_encoder reset was somehow missed),
-//      and end_current_encoder() resets unconditionally.
-// The shadow stores raw addresses only (no retains): after any reset the worst
-// case is a redundant re-bind, never a wrong bind.
-#define ENC_SHADOW_NBUF 8
-#define ENC_SHADOW_NTEX 4
-typedef struct EncBindShadow {
-    const void *owner;                 // the encoder these bindings were made on
-    uint64_t resource_gen;             // mtl_resource_generation at last validation
-    const void *pso;
-    bool viewport_set, scissor_set;
-    MTLViewport viewport;
-    MTLScissorRect scissor;
-    const void *vbuf[ENC_SHADOW_NBUF];
-    NSUInteger vbuf_off[ENC_SHADOW_NBUF];
-    const void *vtex[ENC_SHADOW_NTEX];
-    const void *ftex[ENC_SHADOW_NTEX];
-} EncBindShadow;
-static EncBindShadow enc_shadow;
-static uint64_t mtl_resource_generation = 1;
-
-static inline void enc_shadow_reset(void) { memset(&enc_shadow, 0, sizeof(enc_shadow)); }
-static inline bool
-enc_shadow_is_reset(void) {
-    static const EncBindShadow zero;   // all writes go through full-struct memset
-    return memcmp(&enc_shadow, &zero, sizeof(zero)) == 0;
-}
-// Entry invariant at every encoder creation site: the shadow must already be
-// reset (end_current_encoder precedes both creation sites). Fail-visible
-// rather than fail-stop — the file has no runtime-assert precedent, and after
-// the self-healing reset below a desynced shadow can only cost redundant
-// re-binds, never a wrong bind — so a one-shot log_error marks the invariant
-// regression without taking the renderer down.
-static inline void
-enc_shadow_creation_check(void) {
-    static bool warned = false;
-    if (!warned && !enc_shadow_is_reset()) {
-        warned = true;
-        log_error("metal: encoder bind shadow not reset at encoder creation (W28.4b M1 invariant regression)");
-    }
-    enc_shadow_reset();
-}
-// Validate the shadow against the live encoder + resource generation; called
-// once per draw_quad before any enc_bind_* helper.
-static inline void
-enc_shadow_validate(void) {
-    if (enc_shadow.owner != (__bridge const void *)mtl_current_encoder
-        || enc_shadow.resource_gen != mtl_resource_generation) {
-        enc_shadow_reset();
-        enc_shadow.owner = (__bridge const void *)mtl_current_encoder;
-        enc_shadow.resource_gen = mtl_resource_generation;
-    }
-}
-static inline void
-enc_bind_pso(id<MTLRenderPipelineState> pso) {
-    if (enc_shadow.pso == (__bridge const void *)pso) return;
-    [mtl_current_encoder setRenderPipelineState:pso];
-    enc_shadow.pso = (__bridge const void *)pso;
-}
-static inline void
-enc_bind_viewport(MTLViewport vp) {
-    if (enc_shadow.viewport_set && memcmp(&vp, &enc_shadow.viewport, sizeof(vp)) == 0) return;
-    [mtl_current_encoder setViewport:vp];
-    enc_shadow.viewport = vp;
-    enc_shadow.viewport_set = true;
-}
-static inline void
-enc_bind_scissor(MTLScissorRect sr) {
-    if (enc_shadow.scissor_set && memcmp(&sr, &enc_shadow.scissor, sizeof(sr)) == 0) return;
-    [mtl_current_encoder setScissorRect:sr];
-    enc_shadow.scissor = sr;
-    enc_shadow.scissor_set = true;
-}
-static inline void
-enc_bind_vbuf(id<MTLBuffer> b, NSUInteger off, NSUInteger idx) {
-    if (idx >= ENC_SHADOW_NBUF) {  // out of shadow range: bind unconditionally
-        [mtl_current_encoder setVertexBuffer:b offset:off atIndex:idx];
-        return;
-    }
-    const void *p = (__bridge const void *)b;
-    if (enc_shadow.vbuf[idx] == p && enc_shadow.vbuf_off[idx] == off) return;
-    if (enc_shadow.vbuf[idx] == p) [mtl_current_encoder setVertexBufferOffset:off atIndex:idx];
-    else [mtl_current_encoder setVertexBuffer:b offset:off atIndex:idx];
-    enc_shadow.vbuf[idx] = p;
-    enc_shadow.vbuf_off[idx] = off;
-}
-// setVertexBytes ALIASES the same binding slot as setVertexBuffer at the same
-// index (cell UBO idx 1 vs the border bytes push idx 1; the small programs'
-// bytes at idx 0 vs the cell/border vertex buffer at idx 0). Every vertex
-// bytes push must therefore go through this helper, which forgets the slot's
-// buffer record so the next enc_bind_vbuf on that index re-binds instead of
-// wrongly skipping. Fragment bytes need no counterpart: no fragment BUFFERS
-// are shadowed (only fragment textures, a separate table).
-static inline void
-enc_push_vbytes(const void *bytes, NSUInteger len, NSUInteger idx) {
-    [mtl_current_encoder setVertexBytes:bytes length:len atIndex:idx];
-    if (idx < ENC_SHADOW_NBUF) { enc_shadow.vbuf[idx] = NULL; enc_shadow.vbuf_off[idx] = 0; }
-}
-static inline void
-enc_bind_vtex(id<MTLTexture> t, NSUInteger idx) {
-    if (idx >= ENC_SHADOW_NTEX) { [mtl_current_encoder setVertexTexture:t atIndex:idx]; return; }
-    const void *p = (__bridge const void *)t;
-    if (enc_shadow.vtex[idx] == p) return;
-    [mtl_current_encoder setVertexTexture:t atIndex:idx];
-    enc_shadow.vtex[idx] = p;
-}
-static inline void
-enc_bind_ftex(id<MTLTexture> t, NSUInteger idx) {
-    if (idx >= ENC_SHADOW_NTEX) { [mtl_current_encoder setFragmentTexture:t atIndex:idx]; return; }
-    const void *p = (__bridge const void *)t;
-    if (enc_shadow.ftex[idx] == p) return;
-    [mtl_current_encoder setFragmentTexture:t atIndex:idx];
-    enc_shadow.ftex[idx] = p;
-}
-
 // M1: single-pass layered rendering. Layered windows (transparency, bg image,
 // graphics, overlays, cursor trail) render into a MEMORYLESS RGBA16Unorm working
 // surface (color attachment 0, tile-memory only — never DRAM) using the existing
@@ -405,7 +278,6 @@ ensure_gamma_lut_buffer(void) {
     }
     size_t bytes = (size_t)cached_gamma_lut_count * sizeof(float);
     if (!gamma_lut_buffer || gamma_lut_buffer_count != cached_gamma_lut_count) {
-        if (gamma_lut_buffer) mtl_resource_generation++;
         [gamma_lut_buffer release];
         gamma_lut_buffer = [mtl_device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
         if (!gamma_lut_buffer) { gamma_lut_buffer_src = NULL; gamma_lut_buffer_count = 0; return nil; }
@@ -1142,7 +1014,7 @@ alloc_buffer_data(ssize_t idx, GLsizeiptr size) {
     MetalBuffer *b = &buffers[idx];
     if (b->size == size && b->mtl_buffer) return;
     b->size = size;
-    if (b->mtl_buffer) { [b->mtl_buffer release]; b->mtl_buffer = nil; mtl_resource_generation++; }
+    if (b->mtl_buffer) { [b->mtl_buffer release]; b->mtl_buffer = nil; }
     b->mapped_ptr = NULL;
     if (size == 0) {
         // Metal doesn't allow zero-length buffers — allocate minimum 4 bytes
@@ -1265,7 +1137,7 @@ ring_acquire_slot(MetalBuffer *b) {
         id<MTLBuffer> fresh = [mtl_device newBufferWithLength:need
                                                      options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
         if (fresh) {
-            if (s->buf) { [s->buf release]; mtl_resource_generation++; }
+            if (s->buf) [s->buf release];
             s->buf = fresh;
             s->ptr = fresh.contents;
             s->size = need;
@@ -1786,12 +1658,8 @@ draw_quad(bool blend, unsigned instance_count) {
     // D1: fence the ring buffers this draw will read to this command buffer.
     stamp_ring_fences(current_bound_vao);
 
-    // W28.4b M1: (re)validate the bind shadow against this encoder + the
-    // resource generation before any enc_bind_* below may skip a set.
-    enc_shadow_validate();
-
     // Set viewport
-    enc_bind_viewport(mtl_viewport);
+    [mtl_current_encoder setViewport:mtl_viewport];
 
     // Set scissor if enabled
     if (scissor_enabled) {
@@ -1803,7 +1671,7 @@ draw_quad(bool blend, unsigned instance_count) {
         if (sr.x + sr.width > dw) sr.width = dw > sr.x ? dw - sr.x : 0;
         if (sr.y + sr.height > dh) sr.height = dh > sr.y ? dh - sr.y : 0;
         if (sr.width > 0 && sr.height > 0) {
-            enc_bind_scissor(sr);
+            [mtl_current_encoder setScissorRect:sr];
         }
     }
 
@@ -1811,7 +1679,7 @@ draw_quad(bool blend, unsigned instance_count) {
     if (current_program < 0 || current_program >= NUM_PROGRAMS) return;
     id<MTLRenderPipelineState> pso = pso_get(current_program, blend, mtl_current_enc_fmt, layered_pass_active);
     if (!pso) return;
-    enc_bind_pso(pso);
+    [mtl_current_encoder setRenderPipelineState:pso];
 
     // Bind VAO buffers and program-specific uniform data to the encoder
     // Program IDs: CELL=0-2, SENTINEL=3, BORDERS=4, GRAPHICS=5-7, BGIMAGE=8,
@@ -1824,48 +1692,48 @@ draw_quad(bool blend, unsigned instance_count) {
             if (vao->num_buffers > 0) {
                 ssize_t buf_idx = vao->buffers[0];
                 if (buffers[buf_idx].mtl_buffer) {
-                    enc_bind_vbuf(buffers[buf_idx].mtl_buffer, 0, 0);
+                    [mtl_current_encoder setVertexBuffer:buffers[buf_idx].mtl_buffer offset:0 atIndex:0];
                 }
             }
             // Buffer 1 (selection) → Metal buffer index 5
             if (vao->num_buffers > 1) {
                 ssize_t buf_idx = vao->buffers[1];
                 if (buffers[buf_idx].mtl_buffer) {
-                    enc_bind_vbuf(buffers[buf_idx].mtl_buffer, 0, 5);
+                    [mtl_current_encoder setVertexBuffer:buffers[buf_idx].mtl_buffer offset:0 atIndex:5];
                 }
             }
             // Buffer 2 (uniform block = CellRenderData + color_table) → Metal buffer index 1
             if (vao->num_buffers > 2) {
                 ssize_t buf_idx = vao->buffers[2];
                 if (buffers[buf_idx].mtl_buffer) {
-                    enc_bind_vbuf(buffers[buf_idx].mtl_buffer, 0, 1);
+                    [mtl_current_encoder setVertexBuffer:buffers[buf_idx].mtl_buffer offset:0 atIndex:1];
                 }
             }
         }
         // Gamma LUT → buffer index 3 (M5c: bind the resident buffer instead of
         // copying 1 KB into the command stream via setVertexBytes every draw)
         id<MTLBuffer> glut = ensure_gamma_lut_buffer();
-        if (glut) enc_bind_vbuf(glut, 0, 3);
+        if (glut) [mtl_current_encoder setVertexBuffer:glut offset:0 atIndex:3];
         // Buffer 3 (ColorTable UBO, packed uint[]) → Metal buffer index 4
         if (current_bound_vao >= 0) {
             MetalVAO *vao = &vaos[current_bound_vao];
             if (vao->num_buffers > 3) {
                 ssize_t buf_idx = vao->buffers[3];
                 if (buffers[buf_idx].mtl_buffer) {
-                    enc_bind_vbuf(buffers[buf_idx].mtl_buffer, 0, 4);
+                    [mtl_current_encoder setVertexBuffer:buffers[buf_idx].mtl_buffer offset:0 atIndex:4];
                     // W27 P3.5b: the wide-gamut colour carrier's float4 table
                     // shares this same MTLBuffer, at the fixed byte offset
                     // just past the packed uint region (see block_size() /
                     // METAL_WIDE_COLOR_TABLE_BYTES above) -> Metal buffer
                     // index 6.
-                    enc_bind_vbuf(buffers[buf_idx].mtl_buffer, 1056, 6);
+                    [mtl_current_encoder setVertexBuffer:buffers[buf_idx].mtl_buffer offset:1056 atIndex:6];
                 }
             }
         }
         // Per-draw uniforms (draw_bg_bitfield, row_offset, etc.) → buffer index 2
         MetalCellDrawUniforms cell_draw;
         fill_cell_draw_uniforms(current_program, &cell_draw);
-        enc_push_vbytes(&cell_draw, sizeof(cell_draw), 2);
+        [mtl_current_encoder setVertexBytes:&cell_draw length:sizeof(cell_draw) atIndex:2];
         [mtl_current_encoder setFragmentBytes:&cell_draw length:sizeof(cell_draw) atIndex:2];
 
         // Bind textures: unit 0 = mono sprite atlas (2D array), unit 2 = mono
@@ -1880,26 +1748,22 @@ draw_quad(bool blend, unsigned instance_count) {
         // was constant-false -- a guard that reads as protection while never
         // firing. Stamped at bind time, when metal_frame_index still names the
         // frame being encoded (it is post-incremented at commit).
-        // W28.4b M1 note: the last_drawn_fidx stamps stay UNCONDITIONAL — a
-        // skipped re-bind still means this draw samples the texture, and the
-        // H1 watermark semantics are "the frame that samples", not "the frame
-        // that binds".
         if (bound_tex_2d_array[0] && bound_tex_2d_array[0] < MAX_TEXTURES && textures[bound_tex_2d_array[0]].texture) {
-            enc_bind_ftex(textures[bound_tex_2d_array[0]].texture, 0);
-            enc_bind_vtex(textures[bound_tex_2d_array[0]].texture, 0);
+            [mtl_current_encoder setFragmentTexture:textures[bound_tex_2d_array[0]].texture atIndex:0];
+            [mtl_current_encoder setVertexTexture:textures[bound_tex_2d_array[0]].texture atIndex:0];
             textures[bound_tex_2d_array[0]].last_drawn_fidx = metal_frame_index;
         }
         if (bound_tex_2d[2] && bound_tex_2d[2] < MAX_TEXTURES && textures[bound_tex_2d[2]].texture) {
-            enc_bind_vtex(textures[bound_tex_2d[2]].texture, 2);
+            [mtl_current_encoder setVertexTexture:textures[bound_tex_2d[2]].texture atIndex:2];
             textures[bound_tex_2d[2]].last_drawn_fidx = metal_frame_index;
         }
         if (bound_tex_2d_array[3] && bound_tex_2d_array[3] < MAX_TEXTURES && textures[bound_tex_2d_array[3]].texture) {
-            enc_bind_ftex(textures[bound_tex_2d_array[3]].texture, 1);
-            enc_bind_vtex(textures[bound_tex_2d_array[3]].texture, 1);
+            [mtl_current_encoder setFragmentTexture:textures[bound_tex_2d_array[3]].texture atIndex:1];
+            [mtl_current_encoder setVertexTexture:textures[bound_tex_2d_array[3]].texture atIndex:1];
             textures[bound_tex_2d_array[3]].last_drawn_fidx = metal_frame_index;
         }
         if (bound_tex_2d[4] && bound_tex_2d[4] < MAX_TEXTURES && textures[bound_tex_2d[4]].texture) {
-            enc_bind_vtex(textures[bound_tex_2d[4]].texture, 3);
+            [mtl_current_encoder setVertexTexture:textures[bound_tex_2d[4]].texture atIndex:3];
             textures[bound_tex_2d[4]].last_drawn_fidx = metal_frame_index;
         }
     } else if (current_program == 4) {
@@ -1909,7 +1773,7 @@ draw_quad(bool blend, unsigned instance_count) {
             if (vao->num_buffers > 0) {
                 ssize_t buf_idx = vao->buffers[0];
                 if (buffers[buf_idx].mtl_buffer) {
-                    enc_bind_vbuf(buffers[buf_idx].mtl_buffer, 0, 0);
+                    [mtl_current_encoder setVertexBuffer:buffers[buf_idx].mtl_buffer offset:0 atIndex:0];
                 }
             }
         }
@@ -1919,9 +1783,9 @@ draw_quad(bool blend, unsigned instance_count) {
         // programs) instead of a 1 KB per-frame setVertexBytes copy.
         MetalBorderUniforms border_u;
         fill_border_uniforms(current_program, &border_u);
-        enc_push_vbytes(&border_u, sizeof(border_u), 1);
+        [mtl_current_encoder setVertexBytes:&border_u length:sizeof(border_u) atIndex:1];
         id<MTLBuffer> border_glut = ensure_gamma_lut_buffer();
-        if (border_glut) enc_bind_vbuf(border_glut, 0, 3);
+        if (border_glut) [mtl_current_encoder setVertexBuffer:border_glut offset:0 atIndex:3];
     } else if (current_program >= 5 && current_program <= 7) {
         // C5: MetalGraphicsUniforms — per-instance src_rects/dest_rects[16] arrays
         // (ARRAY_UNIFORM_BASE, G2) then the extra_alpha/amask scalar tail; layout
@@ -1929,11 +1793,11 @@ draw_quad(bool blend, unsigned instance_count) {
         MetalGraphicsUniforms gfx_u;
         fill_graphics_uniforms(current_program, &gfx_u);
         metal_frame_gfx_draw_count++;  // G2: graphics-program draw call this frame
-        enc_push_vbytes(&gfx_u, sizeof(gfx_u), 0);
+        [mtl_current_encoder setVertexBytes:&gfx_u length:sizeof(gfx_u) atIndex:0];
         [mtl_current_encoder setFragmentBytes:&gfx_u length:sizeof(gfx_u) atIndex:0];
         // Bind image texture from unit 1 (GRAPHICS_UNIT)
         if (bound_tex_2d[1] && bound_tex_2d[1] < MAX_TEXTURES && textures[bound_tex_2d[1]].texture) {
-            enc_bind_ftex(textures[bound_tex_2d[1]].texture, 0);
+            [mtl_current_encoder setFragmentTexture:textures[bound_tex_2d[1]].texture atIndex:0];
             // US-307: record the frame that samples this image texture, so the
             // upload path can detect it is still in flight under async present.
             textures[bound_tex_2d[1]].last_drawn_fidx = metal_frame_index;
@@ -1941,43 +1805,43 @@ draw_quad(bool blend, unsigned instance_count) {
     } else if (current_program == 8) {
         MetalBgimageUniforms bg_u;
         fill_bgimage_uniforms(current_program, &bg_u);
-        enc_push_vbytes(&bg_u, sizeof(bg_u), 0);
+        [mtl_current_encoder setVertexBytes:&bg_u length:sizeof(bg_u) atIndex:0];
         [mtl_current_encoder setFragmentBytes:&bg_u length:sizeof(bg_u) atIndex:0];
         if (bound_tex_2d[1] && bound_tex_2d[1] < MAX_TEXTURES && textures[bound_tex_2d[1]].texture) {
-            enc_bind_ftex(textures[bound_tex_2d[1]].texture, 0);
+            [mtl_current_encoder setFragmentTexture:textures[bound_tex_2d[1]].texture atIndex:0];
         }
     } else if (current_program == 9) {
         MetalTintUniforms tint_u;
         fill_tint_uniforms(current_program, &tint_u);
-        enc_push_vbytes(&tint_u, sizeof(tint_u), 0);
+        [mtl_current_encoder setVertexBytes:&tint_u length:sizeof(tint_u) atIndex:0];
         [mtl_current_encoder setFragmentBytes:&tint_u length:sizeof(tint_u) atIndex:0];
     } else if (current_program == 10) {
         // C5: MetalTrailUniforms (float3 trail_color 16-aligned so trail_opacity
         // lands at 64); see fill_trail_uniforms + metal_uniforms.h assert.
         MetalTrailUniforms trail_u;
         fill_trail_uniforms(current_program, &trail_u);
-        enc_push_vbytes(&trail_u, sizeof(trail_u), 0);
+        [mtl_current_encoder setVertexBytes:&trail_u length:sizeof(trail_u) atIndex:0];
         [mtl_current_encoder setFragmentBytes:&trail_u length:sizeof(trail_u) atIndex:0];
     } else if (current_program == 11) {
         MetalBlitUniforms blit_u;
         fill_blit_uniforms(current_program, &blit_u);
-        enc_push_vbytes(&blit_u, sizeof(blit_u), 0);
+        [mtl_current_encoder setVertexBytes:&blit_u length:sizeof(blit_u) atIndex:0];
         [mtl_current_encoder setFragmentBytes:&blit_u length:sizeof(blit_u) atIndex:0];
         if (bound_tex_2d[1] && bound_tex_2d[1] < MAX_TEXTURES && textures[bound_tex_2d[1]].texture) {
-            enc_bind_ftex(textures[bound_tex_2d[1]].texture, 0);
+            [mtl_current_encoder setFragmentTexture:textures[bound_tex_2d[1]].texture atIndex:0];
         }
     } else if (current_program == 12) {
         MetalScreenshotUniforms ss_u;
         fill_screenshot_uniforms(current_program, &ss_u);
-        enc_push_vbytes(&ss_u, sizeof(ss_u), 0);
+        [mtl_current_encoder setVertexBytes:&ss_u length:sizeof(ss_u) atIndex:0];
         [mtl_current_encoder setFragmentBytes:&ss_u length:sizeof(ss_u) atIndex:0];
         if (bound_tex_2d[1] && bound_tex_2d[1] < MAX_TEXTURES && textures[bound_tex_2d[1]].texture) {
-            enc_bind_ftex(textures[bound_tex_2d[1]].texture, 0);
+            [mtl_current_encoder setFragmentTexture:textures[bound_tex_2d[1]].texture atIndex:0];
         }
     } else if (current_program == 13) {
         MetalRoundedRectUniforms rr_u;
         fill_rounded_rect_uniforms(current_program, &rr_u);
-        enc_push_vbytes(&rr_u, sizeof(rr_u), 0);
+        [mtl_current_encoder setVertexBytes:&rr_u length:sizeof(rr_u) atIndex:0];
         [mtl_current_encoder setFragmentBytes:&rr_u length:sizeof(rr_u) atIndex:0];
     }
 
@@ -2576,7 +2440,6 @@ end_current_encoder(void) {
         mtl_current_encoder = nil;
     }
     mtl_current_enc_fmt = MTLPixelFormatInvalid;
-    enc_shadow_reset();  // W28.4b M1: bindings die with the encoder
 }
 
 static bool
@@ -2871,7 +2734,6 @@ metal_begin_layered_frame(void) {
 
     mtl_current_encoder = [mtl_current_command_buffer renderCommandEncoderWithDescriptor:rpd];
     if (!mtl_current_encoder) return;
-    enc_shadow_creation_check();  // W28.4b M1 creation invariant (layered site)
     // draw_quad picks the layered (2-attachment) PSOs; the DYNAMIC att0 format
     // (W27 P4.2) flows through here into pso_get's cache key, so the SDR and EDR
     // working-surface variants can never be confused for one another.
@@ -2907,13 +2769,9 @@ metal_resolve_layered_frame(void) {
         if (pso) {
             MTLViewport full = {0, 0, (double)slot->layered_work_w, (double)slot->layered_work_h, 0, 1};
             MTLScissorRect fullsr = {0, 0, slot->layered_work_w, slot->layered_work_h};
-            // W28.4b M1: the resolve encodes on the SAME encoder draw_quad used,
-            // so it goes through the shadow helpers too (validate first — the
-            // helpers must never trust a shadow another encoder populated).
-            enc_shadow_validate();
-            enc_bind_viewport(full);
-            enc_bind_scissor(fullsr);
-            enc_bind_pso(pso);
+            [mtl_current_encoder setViewport:full];
+            [mtl_current_encoder setScissorRect:fullsr];
+            [mtl_current_encoder setRenderPipelineState:pso];
             [mtl_current_encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         }
     }
@@ -3005,7 +2863,6 @@ begin_render_pass_to_drawable(bool clear) {
     mtl_current_render_pass = rpd;
 
     mtl_current_encoder = [mtl_current_command_buffer renderCommandEncoderWithDescriptor:rpd];
-    enc_shadow_creation_check();  // W28.4b M1 creation invariant (drawable site)
     mtl_current_enc_fmt = target_texture.pixelFormat;
     metal_pass_count++;  // Phase 0: acceptance-criterion-2 probe (== 1 for opaque frames)
     return mtl_current_encoder;
@@ -3423,7 +3280,6 @@ static size_t num_free_texture_ids = 0;
 static void
 recycle_texture_id(GLuint id) {
     [textures[id].texture release];
-    mtl_resource_generation++;  // W28.4b M1: released texture address may be reused
     textures[id].texture = nil;
     textures[id].target = 0;
     // H1: the object this watermark referred to is gone, so the stamp is
@@ -3513,7 +3369,6 @@ void metal_gl_tex_image_2d(GLenum target, int level, int internalformat, int wid
     desc.storageMode = MTLStorageModeShared;
 
     [t->texture release];
-    mtl_resource_generation++;  // W28.4b M1: released texture address may be reused
     t->texture = [mtl_device newTextureWithDescriptor:desc];
     t->last_drawn_fidx = 0;  // US-307: a freshly (re)allocated texture has no in-flight draws
     // G1: count only IMAGE-texture (re)allocs (the graphics/animation upload path
@@ -3656,7 +3511,6 @@ void metal_gl_tex_storage_3d(GLenum target, int levels, GLenum internalformat, i
     desc.storageMode = MTLStorageModeShared;
 
     [t->texture release];
-    mtl_resource_generation++;  // W28.4b M1: released texture address may be reused
     t->texture = [mtl_device newTextureWithDescriptor:desc];
     t->target = GL_TEXTURE_2D_ARRAY;
     // H1: this is an in-place release+recreate, so the watermark now refers to a
@@ -3714,7 +3568,6 @@ void metal_gl_copy_tex_image_2d(GLenum target, int level, GLenum internalformat,
     desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
     desc.storageMode = MTLStorageModeShared;
     [t->texture release];
-    mtl_resource_generation++;  // W28.4b M1: released texture address may be reused
     t->texture = [mtl_device newTextureWithDescriptor:desc];
     t->target = GL_TEXTURE_2D;
     t->width = width;
