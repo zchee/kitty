@@ -745,7 +745,8 @@ fill_border_uniforms(int program, MetalBorderUniforms *u) {
     for (int i = 0; i < 9 && base + i < MAX_UNIFORMS_PER_PROGRAM; i++)
         u->colors[i] = uniform_stores[program].values[base + i].u[0];
     u->background_opacity = slot_f(program, BORDER_U_background_opacity, 0);
-    if (cached_gamma_lut) memcpy(u->gamma_lut, cached_gamma_lut, sizeof(u->gamma_lut));
+    // W28.4b M2: the gamma LUT is no longer copied into this push — draw_quad
+    // binds the resident LUT buffer (ensure_gamma_lut_buffer) at index 3.
 }
 
 static void
@@ -1777,10 +1778,14 @@ draw_quad(bool blend, unsigned instance_count) {
             }
         }
         // C5: MetalBorderUniforms (colors[9] array at ARRAY_UNIFORM_BASE +
-        // background_opacity + resident gamma_lut[256]); see fill_border_uniforms.
+        // background_opacity); see fill_border_uniforms. W28.4b M2: the gamma
+        // LUT rides the resident buffer at index 3 (same binding as the cell
+        // programs) instead of a 1 KB per-frame setVertexBytes copy.
         MetalBorderUniforms border_u;
         fill_border_uniforms(current_program, &border_u);
         [mtl_current_encoder setVertexBytes:&border_u length:sizeof(border_u) atIndex:1];
+        id<MTLBuffer> border_glut = ensure_gamma_lut_buffer();
+        if (border_glut) [mtl_current_encoder setVertexBuffer:border_glut offset:0 atIndex:3];
     } else if (current_program >= 5 && current_program <= 7) {
         // C5: MetalGraphicsUniforms — per-instance src_rects/dest_rects[16] arrays
         // (ARRAY_UNIFORM_BASE, G2) then the extra_alpha/amask scalar tail; layout

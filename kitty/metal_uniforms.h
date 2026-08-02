@@ -64,7 +64,9 @@ typedef struct MetalCellDrawUniforms {
 typedef struct MetalBorderUniforms {
     uint32 colors[9];         // colors[9] multi-element array (packs, no padding)
     float background_opacity;
-    float gamma_lut[256];
+    // W28.4b M2: gamma_lut[256] removed — borders read the resident LUT
+    // MTLBuffer at vertex buffer index 3 (the same binding the cell programs
+    // use), so the per-frame setVertexBytes push shrank 1064 -> 40 bytes.
 } MetalBorderUniforms;
 
 typedef struct MetalGraphicsUniforms {
@@ -146,9 +148,8 @@ _Static_assert(offsetof(MetalCellRenderData, color_sprites_xnum) == 176, "R8-atl
 _Static_assert(sizeof(MetalCellDrawUniforms) == 16, "MetalCellDrawUniforms layout drifted");
 
 // C5: pin the frame-path uniform structs to their MSL layouts.
-_Static_assert(sizeof(MetalBorderUniforms) == 1064, "MetalBorderUniforms layout drifted");
+_Static_assert(sizeof(MetalBorderUniforms) == 40, "MetalBorderUniforms layout drifted");
 _Static_assert(offsetof(MetalBorderUniforms, background_opacity) == 36, "border colors[9] must occupy bytes 0-35");
-_Static_assert(offsetof(MetalBorderUniforms, gamma_lut) == 40, "border gamma_lut must start at 40");
 
 _Static_assert(sizeof(MetalGraphicsUniforms) == 576, "MetalGraphicsUniforms layout drifted");
 _Static_assert(offsetof(MetalGraphicsUniforms, edr_headroom) == 560, "graphics edr_headroom must follow amask_bg_premult at 560");

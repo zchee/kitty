@@ -33,10 +33,12 @@ inline float if_one_then(float cond, float t, float e) { return mix(e, t, cond);
 inline float3 if_one_then(float cond, float3 t, float3 e) { return mix(e, t, cond); }
 inline float4 vec4_premul(float3 rgb, float a) { return float4(rgb * a, a); }
 
+// W28.4b M2: the gamma LUT is no longer part of this struct — borders bind the
+// same resident LUT buffer the cell programs use (buffer(3)), instead of
+// copying 1 KB into the command stream once per frame via setVertexBytes.
 struct BorderUniforms {
     uint colors[9];
     float background_opacity;
-    float gamma_lut[256];
 };
 static_assert(sizeof(BorderUniforms) == sizeof(MetalBorderUniforms),
               "BorderUniforms drifted from MetalBorderUniforms");
@@ -80,7 +82,8 @@ vertex BorderVertexOut border_vertex(
     uint vid [[vertex_id]],
     uint iid [[instance_id]],
     constant uchar *rects_raw [[buffer(0)]],
-    constant BorderUniforms& uniforms [[buffer(1)]]
+    constant BorderUniforms& uniforms [[buffer(1)]],
+    constant float *gamma_lut [[buffer(3)]]
 ) {
     BorderVertexOut out;
     constant float *rf = (constant float*)(rects_raw + iid * BORDER_RECT_C_STRIDE);
@@ -90,9 +93,9 @@ vertex BorderVertexOut border_vertex(
     uint2 pos = border_pos_map[vid];
     out.position = float4(rect[pos.x], rect[pos.y], 0, 1);
 
-    float3 window_bg = as_color_vector(rect_color, 24, uniforms.gamma_lut);
+    float3 window_bg = as_color_vector(rect_color, 24, gamma_lut);
     uint rc = rect_color & 0xFFu;
-    float3 color3 = as_color_vector(uniforms.colors[rc], 16, uniforms.gamma_lut);
+    float3 color3 = as_color_vector(uniforms.colors[rc], 16, gamma_lut);
 
     float is_window_bg = is_integer_value(rc, 3); // WINDOW_BACKGROUND_PLACEHOLDER
     color3 = if_one_then(is_window_bg, window_bg, color3);
