@@ -724,11 +724,15 @@ class VertexOrder(StrEnum):
 
     GL draws every quad as a 4-vertex GL_TRIANGLE_FAN and Metal has no fan, so a
     generated vertex shader may or may not need the fan->strip index buffer, and
-    which one is not derivable from the MSL. `fan` means the shader indexes a
-    constant table baked into itself, so the index IS the fan position and has to
-    be remapped. `client` means the C side hands it the vertices already in draw
-    order (trail reads x_coords[vertex_id], filled by shaders.c), and remapping
-    would permute the index into that array and scramble the geometry.
+    which one is not derivable from the MSL. `fan` means vertex_id is a fan
+    position -- whether the shader indexes a constant table baked into itself OR
+    an array the C side filled in fan order (trail: cursor_trail.c's corners are
+    cyclic because upstream fan-draws them) -- and must go through the remap.
+    `client` is reserved for a shader whose vertex_id order is already strip
+    order end to end; no shader qualifies today, and the first one that claims
+    to must bring pixel evidence (trail claimed it and was refuted: a raw strip
+    over its fan-ordered corners missed a wedge and double-blended a seam,
+    ADR-0029 §8).
 
     Declared here rather than detected, because both obvious detectors are
     proxies that fail silently in both directions: a shader can be fan-ordered

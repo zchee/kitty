@@ -503,7 +503,8 @@ _Static_assert(sizeof(((MetalTintUniforms*)0)->tint_color) == TINT_FRAGMENT_BUFS
     "tint.slang's fragment no longer reads exactly tint_color");
 _Static_assert(sizeof(MetalRoundedRectUniforms) == ROUNDED_RECT_FRAGMENT_BUFSZ_entryPointParams,
     "MetalRoundedRectUniforms no longer fills rounded_rect.slang's fragment block");
-_Static_assert(offsetof(MetalTrailUniforms, cursor_edge_x) == TRAIL_VERTEX_BUFSZ_entryPointParams,
+_Static_assert(offsetof(MetalTrailUniforms, y_coords) == 16 &&
+               offsetof(MetalTrailUniforms, cursor_edge_x) == TRAIL_VERTEX_BUFSZ_entryPointParams,
     "trail.slang's vertex block is no longer exactly x_coords+y_coords");
 _Static_assert(sizeof(MetalTrailUniforms) - offsetof(MetalTrailUniforms, cursor_edge_x) == TRAIL_FRAGMENT_BUFSZ_entryPointParams,
     "the MetalTrailUniforms tail no longer fills trail.slang's fragment block");
