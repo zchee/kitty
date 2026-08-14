@@ -887,6 +887,14 @@ class MetalBindings(NamedTuple):
     textures: dict[str, int]             # name -> [[texture(n)]] index
     samplers: dict[str, int]             # name -> [[sampler(n)]] index
     blocks: dict[str, int]               # MSL struct type name -> computed byte size
+    # W3h step 0: the publication contract below needs the shader identity and
+    # stage STRUCTURED, not re-parsed out of the prefix -- a specialized prefix
+    # like GRAPHICS_VERTEX_ALPHA_MASK defeats both the endswith('_VERTEX')
+    # filter and the rsplit('_', 1) shader lookup (measured in the W3g review:
+    # specialized vertices silently left the contract).
+    shader: str = ''
+    stage: 'Stage' = Stage.vertex
+    specialization: str = ''
 
 
 def strip_slang_suffix(name: str) -> str:
@@ -942,7 +950,7 @@ def parse_metal_bindings(msl: str, stage: Stage, prefix: str) -> MetalBindings:
             add_binding(found, name, int(m.group(2)), prefix)
         return found
 
-    return MetalBindings(prefix, buffers, attributes, indexed_params('texture'), indexed_params('sampler'), blocks)
+    return MetalBindings(prefix, buffers, attributes, indexed_params('texture'), indexed_params('sampler'), blocks, '', stage, '')
 
 
 def internalize_msl_helpers(msl: str, entry: str) -> str:
@@ -1005,7 +1013,7 @@ def fixup_metal_files(dest_dir: str, dest: str = 'kitty/metal-bindings.h') -> No
         fn = metal_function_name(shader, stage, specialization)
         msl = re.sub(rf'\b{entry_point_declaration(msl, stage)[0]}\b', fn, msl)
         msl = internalize_msl_helpers(msl, fn)
-        bindings = parse_metal_bindings(msl, stage, fn.upper())
+        bindings = parse_metal_bindings(msl, stage, fn.upper())._replace(shader=shader, specialization=specialization)
         # The BUFSZ defines pin the C side against slang.py's MODEL of MSL
         # layout; a wrong model would leave C and the #define agreeing and both
         # wrong. Embedding the computed sizes as static_asserts makes the Metal
@@ -1044,10 +1052,14 @@ def fixup_metal_files(dest_dir: str, dest: str = 'kitty/metal-bindings.h') -> No
     # (which lives in shaders.c's enum and not in any header). So the decision is
     # declared once in METAL_SHADERS and published here, rather than restated as
     # prose in an assert message: metal.m relays the value instead of holding an
-    # opinion. Between the three, every way the set can change fails the build --
-    # a removal or a swap takes the #define away, and the count catches an
-    # addition, which nothing else would react to.
-    vertex_shaders = [b.prefix for b in all_bindings if b.prefix.endswith('_VERTEX')]
+    # opinion. Every way the set can change fails the build -- a removal or a
+    # swap takes a #define away, KITTY_SLANG_VERTEX_SHADERS (a count of
+    # DISTINCT shaders, matching metal.m's program-mapping concern) catches a
+    # new shader, and _SPECIALIZATIONS (emitted per stage once a shader has
+    # more than its default variant) catches a variant set changing size.
+    # W3h step 0: the old endswith('_VERTEX') prefix filter silently excluded
+    # specialized vertex entries from all three guarantees (W3g review, F5).
+    vertex_bindings = [b for b in all_bindings if b.stage is Stage.vertex]
     lines.append('')
     # Presence and value are deliberately separate symbols. _IS_GENERATED exists
     # to be #ifdef'd (metal.m's removal guards); _ORDER_FAN is always defined,
@@ -1055,11 +1067,18 @@ def fixup_metal_files(dest_dir: str, dest: str = 'kitty/metal-bindings.h') -> No
     # client-ordered shader lands, its _ORDER_FAN is defined-and-zero, so an
     # #ifdef on it would silently answer "fan" for a shader declared otherwise.
     lines.append('// _ORDER_FAN is always defined (0 or 1): test with #if, never #ifdef.')
-    for prefix in vertex_shaders:
-        order = METAL_SHADERS[prefix.rsplit('_', 1)[0].lower()].vertex_order
-        lines.append(f'#define {prefix}_IS_GENERATED 1')
-        lines.append(f'#define {prefix}_ORDER_FAN {1 if order is VertexOrder.fan else 0}')
-    lines.append(f'#define KITTY_SLANG_VERTEX_SHADERS {len(vertex_shaders)}')
+    for b in vertex_bindings:
+        order = METAL_SHADERS[b.shader].vertex_order
+        lines.append(f'#define {b.prefix}_IS_GENERATED 1')
+        lines.append(f'#define {b.prefix}_ORDER_FAN {1 if order is VertexOrder.fan else 0}')
+    lines.append(f'#define KITTY_SLANG_VERTEX_SHADERS {len({b.shader for b in vertex_bindings})}')
+    variant_counts: dict[tuple[str, Stage], int] = {}
+    for b in all_bindings:
+        key = (b.shader, b.stage)
+        variant_counts[key] = variant_counts.get(key, 0) + 1
+    for (shader_name, stage_v), n in sorted(variant_counts.items()):
+        if n > 1:
+            lines.append(f'#define {shader_name.upper()}_{stage_v.name.upper()}_SPECIALIZATIONS {n}')
     write_if_changed(dest, '\n'.join(lines) + '\n')
 # }}}
 
