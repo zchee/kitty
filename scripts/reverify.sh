@@ -53,8 +53,10 @@ MATRIX=$(cd "$WT" && python3.14 -c '
 import ast
 src = open("scripts/metal-golden.py").read()
 for n in ast.parse(src).body:
-    if isinstance(n, ast.AnnAssign) and getattr(n.target, "id", "") == "CONFIG_MATRIX":
+    tgt = n.target if isinstance(n, ast.AnnAssign) else (n.targets[0] if isinstance(n, ast.Assign) and len(n.targets) == 1 else None)
+    if tgt is not None and getattr(tgt, "id", "") == "CONFIG_MATRIX":
         print(len(n.value.keys))')
+[ -n "$MATRIX" ] || { fail "CONFIG_MATRIX not found by AST (renamed or reshaped?) -- the count guard cannot run"; MATRIX=-1; }
 echo "== matrix size from source: $MATRIX"
 ( cd "$WT" && ./scripts/metal-golden.py capture --output-dir "$OUT/goldens" >/dev/null 2>&1 )
 ( cd "$WT" && ./scripts/metal-golden.py compare "$BASE" "$OUT/goldens" --threshold 0 > "$OUT/compare.json" 2>/dev/null )
