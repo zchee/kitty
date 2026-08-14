@@ -544,25 +544,28 @@ ensure_fan_to_strip_index_buffer(void) {
 // the per-shader marker below catches a removal or a swap, and the count catches
 // an addition, which no marker of its own would make anything here react to.
 _Static_assert(KITTY_SLANG_VERTEX_SHADERS == 2,
-    "a vertex shader was added to METAL_SHADERS in slang.py -- decide whether its program id belongs in "
-    "program_uses_fan_vertex_order(): yes if the shader indexes a pos_map baked into itself, NO if it "
-    "indexes arrays the C side fills (trail), whose order is already the strip order");
-#ifndef BORDER_VERTEX_IS_SLANG
-#error "border's vertex is no longer generated -- drop program 4 from program_uses_fan_vertex_order()"
+    "a vertex shader was added to METAL_SHADERS in slang.py -- declare its VertexOrder there and map "
+    "its program id below");
+#ifndef BORDER_VERTEX_ORDER_FAN
+#error "border's vertex is no longer generated -- drop program 4 below"
 #endif
-#ifndef TINT_VERTEX_IS_SLANG
-#error "tint's vertex is no longer generated -- drop program 9 from program_uses_fan_vertex_order()"
+#ifndef TINT_VERTEX_ORDER_FAN
+#error "tint's vertex is no longer generated -- drop program 9 below"
 #endif
 
-// Not every generated vertex shader wants this. It applies to one that indexes a
-// pos_map baked into the shader, where the index IS the fan position. It must
-// NOT be applied to one that indexes arrays the C side fills -- trail reads
-// x_coords[vertex_id]/y_coords[vertex_id], so the order is already whatever
-// shaders.c wrote, and permuting it would scramble the geometry.
+// Only the program id -> shader mapping lives here, because program ids live in
+// shaders.c's enum and not in any header. Whether that shader needs the fan
+// remap is the shader's own property and is declared in slang.py's
+// METAL_SHADERS: `fan` for one that indexes a table baked into itself, `client`
+// for one the C side hands vertices in draw order (trail), where remapping would
+// scramble the geometry. This relays that answer rather than restating it.
 static bool
 program_uses_fan_vertex_order(int program) {
-    return program == 4 ||   // BORDERS, from border.slang
-           program == 9;     // TINT, from tint.slang
+    switch (program) {
+        case 4: return BORDER_VERTEX_ORDER_FAN;  // BORDERS, from border.slang
+        case 9: return TINT_VERTEX_ORDER_FAN;    // TINT, from tint.slang
+        default: return false;
+    }
 }
 
 static MTLVertexDescriptor*

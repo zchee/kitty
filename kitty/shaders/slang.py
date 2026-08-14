@@ -718,9 +718,33 @@ def write_glsl_header(metadata_map: dict[str, GLSLMetadata], dest: str = 'kitty/
 # equivalent. Generating it would delete the fork's colour management and import
 # no upstream code in exchange. tint has no such epilogue -- effects_shaders.metal
 # declares no function constants at all -- so both of its stages come from slang.
-METAL_SHADERS: MappingProxyType[str, frozenset[Stage]] = MappingProxyType({
-    'border': frozenset({Stage.vertex}),
-    'tint': frozenset({Stage.vertex, Stage.fragment}),
+class VertexOrder(StrEnum):
+    ''' Where a generated vertex shader's draw order comes from.
+
+    GL draws every quad as a 4-vertex GL_TRIANGLE_FAN and Metal has no fan, so a
+    generated vertex shader may or may not need the fan->strip index buffer, and
+    which one is not derivable from the MSL. `fan` means the shader indexes a
+    constant table baked into itself, so the index IS the fan position and has to
+    be remapped. `client` means the C side hands it the vertices already in draw
+    order (trail reads x_coords[vertex_id], filled by shaders.c), and remapping
+    would permute the index into that array and scramble the geometry.
+
+    Declared here rather than detected, because both obvious detectors are
+    proxies that fail silently in both directions: a shader can be fan-ordered
+    without a table, and a file-scope table need not be a fan-order map.
+    '''
+    fan = 'fan'
+    client = 'client'
+
+
+class MetalShader(NamedTuple):
+    stages: frozenset[Stage]
+    vertex_order: VertexOrder
+
+
+METAL_SHADERS: MappingProxyType[str, MetalShader] = MappingProxyType({
+    'border': MetalShader(frozenset({Stage.vertex}), VertexOrder.fan),
+    'tint': MetalShader(frozenset({Stage.vertex, Stage.fragment}), VertexOrder.fan),
 })
 
 # Slang names every entry point vertex_main/fragment_main, which would collide
@@ -742,9 +766,10 @@ def commands_to_compile_to_metal(sources: dict[str, SlangFile], build_dir: str, 
     if sys.platform != 'darwin':
         return
     for base_dest, base_build, slang_module, cmd, sfile in iter_entry_point_shaders(sources, build_dir, dest_dir):
-        stages = METAL_SHADERS.get(os.path.basename(base_dest))
-        if not stages:
+        shader = METAL_SHADERS.get(os.path.basename(base_dest))
+        if shader is None:
             continue
+        stages = shader.stages
         module_mtime = os.path.getmtime(slang_module)
         extra_cmd = ['-line-directive-mode', 'none', '-target', 'metal']
         for ep in sfile.entry_points:
@@ -873,12 +898,16 @@ def internalize_msl_helpers(msl: str, entry: str) -> str:
     `int(N)` but are written on one line — measured across every file slangc
     lowers, and there the two classes never overlap.
 
-    Both ways of getting it wrong are survivable, which is why the rule can be
-    this simple. A miss (a signature wrapped onto two lines) leaves a helper
-    exported and the collision comes back as a duplicate-symbol link error, which
-    is loud. A mis-fire (a constant whose brace lands on the next line) prepends
-    `static` to a `constant` declaration, which compiles and does nothing:
-    namespace-scope `constant` already has internal linkage.
+    Only a MISS is loud: a signature wrapped onto two lines leaves a helper
+    exported, and the collision comes back as a duplicate-symbol link error.
+    Every mis-fire measured so far is SILENT, so do not extend this rule assuming
+    the compiler will catch a mistake. `static` on a `constant` declaration
+    compiles and does nothing (namespace-scope `constant` already has internal
+    linkage); `static` on a struct is a warning only, and setup.py compiles MSL
+    without -Werror, so warnings never fail the build.
+
+    Note also that -Wno-unused-function became load-bearing here: internalizing a
+    helper turns "external, unused, no warning" into "static, unused, warns".
     '''
     lines = msl.splitlines()
     for i, line in enumerate(lines):
@@ -929,17 +958,19 @@ def fixup_metal_files(dest_dir: str, dest: str = 'kitty/metal-bindings.h') -> No
             # [[buffer(n)]] parameters, so the instance data has to go
             # somewhere slang did not already claim.
             lines.append(f'#define {b.prefix}_ATTR_BUFFER {max((i for i, _ in b.buffers.values()), default=-1) + 1}')
-    # metal.m has to know which programs draw from a generated vertex shader --
-    # those keep upstream's triangle-fan vertex order and need the fan->strip
-    # index buffer. It maps program ids, which live in shaders.c and not in any
-    # header, so it cannot derive the set. Publishing the set two ways lets it
-    # gate every way the set can change: a per-shader marker catches a removal
-    # or a swap (the #ifdef around that program's case stops matching), and the
-    # count catches an addition (nothing else would react to a new marker).
+    # metal.m decides per program whether to draw through the fan->strip index
+    # buffer, but the answer is a property of the shader, not of the program id
+    # (which lives in shaders.c's enum and not in any header). So the decision is
+    # declared once in METAL_SHADERS and published here, rather than restated as
+    # prose in an assert message: metal.m relays the value instead of holding an
+    # opinion. Between the three, every way the set can change fails the build --
+    # a removal or a swap takes the #define away, and the count catches an
+    # addition, which nothing else would react to.
     vertex_shaders = [b.prefix for b in all_bindings if b.prefix.endswith('_VERTEX')]
     lines.append('')
     for prefix in vertex_shaders:
-        lines.append(f'#define {prefix}_IS_SLANG 1')
+        order = METAL_SHADERS[prefix.rsplit('_', 1)[0].lower()].vertex_order
+        lines.append(f'#define {prefix}_ORDER_FAN {1 if order is VertexOrder.fan else 0}')
     lines.append(f'#define KITTY_SLANG_VERTEX_SHADERS {len(vertex_shaders)}')
     write_if_changed(dest, '\n'.join(lines) + '\n')
 # }}}
