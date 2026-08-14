@@ -704,6 +704,186 @@ def write_glsl_header(metadata_map: dict[str, GLSLMetadata], dest: str = 'kitty/
 # }}}
 
 
+# Metal {{{
+# The macOS backend renders from MSL, and this is where slang starts supplying
+# it. Migration is one (shader, stage) at a time because every pair listed here
+# is handed to Apple's Metal compiler during the build: adding a pair that slang
+# cannot lower (cell, on the combined-sampler defect of ADR-0026 §2) turns a
+# measurable gap into a broken build. A stage absent from this map keeps its
+# hand-written function in kitty/*.metal.
+#
+# border's fragment stays hand-written on purpose: upstream's fragment is a bare
+# pass-through of color_premul, while this fork's does the primaries conversion
+# and the linear->sRGB encode under function constants that have no slang
+# equivalent. Generating it would delete the fork's colour management and import
+# no upstream code in exchange.
+METAL_SHADERS: MappingProxyType[str, frozenset[Stage]] = MappingProxyType({
+    'border': frozenset({Stage.vertex}),
+})
+
+# Slang names every entry point vertex_main/fragment_main, which would collide
+# in the single default.metallib all shaders link into. Rename to the names
+# kitty/metal.m already looks up.
+def metal_function_name(shader: str, stage: Stage, specialization: str = '') -> str:
+    ans = f'{shader}_{stage.value}'
+    return f'{ans}_{specialization}' if specialization else ans
+
+
+def commands_to_compile_to_metal(sources: dict[str, SlangFile], build_dir: str, dest_dir: str) -> Iterator[Command]:
+    ''' Emit MSL source, not a .metallib, so the output merges into the single
+    kitty/default.metallib that setup.py links from every kitty/*.metal: that
+    build compiles each .metal to AIR and links the lot, and a standalone
+    .metallib per shader cannot join that link. Apple's compiler still runs --
+    it is the AIR step -- so an MSL error slangc would have waved through
+    (`-target metal` succeeds on MSL the Metal compiler rejects) still fails
+    the build. '''
+    if sys.platform != 'darwin':
+        return
+    for base_dest, base_build, slang_module, cmd, sfile in iter_entry_point_shaders(sources, build_dir, dest_dir):
+        stages = METAL_SHADERS.get(os.path.basename(base_dest))
+        if not stages:
+            continue
+        module_mtime = os.path.getmtime(slang_module)
+        extra_cmd = ['-line-directive-mode', 'none', '-target', 'metal']
+        for ep in sfile.entry_points:
+            if ep.stage not in stages:
+                continue
+            for sp in sfile.specializations:
+                v = {Stage.vertex: 'vert', Stage.fragment: 'frag'}[ep.stage]
+                c = list(cmd)
+                dest = f'{base_dest}{sp.filename_insert}.{v}.metal' if sp.name else f'{base_dest}.{v}.metal'
+                if sp.variables:
+                    c.insert(-1, f'{base_build}{sp.filename_insert}.slang-module')
+                c += extra_cmd + ['-entry', ep.name, '-stage', ep.stage.name, '-o', dest]
+                yield Command(safe_mtime(dest) < module_mtime,
+                              f'Linking |{os.path.basename(slang_module)}| to MSL {ep.stage.value} shader ...', c)
+
+
+MSL_SCALAR_SIZES = MappingProxyType({
+    'bool': 1, 'char': 1, 'uchar': 1, 'short': 2, 'ushort': 2, 'int': 4, 'uint': 4, 'float': 4, 'half': 2,
+})
+
+
+def msl_type_size_align(decl: str) -> tuple[int, int]:
+    ' Size and alignment of an MSL type as slang spells it in its output. '
+    decl = decl.strip()
+    if m := re.fullmatch(r'array<(.+),\s*int\((\d+)\)>', decl):
+        size, align = msl_type_size_align(m.group(1))
+        return size * int(m.group(2)), align
+    if m := re.fullmatch(r'([a-z]+)([234])?', decl):
+        if (base := MSL_SCALAR_SIZES.get(m.group(1))) is not None:
+            n = int(m.group(2) or 1)
+            # MSL rounds a 3-component vector up to 4 components for both.
+            width = base * (4 if n == 3 else n)
+            return width, width
+    raise ValueError(f'Cannot size the MSL type {decl!r} from a generated shader')
+
+
+class MSLMember(NamedTuple):
+    type_name: str
+    name: str
+    attribute: str  # the [[...]] qualifier, without the brackets
+
+
+def parse_msl_structs(msl: str) -> dict[str, list[MSLMember]]:
+    ans: dict[str, list[MSLMember]] = {}
+    for m in re.finditer(r'\bstruct\s+(\w+)\s*\{([^}]*)\}', msl):
+        members = []
+        for line in m.group(2).splitlines():
+            # `array<uint, int(9)> colors_0;` / `float4 rect_0 [[attribute(0)]];`
+            if d := re.fullmatch(r'(.+?)\s+(\w+)\s*(?:\[\[(.+?)\]\])?\s*;', line.strip()):
+                members.append(MSLMember(d.group(1), d.group(2), d.group(3) or ''))
+        ans[m.group(1)] = members
+    return ans
+
+
+def msl_struct_size(members: Iterable[MSLMember]) -> int:
+    size, max_align = 0, 1
+    for member in members:
+        msize, malign = msl_type_size_align(member.type_name)
+        max_align = max(max_align, malign)
+        size = ((size + malign - 1) // malign) * malign + msize
+    return ((size + max_align - 1) // max_align) * max_align
+
+
+def entry_point_declaration(msl: str, stage: Stage) -> tuple[str, str]:
+    ' The generated entry point\'s name and its parameter list. '
+    m = re.search(rf'\[\[{stage.value}\]\]\s+\S+\s+(\w+)\s*\(', msl)
+    if m is None:
+        raise ValueError(f'The generated MSL has no [[{stage.value}]] entry point')
+    depth = 0
+    for i in range(m.end() - 1, len(msl)):
+        if msl[i] == '(':
+            depth += 1
+        elif msl[i] == ')':
+            depth -= 1
+            if not depth:
+                return m.group(1), msl[m.end():i]
+    raise ValueError('The generated MSL entry point has an unterminated parameter list')
+
+
+class MetalBindings(NamedTuple):
+    prefix: str
+    buffers: dict[str, tuple[int, int]]  # name -> (index, byte size of the struct)
+    attributes: dict[str, int]           # name -> attribute index
+
+
+def strip_slang_suffix(name: str) -> str:
+    ' Slang uniquifies every identifier with a _N suffix; the C side wants the source spelling. '
+    return re.sub(r'_\d+$', '', name)
+
+
+def parse_metal_bindings(msl: str, stage: Stage, prefix: str) -> MetalBindings:
+    structs = parse_msl_structs(msl)
+    _, signature = entry_point_declaration(msl, stage)
+    buffers = {}
+    for m in re.finditer(r'(\w+)\s+(?:constant|device)\s*\*\s*(\w+)\s*\[\[buffer\((\d+)\)\]\]', signature):
+        buffers[strip_slang_suffix(m.group(2))] = (int(m.group(3)), msl_struct_size(structs[m.group(1)]))
+    attributes = {}
+    if m := re.search(r'(\w+)\s+\w+\s*\[\[stage_in\]\]', signature):
+        for member in structs.get(m.group(1), ()):
+            if a := re.fullmatch(r'attribute\((\d+)\)', member.attribute):
+                attributes[strip_slang_suffix(member.name)] = int(a.group(1))
+    return MetalBindings(prefix, buffers, attributes)
+
+
+def fixup_metal_files(dest_dir: str, dest: str = 'kitty/metal-bindings.h') -> None:
+    ''' Rename the generated entry points to the names metal.m binds by, and
+    publish the bindings slangc chose. The indices are an output of the
+    compiler, not a contract, so pinning them in a generated header turns a
+    slangc that re-assigns a buffer into a changed #define (and a failing
+    _Static_assert when a struct also resized) instead of a shader quietly
+    reading the wrong bytes. '''
+    if sys.platform != 'darwin':
+        return
+    all_bindings: list[MetalBindings] = []
+    for path in sorted(glob.glob(os.path.join(dest_dir, '*.metal'))):
+        parts = os.path.basename(path).split('.')
+        shader, stage = parts[0], {'vert': Stage.vertex, 'frag': Stage.fragment}[parts[-2]]
+        specialization = '.'.join(parts[1:-2])
+        with open(path) as f:
+            msl = f.read()
+        fn = metal_function_name(shader, stage, specialization)
+        msl = re.sub(rf'\b{entry_point_declaration(msl, stage)[0]}\b', fn, msl)
+        write_if_changed(path, msl)
+        all_bindings.append(parse_metal_bindings(msl, stage, fn.upper()))
+    lines = ['// generated by slang.py DO NOT EDIT', '#pragma once']
+    for b in all_bindings:
+        lines.append('')
+        for name, (index, size) in sorted(b.buffers.items()):
+            lines.append(f'#define {b.prefix}_BUF_{name} {index}')
+            lines.append(f'#define {b.prefix}_BUFSZ_{name} {size}u')
+        for name, index in sorted(b.attributes.items()):
+            lines.append(f'#define {b.prefix}_ATTR_{name} {index}')
+        if b.attributes:
+            # Vertex attributes share the buffer argument table with the
+            # [[buffer(n)]] parameters, so the instance data has to go
+            # somewhere slang did not already claim.
+            lines.append(f'#define {b.prefix}_ATTR_BUFFER {max(i for i, _ in b.buffers.values()) + 1}')
+    write_if_changed(dest, '\n'.join(lines) + '\n')
+# }}}
+
+
 ParallelRun = Callable[[Iterable[tuple[bool, str, list[str]]]], None]
 
 
@@ -771,14 +951,17 @@ def compile_builtin_shaders(build_dir: str, dest_dir: str, parallel_run: Paralle
     # Now glsl files
     built_glsl_files: list[str] = []
     glsl_commands = commands_to_compile_to_glsl(source_tree, build_dir, dest_dir, built_glsl_files)
+    # Now the MSL the Metal backend renders from
+    metal_commands = commands_to_compile_to_metal(source_tree, build_dir, dest_dir)
     # Now run all commands
-    parallel_run(chain(spirv_commands, glsl_commands))
+    parallel_run(chain(spirv_commands, glsl_commands, metal_commands))
     metadata_map = {}
     fixup_opengl_files(glob.glob(os.path.join(dest_dir, '*.glsl')), metadata_map=metadata_map)
     if shutil.which('glslangValidator'):
         from kitty.shaders.validate_shaders import validation_command_for_file
         parallel_run((True, f'Validating |{os.path.basename(x)}| ...', validation_command_for_file(x)) for x in built_glsl_files)
     write_glsl_header(metadata_map)
+    fixup_metal_files(dest_dir)
 
 
 def main() -> None:

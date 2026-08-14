@@ -30,6 +30,12 @@
 // (<CLASS>_U_<name>), consumed by the fill_*_uniforms() functions below in
 // place of the old find_uniform_slot() string-literal lookups.
 #include "uniforms_generated.h"
+// W3b: the buffer/attribute indices and block sizes slangc chose for the
+// shaders generated from kitty/shaders/*.slang. Written by slang.py and kept in
+// the tree for the same reason glsl-uniforms.h is: the C extension is compiled
+// before the shader build can run, so the header has to already exist. The
+// asserts below catch a slangc that re-assigns one.
+#include "metal-bindings.h"
 #include "state.h"
 #include "png-reader.h"
 
@@ -475,17 +481,69 @@ _Static_assert(offsetof(GPUCell, bg) == offsetof(GPUCell, fg) + 4 &&
 _Static_assert(offsetof(GPUCell, attrs) == offsetof(GPUCell, sprite_idx) + 4,
     "MTLVertexFormatUInt2 at attribute 1 assumes sprite_idx and attrs are contiguous");
 
-// BorderRect (kitty/state.h): border_shaders.metal walks the instance array by
-// byte stride and reads the colour by word index, since the struct is not
-// 16-aligned. Those two constants live in metal_uniforms.h so the shader and
-// this file share one definition; here is where they meet the real struct.
-_Static_assert(BORDER_RECT_C_STRIDE == sizeof(BorderRect),
-    "border_vertex instance stride drifted from sizeof(BorderRect)");
-_Static_assert(BORDER_RECT_COLOR_WORD * 4u == offsetof(BorderRect, color),
-    "border_vertex reads BorderRect.color at the wrong word index");
+// BorderRect (kitty/state.h) is the border instance array. W3b: border_vertex
+// is generated from border.slang, so it takes rect/rect_color as real vertex
+// attributes rather than walking the buffer by hand; the descriptor below reads
+// the offsets straight off the C struct, which makes an inserted field a
+// changed offset rather than a silently recoloured border.
 _Static_assert(offsetof(BorderRect, left) == 0 && offsetof(BorderRect, top) == 4 &&
                offsetof(BorderRect, right) == 8 && offsetof(BorderRect, bottom) == 12,
-    "border_vertex reads the rect floats as rf[0..3] from offset 0");
+    "MTLVertexFormatFloat4 at attribute 0 assumes left, top, right, bottom are contiguous");
+
+// The uniform pushes below hand slang-declared structs their exact size; these
+// pin that against what slangc actually emitted for the shader this build
+// linked (kitty/metal-bindings.h).
+_Static_assert(sizeof(((MetalBorderUniforms*)0)->colors) == BORDER_VERTEX_BUFSZ_clrs,
+    "border colors[] no longer fills border.slang's Colors block");
+_Static_assert(sizeof(((MetalBorderUniforms*)0)->background_opacity) == BORDER_VERTEX_BUFSZ_globalParams,
+    "border.slang's global uniform block is no longer just background_opacity");
+
+// Every quad here is a 4-vertex GL_TRIANGLE_FAN in GL, and Metal has no fan
+// primitive, so the hand-written shaders bake the permutation into their
+// vertex-id lookup table (cell_shaders.metal: strip[0]=fan[2], strip[1]=fan[1],
+// strip[2]=fan[3], strip[3]=fan[0]). A slang-generated vertex shader keeps
+// upstream's fan order instead -- it is upstream's source -- so for those the
+// same permutation is applied as an index buffer, which is where a fan->strip
+// remap belongs anyway. Drawing a strip through these indices makes
+// [[vertex_id]] the fan index the shader expects.
+static const uint16_t fan_to_strip_indices[4] = {2, 1, 3, 0};
+static id<MTLBuffer> fan_to_strip_index_buffer = nil;
+
+static id<MTLBuffer>
+ensure_fan_to_strip_index_buffer(void) {
+    if (!fan_to_strip_index_buffer && mtl_device) {
+        fan_to_strip_index_buffer = [mtl_device newBufferWithBytes:fan_to_strip_indices
+                                                            length:sizeof(fan_to_strip_indices)
+                                                           options:MTLResourceStorageModeShared];
+    }
+    return fan_to_strip_index_buffer;
+}
+
+// Which programs render from a slang-generated vertex shader. Kept in step with
+// METAL_SHADERS in kitty/shaders/slang.py; the goldens catch a stale entry,
+// since a fan-ordered shader drawn as a raw strip renders bowties.
+static bool
+program_uses_fan_vertex_order(int program) {
+    return program == 4;  // BORDERS
+}
+
+static MTLVertexDescriptor*
+border_vertex_descriptor(void) {
+    static MTLVertexDescriptor *border_vd = nil;
+    if (!border_vd) {
+        border_vd = [[MTLVertexDescriptor alloc] init];
+        border_vd.attributes[BORDER_VERTEX_ATTR_rect].format = MTLVertexFormatFloat4;
+        border_vd.attributes[BORDER_VERTEX_ATTR_rect].offset = offsetof(BorderRect, left);
+        border_vd.attributes[BORDER_VERTEX_ATTR_rect].bufferIndex = BORDER_VERTEX_ATTR_BUFFER;
+        border_vd.attributes[BORDER_VERTEX_ATTR_rect_color].format = MTLVertexFormatUInt;
+        border_vd.attributes[BORDER_VERTEX_ATTR_rect_color].offset = offsetof(BorderRect, color);
+        border_vd.attributes[BORDER_VERTEX_ATTR_rect_color].bufferIndex = BORDER_VERTEX_ATTR_BUFFER;
+        border_vd.layouts[BORDER_VERTEX_ATTR_BUFFER].stride = sizeof(BorderRect);
+        border_vd.layouts[BORDER_VERTEX_ATTR_BUFFER].stepFunction = MTLVertexStepFunctionPerInstance;
+        border_vd.layouts[BORDER_VERTEX_ATTR_BUFFER].stepRate = 1;
+    }
+    return border_vd;
+}
 
 static MTLVertexDescriptor*
 cell_vertex_descriptor(void) {
@@ -630,7 +688,7 @@ build_pso(int program, bool blend, MTLPixelFormat fmt, bool layered, MTLPixelFor
             MTLFunctionConstantValues *fc = [[MTLFunctionConstantValues alloc] init];
             [fc setConstantValue:&target_color_space type:MTLDataTypeInt atIndex:0]; // TARGET_COLOR_SPACE
             [fc setConstantValue:&target_primaries_is_p3 type:MTLDataTypeBool atIndex:1]; // TARGET_PRIMARIES_IS_P3
-            return create_pipeline_state(@"border_vertex", @"border_fragment", blend, nil, fmt, layered, att1_fmt, fc);
+            return create_pipeline_state(@"border_vertex", @"border_fragment", blend, border_vertex_descriptor(), fmt, layered, att1_fmt, fc);
         }
         case 5: case 6: case 7: {
             MTLFunctionConstantValues *fc = [[MTLFunctionConstantValues alloc] init];
@@ -776,7 +834,7 @@ fill_border_uniforms(int program, MetalBorderUniforms *u) {
         u->colors[i] = uniform_stores[program].values[base + i].u[0];
     u->background_opacity = slot_f(program, BORDER_U_background_opacity, 0);
     // W28.4b M2: the gamma LUT is no longer copied into this push — draw_quad
-    // binds the resident LUT buffer (ensure_gamma_lut_buffer) at index 3.
+    // binds the resident LUT buffer (ensure_gamma_lut_buffer) separately.
 }
 
 static void
@@ -1797,25 +1855,30 @@ draw_quad(bool blend, unsigned instance_count) {
             textures[bound_tex_2d[4]].last_drawn_fidx = metal_frame_index;
         }
     } else if (current_program == 4) {
-        // Borders — bind rect buffer from VAO, uniforms as buffer
+        // Borders — bind the BorderRect instance array from the VAO as vertex
+        // attribute data (border_vertex_descriptor), then the three constant
+        // blocks border.slang declares, each at the index slangc gave it.
         if (current_bound_vao >= 0) {
             MetalVAO *vao = &vaos[current_bound_vao];
             if (vao->num_buffers > 0) {
                 ssize_t buf_idx = vao->buffers[0];
                 if (buffers[buf_idx].mtl_buffer) {
-                    [mtl_current_encoder setVertexBuffer:buffers[buf_idx].mtl_buffer offset:0 atIndex:0];
+                    [mtl_current_encoder setVertexBuffer:buffers[buf_idx].mtl_buffer offset:0 atIndex:BORDER_VERTEX_ATTR_BUFFER];
                 }
             }
         }
         // C5: MetalBorderUniforms (colors[9] array at ARRAY_UNIFORM_BASE +
-        // background_opacity); see fill_border_uniforms. W28.4b M2: the gamma
-        // LUT rides the resident buffer at index 3 (same binding as the cell
-        // programs) instead of a 1 KB per-frame setVertexBytes copy.
+        // background_opacity); see fill_border_uniforms. The slang shader splits
+        // the two across separate blocks, so they push separately -- still 40
+        // bytes total. W28.4b M2: the gamma LUT rides the resident buffer
+        // instead of a 1 KB per-frame setVertexBytes copy.
         MetalBorderUniforms border_u;
         fill_border_uniforms(current_program, &border_u);
-        [mtl_current_encoder setVertexBytes:&border_u length:sizeof(border_u) atIndex:1];
+        [mtl_current_encoder setVertexBytes:border_u.colors length:sizeof(border_u.colors) atIndex:BORDER_VERTEX_BUF_clrs];
+        [mtl_current_encoder setVertexBytes:&border_u.background_opacity length:sizeof(border_u.background_opacity)
+                                    atIndex:BORDER_VERTEX_BUF_globalParams];
         id<MTLBuffer> border_glut = ensure_gamma_lut_buffer();
-        if (border_glut) [mtl_current_encoder setVertexBuffer:border_glut offset:0 atIndex:3];
+        if (border_glut) [mtl_current_encoder setVertexBuffer:border_glut offset:0 atIndex:BORDER_VERTEX_BUF_glt];
     } else if (current_program >= 5 && current_program <= 7) {
         // C5: MetalGraphicsUniforms — per-instance src_rects/dest_rects[16] arrays
         // (ARRAY_UNIFORM_BASE, G2) then the extra_alpha/amask scalar tail; layout
@@ -1875,7 +1938,17 @@ draw_quad(bool blend, unsigned instance_count) {
         [mtl_current_encoder setFragmentBytes:&rr_u length:sizeof(rr_u) atIndex:0];
     }
 
-    if (instance_count > 0) {
+    // A generated vertex shader keeps upstream's fan order, so it is drawn
+    // through the permutation index buffer. There is deliberately no fallback
+    // to a raw strip here: that path renders bowties, which is worse than
+    // failing loudly, and the buffer can only be nil when there is no device
+    // and so no encoder either.
+    if (program_uses_fan_vertex_order(current_program)) {
+        [mtl_current_encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangleStrip indexCount:4
+                                         indexType:MTLIndexTypeUInt16
+                                       indexBuffer:ensure_fan_to_strip_index_buffer() indexBufferOffset:0
+                                     instanceCount:instance_count > 0 ? instance_count : 1];
+    } else if (instance_count > 0) {
         [mtl_current_encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:instance_count];
     } else {
         [mtl_current_encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];

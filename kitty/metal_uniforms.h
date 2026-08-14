@@ -15,16 +15,6 @@
 // struct GPUCellRenderData in kitty/shaders.c — keep field-for-field parity
 // with it and with the CellRenderData UBO block in kitty/cell_vertex.glsl.
 
-// The border instance array is the C-side BorderRect (kitty/state.h) read
-// straight out of the vertex buffer. It is 56 bytes at natural C alignment,
-// which is neither 16-aligned nor expressible as an MSL struct, so the shader
-// addresses instances by explicit byte stride and reads 4-byte scalars. That
-// makes these two numbers a cross-language contract over a struct upstream
-// owns; metal.m pins them against offsetof/sizeof so a field inserted ahead of
-// `color` fails the build instead of silently recolouring every border.
-#define BORDER_RECT_C_STRIDE 56u
-#define BORDER_RECT_COLOR_WORD 8u
-
 #ifdef __METAL_VERSION__
 #include <metal_stdlib>
 typedef metal::uint uint32;
@@ -71,16 +61,19 @@ typedef struct MetalCellDrawUniforms {
 // out of the metal.m draw dispatch (were anonymous inline structs) so the C
 // filler writes MSL-layout memory directly and the _Static_asserts below pin the
 // padding-sensitive offsets against the per-program .metal declarations. Each
-// mirrors a struct in its shader: MetalBorderUniforms<->BorderUniforms
-// (border_*.metal), MetalGraphicsUniforms<->GraphicsUniforms
+// mirrors a struct in its shader: MetalGraphicsUniforms<->GraphicsUniforms
 // (graphics_shaders.metal), etc. MSL aligns float3 to 16 bytes, hence the pads.
 // The byte-identical golden set is the cross-check that these match the shaders.
+// W3b: MetalBorderUniforms is the exception -- border's vertex is generated from
+// border.slang, which splits these two fields across separate constant blocks,
+// so metal.m pushes them separately and asserts each against the block size in
+// the generated kitty/metal-bindings.h.
 typedef struct MetalBorderUniforms {
     uint32 colors[9];         // colors[9] multi-element array (packs, no padding)
     float background_opacity;
     // W28.4b M2: gamma_lut[256] removed — borders read the resident LUT
-    // MTLBuffer at vertex buffer index 3 (the same binding the cell programs
-    // use), so the per-frame setVertexBytes push shrank 1064 -> 40 bytes.
+    // MTLBuffer (BORDER_VERTEX_BUF_glt) instead, so the per-frame
+    // setVertexBytes push shrank 1064 -> 40 bytes.
 } MetalBorderUniforms;
 
 typedef struct MetalGraphicsUniforms {

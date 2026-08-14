@@ -1560,16 +1560,27 @@ def build_shaders(args: Options, kitty_exe: str, for_freeze: bool) -> None:
         if os.environ.get('CI') == 'true' and cp.returncode < 0 and shutil.which('coredumpctl'):
             subprocess.run(['sh', '-c', 'echo bt | coredumpctl debug'])
         raise SystemExit(f'Generating shaders failed with exit code: {cp.returncode}')
+    # This runs after build()'s metallib link -- it has to, because generating
+    # the MSL needs the kitty binary that build() produces -- so relink now that
+    # the generated shaders exist. Without this the Metal backend would render
+    # from whatever the previous build left behind.
+    compile_metal_shaders()
     if for_freeze:
         libdir = os.path.join(os.path.dirname(kitty_exe), '..', 'Resources' if is_macos else 'lib', 'kitty')
         shutil.copytree('shaders', os.path.join(libdir, 'shaders'), dirs_exist_ok=True)
 
 
 def compile_metal_shaders() -> Optional[str]:
-    '''Compile kitty/*.metal into the metallib used by the Metal rendering backend.'''
+    '''Compile the MSL shaders into the metallib used by the Metal rendering backend.
+
+    Two sources feed one library: the hand-written kitty/*.metal, and the MSL
+    slangc generates from kitty/shaders/*.slang (build_shaders -> slang.py's
+    METAL_SHADERS map). They merge here rather than as separate metallibs
+    because metal.m resolves every function out of a single default library.
+    '''
     if not is_macos:
         return None
-    metal_files = sorted(glob.glob('kitty/*.metal'))
+    metal_files = sorted(glob.glob('kitty/*.metal')) + sorted(glob.glob(os.path.join('shaders', '*.metal')))
     if not metal_files:
         return None
     metallib_path = 'kitty/default.metallib'
