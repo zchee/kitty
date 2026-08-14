@@ -66,8 +66,13 @@ float3 as_color_vector(uint c, int shift) {
     return float3(to_color(c >> shift), to_color(c >> (shift - 8)), to_color(c >> (shift - 16)));
 }
 
+// Kept at file scope: slang's Metal emitter pointerizes the parameter list of
+// a vertex entry that mixes a uniform parameter with vertex attributes, then
+// stamps [[stage_in]] on the pointers, which the Metal compiler rejects.
+uniform float background_opacity;
+
 [shader("vertex")]
-VertexOutput vertex_main(float4 rect, uint rect_color, uniform float background_opacity, uint vertex_id : SV_VertexID)
+VertexOutput vertex_main(float4 rect, uint rect_color, uint vertex_id : SV_VertexID)
 {
     VertexOutput output;
 

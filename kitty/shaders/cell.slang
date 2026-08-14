@@ -53,6 +53,11 @@ ConstantBuffer<GammaLUT> glt;
 uniform Sampler2D<uint4> sprite_decorations_map;
 //
 
+// Kept at file scope: slang's Metal emitter pointerizes the parameter list of
+// a vertex entry that mixes a uniform parameter with vertex attributes, then
+// stamps [[stage_in]] on the pointers, which the Metal compiler rejects.
+uniform uint draw_bg_bitfield;
+
 static const int fg_index_map[3] = {0, 1, 0};
 static const uint2 cell_pos_map[4] = {
     uint2(1u, 0u),  // right, top
@@ -376,7 +381,6 @@ VertexOutput vertex_main(
     [[vk::location(2)]] uint  is_selected,
     uint vertex_id : SV_VertexID,
     uint instance_id : SV_InstanceID,
-    uniform uint draw_bg_bitfield,
 ) {
     VertexOutput vo;
 
