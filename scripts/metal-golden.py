@@ -214,13 +214,18 @@ def cmd_capture(args: argparse.Namespace) -> int:
         "kitty_version": get_kitty_version(),
         # Provenance: which source state produced the binary under capture. A
         # baseline whose lineage rests on a file timestamp cannot prove it
-        # predates a migration; the SHA (+ dirty marker) can.
+        # predates a migration; the SHA (+ the modified-file list) can.
         "git_head": subprocess.run(
             ["git", "rev-parse", "HEAD"], capture_output=True, text=True
         ).stdout.strip() or "unknown",
-        "git_dirty": bool(subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=no"], capture_output=True, text=True
-        ).stdout.strip()),
+        # The boolean alone cannot discriminate: this repo's build regenerates
+        # the tracked kitty/glsl-uniforms.h, so every capture is "dirty". The
+        # file list is what lets a reader tell that apart from real edits.
+        "git_dirty_files": sorted(
+            line[3:] for line in subprocess.run(
+                ["git", "status", "--porcelain", "--untracked-files=no"], capture_output=True, text=True
+            ).stdout.splitlines() if line.strip()
+        ),
         "machine": get_machine_info(),
         "output_dir": str(args.output_dir),
         "captures": {},
