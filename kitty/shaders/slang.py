@@ -871,10 +871,16 @@ def parse_metal_bindings(msl: str, stage: Stage, prefix: str) -> MetalBindings:
     structs = parse_msl_structs(msl)
     _, signature = entry_point_declaration(msl, stage)
     buffers: dict[str, Any] = {}
-    for m in re.finditer(r'(\w+)\s+(?:constant|device)\s*\*\s*(\w+)\s*\[\[buffer\((\d+)\)\]\]', signature):
+    matches = list(re.finditer(r'(\w+)\s+(?:constant|device)\s*\*\s*(\w+)\s*\[\[buffer\((\d+)\)\]\]', signature))
+    # Counted against the raw occurrences, not tested for emptiness: an
+    # all-or-nothing guard misses the partial case where slangc changes its
+    # spelling for one parameter kind and the regex silently skips just that one.
+    if len(matches) != signature.count('[[buffer('):
+        raise ValueError(
+            f'{prefix}: the entry signature declares {signature.count("[[buffer(")} buffer parameters '
+            f'but only {len(matches)} were recognised -- slangc changed its spelling')
+    for m in matches:
         add_binding(buffers, strip_slang_suffix(m.group(2)), (int(m.group(3)), msl_struct_size(structs[m.group(1)])), prefix)
-    if not buffers and '[[buffer(' in signature:
-        raise ValueError(f'{prefix}: slangc spells its buffer parameters in a form this parser does not recognise')
     attributes: dict[str, Any] = {}
     if m := re.search(r'(\w+)\s+\w+\s*\[\[stage_in\]\]', signature):
         for member in structs.get(m.group(1), ()):
