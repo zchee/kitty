@@ -524,14 +524,18 @@ ensure_fan_to_strip_index_buffer(void) {
 // slang.py's METAL_SHADERS -- and the goldens would not catch the omission for
 // every shader (the config matrix does not exercise blit, screenshot, tint or
 // rounded_rect, so migrating one of those and forgetting it here would render
-// bowties against a green gate). The generated count makes growing the set fail
-// the build here instead.
+// bowties against a green gate). So the generated header gates both directions:
+// the per-shader marker below catches a removal or a swap, and the count catches
+// an addition, which no marker of its own would make anything here react to.
 _Static_assert(KITTY_SLANG_VERTEX_SHADERS == 1,
     "a vertex shader was added to METAL_SHADERS in slang.py -- add its program id to program_uses_fan_vertex_order()");
+#ifndef BORDER_VERTEX_IS_SLANG
+#error "border's vertex is no longer generated -- drop program 4 from program_uses_fan_vertex_order()"
+#endif
 
 static bool
 program_uses_fan_vertex_order(int program) {
-    return program == 4;  // BORDERS
+    return program == 4;  // BORDERS, from border.slang
 }
 
 static MTLVertexDescriptor*

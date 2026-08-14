@@ -892,10 +892,15 @@ def fixup_metal_files(dest_dir: str, dest: str = 'kitty/metal-bindings.h') -> No
     # metal.m has to know which programs draw from a generated vertex shader --
     # those keep upstream's triangle-fan vertex order and need the fan->strip
     # index buffer. It maps program ids, which live in shaders.c and not in any
-    # header, so it cannot derive the set; this count lets it assert that the
-    # set has not grown behind its back.
+    # header, so it cannot derive the set. Publishing the set two ways lets it
+    # gate every way the set can change: a per-shader marker catches a removal
+    # or a swap (the #ifdef around that program's case stops matching), and the
+    # count catches an addition (nothing else would react to a new marker).
+    vertex_shaders = [b.prefix for b in all_bindings if b.prefix.endswith('_VERTEX')]
     lines.append('')
-    lines.append(f'#define KITTY_SLANG_VERTEX_SHADERS {sum(1 for b in all_bindings if b.prefix.endswith("_VERTEX"))}')
+    for prefix in vertex_shaders:
+        lines.append(f'#define {prefix}_IS_SLANG 1')
+    lines.append(f'#define KITTY_SLANG_VERTEX_SHADERS {len(vertex_shaders)}')
     write_if_changed(dest, '\n'.join(lines) + '\n')
 # }}}
 
