@@ -503,14 +503,25 @@ _Static_assert(sizeof(((MetalTintUniforms*)0)->tint_color) == TINT_FRAGMENT_BUFS
     "tint.slang's fragment no longer reads exactly tint_color");
 
 // Every quad here is a 4-vertex GL_TRIANGLE_FAN in GL, and Metal has no fan
-// primitive, so the hand-written shaders bake the permutation into their
-// vertex-id lookup table (cell_shaders.metal: strip[0]=fan[2], strip[1]=fan[1],
-// strip[2]=fan[3], strip[3]=fan[0]). A slang-generated vertex shader keeps
-// upstream's fan order instead -- it is upstream's source -- so for those the
-// same permutation is applied as an index buffer, which is where a fan->strip
-// remap belongs anyway. Drawing a strip through these indices makes
-// [[vertex_id]] the fan index the shader expects.
-static const uint16_t fan_to_strip_indices[4] = {2, 1, 3, 0};
+// primitive, so each hand-written shader bakes a permutation into its vertex-id
+// lookup table. A slang-generated vertex shader keeps upstream's fan order
+// instead -- it is upstream's source -- so for those the permutation moves into
+// an index buffer, which is where a fan->strip remap belongs anyway. Drawing a
+// strip through these indices makes [[vertex_id]] the fan index the shader
+// expects.
+//
+// {1,2,0,3} specifically, because it is the permutation that preserves the
+// fan's own triangulation: a fan (v0,v1,v2,v3) is {v0,v1,v2} + {v0,v2,v3},
+// split on the v0-v2 diagonal, and a strip (s0,s1,s2,s3) splits on s1-s2, so
+// only a permutation putting v0 and v2 in the middle reproduces it. The
+// hand-written shaders are NOT consistent about this -- cell and border use
+// {2,1,3,0}, which splits on the other diagonal, while tint used {1,2,0,3} --
+// and they get away with it because a rectangle is convex, so both
+// triangulations rasterize the same pixels. That stops being true for a quad
+// that is not a parallelogram, or as soon as a corner varying is not affine in
+// position, which is why the generated path uses the faithful one rather than
+// the one border happened to have.
+static const uint16_t fan_to_strip_indices[4] = {1, 2, 0, 3};
 static id<MTLBuffer> fan_to_strip_index_buffer = nil;
 
 static id<MTLBuffer>
@@ -533,7 +544,9 @@ ensure_fan_to_strip_index_buffer(void) {
 // the per-shader marker below catches a removal or a swap, and the count catches
 // an addition, which no marker of its own would make anything here react to.
 _Static_assert(KITTY_SLANG_VERTEX_SHADERS == 2,
-    "a vertex shader was added to METAL_SHADERS in slang.py -- add its program id to program_uses_fan_vertex_order()");
+    "a vertex shader was added to METAL_SHADERS in slang.py -- decide whether its program id belongs in "
+    "program_uses_fan_vertex_order(): yes if the shader indexes a pos_map baked into itself, NO if it "
+    "indexes arrays the C side fills (trail), whose order is already the strip order");
 #ifndef BORDER_VERTEX_IS_SLANG
 #error "border's vertex is no longer generated -- drop program 4 from program_uses_fan_vertex_order()"
 #endif
@@ -541,12 +554,13 @@ _Static_assert(KITTY_SLANG_VERTEX_SHADERS == 2,
 #error "tint's vertex is no longer generated -- drop program 9 from program_uses_fan_vertex_order()"
 #endif
 
+// Not every generated vertex shader wants this. It applies to one that indexes a
+// pos_map baked into the shader, where the index IS the fan position. It must
+// NOT be applied to one that indexes arrays the C side fills -- trail reads
+// x_coords[vertex_id]/y_coords[vertex_id], so the order is already whatever
+// shaders.c wrote, and permuting it would scramble the geometry.
 static bool
 program_uses_fan_vertex_order(int program) {
-    // The permutation is the same for every one of these even though their fan
-    // orders differ (border's starts at right-top, tint's at left-top): for any
-    // four vertices in cyclic order around a quad, {2,1,3,0} yields a strip
-    // whose two triangles are the two the fan describes.
     return program == 4 ||   // BORDERS, from border.slang
            program == 9;     // TINT, from tint.slang
 }

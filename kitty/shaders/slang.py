@@ -868,10 +868,17 @@ def internalize_msl_helpers(msl: str, entry: str) -> str:
     together dies with `LLVM ERROR: multiple symbols`. MSL is C++, so `static`
     is the fix and no call site changes.
 
-    A definition is a line at column 0 that contains `(` and whose next line is
-    exactly `{`. That excludes slang's file-scope array constants, which contain
-    `(` from `int(N)` but are written on one line. Getting it wrong makes the
-    Metal compiler reject the file, which is the failure this should have.
+    A definition is a line at column 0 that contains `(` whose next line is a bare
+    `{`. That excludes slang's file-scope array constants, which contain `(` from
+    `int(N)` but are written on one line — measured across every file slangc
+    lowers, and there the two classes never overlap.
+
+    Both ways of getting it wrong are survivable, which is why the rule can be
+    this simple. A miss (a signature wrapped onto two lines) leaves a helper
+    exported and the collision comes back as a duplicate-symbol link error, which
+    is loud. A mis-fire (a constant whose brace lands on the next line) prepends
+    `static` to a `constant` declaration, which compiles and does nothing:
+    namespace-scope `constant` already has internal linkage.
     '''
     lines = msl.splitlines()
     for i, line in enumerate(lines):
