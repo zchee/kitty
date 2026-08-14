@@ -3552,7 +3552,15 @@ void metal_gl_bind_texture(GLenum target, GLuint id) {
 // real MTLSamplerState built from this record; hand-written shaders keep their
 // constexpr samplers and are unaffected.
 void metal_gl_tex_parameteri(GLenum target, GLenum pname, GLint param) {
-    GLuint id = (target == GL_TEXTURE_2D) ? currently_bound_texture_2d : currently_bound_texture_2d_array;
+    GLuint id;
+    switch (target) {
+        // Any other target must not fall through to a bound slot: it would
+        // silently record onto an unrelated texture, and generated shaders
+        // now consume these records.
+        case GL_TEXTURE_2D: id = currently_bound_texture_2d; break;
+        case GL_TEXTURE_2D_ARRAY: id = currently_bound_texture_2d_array; break;
+        default: return;
+    }
     if (!id || id >= MAX_TEXTURES) return;
     MetalTexture *t = &textures[id];
     switch (pname) {
