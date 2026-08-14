@@ -833,17 +833,26 @@ def strip_slang_suffix(name: str) -> str:
     return re.sub(r'_\d+$', '', name)
 
 
+def add_binding(bindings: dict[str, Any], name: str, value: Any, prefix: str) -> None:
+    ' Stripping slang\'s _N suffix can collide; a silently dropped binding is the one thing this header exists to prevent. '
+    if name in bindings:
+        raise ValueError(f'Two {prefix} bindings collapse onto the name {name!r} once slang\'s numeric suffix is stripped')
+    bindings[name] = value
+
+
 def parse_metal_bindings(msl: str, stage: Stage, prefix: str) -> MetalBindings:
     structs = parse_msl_structs(msl)
     _, signature = entry_point_declaration(msl, stage)
-    buffers = {}
+    buffers: dict[str, Any] = {}
     for m in re.finditer(r'(\w+)\s+(?:constant|device)\s*\*\s*(\w+)\s*\[\[buffer\((\d+)\)\]\]', signature):
-        buffers[strip_slang_suffix(m.group(2))] = (int(m.group(3)), msl_struct_size(structs[m.group(1)]))
-    attributes = {}
+        add_binding(buffers, strip_slang_suffix(m.group(2)), (int(m.group(3)), msl_struct_size(structs[m.group(1)])), prefix)
+    if not buffers and '[[buffer(' in signature:
+        raise ValueError(f'{prefix}: slangc spells its buffer parameters in a form this parser does not recognise')
+    attributes: dict[str, Any] = {}
     if m := re.search(r'(\w+)\s+\w+\s*\[\[stage_in\]\]', signature):
         for member in structs.get(m.group(1), ()):
             if a := re.fullmatch(r'attribute\((\d+)\)', member.attribute):
-                attributes[strip_slang_suffix(member.name)] = int(a.group(1))
+                add_binding(attributes, strip_slang_suffix(member.name), int(a.group(1)), prefix)
     return MetalBindings(prefix, buffers, attributes)
 
 
@@ -879,7 +888,14 @@ def fixup_metal_files(dest_dir: str, dest: str = 'kitty/metal-bindings.h') -> No
             # Vertex attributes share the buffer argument table with the
             # [[buffer(n)]] parameters, so the instance data has to go
             # somewhere slang did not already claim.
-            lines.append(f'#define {b.prefix}_ATTR_BUFFER {max(i for i, _ in b.buffers.values()) + 1}')
+            lines.append(f'#define {b.prefix}_ATTR_BUFFER {max((i for i, _ in b.buffers.values()), default=-1) + 1}')
+    # metal.m has to know which programs draw from a generated vertex shader --
+    # those keep upstream's triangle-fan vertex order and need the fan->strip
+    # index buffer. It maps program ids, which live in shaders.c and not in any
+    # header, so it cannot derive the set; this count lets it assert that the
+    # set has not grown behind its back.
+    lines.append('')
+    lines.append(f'#define KITTY_SLANG_VERTEX_SHADERS {sum(1 for b in all_bindings if b.prefix.endswith("_VERTEX"))}')
     write_if_changed(dest, '\n'.join(lines) + '\n')
 # }}}
 

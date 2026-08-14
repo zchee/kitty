@@ -519,9 +519,16 @@ ensure_fan_to_strip_index_buffer(void) {
     return fan_to_strip_index_buffer;
 }
 
-// Which programs render from a slang-generated vertex shader. Kept in step with
-// METAL_SHADERS in kitty/shaders/slang.py; the goldens catch a stale entry,
-// since a fan-ordered shader drawn as a raw strip renders bowties.
+// Which programs render from a slang-generated vertex shader. The program ids
+// live in shaders.c's enum, not in a header, so this cannot be derived from
+// slang.py's METAL_SHADERS -- and the goldens would not catch the omission for
+// every shader (the config matrix does not exercise blit, screenshot, tint or
+// rounded_rect, so migrating one of those and forgetting it here would render
+// bowties against a green gate). The generated count makes growing the set fail
+// the build here instead.
+_Static_assert(KITTY_SLANG_VERTEX_SHADERS == 1,
+    "a vertex shader was added to METAL_SHADERS in slang.py -- add its program id to program_uses_fan_vertex_order()");
+
 static bool
 program_uses_fan_vertex_order(int program) {
     return program == 4;  // BORDERS
@@ -1713,6 +1720,7 @@ stamp_ring_fences(ssize_t vao_idx) {
 void
 draw_quad(bool blend, unsigned instance_count) {
     if (!mtl_current_layer) return;
+    bool border_instances_bound = false;
     if (metal_log_path() && dq_log_count < 64) {
         CGSize ds = mtl_current_layer.drawableSize;
         METAL_TRACE("draw_quad[%d]: prog=%d blend=%d inst=%u vao=%zd fb=%u enc_fmt=%lu vp=(%.0f,%.0f,%.0f,%.0f) ds=%.0fx%.0f\n",
@@ -1858,12 +1866,17 @@ draw_quad(bool blend, unsigned instance_count) {
         // Borders — bind the BorderRect instance array from the VAO as vertex
         // attribute data (border_vertex_descriptor), then the three constant
         // blocks border.slang declares, each at the index slangc gave it.
+        // Bind or skip: the attribute buffer index is shared with whatever the
+        // previous program put there (the cell programs bind the gamma LUT at
+        // an index in this range), so leaving it unbound would fetch BorderRect
+        // attributes out of unrelated data and draw plausible garbage.
         if (current_bound_vao >= 0) {
             MetalVAO *vao = &vaos[current_bound_vao];
             if (vao->num_buffers > 0) {
                 ssize_t buf_idx = vao->buffers[0];
                 if (buffers[buf_idx].mtl_buffer) {
                     [mtl_current_encoder setVertexBuffer:buffers[buf_idx].mtl_buffer offset:0 atIndex:BORDER_VERTEX_ATTR_BUFFER];
+                    border_instances_bound = true;
                 }
             }
         }
@@ -1944,6 +1957,10 @@ draw_quad(bool blend, unsigned instance_count) {
     // failing loudly, and the buffer can only be nil when there is no device
     // and so no encoder either.
     if (program_uses_fan_vertex_order(current_program)) {
+        if (!border_instances_bound) {
+            log_error("Metal: border instance buffer is not bound; skipping the draw");
+            return;
+        }
         [mtl_current_encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangleStrip indexCount:4
                                          indexType:MTLIndexTypeUInt16
                                        indexBuffer:ensure_fan_to_strip_index_buffer() indexBufferOffset:0
