@@ -57,17 +57,17 @@ typedef struct MetalCellDrawUniforms {
     float text_gamma_adjustment;
 } MetalCellDrawUniforms;
 
-// C5: per-draw uniform structs for the remaining frame-path programs, hoisted
-// out of the metal.m draw dispatch (were anonymous inline structs) so the C
-// filler writes MSL-layout memory directly and the _Static_asserts below pin the
-// padding-sensitive offsets against the per-program .metal declarations. Each
-// mirrors a struct in its shader: MetalGraphicsUniforms<->GraphicsUniforms
-// (graphics_shaders.metal), etc. MSL aligns float3 to 16 bytes, hence the pads.
+// C5: per-draw uniform structs for the frame-path programs, hoisted out of the
+// metal.m draw dispatch (were anonymous inline structs) so the C filler writes
+// MSL-layout memory directly. MSL aligns float3 to 16 bytes, hence the pads.
 // The byte-identical golden set is the cross-check that these match the shaders.
-// W3b: MetalBorderUniforms is the exception -- border's vertex is generated from
-// border.slang, which splits these two fields across separate constant blocks,
-// so metal.m pushes them separately and asserts each against the block size in
-// the generated kitty/metal-bindings.h.
+// Two regimes since W3b-W3d:
+//  - hand-written shaders (graphics, bgimage, blit, screenshot, cell) declare a
+//    mirror struct in their .metal and the static_asserts there pin the pair;
+//  - slang-generated shaders (border, tint, trail, rounded_rect) take their
+//    uniforms in the block shapes slangc chose, so metal.m pushes the matching
+//    slice or whole struct and asserts sizes/offsets against the generated
+//    kitty/metal-bindings.h instead.
 typedef struct MetalBorderUniforms {
     uint32 colors[9];         // colors[9] multi-element array (packs, no padding)
     float background_opacity;
@@ -135,12 +135,16 @@ typedef struct MetalScreenshotUniforms {
     float _pad[2];
 } MetalScreenshotUniforms;
 
+// W3d: laid out to mirror rounded_rect.slang's fragment entryPointParams block
+// (the declaration order of the uniform parameters), because the C side pushes
+// this struct as one contiguous blob into that block. _pad0 is MSL's alignment
+// hole before the 16-aligned color.
 typedef struct MetalRoundedRectUniforms {
-    float color[4];
-    float background_color[4];
     float rect[4];
     float params[2];
-    float _pad[2];
+    float _pad0[2];
+    float color[4];
+    float background_color[4];
 } MetalRoundedRectUniforms;
 
 #ifndef __METAL_VERSION__
@@ -180,5 +184,7 @@ _Static_assert(sizeof(MetalScreenshotUniforms) == 48, "MetalScreenshotUniforms l
 _Static_assert(offsetof(MetalScreenshotUniforms, src_size) == 32, "screenshot src_size must start at 32");
 
 _Static_assert(sizeof(MetalRoundedRectUniforms) == 64, "MetalRoundedRectUniforms layout drifted");
-_Static_assert(offsetof(MetalRoundedRectUniforms, params) == 48, "rounded_rect params must start at 48");
+_Static_assert(offsetof(MetalRoundedRectUniforms, params) == 16 && offsetof(MetalRoundedRectUniforms, color) == 32 &&
+               offsetof(MetalRoundedRectUniforms, background_color) == 48,
+    "MetalRoundedRectUniforms no longer mirrors rounded_rect.slang's fragment block");
 #endif

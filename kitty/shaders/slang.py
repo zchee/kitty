@@ -716,8 +716,9 @@ def write_glsl_header(metadata_map: dict[str, GLSLMetadata], dest: str = 'kitty/
 # pass-through of color_premul, while this fork's does the primaries conversion
 # and the linear->sRGB encode under function constants that have no slang
 # equivalent. Generating it would delete the fork's colour management and import
-# no upstream code in exchange. tint has no such epilogue -- effects_shaders.metal
-# declares no function constants at all -- so both of its stages come from slang.
+# no upstream code in exchange. tint, trail and rounded_rect had no such
+# epilogue (their former home, effects_shaders.metal, declared no function
+# constants at all), so all their stages come from slang and that file is gone.
 class VertexOrder(StrEnum):
     ''' Where a generated vertex shader's draw order comes from.
 
@@ -745,6 +746,11 @@ class MetalShader(NamedTuple):
 METAL_SHADERS: MappingProxyType[str, MetalShader] = MappingProxyType({
     'border': MetalShader(frozenset({Stage.vertex}), VertexOrder.fan),
     'tint': MetalShader(frozenset({Stage.vertex, Stage.fragment}), VertexOrder.fan),
+    'rounded_rect': MetalShader(frozenset({Stage.vertex, Stage.fragment}), VertexOrder.fan),
+    # trail indexes x_coords[vertex_id]/y_coords[vertex_id], which the C side
+    # fills in draw order (shaders.c fills them from CursorTrail.corner_x) --
+    # remapping vertex_id would permute an order the client already fixed.
+    'trail': MetalShader(frozenset({Stage.vertex, Stage.fragment}), VertexOrder.client),
 })
 
 # Slang names every entry point vertex_main/fragment_main, which would collide

@@ -501,6 +501,15 @@ _Static_assert(sizeof(((MetalTintUniforms*)0)->edges) == TINT_VERTEX_BUFSZ_entry
     "tint.slang's vertex no longer reads exactly edges");
 _Static_assert(sizeof(((MetalTintUniforms*)0)->tint_color) == TINT_FRAGMENT_BUFSZ_entryPointParams,
     "tint.slang's fragment no longer reads exactly tint_color");
+_Static_assert(sizeof(MetalRoundedRectUniforms) == ROUNDED_RECT_FRAGMENT_BUFSZ_entryPointParams,
+    "MetalRoundedRectUniforms no longer fills rounded_rect.slang's fragment block");
+_Static_assert(offsetof(MetalTrailUniforms, cursor_edge_x) == TRAIL_VERTEX_BUFSZ_entryPointParams,
+    "trail.slang's vertex block is no longer exactly x_coords+y_coords");
+_Static_assert(sizeof(MetalTrailUniforms) - offsetof(MetalTrailUniforms, cursor_edge_x) == TRAIL_FRAGMENT_BUFSZ_entryPointParams,
+    "the MetalTrailUniforms tail no longer fills trail.slang's fragment block");
+_Static_assert(offsetof(MetalTrailUniforms, trail_color) - offsetof(MetalTrailUniforms, cursor_edge_x) == 16 &&
+               offsetof(MetalTrailUniforms, trail_opacity) - offsetof(MetalTrailUniforms, cursor_edge_x) == 32,
+    "the C padding after trail_color no longer matches the MSL float3 slot");
 
 // Every quad here is a 4-vertex GL_TRIANGLE_FAN in GL, and Metal has no fan
 // primitive, so each hand-written shader bakes a permutation into its vertex-id
@@ -545,7 +554,7 @@ ensure_fan_to_strip_index_buffer(void) {
 // So the generated header gates both directions:
 // the per-shader marker below catches a removal or a swap, and the count catches
 // an addition, which no marker of its own would make anything here react to.
-_Static_assert(KITTY_SLANG_VERTEX_SHADERS == 2,
+_Static_assert(KITTY_SLANG_VERTEX_SHADERS == 4,
     "a vertex shader was added to METAL_SHADERS in slang.py -- declare its VertexOrder there and map "
     "its program id below");
 #ifndef BORDER_VERTEX_IS_GENERATED
@@ -553,6 +562,12 @@ _Static_assert(KITTY_SLANG_VERTEX_SHADERS == 2,
 #endif
 #ifndef TINT_VERTEX_IS_GENERATED
 #error "tint's vertex is no longer generated -- drop program 9 below"
+#endif
+#ifndef ROUNDED_RECT_VERTEX_IS_GENERATED
+#error "rounded_rect's vertex is no longer generated -- drop program 13 below"
+#endif
+#ifndef TRAIL_VERTEX_IS_GENERATED
+#error "trail's vertex is no longer generated -- drop program 10 below"
 #endif
 
 // Only the program id -> shader mapping lives here, because program ids live in
@@ -564,8 +579,10 @@ _Static_assert(KITTY_SLANG_VERTEX_SHADERS == 2,
 static bool
 program_uses_fan_vertex_order(int program) {
     switch (program) {
-        case 4: return BORDER_VERTEX_ORDER_FAN;  // BORDERS, from border.slang
-        case 9: return TINT_VERTEX_ORDER_FAN;    // TINT, from tint.slang
+        case 4: return BORDER_VERTEX_ORDER_FAN;         // BORDERS, from border.slang
+        case 9: return TINT_VERTEX_ORDER_FAN;           // TINT, from tint.slang
+        case 10: return TRAIL_VERTEX_ORDER_FAN;         // TRAIL, from trail.slang (client order: 0)
+        case 13: return ROUNDED_RECT_VERTEX_ORDER_FAN;  // ROUNDED_RECT, from rounded_rect.slang
         default: return false;
     }
 }
@@ -949,10 +966,10 @@ fill_screenshot_uniforms(int program, MetalScreenshotUniforms *u) {
 static void
 fill_rounded_rect_uniforms(int program, MetalRoundedRectUniforms *u) {
     memset(u, 0, sizeof(*u));
-    slot_fv(program, ROUNDED_RECT_U_color, u->color, 4);
-    slot_fv(program, ROUNDED_RECT_U_background_color, u->background_color, 4);
     slot_fv(program, ROUNDED_RECT_U_rect, u->rect, 4);
     slot_fv(program, ROUNDED_RECT_U_params, u->params, 2);
+    slot_fv(program, ROUNDED_RECT_U_color, u->color, 4);
+    slot_fv(program, ROUNDED_RECT_U_background_color, u->background_color, 4);
 }
 
 // Number of entries in the ColorTable UBO: NUM_COLORS + MARK_MASK + MARK_MASK + 2
@@ -1969,12 +1986,18 @@ draw_quad(bool blend, unsigned instance_count) {
         [mtl_current_encoder setFragmentBytes:tint_u.tint_color length:sizeof(tint_u.tint_color)
                                       atIndex:TINT_FRAGMENT_BUF_entryPointParams];
     } else if (current_program == 10) {
-        // C5: MetalTrailUniforms (float3 trail_color 16-aligned so trail_opacity
-        // lands at 64); see fill_trail_uniforms + metal_uniforms.h assert.
+        // trail.slang splits its uniforms per stage: the vertex reads only the
+        // corner coordinates, the fragment only the cursor mask and colour. The
+        // fragment slice works because the C struct's _pad0 after trail_color[3]
+        // occupies exactly the MSL float3's tail pad -- pinned by the asserts
+        // next to the other slang push sizes.
         MetalTrailUniforms trail_u;
         fill_trail_uniforms(current_program, &trail_u);
-        [mtl_current_encoder setVertexBytes:&trail_u length:sizeof(trail_u) atIndex:0];
-        [mtl_current_encoder setFragmentBytes:&trail_u length:sizeof(trail_u) atIndex:0];
+        [mtl_current_encoder setVertexBytes:trail_u.x_coords length:offsetof(MetalTrailUniforms, cursor_edge_x)
+                                    atIndex:TRAIL_VERTEX_BUF_entryPointParams];
+        [mtl_current_encoder setFragmentBytes:trail_u.cursor_edge_x
+                                       length:sizeof(MetalTrailUniforms) - offsetof(MetalTrailUniforms, cursor_edge_x)
+                                      atIndex:TRAIL_FRAGMENT_BUF_entryPointParams];
     } else if (current_program == 11) {
         MetalBlitUniforms blit_u;
         fill_blit_uniforms(current_program, &blit_u);
@@ -1992,10 +2015,13 @@ draw_quad(bool blend, unsigned instance_count) {
             [mtl_current_encoder setFragmentTexture:textures[bound_tex_2d[1]].texture atIndex:0];
         }
     } else if (current_program == 13) {
+        // rounded_rect.slang's vertex takes no uniforms at all (its rect and
+        // pos_map are baked in), so only the fragment block is pushed. The
+        // struct mirrors that block's layout and is pushed whole.
         MetalRoundedRectUniforms rr_u;
         fill_rounded_rect_uniforms(current_program, &rr_u);
-        [mtl_current_encoder setVertexBytes:&rr_u length:sizeof(rr_u) atIndex:0];
-        [mtl_current_encoder setFragmentBytes:&rr_u length:sizeof(rr_u) atIndex:0];
+        [mtl_current_encoder setFragmentBytes:&rr_u length:sizeof(rr_u)
+                                      atIndex:ROUNDED_RECT_FRAGMENT_BUF_entryPointParams];
     }
 
     // A generated vertex shader keeps upstream's fan order, so it is drawn

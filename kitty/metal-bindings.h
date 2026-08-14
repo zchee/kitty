@@ -11,15 +11,29 @@
 #define BORDER_VERTEX_ATTR_rect_color 1
 #define BORDER_VERTEX_ATTR_BUFFER 3
 
+#define ROUNDED_RECT_FRAGMENT_BUF_entryPointParams 0
+#define ROUNDED_RECT_FRAGMENT_BUFSZ_entryPointParams 64u
+
+
 #define TINT_FRAGMENT_BUF_entryPointParams 0
 #define TINT_FRAGMENT_BUFSZ_entryPointParams 16u
 
 #define TINT_VERTEX_BUF_entryPointParams 0
 #define TINT_VERTEX_BUFSZ_entryPointParams 16u
 
+#define TRAIL_FRAGMENT_BUF_entryPointParams 0
+#define TRAIL_FRAGMENT_BUFSZ_entryPointParams 48u
+
+#define TRAIL_VERTEX_BUF_entryPointParams 0
+#define TRAIL_VERTEX_BUFSZ_entryPointParams 32u
+
 // _ORDER_FAN is always defined (0 or 1): test with #if, never #ifdef.
 #define BORDER_VERTEX_IS_GENERATED 1
 #define BORDER_VERTEX_ORDER_FAN 1
+#define ROUNDED_RECT_VERTEX_IS_GENERATED 1
+#define ROUNDED_RECT_VERTEX_ORDER_FAN 1
 #define TINT_VERTEX_IS_GENERATED 1
 #define TINT_VERTEX_ORDER_FAN 1
-#define KITTY_SLANG_VERTEX_SHADERS 2
+#define TRAIL_VERTEX_IS_GENERATED 1
+#define TRAIL_VERTEX_ORDER_FAN 0
+#define KITTY_SLANG_VERTEX_SHADERS 4
