@@ -17,6 +17,9 @@
 #define TINT_VERTEX_BUF_entryPointParams 0
 #define TINT_VERTEX_BUFSZ_entryPointParams 16u
 
+// _ORDER_FAN is always defined (0 or 1): test with #if, never #ifdef.
+#define BORDER_VERTEX_IS_GENERATED 1
 #define BORDER_VERTEX_ORDER_FAN 1
+#define TINT_VERTEX_IS_GENERATED 1
 #define TINT_VERTEX_ORDER_FAN 1
 #define KITTY_SLANG_VERTEX_SHADERS 2

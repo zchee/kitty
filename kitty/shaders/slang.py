@@ -968,8 +968,15 @@ def fixup_metal_files(dest_dir: str, dest: str = 'kitty/metal-bindings.h') -> No
     # addition, which nothing else would react to.
     vertex_shaders = [b.prefix for b in all_bindings if b.prefix.endswith('_VERTEX')]
     lines.append('')
+    # Presence and value are deliberately separate symbols. _IS_GENERATED exists
+    # to be #ifdef'd (metal.m's removal guards); _ORDER_FAN is always defined,
+    # as 0 or 1, and must be read with #if or as an expression. The moment a
+    # client-ordered shader lands, its _ORDER_FAN is defined-and-zero, so an
+    # #ifdef on it would silently answer "fan" for a shader declared otherwise.
+    lines.append('// _ORDER_FAN is always defined (0 or 1): test with #if, never #ifdef.')
     for prefix in vertex_shaders:
         order = METAL_SHADERS[prefix.rsplit('_', 1)[0].lower()].vertex_order
+        lines.append(f'#define {prefix}_IS_GENERATED 1')
         lines.append(f'#define {prefix}_ORDER_FAN {1 if order is VertexOrder.fan else 0}')
     lines.append(f'#define KITTY_SLANG_VERTEX_SHADERS {len(vertex_shaders)}')
     write_if_changed(dest, '\n'.join(lines) + '\n')

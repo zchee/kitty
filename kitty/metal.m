@@ -548,10 +548,10 @@ ensure_fan_to_strip_index_buffer(void) {
 _Static_assert(KITTY_SLANG_VERTEX_SHADERS == 2,
     "a vertex shader was added to METAL_SHADERS in slang.py -- declare its VertexOrder there and map "
     "its program id below");
-#ifndef BORDER_VERTEX_ORDER_FAN
+#ifndef BORDER_VERTEX_IS_GENERATED
 #error "border's vertex is no longer generated -- drop program 4 below"
 #endif
-#ifndef TINT_VERTEX_ORDER_FAN
+#ifndef TINT_VERTEX_IS_GENERATED
 #error "tint's vertex is no longer generated -- drop program 9 below"
 #endif
 
