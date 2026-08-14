@@ -1720,7 +1720,12 @@ stamp_ring_fences(ssize_t vao_idx) {
 void
 draw_quad(bool blend, unsigned instance_count) {
     if (!mtl_current_layer) return;
-    bool border_instances_bound = false;
+    // Cleared only by a program that draws from a per-instance vertex buffer;
+    // every other program leaves it alone, so adding one to
+    // program_uses_fan_vertex_order() cannot make its draw vanish. Only border
+    // has vertex attributes today -- the other generated vertex shaders take
+    // SV_VertexID only, so they need the fan->strip indices but no instance data.
+    bool instance_buffer_ok = true;
     if (metal_log_path() && dq_log_count < 64) {
         CGSize ds = mtl_current_layer.drawableSize;
         METAL_TRACE("draw_quad[%d]: prog=%d blend=%d inst=%u vao=%zd fb=%u enc_fmt=%lu vp=(%.0f,%.0f,%.0f,%.0f) ds=%.0fx%.0f\n",
@@ -1870,13 +1875,14 @@ draw_quad(bool blend, unsigned instance_count) {
         // previous program put there (the cell programs bind the gamma LUT at
         // an index in this range), so leaving it unbound would fetch BorderRect
         // attributes out of unrelated data and draw plausible garbage.
+        instance_buffer_ok = false;
         if (current_bound_vao >= 0) {
             MetalVAO *vao = &vaos[current_bound_vao];
             if (vao->num_buffers > 0) {
                 ssize_t buf_idx = vao->buffers[0];
                 if (buffers[buf_idx].mtl_buffer) {
                     [mtl_current_encoder setVertexBuffer:buffers[buf_idx].mtl_buffer offset:0 atIndex:BORDER_VERTEX_ATTR_BUFFER];
-                    border_instances_bound = true;
+                    instance_buffer_ok = true;
                 }
             }
         }
@@ -1957,8 +1963,8 @@ draw_quad(bool blend, unsigned instance_count) {
     // failing loudly, and the buffer can only be nil when there is no device
     // and so no encoder either.
     if (program_uses_fan_vertex_order(current_program)) {
-        if (!border_instances_bound) {
-            log_error("Metal: border instance buffer is not bound; skipping the draw");
+        if (!instance_buffer_ok) {
+            log_error("Metal: program %d has no instance buffer bound; skipping the draw", current_program);
             return;
         }
         [mtl_current_encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangleStrip indexCount:4
