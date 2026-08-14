@@ -15,6 +15,16 @@
 // struct GPUCellRenderData in kitty/shaders.c — keep field-for-field parity
 // with it and with the CellRenderData UBO block in kitty/cell_vertex.glsl.
 
+// The border instance array is the C-side BorderRect (kitty/state.h) read
+// straight out of the vertex buffer. It is 56 bytes at natural C alignment,
+// which is neither 16-aligned nor expressible as an MSL struct, so the shader
+// addresses instances by explicit byte stride and reads 4-byte scalars. That
+// makes these two numbers a cross-language contract over a struct upstream
+// owns; metal.m pins them against offsetof/sizeof so a field inserted ahead of
+// `color` fails the build instead of silently recolouring every border.
+#define BORDER_RECT_C_STRIDE 56u
+#define BORDER_RECT_COLOR_WORD 8u
+
 #ifdef __METAL_VERSION__
 #include <metal_stdlib>
 typedef metal::uint uint32;

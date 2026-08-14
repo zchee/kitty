@@ -43,13 +43,11 @@ struct BorderUniforms {
 static_assert(sizeof(BorderUniforms) == sizeof(MetalBorderUniforms),
               "BorderUniforms drifted from MetalBorderUniforms");
 
-// The C-side BorderRect (kitty/state.h) is 56 bytes with natural C
-// alignment; an MSL struct containing float4 is padded to a 64-byte stride
-// and 56 is not 16-aligned, so neither struct indexing nor float4 loads may
-// be used on the instance array. Instances are addressed with an explicit
-// byte stride and read as 4-byte scalars (offset 0: rect floats, offset 32:
-// color).
-#define BORDER_RECT_C_STRIDE 56u
+// Instances are addressed with an explicit byte stride and read as 4-byte
+// scalars (offset 0: rect floats, BORDER_RECT_COLOR_WORD: color) because the
+// C-side BorderRect is not 16-aligned and so cannot be an MSL struct. Both
+// constants come from metal_uniforms.h, where metal.m pins them against the
+// real offsetof/sizeof of BorderRect.
 
 struct BorderVertexOut {
     float4 position [[position]];
@@ -88,7 +86,7 @@ vertex BorderVertexOut border_vertex(
     BorderVertexOut out;
     constant float *rf = (constant float*)(rects_raw + iid * BORDER_RECT_C_STRIDE);
     float4 rect = float4(rf[0], rf[1], rf[2], rf[3]);
-    uint rect_color = ((constant uint*)rf)[8]; // offsetof(BorderRect, color) == 32
+    uint rect_color = ((constant uint*)rf)[BORDER_RECT_COLOR_WORD];
 
     uint2 pos = border_pos_map[vid];
     out.position = float4(rect[pos.x], rect[pos.y], 0, 1);

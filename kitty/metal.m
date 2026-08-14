@@ -456,6 +456,37 @@ create_pipeline_state(NSString *vertex_fn, NSString *fragment_fn, bool enable_bl
 }
 
 // Vertex descriptor for the instanced cell programs (built once).
+// Drift gates for the two layouts this backend reproduces by hand from types
+// upstream owns. Both are the failure shape that bit the CellRenderData block:
+// a change on their side stays silent here because nothing compares the two.
+//
+// GPUCell (kitty/line.h): the descriptor below restates its layout for the GPU
+// because add_attribute_to_vao() is a no-op on Metal (see its stub), so the
+// registration in create_cell_vao() -- the one that actually spells offsetof --
+// never reaches this backend. The offsets are offsetof() now, but the vector
+// FORMATS still assume which fields sit next to each other, and sizeof(GPUCell)
+// asserted in line.h catches a resize, not a REORDER: swapping two 4-byte
+// members keeps 20 bytes and quietly feeds the shader the wrong words.
+_Static_assert(sizeof(color_type) == 4 && sizeof(sprite_index) == 4 && sizeof(CellAttrs) == 4,
+    "cell vertex attributes assume 4-byte GPUCell members");
+_Static_assert(offsetof(GPUCell, bg) == offsetof(GPUCell, fg) + 4 &&
+               offsetof(GPUCell, decoration_fg) == offsetof(GPUCell, fg) + 8,
+    "MTLVertexFormatUInt3 at attribute 0 assumes fg, bg, decoration_fg are contiguous");
+_Static_assert(offsetof(GPUCell, attrs) == offsetof(GPUCell, sprite_idx) + 4,
+    "MTLVertexFormatUInt2 at attribute 1 assumes sprite_idx and attrs are contiguous");
+
+// BorderRect (kitty/state.h): border_shaders.metal walks the instance array by
+// byte stride and reads the colour by word index, since the struct is not
+// 16-aligned. Those two constants live in metal_uniforms.h so the shader and
+// this file share one definition; here is where they meet the real struct.
+_Static_assert(BORDER_RECT_C_STRIDE == sizeof(BorderRect),
+    "border_vertex instance stride drifted from sizeof(BorderRect)");
+_Static_assert(BORDER_RECT_COLOR_WORD * 4u == offsetof(BorderRect, color),
+    "border_vertex reads BorderRect.color at the wrong word index");
+_Static_assert(offsetof(BorderRect, left) == 0 && offsetof(BorderRect, top) == 4 &&
+               offsetof(BorderRect, right) == 8 && offsetof(BorderRect, bottom) == 12,
+    "border_vertex reads the rect floats as rf[0..3] from offset 0");
+
 static MTLVertexDescriptor*
 cell_vertex_descriptor(void) {
     static MTLVertexDescriptor *cell_vd = nil;
@@ -463,13 +494,13 @@ cell_vertex_descriptor(void) {
         cell_vd = [[MTLVertexDescriptor alloc] init];
         // Buffer 0: GPUCell data — attribute 0: colors (uvec3 = fg, bg, decoration_fg)
         cell_vd.attributes[0].format = MTLVertexFormatUInt3;
-        cell_vd.attributes[0].offset = 0; // offsetof(GPUCell, fg)
+        cell_vd.attributes[0].offset = offsetof(GPUCell, fg);
         cell_vd.attributes[0].bufferIndex = 0;
         // attribute 1: sprite_idx (uvec2 = sprite_idx, attrs)
         cell_vd.attributes[1].format = MTLVertexFormatUInt2;
-        cell_vd.attributes[1].offset = 12; // offsetof(GPUCell, sprite_idx)
+        cell_vd.attributes[1].offset = offsetof(GPUCell, sprite_idx);
         cell_vd.attributes[1].bufferIndex = 0;
-        cell_vd.layouts[0].stride = 20; // sizeof(GPUCell), asserted in line.h
+        cell_vd.layouts[0].stride = sizeof(GPUCell);
         cell_vd.layouts[0].stepFunction = MTLVertexStepFunctionPerInstance;
         cell_vd.layouts[0].stepRate = 1;
         // Buffer 1: selection data — attribute 2: is_selected (uint8)
