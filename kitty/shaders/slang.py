@@ -751,9 +751,10 @@ METAL_SHADERS: MappingProxyType[str, MetalShader] = MappingProxyType({
     'border': MetalShader(frozenset({Stage.vertex}), VertexOrder.fan),
     'tint': MetalShader(frozenset({Stage.vertex, Stage.fragment}), VertexOrder.fan),
     'rounded_rect': MetalShader(frozenset({Stage.vertex, Stage.fragment}), VertexOrder.fan),
-    # fan derived from the hand-written source, not assumed: it baked
-    # strip-reorder LUTs for BOTH pos and tex ("Position mapping using strip
-    # order"), the mark of an upstream fan-order shader ported to the strip draw.
+    # fan by the checkable identity, not by the presence of a LUT (a table need
+    # not be a fan map -- see the VertexOrder docstring): the retired hand-written
+    # LUTs equal the slang ones permuted by exactly fan_to_strip_indices, for
+    # position AND texcoord, so the index remap reproduces the shipped geometry.
     'bgimage': MetalShader(frozenset({Stage.vertex, Stage.fragment}), VertexOrder.fan),
     # trail indexes x_coords[vertex_id]/y_coords[vertex_id], which the C side
     # fills in FAN order (cursor_trail.c's corner_index yields TR,BR,BL,TL --
@@ -996,7 +997,12 @@ def fixup_metal_files(dest_dir: str, dest: str = 'kitty/metal-bindings.h') -> No
         # The BUFSZ defines pin the C side against slang.py's MODEL of MSL
         # layout; a wrong model would leave C and the #define agreeing and both
         # wrong. Embedding the computed sizes as static_asserts makes the Metal
-        # compiler validate the model itself on every build.
+        # compiler validate the model itself on every build. Strip any previously
+        # embedded asserts first: the file is mutated in place and mtime-gated,
+        # so a model change without a .slang change would otherwise append a
+        # second, contradictory assert beside the stale one and blame the
+        # now-correct model.
+        msl = re.sub(r'^static_assert\(sizeof\(\w+\) == \d+, "slang\.py mis-sized[^"]*"\);\n', '', msl, flags=re.M)
         for type_name, size in sorted(bindings.blocks.items()):
             assert_line = (f'static_assert(sizeof({type_name}) == {size}, '
                            f'"slang.py mis-sized this block; fix msl_type_size_align");')

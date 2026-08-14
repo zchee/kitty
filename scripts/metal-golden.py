@@ -74,6 +74,13 @@ CONFIG_MATRIX: dict[str, list[str]] = {
     # trail animation itself).
     "cursor_trail": ["cursor_trail=20"],
     "bgimage": [f"background_image={BGIMAGE_ASSET}"],
+    # W3e F1b: a non-1:1 layout, because the default tiled config samples the
+    # texture exactly 1:1 (every sample lands on a texel centre), which makes it
+    # structurally blind to the sampler FILTER -- the W3e review measured an
+    # 11.07% pixel delta between nearest and linear on this layout that no
+    # other config can see. Locks filter (nearest by default) and the
+    # REPEAT_CLAMP wrap the scaled layouts use.
+    "bgimage-scaled": [f"background_image={BGIMAGE_ASSET}", "background_image_layout=scaled"],
     # W27 P3.6 / GLSL-freeze-out stage 0 (risk R4): coverage for the GRAPHICS
     # and ROUNDED_RECT programs, previously exercised by no golden config, and
     # the OKLCH-palette scene that locks the dump channel's rendering of

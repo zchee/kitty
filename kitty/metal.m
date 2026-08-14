@@ -555,6 +555,11 @@ _Static_assert(sizeof(MetalRoundedRectUniforms) == ROUNDED_RECT_FRAGMENT_BUFSZ_e
     "MetalRoundedRectUniforms no longer fills rounded_rect.slang's fragment block");
 _Static_assert(offsetof(MetalBgimageUniforms, background) == BGIMAGE_VERTEX_BUFSZ_entryPointParams,
     "bgimage.slang's vertex block is no longer exactly tiled+sizes+positions");
+// The gamma LUT rides a real MTLBuffer (the one place a short buffer is a
+// genuine out-of-bounds read), and until now nothing consumed its generated
+// size -- the one block whose total parse loss would have been silent.
+_Static_assert(BORDER_VERTEX_BUFSZ_glt == 256u * sizeof(float),
+    "border.slang's GammaLUT block no longer holds 256 floats");
 _Static_assert(sizeof(((MetalBgimageUniforms*)0)->background) == BGIMAGE_FRAGMENT_BUFSZ_entryPointParams,
     "bgimage.slang's fragment no longer reads exactly background");
 _Static_assert(offsetof(MetalTrailUniforms, y_coords) == 16 &&
@@ -3799,7 +3804,8 @@ void metal_gl_tex_storage_3d(GLenum target, int levels, GLenum internalformat, i
     // F1: the mono R8 atlas stores coverage in the single red channel; swizzle so
     // a sampler reads coverage in .a (RGB<-1), matching the GL_TEXTURE_SWIZZLE_*
     // set on the GL backend and the .a-only sampling the cell fragment does for
-    // mono glyphs. (glTexParameteri is a no-op on Metal, hence the swizzle here.)
+    // mono glyphs. (The GL_TEXTURE_SWIZZLE_* parameteri calls fall through the
+    // W3e recorder's default case, so the swizzle still has to live here.)
     if (desc.pixelFormat == MTLPixelFormatR8Unorm) {
         desc.swizzle = MTLTextureSwizzleChannelsMake(
             MTLTextureSwizzleOne, MTLTextureSwizzleOne, MTLTextureSwizzleOne, MTLTextureSwizzleRed);
