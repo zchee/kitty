@@ -94,8 +94,10 @@ typedef struct MetalGraphicsUniforms {
     float src_max_component;
     // MSL rounds a struct's size up to its alignment, and the float4 members
     // above make that 16. The three floats land at 560..571, so MSL pads to 576
-    // — spell that padding out here or the static_assert in
-    // graphics_shaders.metal (sizeof parity) fails.
+    // — spell that padding out here or the tail-slice static_assert in metal.m
+    // (W3h: this struct's layout is pinned against graphics_fork.slang's
+    // generated blocks — vertex = the leading 512, fragment = the 64-byte
+    // tail from extra_alpha) fails.
     float _pad2;
 } MetalGraphicsUniforms;
 

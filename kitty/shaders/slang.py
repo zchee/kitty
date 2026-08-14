@@ -281,6 +281,12 @@ class SlangFile(NamedTuple):
                 yield s()
                 yield s('alpha_mask', is_alpha_mask='true')
                 yield s('premult', texture_is_not_premultiplied='true')
+            case 'graphics_fork.slang':
+                # The fork wrapper (W3h) carries upstream's axes under
+                # upstream's names, so its variant set mirrors graphics'.
+                yield s()
+                yield s('alpha_mask', is_alpha_mask='true')
+                yield s('premult', texture_is_not_premultiplied='true')
             case 'cell.slang':
                 d = cell_variant()
                 seen = set()
@@ -776,6 +782,13 @@ METAL_SHADERS: MappingProxyType[str, MetalShader] = MappingProxyType({
     # texture flip into its tex LUT; the generated shader is upstream-faithful,
     # so the C push swaps src_rect's top/bottom instead (metal.m, program 12).
     'screenshot': MetalShader(frozenset({Stage.vertex, Stage.fragment}), VertexOrder.fan),
+    # graphics_fork (W3h): the fork-owned wrapper, NOT upstream graphics.slang
+    # (whose vertex is non-instanced and cannot express G2 — ADR-0032 §1).
+    # Fan, derived: the wrapper embeds blit-common's fan table (RT,RB,LB,LT)
+    # and the C side draws it through the fan->strip index remap with
+    # instanceCount — the exact composition BORDERS has shipped since W3b
+    # (generated fan vertex + per-instance data, ADR-0032 §8 F7).
+    'graphics_fork': MetalShader(frozenset({Stage.vertex, Stage.fragment}), VertexOrder.fan),
 })
 
 # Slang names every entry point vertex_main/fragment_main, which would collide

@@ -564,6 +564,10 @@ _Static_assert(sizeof(((MetalBgimageUniforms*)0)->background) == BGIMAGE_FRAGMEN
     "bgimage.slang's fragment no longer reads exactly background");
 _Static_assert(offsetof(MetalScreenshotUniforms, src_size) == SCREENSHOT_VERTEX_BUFSZ_entryPointParams,
     "screenshot.slang's vertex block is no longer exactly src_rect+dest_rect");
+_Static_assert(offsetof(MetalGraphicsUniforms, extra_alpha) == GRAPHICS_FORK_VERTEX_BUFSZ_entryPointParams,
+    "graphics_fork.slang's vertex block is no longer exactly the two rect arrays");
+_Static_assert(sizeof(MetalGraphicsUniforms) - offsetof(MetalGraphicsUniforms, extra_alpha) == GRAPHICS_FORK_FRAGMENT_BUFSZ_entryPointParams,
+    "the MetalGraphicsUniforms tail no longer fills graphics_fork.slang's fragment block");
 _Static_assert(sizeof(((MetalScreenshotUniforms*)0)->src_size) == SCREENSHOT_FRAGMENT_BUFSZ_entryPointParams,
     "screenshot.slang's fragment no longer reads exactly src_size");
 _Static_assert(offsetof(MetalTrailUniforms, y_coords) == 16 &&
@@ -624,9 +628,11 @@ ensure_fan_to_strip_index_buffer(void) {
 // So the generated header gates both directions:
 // the per-shader marker below catches a removal or a swap, and the count catches
 // an addition, which no marker of its own would make anything here react to.
-_Static_assert(KITTY_SLANG_VERTEX_SHADERS == 6,
+_Static_assert(KITTY_SLANG_VERTEX_SHADERS == 7,
     "a vertex shader was added to METAL_SHADERS in slang.py -- declare its VertexOrder there and map "
     "its program id below");
+_Static_assert(GRAPHICS_FORK_VERTEX_SPECIALIZATIONS == 3 && GRAPHICS_FORK_FRAGMENT_SPECIALIZATIONS == 3,
+    "graphics_fork's variant set changed size -- the three PSO cases below select entry names per variant");
 #ifndef BORDER_VERTEX_IS_GENERATED
 #error "border's vertex is no longer generated -- drop program 4 below"
 #endif
@@ -645,6 +651,9 @@ _Static_assert(KITTY_SLANG_VERTEX_SHADERS == 6,
 #ifndef SCREENSHOT_VERTEX_IS_GENERATED
 #error "screenshot's vertex is no longer generated -- drop program 12 below"
 #endif
+#ifndef GRAPHICS_FORK_VERTEX_IS_GENERATED
+#error "graphics_fork's vertex is no longer generated -- drop programs 5-7 below"
+#endif
 
 // Only the program id -> shader mapping lives here, because program ids live in
 // shaders.c's enum and not in any header. Whether that shader needs the fan
@@ -656,6 +665,8 @@ static bool
 program_uses_fan_vertex_order(int program) {
     switch (program) {
         case 4: return BORDER_VERTEX_ORDER_FAN;         // BORDERS, from border.slang
+        case 5: case 6: case 7:
+            return GRAPHICS_FORK_VERTEX_ORDER_FAN;      // GRAPHICS x3, from graphics_fork.slang (fork wrapper)
         case 8: return BGIMAGE_VERTEX_ORDER_FAN;        // BGIMAGE, from bgimage.slang
         case 9: return TINT_VERTEX_ORDER_FAN;           // TINT, from tint.slang
         case 10: return TRAIL_VERTEX_ORDER_FAN;         // TRAIL, from trail.slang
@@ -828,14 +839,19 @@ build_pso(int program, bool blend, MTLPixelFormat fmt, bool layered, MTLPixelFor
             [fc setConstantValue:&target_primaries_is_p3 type:MTLDataTypeBool atIndex:1]; // TARGET_PRIMARIES_IS_P3
             return create_pipeline_state(@"border_vertex", @"border_fragment", blend, border_vertex_descriptor(), fmt, layered, att1_fmt, fc);
         }
-        case 5: case 6: case 7: {
-            MTLFunctionConstantValues *fc = [[MTLFunctionConstantValues alloc] init];
-            bool is_alpha_mask = (program == 7);
-            bool is_premult = (program == 6);
-            [fc setConstantValue:&is_alpha_mask type:MTLDataTypeBool atIndex:0];
-            [fc setConstantValue:&is_premult type:MTLDataTypeBool atIndex:1];
-            return create_pipeline_state(@"graphics_vertex", @"graphics_fragment", blend, nil, fmt, layered, att1_fmt, fc);
-        }
+        // W3h: the three graphics programs are slang build-time specializations
+        // of the fork wrapper (graphics_fork.slang) — the runtime function
+        // constants became compiled variants, one entry pair per program.
+        // POLARITY (measured the hard way — the first mapping inverted 5/6 and
+        // moved the graphics golden by 65): upstream's axis is
+        // texture_is_NOT_premultiplied, the fork's old fc was IS_premultiplied.
+        // legacy.py is the canonical mirror: GRAPHICS_PROGRAM compiles with
+        // TEXTURE_IS_NOT_PREMULTIPLIED=1 (the 'premult' variant — it DOES the
+        // premultiply), GRAPHICS_PREMULT_PROGRAM with =0 (the default variant
+        // — sources already premultiplied, no-op).
+        case 5: return create_pipeline_state(@"graphics_fork_vertex_premult", @"graphics_fork_fragment_premult", blend, nil, fmt, layered, att1_fmt, nil);
+        case 6: return create_pipeline_state(@"graphics_fork_vertex", @"graphics_fork_fragment", blend, nil, fmt, layered, att1_fmt, nil);
+        case 7: return create_pipeline_state(@"graphics_fork_vertex_alpha_mask", @"graphics_fork_fragment_alpha_mask", blend, nil, fmt, layered, att1_fmt, nil);
         case 8: return create_pipeline_state(@"bgimage_vertex", @"bgimage_fragment", blend, nil, fmt, layered, att1_fmt, nil);
         case 9: return create_pipeline_state(@"tint_vertex", @"tint_fragment", blend, nil, fmt, layered, att1_fmt, nil);
         case 10: return create_pipeline_state(@"trail_vertex", @"trail_fragment", blend, nil, fmt, layered, att1_fmt, nil);
@@ -2045,11 +2061,18 @@ draw_quad(bool blend, unsigned instance_count) {
         MetalGraphicsUniforms gfx_u;
         fill_graphics_uniforms(current_program, &gfx_u);
         metal_frame_gfx_draw_count++;  // G2: graphics-program draw call this frame
-        [mtl_current_encoder setVertexBytes:&gfx_u length:sizeof(gfx_u) atIndex:0];
-        [mtl_current_encoder setFragmentBytes:&gfx_u length:sizeof(gfx_u) atIndex:0];
+        // W3h: graphics_fork.slang splits per stage — the vertex reads the two
+        // per-instance rect arrays (the leading 512 bytes), the fragment the
+        // scalar tail (64 bytes from extra_alpha). Both slices of the one C
+        // struct, pinned by the static asserts next to the other slang sizes.
+        [mtl_current_encoder setVertexBytes:&gfx_u length:offsetof(MetalGraphicsUniforms, extra_alpha)
+                                    atIndex:GRAPHICS_FORK_VERTEX_BUF_entryPointParams];
+        [mtl_current_encoder setFragmentBytes:&gfx_u.extra_alpha
+                                       length:sizeof(MetalGraphicsUniforms) - offsetof(MetalGraphicsUniforms, extra_alpha)
+                                      atIndex:GRAPHICS_FORK_FRAGMENT_BUF_entryPointParams];
         // Bind image texture from unit 1 (GRAPHICS_UNIT)
         if (bound_tex_2d[1] && bound_tex_2d[1] < MAX_TEXTURES && textures[bound_tex_2d[1]].texture) {
-            [mtl_current_encoder setFragmentTexture:textures[bound_tex_2d[1]].texture atIndex:0];
+            [mtl_current_encoder setFragmentTexture:textures[bound_tex_2d[1]].texture atIndex:GRAPHICS_FORK_FRAGMENT_TEX_image];
             // W3f: sample through the texture's own recorded GL state instead
             // of a constexpr stand-in. send_image_to_gpu requests LINEAR +
             // REPEAT_CLAMP (CLAMP_TO_BORDER, transparent black) for graphics
@@ -2057,7 +2080,7 @@ draw_quad(bool blend, unsigned instance_count) {
             // nearest + clamp_to_edge -- wrong on BOTH axes (the campaign's
             // fourth recovered divergence, visible on any scaled image/logo).
             id<MTLSamplerState> smp = sampler_state_for(textures[bound_tex_2d[1]].filter_linear, textures[bound_tex_2d[1]].wrap);
-            if (smp) [mtl_current_encoder setFragmentSamplerState:smp atIndex:0];
+            if (smp) [mtl_current_encoder setFragmentSamplerState:smp atIndex:GRAPHICS_FORK_FRAGMENT_SAMP_image];
             // US-307: record the frame that samples this image texture, so the
             // upload path can detect it is still in flight under async present.
             textures[bound_tex_2d[1]].last_drawn_fidx = metal_frame_index;
