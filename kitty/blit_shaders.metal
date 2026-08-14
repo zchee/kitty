@@ -94,65 +94,15 @@ fragment float4 blit_fragment(
     return float4(srgb * color_premul.a, color_premul.a);
 }
 
-// ---- Screenshot uniforms ----
-
-struct ScreenshotUniforms {
-    float4 src_rect;
-    float4 dest_rect;
-    float2 src_size;
-};
-static_assert(sizeof(ScreenshotUniforms) == sizeof(MetalScreenshotUniforms),
-              "ScreenshotUniforms drifted from MetalScreenshotUniforms");
-
-// ---- Screenshot Vertex Shader ----
-
-vertex BlitVertexOut screenshot_vertex(
-    uint vid [[vertex_id]],
-    constant ScreenshotUniforms& uniforms [[buffer(0)]]
-) {
-    BlitVertexOut out;
-    int2 pos = blit_pos_map[vid];
-    int2 tex = blit_tex_map[vid];
-    out.texcoord = float2(uniforms.src_rect[tex.x], uniforms.src_rect[tex.y]);
-    out.position = float4(uniforms.dest_rect[pos.x], uniforms.dest_rect[pos.y], 0, 1);
-    return out;
-}
-
-// ---- Screenshot Fragment Shader ----
-// Proper downscaling with sRGB-aware 2×2 sampling
-
-fragment float4 screenshot_fragment(
-    BlitVertexOut in [[stage_in]],
-    texture2d<float> image [[texture(0)]],
-    constant ScreenshotUniforms& uniforms [[buffer(0)]]
-) {
-    constexpr sampler s(mag_filter::linear, min_filter::linear);
-    float2 texel_size = 1.0f / uniforms.src_size;
-    float2 tc = in.texcoord;
-
-    // Sample a 2x2 grid for better quality downscaling
-    float4 s00 = image.sample(s, tc + float2(-0.25f, -0.25f) * texel_size);
-    float4 s10 = image.sample(s, tc + float2( 0.25f, -0.25f) * texel_size);
-    float4 s01 = image.sample(s, tc + float2(-0.25f,  0.25f) * texel_size);
-    float4 s11 = image.sample(s, tc + float2( 0.25f,  0.25f) * texel_size);
-
-    // Unpremultiply and convert to linear for each sample
-    float3 linear00 = s00.a > 0.0f ? srgb2linear(s00.rgb / s00.a) : float3(0.0f);
-    float3 linear10 = s10.a > 0.0f ? srgb2linear(s10.rgb / s10.a) : float3(0.0f);
-    float3 linear01 = s01.a > 0.0f ? srgb2linear(s01.rgb / s01.a) : float3(0.0f);
-    float3 linear11 = s11.a > 0.0f ? srgb2linear(s11.rgb / s11.a) : float3(0.0f);
-
-    float avg_alpha = (s00.a + s10.a + s01.a + s11.a) * 0.25f;
-
-    // Weight colors by alpha for proper transparency-aware downsampling
-    float3 weighted_sum = linear00 * s00.a + linear10 * s10.a + linear01 * s01.a + linear11 * s11.a;
-    float total_weight = s00.a + s10.a + s01.a + s11.a;
-    float3 avg_linear = total_weight > 0.0f ? weighted_sum / total_weight : float3(0.0f);
-
-    float3 srgb_color = linear2srgb(avg_linear);
-    return float4(srgb_color, avg_alpha);
-}
-
+// W3f: the screenshot vertex+fragment pair now comes from
+// kitty/shaders/screenshot.slang (generated MSL keeps the same entry-point
+// names, so the hand-written pair had to leave in the same commit -- the
+// metallib rejects duplicate symbols). The hand-written fragment sampled a
+// 2x2 grid of LINEAR taps at +/-0.25 texel (a tent over 3x3) and linearized
+// AFTER blending; upstream Gathers the exact 2x2 texel quad and linearizes
+// each texel first. Its uniforms struct and the ScreenshotUniforms
+// static_assert went with it; the C-side MetalScreenshotUniforms now pins
+// against the generated blocks in metal.m.
 // ---- Layers resolve (M1: single-pass layered rendering) ----
 // The Metal backend renders layered windows (transparency, bg image, graphics,
 // overlays, cursor trail) into a MEMORYLESS RGBA16Unorm working surface (color

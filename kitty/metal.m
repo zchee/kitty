@@ -562,6 +562,10 @@ _Static_assert(BORDER_VERTEX_BUFSZ_glt == 256u * sizeof(float),
     "border.slang's GammaLUT block no longer holds 256 floats");
 _Static_assert(sizeof(((MetalBgimageUniforms*)0)->background) == BGIMAGE_FRAGMENT_BUFSZ_entryPointParams,
     "bgimage.slang's fragment no longer reads exactly background");
+_Static_assert(offsetof(MetalScreenshotUniforms, src_size) == SCREENSHOT_VERTEX_BUFSZ_entryPointParams,
+    "screenshot.slang's vertex block is no longer exactly src_rect+dest_rect");
+_Static_assert(sizeof(((MetalScreenshotUniforms*)0)->src_size) == SCREENSHOT_FRAGMENT_BUFSZ_entryPointParams,
+    "screenshot.slang's fragment no longer reads exactly src_size");
 _Static_assert(offsetof(MetalTrailUniforms, y_coords) == 16 &&
                offsetof(MetalTrailUniforms, cursor_edge_x) == TRAIL_VERTEX_BUFSZ_entryPointParams,
     "trail.slang's vertex block is no longer exactly x_coords+y_coords");
@@ -609,16 +613,18 @@ ensure_fan_to_strip_index_buffer(void) {
 // Which programs render from a slang-generated vertex shader. The program ids
 // live in shaders.c's enum, not in a header, so this cannot be derived from
 // slang.py's METAL_SHADERS -- and the goldens would not catch the omission for
-// every shader (screenshot is the one program no golden config exercises;
-// blit is stronger than uncovered -- it is UNREACHABLE on this backend, its
-// only draw site living in shaders.c's #else/GL branch since M1 replaced the
-// blit pass with metal_resolve_layered_frame. tint and rounded_rect ARE
-// covered via progress-bar -- measured, breaking either generated fragment
-// moves it -- trail via cursor-trail-pinned, bgimage via its own config).
+// every shader (every program with a generated vertex now has golden
+// coverage: tint and rounded_rect via progress-bar -- measured, breaking
+// either generated fragment moves it -- trail via cursor-trail-pinned,
+// bgimage via its own config, and screenshot via the W3f screenshot-thumb
+// config, whose artifact is the thumbnail lever's output. blit remains
+// stronger than uncovered -- it is UNREACHABLE on this backend, its only
+// draw site living in shaders.c's #else/GL branch since M1 replaced the
+// blit pass with metal_resolve_layered_frame).
 // So the generated header gates both directions:
 // the per-shader marker below catches a removal or a swap, and the count catches
 // an addition, which no marker of its own would make anything here react to.
-_Static_assert(KITTY_SLANG_VERTEX_SHADERS == 5,
+_Static_assert(KITTY_SLANG_VERTEX_SHADERS == 6,
     "a vertex shader was added to METAL_SHADERS in slang.py -- declare its VertexOrder there and map "
     "its program id below");
 #ifndef BORDER_VERTEX_IS_GENERATED
@@ -636,6 +642,9 @@ _Static_assert(KITTY_SLANG_VERTEX_SHADERS == 5,
 #ifndef BGIMAGE_VERTEX_IS_GENERATED
 #error "bgimage's vertex is no longer generated -- drop program 8 below"
 #endif
+#ifndef SCREENSHOT_VERTEX_IS_GENERATED
+#error "screenshot's vertex is no longer generated -- drop program 12 below"
+#endif
 
 // Only the program id -> shader mapping lives here, because program ids live in
 // shaders.c's enum and not in any header. Whether that shader needs the fan
@@ -650,6 +659,7 @@ program_uses_fan_vertex_order(int program) {
         case 8: return BGIMAGE_VERTEX_ORDER_FAN;        // BGIMAGE, from bgimage.slang
         case 9: return TINT_VERTEX_ORDER_FAN;           // TINT, from tint.slang
         case 10: return TRAIL_VERTEX_ORDER_FAN;         // TRAIL, from trail.slang
+        case 12: return SCREENSHOT_VERTEX_ORDER_FAN;    // SCREENSHOT, from screenshot.slang
         case 13: return ROUNDED_RECT_VERTEX_ORDER_FAN;  // ROUNDED_RECT, from rounded_rect.slang
         default: return false;
     }
@@ -2063,6 +2073,31 @@ draw_quad(bool blend, unsigned instance_count) {
             id<MTLSamplerState> smp = sampler_state_for(textures[bg_tex].filter_linear, textures[bg_tex].wrap);
             if (smp) [mtl_current_encoder setFragmentSamplerState:smp atIndex:BGIMAGE_FRAGMENT_SAMP_image];
         }
+    } else if (current_program == 12) {
+        // screenshot.slang splits per stage: the vertex reads src_rect +
+        // dest_rect, the fragment only src_size (for its Gather coordinate).
+        MetalScreenshotUniforms ss_u;
+        fill_screenshot_uniforms(current_program, &ss_u);
+        // The C caller bakes GL's bottom-up texture orientation into
+        // src_rect's y endpoints, and the retired hand-written vertex
+        // cancelled that in its tex LUT (Metal wrote the copied source
+        // top-down). The generated vertex is upstream-faithful and has no
+        // such flip, so swap top/bottom here instead -- same cancellation,
+        // one layer down.
+        float tmp = ss_u.src_rect[1]; ss_u.src_rect[1] = ss_u.src_rect[3]; ss_u.src_rect[3] = tmp;
+        [mtl_current_encoder setVertexBytes:&ss_u length:offsetof(MetalScreenshotUniforms, src_size)
+                                    atIndex:SCREENSHOT_VERTEX_BUF_entryPointParams];
+        [mtl_current_encoder setFragmentBytes:ss_u.src_size length:sizeof(ss_u.src_size)
+                                      atIndex:SCREENSHOT_FRAGMENT_BUF_entryPointParams];
+        // take_screenshot_of_rectangular_region binds its framebuffer copy at
+        // GRAPHICS_UNIT (1) and records LINEAR + CLAMP_TO_EDGE on it, so the
+        // recorded state IS the GL request -- no constexpr stand-in.
+        GLuint ss_tex = bound_tex_2d[1];
+        if (ss_tex && ss_tex < MAX_TEXTURES && textures[ss_tex].texture) {
+            [mtl_current_encoder setFragmentTexture:textures[ss_tex].texture atIndex:SCREENSHOT_FRAGMENT_TEX_image];
+            id<MTLSamplerState> smp = sampler_state_for(textures[ss_tex].filter_linear, textures[ss_tex].wrap);
+            if (smp) [mtl_current_encoder setFragmentSamplerState:smp atIndex:SCREENSHOT_FRAGMENT_SAMP_image];
+        }
     } else if (current_program == 9) {
         // tint.slang takes its uniforms as entry-point parameters, so slang gives
         // each stage its own block holding only what that stage reads -- unlike
@@ -2091,14 +2126,6 @@ draw_quad(bool blend, unsigned instance_count) {
         fill_blit_uniforms(current_program, &blit_u);
         [mtl_current_encoder setVertexBytes:&blit_u length:sizeof(blit_u) atIndex:0];
         [mtl_current_encoder setFragmentBytes:&blit_u length:sizeof(blit_u) atIndex:0];
-        if (bound_tex_2d[1] && bound_tex_2d[1] < MAX_TEXTURES && textures[bound_tex_2d[1]].texture) {
-            [mtl_current_encoder setFragmentTexture:textures[bound_tex_2d[1]].texture atIndex:0];
-        }
-    } else if (current_program == 12) {
-        MetalScreenshotUniforms ss_u;
-        fill_screenshot_uniforms(current_program, &ss_u);
-        [mtl_current_encoder setVertexBytes:&ss_u length:sizeof(ss_u) atIndex:0];
-        [mtl_current_encoder setFragmentBytes:&ss_u length:sizeof(ss_u) atIndex:0];
         if (bound_tex_2d[1] && bound_tex_2d[1] < MAX_TEXTURES && textures[bound_tex_2d[1]].texture) {
             [mtl_current_encoder setFragmentTexture:textures[bound_tex_2d[1]].texture atIndex:0];
         }
@@ -3875,8 +3902,22 @@ void metal_gl_copy_tex_image_2d(GLenum target, int level, GLenum internalformat,
     MetalTexture *t = get_texture(tex_id);
     if (!t) return;
 
-    // Create or recreate the texture
-    MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+    // Resolve the copy source FIRST: blitEncoder copyFromTexture requires
+    // matching pixel formats, and the capture offscreen is BGRA8 — a
+    // hardcoded RGBA8 destination made the blit invalid, so the destination
+    // stayed UNINITIALIZED and every consumer downstream (the SCREENSHOT
+    // thumbnail path) sampled undefined memory (W3f finding).
+    id<MTLTexture> source = nil;
+    if (bound_framebuffer && bound_framebuffer < MAX_FRAMEBUFFERS && framebuffers[bound_framebuffer].render_target) {
+        source = framebuffers[bound_framebuffer].render_target;
+    } else if (metal_capture_to_offscreen() && dump_offscreen_base) {
+        source = dump_offscreen_base;  // C4a: framebufferOnly drawable is unreadable; the frame rendered here
+    } else if (mtl_current_drawable) {
+        source = current_drawable_texture();
+    }
+
+    // Create or recreate the texture, in the source's own format
+    MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:source ? source.pixelFormat : MTLPixelFormatRGBA8Unorm
                                                                                     width:width
                                                                                    height:height
                                                                                 mipmapped:NO];
@@ -3888,16 +3929,6 @@ void metal_gl_copy_tex_image_2d(GLenum target, int level, GLenum internalformat,
     t->width = width;
     t->height = height;
     t->depth = 1;
-
-    // Copy from current drawable/render target to the new texture
-    id<MTLTexture> source = nil;
-    if (bound_framebuffer && bound_framebuffer < MAX_FRAMEBUFFERS && framebuffers[bound_framebuffer].render_target) {
-        source = framebuffers[bound_framebuffer].render_target;
-    } else if (metal_capture_to_offscreen() && dump_offscreen_base) {
-        source = dump_offscreen_base;  // C4a: framebufferOnly drawable is unreadable; the frame rendered here
-    } else if (mtl_current_drawable) {
-        source = current_drawable_texture();
-    }
     if (source && t->texture) {
         // Must end current encoder before using blit encoder
         end_current_encoder();
@@ -4002,10 +4033,41 @@ void metal_gl_read_pixels(int x, int y, int width, int height, GLenum format, GL
             [mtl_current_command_buffer waitUntilCompleted];
             mtl_current_command_buffer = nil;
         }
-        [source getBytes:data
-             bytesPerRow:width * 4
-              fromRegion:MTLRegionMake2D(x, y, width, height)
-             mipmapLevel:0];
+        // The caller's contract is GL_RGBA/GL_UNSIGNED_BYTE (4 B/px, RGBA
+        // order). The source is whatever the bound target really is: the
+        // thumbnail scratch FBO is RGBA16Unorm (8 B/px — reading it at
+        // bytesPerRow = width*4 interleaved half-pixels into the caller's
+        // buffer, the second half of the W3f thumbnail-garbage finding) and
+        // the capture offscreen is BGRA8 (needs an R/B swizzle for RGBA).
+        switch (source.pixelFormat) {
+            case MTLPixelFormatRGBA16Unorm: {
+                uint16_t *wide = malloc((size_t)width * height * 8);
+                if (!wide) break;
+                [source getBytes:wide
+                     bytesPerRow:(NSUInteger)width * 8
+                      fromRegion:MTLRegionMake2D(x, y, width, height)
+                     mipmapLevel:0];
+                uint8_t *out = data;
+                for (size_t i = 0; i < (size_t)width * height * 4; i++) out[i] = wide[i] >> 8;
+                free(wide);
+            } break;
+            case MTLPixelFormatBGRA8Unorm: case MTLPixelFormatBGRA8Unorm_sRGB: {
+                [source getBytes:data
+                     bytesPerRow:(NSUInteger)width * 4
+                      fromRegion:MTLRegionMake2D(x, y, width, height)
+                     mipmapLevel:0];
+                uint8_t *px = data;
+                for (size_t i = 0; i < (size_t)width * height; i++, px += 4) {
+                    uint8_t b = px[0]; px[0] = px[2]; px[2] = b;
+                }
+            } break;
+            default:
+                [source getBytes:data
+                     bytesPerRow:(NSUInteger)width * 4
+                      fromRegion:MTLRegionMake2D(x, y, width, height)
+                     mipmapLevel:0];
+                break;
+        }
         // Start a new command buffer for any subsequent work
         ensure_command_buffer();
     }

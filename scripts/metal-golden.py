@@ -107,7 +107,18 @@ CONFIG_MATRIX: dict[str, list[str]] = {
         "cursor_blink_interval=0", "cursor_shape_unfocused=unchanged",
         "cursor_trail=1", "cursor_trail_color=#7742ff",
     ],
+    # W3f gate: the compared artifact for this config is the SCREENSHOT_PROGRAM
+    # output (the boss-side KITTY_METAL_TEST_THUMBNAIL lever fires one thumbnail
+    # request at scale 0.5 and writes it as the config's PNG); the ordinary
+    # frame dump lands in the frames/ subdirectory, outside the compare glob.
+    # This is the only config that executes SCREENSHOT_PROGRAM -- every other
+    # golden uses the KITTY_METAL_DUMP_FRAME offscreen read, which bypasses it.
+    "screenshot-thumb": [],
 }
+
+# Configs whose golden artifact is the thumbnail lever's output (value =
+# screenshot scale passed to the lever), not the frame dump.
+THUMB_CONFIGS: dict[str, str] = {"screenshot-thumb": "0.5"}
 
 # Scene argument handed to the content helper (argv[1]); configs not listed
 # here run the legacy scene, whose bytes are pinned by the existing baselines.
@@ -132,6 +143,20 @@ def capture_config(name: str, opts: list[str], output_dir: Path, timeout: float,
     png_path = output_dir / f"{name}.png"
     if png_path.exists():
         png_path.unlink()  # never let a stale PNG from a prior failed run masquerade as a fresh capture
+    thumb_scale = THUMB_CONFIGS.get(name)
+    # For thumbnail configs the frame dump is redirected into a subdirectory
+    # (compare's glob("*.png") does not recurse -- NOTE it DOES match a
+    # leading dot, so a dot-prefixed sibling would still be compared) and
+    # png_path receives the lever's SCREENSHOT_PROGRAM output instead, so all
+    # downstream validation (existence, size, unique-colors) applies to the
+    # shader's pixels.
+    if thumb_scale:
+        dump_path = output_dir / "frames" / f"{name}.png"
+        dump_path.parent.mkdir(parents=True, exist_ok=True)
+        if dump_path.exists():
+            dump_path.unlink()
+    else:
+        dump_path = png_path
 
     # cursor_blink_interval=0 always comes first so a per-config opts entry
     # could still override it if a future config matrix entry ever needed
@@ -161,7 +186,11 @@ def capture_config(name: str, opts: list[str], output_dir: Path, timeout: float,
         helper_argv.append(scene)
     proc = spawn_kitty(
         helper_argv,
-        extra_env={"KITTY_METAL_DUMP_FRAME": str(png_path), **CONFIG_ENV.get(name, {}), **(env or {})},
+        extra_env={
+            "KITTY_METAL_DUMP_FRAME": str(dump_path),
+            **({"KITTY_METAL_TEST_THUMBNAIL": f"{png_path}:{thumb_scale}"} if thumb_scale else {}),
+            **CONFIG_ENV.get(name, {}), **(env or {}),
+        },
         extra_kitty_opts=full_opts,
         take_focus=True,
     )

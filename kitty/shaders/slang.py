@@ -764,6 +764,18 @@ METAL_SHADERS: MappingProxyType[str, MetalShader] = MappingProxyType({
     # cyclic corners misses the top wedge and double-blends a seam, and the
     # fork's hand-written trail had rendered that way since the MSL port.
     'trail': MetalShader(frozenset({Stage.vertex, Stage.fragment}), VertexOrder.fan),
+    # screenshot: blit-common's vertex_pos_map walks the quad perimeter
+    # RT,RB,LB,LT -- drawn as a strip that order leaves the top corner region
+    # uncovered (verified by tiling the two strip triangles), so it is a fan.
+    # NOTE: unlike bgimage, the retired hand-written LUT is NOT the fan table
+    # permuted by fan_to_strip_indices -- the two strips split the quad along
+    # DIFFERENT diagonals. They render identically because every interpolated
+    # attribute (texcoord) is affine across the rectangle, so the diagonal
+    # choice cannot change any pixel; the golden thumbnail gate is the proof.
+    # The hand-written vertex also baked the GL-bottom-up vs Metal-top-down
+    # texture flip into its tex LUT; the generated shader is upstream-faithful,
+    # so the C push swaps src_rect's top/bottom instead (metal.m, program 12).
+    'screenshot': MetalShader(frozenset({Stage.vertex, Stage.fragment}), VertexOrder.fan),
 })
 
 # Slang names every entry point vertex_main/fragment_main, which would collide

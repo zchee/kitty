@@ -111,7 +111,9 @@ from .fast_data_types import (
     oob_channel_detach,
     os_window_focus_counters,
     os_window_font_size,
+    png_from_32bit_rgba_data,
     redirect_mouse_handling,
+    request_callback_with_thumbnail,
     ring_bell,
     run_with_activation_token,
     safe_pipe,
@@ -444,6 +446,32 @@ class Boss:
         self.mappings: Mappings = Mappings(global_shortcuts, self.refresh_active_tab_bar)
         self.notification_manager: NotificationManager = NotificationManager(debug=self.args.debug_keyboard or self.args.debug_rendering)
         self.atexit.unlink(store_effective_config())
+        thumb_spec = os.environ.get('KITTY_METAL_TEST_THUMBNAIL')
+        if thumb_spec:
+            # W3f gate lever: SCREENSHOT_PROGRAM's only production trigger is
+            # the tab/window drag thumbnail, which a headless golden run cannot
+            # drive. "path[:scale]" schedules one thumbnail request after the
+            # scene settles and writes the shader's output as a PNG, so the
+            # program's pixels become a comparable golden artifact.
+            path, _, scale = thumb_spec.partition(':')
+            self._metal_test_thumbnail_path = path
+            add_timer(partial(self._metal_test_thumbnail_fire, float(scale or '0.25')), 1.5, False)
+
+    def _metal_test_thumbnail_fire(self, scale: float, timer_id: int | None = None) -> None:
+        if self.os_window_map:
+            os_window_id = next(iter(self.os_window_map))
+            # max_width far above any viewport so the thumbnail keeps the exact
+            # requested scale (the cap path rescales with a hardcoded 300).
+            request_callback_with_thumbnail('_metal_test_thumbnail_ready', os_window_id, 0, False, scale, 1000000)
+        # The request only marks the window dirty; with no further events the
+        # main loop never wakes to serve it (production requests ride the drag
+        # gesture's own event stream). A follow-up timer IS a wakeup, and the
+        # loop's render phase then observes the pending request.
+        add_timer(lambda timer_id=None: None, 0.05, False)
+
+    def _metal_test_thumbnail_ready(self, os_window_id: int, window_id: int, pixels: bytes, width: int, height: int) -> None:
+        with open(self._metal_test_thumbnail_path, 'wb') as f:
+            f.write(png_from_32bit_rgba_data(pixels, width, height, True))
 
     def startup_first_child(self, os_window_id: int | None, startup_sessions: Iterable[Session] = ()) -> None:
         si = startup_sessions or create_sessions(get_options(), self.args, default_session=get_options().startup_session)
