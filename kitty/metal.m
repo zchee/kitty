@@ -2050,6 +2050,14 @@ draw_quad(bool blend, unsigned instance_count) {
         // Bind image texture from unit 1 (GRAPHICS_UNIT)
         if (bound_tex_2d[1] && bound_tex_2d[1] < MAX_TEXTURES && textures[bound_tex_2d[1]].texture) {
             [mtl_current_encoder setFragmentTexture:textures[bound_tex_2d[1]].texture atIndex:0];
+            // W3f: sample through the texture's own recorded GL state instead
+            // of a constexpr stand-in. send_image_to_gpu requests LINEAR +
+            // REPEAT_CLAMP (CLAMP_TO_BORDER, transparent black) for graphics
+            // images and window logos; the old constexpr sampler gave
+            // nearest + clamp_to_edge -- wrong on BOTH axes (the campaign's
+            // fourth recovered divergence, visible on any scaled image/logo).
+            id<MTLSamplerState> smp = sampler_state_for(textures[bound_tex_2d[1]].filter_linear, textures[bound_tex_2d[1]].wrap);
+            if (smp) [mtl_current_encoder setFragmentSamplerState:smp atIndex:0];
             // US-307: record the frame that samples this image texture, so the
             // upload path can detect it is still in flight under async present.
             textures[bound_tex_2d[1]].last_drawn_fidx = metal_frame_index;

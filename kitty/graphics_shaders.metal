@@ -105,9 +105,12 @@ vertex GraphicsVertexOut graphics_vertex(
 fragment float4 graphics_fragment(
     GraphicsVertexOut in [[stage_in]],
     texture2d<float> image [[texture(0)]],
+    sampler s [[sampler(0)]],
     constant GraphicsUniforms& uniforms [[buffer(0)]]
 ) {
-    constexpr sampler s(mag_filter::nearest, min_filter::nearest);
+    // W3f: the sampler comes from the C side's recorded GL parameters
+    // (linear + clamp-to-border for images and window logos), replacing a
+    // constexpr nearest/clamp-to-edge that diverged from GL on both axes.
     float4 color = image.sample(s, in.texcoord);
 
     if (IS_ALPHA_MASK) {
