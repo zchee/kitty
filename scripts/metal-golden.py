@@ -120,6 +120,19 @@ CONFIG_MATRIX: dict[str, list[str]] = {
 # screenshot scale passed to the lever), not the frame dump.
 THUMB_CONFIGS: dict[str, str] = {"screenshot-thumb": "0.5"}
 
+# W3h review F11: a guard that derives its expectation from the thing it
+# guards cannot detect that thing changing -- reverify.sh's count gate reads
+# len(CONFIG_MATRIX), so a config silently deleted ABOVE would shrink both
+# sides in lockstep and pass. This declared constant is the metal.m
+# KITTY_SLANG_VERTEX_SHADERS idiom: growing or shrinking the matrix is an
+# explicit act (edit this number in the same diff), and every capture or
+# compare fails loud until it is.
+EXPECT_CONFIG_MATRIX = 11
+assert len(CONFIG_MATRIX) == EXPECT_CONFIG_MATRIX, (
+    f"CONFIG_MATRIX has {len(CONFIG_MATRIX)} configs but EXPECT_CONFIG_MATRIX declares "
+    f"{EXPECT_CONFIG_MATRIX} -- update the constant in the same change that alters the matrix"
+)
+
 # Scene argument handed to the content helper (argv[1]); configs not listed
 # here run the legacy scene, whose bytes are pinned by the existing baselines.
 CONFIG_SCENE: dict[str, str] = {

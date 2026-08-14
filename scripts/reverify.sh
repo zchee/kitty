@@ -45,10 +45,17 @@ DIRTY=$(git -C "$WT" status --short | grep -v 'kitty/glsl-uniforms.h')
 
 echo "== goldens vs baseline (threshold 0)"
 # The expected matrix size comes from CONFIG_MATRIX by AST and GATES the
-# compare below (W3h review F5: a compare over a silently-short capture set
-# printed a self-referential "n/n at 0" and reached PASS — the pass-shaped
-# failure this script was chartered to eliminate, reintroduced one line from
-# its own remedy).
+# compare below. Measured failure taxonomy (W3h review F5 round-2 + F11 --
+# the reviewer's own first framing was refuted by their own probe):
+#   (a) truncated capture, full baseline: compare's UNION emits missing-from
+#       errors -> already FAILS loud, no guard needed;
+#   (b) subset baseline, full capture: same union, same loud FAIL;
+#   (c) capture AND baseline short the same configs: only this count gate
+#       catches it (n < declared matrix);
+#   (d) CONFIG_MATRIX itself silently shrunk: this gate alone cannot see it
+#       (expected shrinks in lockstep) -- EXPECT_CONFIG_MATRIX in
+#       metal-golden.py (a human-edited declared constant, F11) makes every
+#       capture/compare fail loud until the shrink is explicit.
 MATRIX=$(cd "$WT" && python3.14 -c '
 import ast
 src = open("scripts/metal-golden.py").read()
