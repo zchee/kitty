@@ -126,7 +126,10 @@ THUMB_CONFIGS: dict[str, str] = {"screenshot-thumb": "0.5"}
 # sides in lockstep and pass. This declared constant is the metal.m
 # KITTY_SLANG_VERTEX_SHADERS idiom: growing or shrinking the matrix is an
 # explicit act (edit this number in the same diff), and every capture or
-# compare fails loud until it is.
+# compare fails loud until it is. reverify.sh reads this file by AST (it
+# never imports), so the assert fires at capture/compare EXECUTION, not
+# during reverify's count read -- the two readers are complementary; do
+# not "fix" the constant into the AST path.
 EXPECT_CONFIG_MATRIX = 11
 assert len(CONFIG_MATRIX) == EXPECT_CONFIG_MATRIX, (
     f"CONFIG_MATRIX has {len(CONFIG_MATRIX)} configs but EXPECT_CONFIG_MATRIX declares "
