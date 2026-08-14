@@ -462,12 +462,12 @@ class Boss:
             os_window_id = next(iter(self.os_window_map))
             # max_width far above any viewport so the thumbnail keeps the exact
             # requested scale (the cap path rescales with a hardcoded 300).
+            # This request only sets state and needs_render: GLFW timer
+            # callbacks fire OUTSIDE the tick (child-monitor.c), so nothing
+            # here schedules the render pass that would serve it. The golden
+            # content helper supplies that by writing inert pty damage during
+            # its hold; production requests ride the drag's own event stream.
             request_callback_with_thumbnail('_metal_test_thumbnail_ready', os_window_id, 0, False, scale, 1000000)
-        # The request only marks the window dirty; with no further events the
-        # main loop never wakes to serve it (production requests ride the drag
-        # gesture's own event stream). A follow-up timer IS a wakeup, and the
-        # loop's render phase then observes the pending request.
-        add_timer(lambda timer_id=None: None, 0.05, False)
 
     def _metal_test_thumbnail_ready(self, os_window_id: int, window_id: int, pixels: bytes, width: int, height: int) -> None:
         with open(self._metal_test_thumbnail_path, 'wb') as f:

@@ -210,7 +210,14 @@ def capture_config(name: str, opts: list[str], output_dir: Path, timeout: float,
             png_path.unlink()
         return result
     if not png_path.exists():
-        result["error"] = "no PNG produced (KITTY_METAL_DUMP_FRAME never wrote a file)"
+        if thumb_scale:
+            # F5: for thumbnail configs the frame dump usually DID write (into
+            # frames/); the missing artifact is the lever's thumbnail -- which
+            # is exactly what a starved request looks like (see the boss lever
+            # comment: a request with no subsequent pty damage never renders).
+            result["error"] = "no thumbnail produced (KITTY_METAL_TEST_THUMBNAIL request never served; frame dump status is separate, see frames/)"
+        else:
+            result["error"] = "no PNG produced (KITTY_METAL_DUMP_FRAME never wrote a file)"
         return result
     result["path"] = str(png_path)
     result["bytes"] = png_path.stat().st_size
