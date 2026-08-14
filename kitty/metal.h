@@ -266,8 +266,12 @@ void metal_set_cell_shader_opts(bool do_fg_override, int fg_override_algo, float
 #define glActiveTexture(unit) metal_gl_active_texture(unit)
 #define glBindTexture(target, id) metal_gl_bind_texture(target, id)
 #define glGenTextures(n, ids) metal_gl_gen_textures(n, ids)
-#define glTexParameteri(target, pname, param) ((void)(target), (void)(pname), (void)(param)) // handled during texture creation
+#define glTexParameteri(target, pname, param) metal_gl_tex_parameteri(target, pname, param)
+// Only ever called for GL_TEXTURE_BORDER_COLOR with a zero border (shaders.c),
+// which the sampler cache maps to clamp_to_border_color's transparent black, so
+// the values themselves need no recording.
 #define glTexParameterfv(target, pname, params) ((void)(target), (void)(pname), (void)(params))
+void metal_gl_tex_parameteri(GLenum target, GLenum pname, GLint param);
 #define glTexImage2D(...) metal_gl_tex_image_2d(__VA_ARGS__)
 #define glTexSubImage2D(...) metal_gl_tex_sub_image_2d(__VA_ARGS__)
 #define glTexSubImage3D(...) metal_gl_tex_sub_image_3d(__VA_ARGS__)

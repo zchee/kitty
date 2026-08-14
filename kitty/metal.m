@@ -1409,6 +1409,15 @@ typedef struct {
     // async-presented committed frame may still be sampling it (see
     // texture_upload_in_flight). Written on the main thread (draw + realloc).
     uint64_t last_drawn_fidx;
+    // W3e: sampler state the GL side sets via glTexParameteri, recorded instead
+    // of dropped. Hand-written shaders ignore it (constexpr samplers); shaders
+    // generated from slang take a runtime [[sampler(n)]] and bind an
+    // MTLSamplerState built from these. GL's own defaults would be
+    // mipmapped+REPEAT, but every kitty texture sets both explicitly right
+    // after creation, so plain zeroes (nearest, and wrap 0 mapped to
+    // clamp_to_edge) are a safe pre-parameter state.
+    bool filter_linear;
+    GLenum wrap; // GL_REPEAT / GL_MIRRORED_REPEAT / GL_CLAMP_TO_BORDER / GL_CLAMP_TO_EDGE / 0
 } MetalTexture;
 
 #define MAX_TEXTURES 1024
@@ -3458,6 +3467,31 @@ void metal_gl_bind_texture(GLenum target, GLuint id) {
     // Also track per-target for tex_image/tex_sub calls
     if (target == GL_TEXTURE_2D) currently_bound_texture_2d = id;
     else if (target == GL_TEXTURE_2D_ARRAY) currently_bound_texture_2d_array = id;
+}
+
+// W3e: record the GL sampler parameters instead of dropping them. This used to
+// be a no-op macro, which is how the fork's Metal bgimage never tiled: GL sets
+// GL_REPEAT on the background-image texture (send_image_to_gpu) and the
+// hand-written shader's constexpr sampler clamped. Generated shaders bind a
+// real MTLSamplerState built from this record; hand-written shaders keep their
+// constexpr samplers and are unaffected.
+void metal_gl_tex_parameteri(GLenum target, GLenum pname, GLint param) {
+    GLuint id = (target == GL_TEXTURE_2D) ? currently_bound_texture_2d : currently_bound_texture_2d_array;
+    if (!id || id >= MAX_TEXTURES) return;
+    MetalTexture *t = &textures[id];
+    switch (pname) {
+        case GL_TEXTURE_MIN_FILTER:
+        case GL_TEXTURE_MAG_FILTER:
+            // kitty always sets both to the same value; a single flag suffices.
+            t->filter_linear = (param == GL_LINEAR);
+            break;
+        case GL_TEXTURE_WRAP_S:
+        case GL_TEXTURE_WRAP_T:
+            // Likewise always set pairwise to the same mode.
+            t->wrap = (GLenum)param;
+            break;
+        default: break;
+    }
 }
 
 static GLuint
