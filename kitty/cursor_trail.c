@@ -196,14 +196,16 @@ update_cursor_trail(CursorTrail *ct, Window *w, monotonic_t now, OSWindow *os_wi
 
     if (cursor_trail_pinned_for_test()) {
         static const int corner_index[2][4] = {{1, 1, 0, 0}, {0, 1, 1, 0}};
-        const float cx = (EDGE(x, 0) + EDGE(x, 1)) * 0.5f, cy = (EDGE(y, 0) + EDGE(y, 1)) * 0.5f;
         for (int i = 0; i < 4; ++i) {
             // Each corner: its cursor-rect target, displaced one cell away from
-            // the cursor centre, so the visible ring cannot be masked out by
-            // the fragment's own cursor-interior test.
-            const float tx = EDGE(x, corner_index[0][i]), ty = EDGE(y, corner_index[1][i]);
-            ct->corner_x[i] = tx + copysignf(g.dx, tx - cx);
-            ct->corner_y[i] = ty + copysignf(g.dy, ty - cy);
+            // the cursor rect, so the visible ring cannot be masked out by the
+            // fragment's own cursor-interior test. The displacement direction
+            // comes from the edge index itself (x: 1 is the right edge, 0 the
+            // left; y: 0 is the top edge in NDC, 1 the bottom), not from the
+            // rect's extent, so a degenerate rect (a zero-thickness beam or
+            // underline) still pins a well-formed quad.
+            ct->corner_x[i] = EDGE(x, corner_index[0][i]) + (corner_index[0][i] ? g.dx : -g.dx);
+            ct->corner_y[i] = EDGE(y, corner_index[1][i]) + (corner_index[1][i] ? -g.dy : g.dy);
         }
         ct->opacity = 1.0f;
         ct->needs_render = true;

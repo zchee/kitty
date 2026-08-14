@@ -124,7 +124,8 @@ for cells/borders/graphics. Metal has no fan. Mapping:
 shader**: `strip[0..3] = fan[2], fan[1], fan[3], fan[0]`. The LUT lives next
 to each shader’s `*_pos_map` constant (`cell_shaders.metal:145`,
 `border_shaders.metal:41`, `graphics_shaders.metal:48`, `blit_shaders.metal:63`,
-`effects_shaders.metal`). Corner *semantics* (which corner a vertex id means)
+`effects_shaders.metal`, whose shaders have since migrated to slang-generated
+MSL and whose file is gone — W3c/W3d). Corner *semantics* (which corner a vertex id means)
 are preserved, so derived values (sprite coords, tex coords) stay correct.
 
 ## Coordinate conventions

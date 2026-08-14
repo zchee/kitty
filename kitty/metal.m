@@ -507,9 +507,10 @@ _Static_assert(offsetof(MetalTrailUniforms, cursor_edge_x) == TRAIL_VERTEX_BUFSZ
     "trail.slang's vertex block is no longer exactly x_coords+y_coords");
 _Static_assert(sizeof(MetalTrailUniforms) - offsetof(MetalTrailUniforms, cursor_edge_x) == TRAIL_FRAGMENT_BUFSZ_entryPointParams,
     "the MetalTrailUniforms tail no longer fills trail.slang's fragment block");
-_Static_assert(offsetof(MetalTrailUniforms, trail_color) - offsetof(MetalTrailUniforms, cursor_edge_x) == 16 &&
+_Static_assert(offsetof(MetalTrailUniforms, cursor_edge_y) - offsetof(MetalTrailUniforms, cursor_edge_x) == 8 &&
+               offsetof(MetalTrailUniforms, trail_color) - offsetof(MetalTrailUniforms, cursor_edge_x) == 16 &&
                offsetof(MetalTrailUniforms, trail_opacity) - offsetof(MetalTrailUniforms, cursor_edge_x) == 32,
-    "the C padding after trail_color no longer matches the MSL float3 slot");
+    "the MetalTrailUniforms tail no longer matches trail.slang's fragment block member-for-member");
 
 // Every quad here is a 4-vertex GL_TRIANGLE_FAN in GL, and Metal has no fan
 // primitive, so each hand-written shader bakes a permutation into its vertex-id
@@ -548,10 +549,11 @@ ensure_fan_to_strip_index_buffer(void) {
 // Which programs render from a slang-generated vertex shader. The program ids
 // live in shaders.c's enum, not in a header, so this cannot be derived from
 // slang.py's METAL_SHADERS -- and the goldens would not catch the omission for
-// every shader (the config matrix does not exercise blit, screenshot or
-// rounded_rect, so migrating one of those and forgetting it here would render
-// bowties against a green gate; tint IS covered, via progress-bar's track).
-// So the generated header gates both directions:
+// every shader (the config matrix does not exercise blit or screenshot, so
+// migrating one of those and forgetting it here would render bowties against a
+// green gate; tint and rounded_rect ARE covered via progress-bar -- measured,
+// breaking either generated fragment moves it -- and trail via
+// cursor-trail-pinned). So the generated header gates both directions:
 // the per-shader marker below catches a removal or a swap, and the count catches
 // an addition, which no marker of its own would make anything here react to.
 _Static_assert(KITTY_SLANG_VERTEX_SHADERS == 4,
@@ -581,7 +583,7 @@ program_uses_fan_vertex_order(int program) {
     switch (program) {
         case 4: return BORDER_VERTEX_ORDER_FAN;         // BORDERS, from border.slang
         case 9: return TINT_VERTEX_ORDER_FAN;           // TINT, from tint.slang
-        case 10: return TRAIL_VERTEX_ORDER_FAN;         // TRAIL, from trail.slang (client order: 0)
+        case 10: return TRAIL_VERTEX_ORDER_FAN;         // TRAIL, from trail.slang
         case 13: return ROUNDED_RECT_VERTEX_ORDER_FAN;  // ROUNDED_RECT, from rounded_rect.slang
         default: return false;
     }

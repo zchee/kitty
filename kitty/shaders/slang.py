@@ -748,9 +748,13 @@ METAL_SHADERS: MappingProxyType[str, MetalShader] = MappingProxyType({
     'tint': MetalShader(frozenset({Stage.vertex, Stage.fragment}), VertexOrder.fan),
     'rounded_rect': MetalShader(frozenset({Stage.vertex, Stage.fragment}), VertexOrder.fan),
     # trail indexes x_coords[vertex_id]/y_coords[vertex_id], which the C side
-    # fills in draw order (shaders.c fills them from CursorTrail.corner_x) --
-    # remapping vertex_id would permute an order the client already fixed.
-    'trail': MetalShader(frozenset({Stage.vertex, Stage.fragment}), VertexOrder.client),
+    # fills in FAN order (cursor_trail.c's corner_index yields TR,BR,BL,TL --
+    # cyclic -- because upstream draws every quad as GL_TRIANGLE_FAN, gl.c).
+    # It was first declared client on the belief that the array order was
+    # already the draw order; measurement refuted that -- a raw strip over
+    # cyclic corners misses the top wedge and double-blends a seam, and the
+    # fork's hand-written trail had rendered that way since the MSL port.
+    'trail': MetalShader(frozenset({Stage.vertex, Stage.fragment}), VertexOrder.fan),
 })
 
 # Slang names every entry point vertex_main/fragment_main, which would collide
