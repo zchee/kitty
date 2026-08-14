@@ -86,6 +86,17 @@ CONFIG_MATRIX: dict[str, list[str]] = {
     # tone-map with the headroom PINNED (see CONFIG_ENV), so the dump-channel
     # rendition is display-state-independent.
     "hdr-ramp": [],
+    # W3d: coverage for the TRAIL program, which every other config is blind to
+    # (cursor_trail=20 above never renders a visible trail at capture time —
+    # the trail exists only mid-animation, and a settled trail masks itself
+    # out). KITTY_METAL_TEST_PIN_TRAIL (see CONFIG_ENV) pins the corners one
+    # cell outside the cursor rect at opacity 1, a deterministic function of
+    # the settled cursor position. Explicit trail colour so the baseline does
+    # not depend on the cursor colour.
+    "cursor-trail-pinned": [
+        "cursor_blink_interval=0", "cursor_shape_unfocused=unchanged",
+        "cursor_trail=1", "cursor_trail_color=#7742ff",
+    ],
 }
 
 # Scene argument handed to the content helper (argv[1]); configs not listed
@@ -102,6 +113,7 @@ CONFIG_ENV: dict[str, dict[str, str]] = {
     # Deterministic tone-map ceiling for the EDR golden (the live headroom
     # moves with the panel and its brightness slider).
     "hdr-ramp": {"KITTY_METAL_EDR_HEADROOM_OVERRIDE": "2.0"},
+    "cursor-trail-pinned": {"KITTY_METAL_TEST_PIN_TRAIL": "1"},
 }
 
 

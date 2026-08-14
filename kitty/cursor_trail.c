@@ -161,6 +161,19 @@ update_cursor_trail_needs_render(CursorTrail *ct, Window *w, ndc_coords g) {
     }
 }
 
+// W3d regression lever: the trail exists only mid-animation (a settled trail
+// masks itself out against the cursor rect), so no capture of it is ever
+// byte-stable and the golden harness is structurally blind to the trail
+// shaders. With the pin, the corners sit one cell outside the cursor rect at
+// full opacity and the trail draws every frame — a deterministic function of
+// the settled cursor position, which is what a pixel baseline needs.
+static bool
+cursor_trail_pinned_for_test(void) {
+    static int state = -1;
+    if (state < 0) { const char *v = getenv("KITTY_METAL_TEST_PIN_TRAIL"); state = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0; }
+    return state == 1;
+}
+
 bool
 update_cursor_trail(CursorTrail *ct, Window *w, monotonic_t now, OSWindow *os_window) {
     ndc_coords g = {
@@ -180,6 +193,22 @@ update_cursor_trail(CursorTrail *ct, Window *w, monotonic_t now, OSWindow *os_wi
     update_cursor_trail_needs_render(ct, w, g);
 
     ct->updated_at = now;
+
+    if (cursor_trail_pinned_for_test()) {
+        static const int corner_index[2][4] = {{1, 1, 0, 0}, {0, 1, 1, 0}};
+        const float cx = (EDGE(x, 0) + EDGE(x, 1)) * 0.5f, cy = (EDGE(y, 0) + EDGE(y, 1)) * 0.5f;
+        for (int i = 0; i < 4; ++i) {
+            // Each corner: its cursor-rect target, displaced one cell away from
+            // the cursor centre, so the visible ring cannot be masked out by
+            // the fragment's own cursor-interior test.
+            const float tx = EDGE(x, corner_index[0][i]), ty = EDGE(y, corner_index[1][i]);
+            ct->corner_x[i] = tx + copysignf(g.dx, tx - cx);
+            ct->corner_y[i] = ty + copysignf(g.dy, ty - cy);
+        }
+        ct->opacity = 1.0f;
+        ct->needs_render = true;
+        return true;
+    }
 
     // returning true here will cause the cells to be drawn
     return ct->needs_render || needs_render_prev;
