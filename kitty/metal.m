@@ -294,6 +294,56 @@ ensure_gamma_lut_buffer(void) {
     return gamma_lut_buffer;
 }
 
+// W3e: MTLSamplerState cache for shaders generated from slang, which take a
+// runtime [[sampler(n)]] where the hand-written MSL used constexpr samplers.
+// Keyed by (linear filter, GL wrap mode); the population is tiny (kitty sets
+// nearest/linear x REPEAT/MIRRORED_REPEAT/CLAMP_TO_BORDER/CLAMP_TO_EDGE).
+typedef struct {
+    id<MTLSamplerState> state;
+    bool linear;
+    GLenum wrap;
+    bool in_use;
+} SamplerCacheEntry;
+#define MAX_SAMPLER_STATES 8
+static SamplerCacheEntry sampler_cache[MAX_SAMPLER_STATES];
+
+static MTLSamplerAddressMode
+sampler_address_for_gl_wrap(GLenum wrap) {
+    switch (wrap) {
+        case GL_REPEAT: return MTLSamplerAddressModeRepeat;
+        case GL_MIRRORED_REPEAT: return MTLSamplerAddressModeMirrorRepeat;
+        // shaders.c pairs CLAMP_TO_BORDER with a zero border colour, which is
+        // MTLSamplerBorderColorTransparentBlack, the Metal default.
+        case GL_CLAMP_TO_BORDER: return MTLSamplerAddressModeClampToBorderColor;
+        default: return MTLSamplerAddressModeClampToEdge;
+    }
+}
+
+static id<MTLSamplerState>
+sampler_state_for(bool linear, GLenum wrap) {
+    for (int i = 0; i < MAX_SAMPLER_STATES; i++) {
+        if (sampler_cache[i].in_use && sampler_cache[i].linear == linear && sampler_cache[i].wrap == wrap)
+            return sampler_cache[i].state;
+    }
+    if (!mtl_device) return nil;
+    MTLSamplerDescriptor *d = [[MTLSamplerDescriptor alloc] init];
+    d.minFilter = linear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+    d.magFilter = d.minFilter;
+    d.sAddressMode = sampler_address_for_gl_wrap(wrap);
+    d.tAddressMode = d.sAddressMode;
+    id<MTLSamplerState> s = [mtl_device newSamplerStateWithDescriptor:d];
+    [d release];
+    if (!s) return nil;
+    for (int i = 0; i < MAX_SAMPLER_STATES; i++) {
+        if (!sampler_cache[i].in_use) {
+            sampler_cache[i] = (SamplerCacheEntry){.state = s, .linear = linear, .wrap = wrap, .in_use = true};
+            return s;
+        }
+    }
+    log_error("Metal: sampler state cache overflow");
+    return s; // usable but uncached; unreachable with kitty's parameter population
+}
+
 // Current VAO binding for buffer access
 static ssize_t current_bound_vao = -1;
 
@@ -503,6 +553,10 @@ _Static_assert(sizeof(((MetalTintUniforms*)0)->tint_color) == TINT_FRAGMENT_BUFS
     "tint.slang's fragment no longer reads exactly tint_color");
 _Static_assert(sizeof(MetalRoundedRectUniforms) == ROUNDED_RECT_FRAGMENT_BUFSZ_entryPointParams,
     "MetalRoundedRectUniforms no longer fills rounded_rect.slang's fragment block");
+_Static_assert(offsetof(MetalBgimageUniforms, background) == BGIMAGE_VERTEX_BUFSZ_entryPointParams,
+    "bgimage.slang's vertex block is no longer exactly tiled+sizes+positions");
+_Static_assert(sizeof(((MetalBgimageUniforms*)0)->background) == BGIMAGE_FRAGMENT_BUFSZ_entryPointParams,
+    "bgimage.slang's fragment no longer reads exactly background");
 _Static_assert(offsetof(MetalTrailUniforms, y_coords) == 16 &&
                offsetof(MetalTrailUniforms, cursor_edge_x) == TRAIL_VERTEX_BUFSZ_entryPointParams,
     "trail.slang's vertex block is no longer exactly x_coords+y_coords");
@@ -550,14 +604,16 @@ ensure_fan_to_strip_index_buffer(void) {
 // Which programs render from a slang-generated vertex shader. The program ids
 // live in shaders.c's enum, not in a header, so this cannot be derived from
 // slang.py's METAL_SHADERS -- and the goldens would not catch the omission for
-// every shader (the config matrix does not exercise blit or screenshot, so
-// migrating one of those and forgetting it here would render bowties against a
-// green gate; tint and rounded_rect ARE covered via progress-bar -- measured,
-// breaking either generated fragment moves it -- and trail via
-// cursor-trail-pinned). So the generated header gates both directions:
+// every shader (screenshot is the one program no golden config exercises;
+// blit is stronger than uncovered -- it is UNREACHABLE on this backend, its
+// only draw site living in shaders.c's #else/GL branch since M1 replaced the
+// blit pass with metal_resolve_layered_frame. tint and rounded_rect ARE
+// covered via progress-bar -- measured, breaking either generated fragment
+// moves it -- trail via cursor-trail-pinned, bgimage via its own config).
+// So the generated header gates both directions:
 // the per-shader marker below catches a removal or a swap, and the count catches
 // an addition, which no marker of its own would make anything here react to.
-_Static_assert(KITTY_SLANG_VERTEX_SHADERS == 4,
+_Static_assert(KITTY_SLANG_VERTEX_SHADERS == 5,
     "a vertex shader was added to METAL_SHADERS in slang.py -- declare its VertexOrder there and map "
     "its program id below");
 #ifndef BORDER_VERTEX_IS_GENERATED
@@ -572,6 +628,9 @@ _Static_assert(KITTY_SLANG_VERTEX_SHADERS == 4,
 #ifndef TRAIL_VERTEX_IS_GENERATED
 #error "trail's vertex is no longer generated -- drop program 10 below"
 #endif
+#ifndef BGIMAGE_VERTEX_IS_GENERATED
+#error "bgimage's vertex is no longer generated -- drop program 8 below"
+#endif
 
 // Only the program id -> shader mapping lives here, because program ids live in
 // shaders.c's enum and not in any header. Whether that shader needs the fan
@@ -583,6 +642,7 @@ static bool
 program_uses_fan_vertex_order(int program) {
     switch (program) {
         case 4: return BORDER_VERTEX_ORDER_FAN;         // BORDERS, from border.slang
+        case 8: return BGIMAGE_VERTEX_ORDER_FAN;        // BGIMAGE, from bgimage.slang
         case 9: return TINT_VERTEX_ORDER_FAN;           // TINT, from tint.slang
         case 10: return TRAIL_VERTEX_ORDER_FAN;         // TRAIL, from trail.slang
         case 13: return ROUNDED_RECT_VERTEX_ORDER_FAN;  // ROUNDED_RECT, from rounded_rect.slang
@@ -929,10 +989,10 @@ fill_graphics_uniforms(int program, MetalGraphicsUniforms *u) {
 static void
 fill_bgimage_uniforms(int program, MetalBgimageUniforms *u) {
     memset(u, 0, sizeof(*u));
+    u->tiled = slot_f(program, BGIMAGE_U_tiled, 0);
     slot_fv(program, BGIMAGE_U_sizes, u->sizes, 4);
     slot_fv(program, BGIMAGE_U_positions, u->positions, 4);
     slot_fv(program, BGIMAGE_U_background, u->background, 4);
-    u->tiled = slot_f(program, BGIMAGE_U_tiled, 0);
 }
 
 static void
@@ -1980,12 +2040,23 @@ draw_quad(bool blend, unsigned instance_count) {
             textures[bound_tex_2d[1]].last_drawn_fidx = metal_frame_index;
         }
     } else if (current_program == 8) {
+        // bgimage.slang splits per stage: the vertex reads tiled+sizes+positions
+        // (the leading 48 bytes), the fragment only background. The texture now
+        // comes with a real sampler built from the recorded GL parameters --
+        // which is what makes tiled background images actually tile: GL sets
+        // GL_REPEAT, the old constexpr sampler clamped, and the wrap was
+        // silently dropped by the shim until W3e.
         MetalBgimageUniforms bg_u;
         fill_bgimage_uniforms(current_program, &bg_u);
-        [mtl_current_encoder setVertexBytes:&bg_u length:sizeof(bg_u) atIndex:0];
-        [mtl_current_encoder setFragmentBytes:&bg_u length:sizeof(bg_u) atIndex:0];
-        if (bound_tex_2d[1] && bound_tex_2d[1] < MAX_TEXTURES && textures[bound_tex_2d[1]].texture) {
-            [mtl_current_encoder setFragmentTexture:textures[bound_tex_2d[1]].texture atIndex:0];
+        [mtl_current_encoder setVertexBytes:&bg_u length:offsetof(MetalBgimageUniforms, background)
+                                    atIndex:BGIMAGE_VERTEX_BUF_entryPointParams];
+        [mtl_current_encoder setFragmentBytes:bg_u.background length:sizeof(bg_u.background)
+                                      atIndex:BGIMAGE_FRAGMENT_BUF_entryPointParams];
+        GLuint bg_tex = bound_tex_2d[1];
+        if (bg_tex && bg_tex < MAX_TEXTURES && textures[bg_tex].texture) {
+            [mtl_current_encoder setFragmentTexture:textures[bg_tex].texture atIndex:BGIMAGE_FRAGMENT_TEX_image];
+            id<MTLSamplerState> smp = sampler_state_for(textures[bg_tex].filter_linear, textures[bg_tex].wrap);
+            if (smp) [mtl_current_encoder setFragmentSamplerState:smp atIndex:BGIMAGE_FRAGMENT_SAMP_image];
         }
     } else if (current_program == 9) {
         // tint.slang takes its uniforms as entry-point parameters, so slang gives

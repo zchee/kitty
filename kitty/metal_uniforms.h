@@ -99,12 +99,16 @@ typedef struct MetalGraphicsUniforms {
     float _pad2;
 } MetalGraphicsUniforms;
 
+// W3e: laid out to mirror bgimage.slang's blocks -- the vertex entryPointParams
+// {tiled, sizes, positions} (48 bytes; _pad0 is MSL's alignment hole after the
+// lone float) followed by the fragment's {background} (16 bytes), so the two
+// per-stage pushes are contiguous slices of this one struct.
 typedef struct MetalBgimageUniforms {
+    float tiled;
+    float _pad0[3];
     float sizes[4];
     float positions[4];
     float background[4];
-    float tiled;
-    float _pad[3];
 } MetalBgimageUniforms;
 
 typedef struct MetalTintUniforms {
@@ -170,7 +174,9 @@ _Static_assert(offsetof(MetalGraphicsUniforms, amask_fg) == 528, "graphics amask
 _Static_assert(offsetof(MetalGraphicsUniforms, amask_bg_premult) == 544, "graphics amask_bg_premult must start at 544");
 
 _Static_assert(sizeof(MetalBgimageUniforms) == 64, "MetalBgimageUniforms layout drifted");
-_Static_assert(offsetof(MetalBgimageUniforms, tiled) == 48, "bgimage tiled must land at 48");
+_Static_assert(offsetof(MetalBgimageUniforms, sizes) == 16 && offsetof(MetalBgimageUniforms, positions) == 32 &&
+               offsetof(MetalBgimageUniforms, background) == 48,
+    "MetalBgimageUniforms no longer mirrors bgimage.slang's vertex+fragment blocks");
 
 _Static_assert(sizeof(MetalTintUniforms) == 32, "MetalTintUniforms layout drifted");
 _Static_assert(offsetof(MetalTintUniforms, edges) == 16, "tint edges must start at 16");

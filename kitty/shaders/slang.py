@@ -751,6 +751,10 @@ METAL_SHADERS: MappingProxyType[str, MetalShader] = MappingProxyType({
     'border': MetalShader(frozenset({Stage.vertex}), VertexOrder.fan),
     'tint': MetalShader(frozenset({Stage.vertex, Stage.fragment}), VertexOrder.fan),
     'rounded_rect': MetalShader(frozenset({Stage.vertex, Stage.fragment}), VertexOrder.fan),
+    # fan derived from the hand-written source, not assumed: it baked
+    # strip-reorder LUTs for BOTH pos and tex ("Position mapping using strip
+    # order"), the mark of an upstream fan-order shader ported to the strip draw.
+    'bgimage': MetalShader(frozenset({Stage.vertex, Stage.fragment}), VertexOrder.fan),
     # trail indexes x_coords[vertex_id]/y_coords[vertex_id], which the C side
     # fills in FAN order (cursor_trail.c's corner_index yields TR,BR,BL,TL --
     # cyclic -- because upstream draws every quad as GL_TRIANGLE_FAN, gl.c).

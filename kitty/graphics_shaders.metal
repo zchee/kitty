@@ -5,24 +5,17 @@
  * Distributed under terms of the GPL3 license.
  *
  * MSL port of graphics_vertex.glsl + graphics_fragment.glsl (3 variants)
- * Also includes bgimage_vertex.glsl + bgimage_fragment.glsl
+ * (bgimage lived here too until W3e moved it to generated MSL)
  */
 
 #include <metal_stdlib>
 using namespace metal;
-// W27 GLSL-freezeout stage 1 (D4): pins GraphicsUniforms/BgimageUniforms
-// (below) against the C-side MetalGraphicsUniforms/MetalBgimageUniforms
-// (metal.m/metal_uniforms.h) at compile time.
+// W27 GLSL-freezeout stage 1 (D4): pins GraphicsUniforms (below) against the
+// C-side MetalGraphicsUniforms (metal.m/metal_uniforms.h) at compile time.
 #include "metal_uniforms.h"
 
 inline float4 vec4_premul(float3 rgb, float a) { return float4(rgb * a, a); }
 inline float4 vec4_premul(float4 rgba) { return float4(rgba.rgb * rgba.a, rgba.a); }
-
-inline float4 alpha_blend(float4 over, float4 under) {
-    float alpha = mix(under.a, 1.0f, over.a);
-    float3 combined_color = mix(under.rgb * under.a, over.rgb, over.a);
-    return float4(combined_color, alpha);
-}
 
 inline float4 alpha_blend_premul(float4 over, float4 under) {
     float inv = 1.0f - over.a;
@@ -136,63 +129,7 @@ fragment float4 graphics_fragment(
     return color;
 }
 
-// ==== BGIMAGE SHADER ====
-
-struct BgimageUniforms {
-    float4 sizes;       // window_w, window_h, image_w, image_h
-    float4 positions;   // left, top, right, bottom
-    float4 background;  // r, g, b, a
-    float tiled;
-};
-static_assert(sizeof(BgimageUniforms) == sizeof(MetalBgimageUniforms),
-              "BgimageUniforms drifted from MetalBgimageUniforms");
-
-struct BgimageVertexOut {
-    float4 position [[position]];
-    float2 texcoord;
-};
-
-vertex BgimageVertexOut bgimage_vertex(
-    uint vid [[vertex_id]],
-    constant BgimageUniforms& uniforms [[buffer(0)]]
-) {
-    BgimageVertexOut out;
-
-    // Texture coordinate mapping
-    const float2 tex_map[4] = {
-        float2(0, 1),  // LB
-        float2(1, 1),  // RB
-        float2(0, 0),  // LT
-        float2(1, 0),  // RT
-    };
-
-    // Position mapping using strip order
-    float l = uniforms.positions[0], t = uniforms.positions[1];
-    float r = uniforms.positions[2], b = uniforms.positions[3];
-    const float2 pos_map[4] = {
-        float2(l, b),
-        float2(r, b),
-        float2(l, t),
-        float2(r, t),
-    };
-
-    float2 tex_coords = tex_map[vid];
-
-    // Tiling factor
-    float tiled = uniforms.tiled;
-    float scale_x = tiled * (uniforms.sizes[0] / uniforms.sizes[2]) + (1.0f - tiled);
-    float scale_y = tiled * (uniforms.sizes[1] / uniforms.sizes[3]) + (1.0f - tiled);
-    out.texcoord = float2(tex_coords.x * scale_x, tex_coords.y * scale_y);
-    out.position = float4(pos_map[vid], 0, 1);
-    return out;
-}
-
-fragment float4 bgimage_fragment(
-    BgimageVertexOut in [[stage_in]],
-    texture2d<float> image [[texture(0)]],
-    constant BgimageUniforms& uniforms [[buffer(0)]]
-) {
-    constexpr sampler s(mag_filter::linear, min_filter::linear);
-    float4 color = image.sample(s, in.texcoord);
-    return alpha_blend(color, uniforms.background);
-}
+// W3e: bgimage's two stages now come from kitty/shaders/bgimage.slang. Its
+// hand-written fragment sampled through a constexpr clamp-to-edge sampler, so
+// tiled background images never tiled on this fork's Metal; the generated
+// fragment takes a runtime sampler bound from the recorded GL wrap state.
