@@ -367,7 +367,7 @@ vertex CellVertexOut cell_vertex(
     uint row = iid / rd.columns;
     uint column = iid - row * rd.columns;
     float left = -1.0f + float(column) * dx;
-    float top = 1.0f - (float(row) + du.row_offset) * dy;
+    float top = 1.0f - (float(row) + rd.row_offset) * dy;
     uint2 pos = cell_pos_map[vid];
     out.position = float4(float2(left, left + dx)[pos.x], float2(top, top - dy)[pos.y], 0.f, 1.f);
     // The character sprite being rendered

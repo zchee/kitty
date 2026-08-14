@@ -1457,8 +1457,10 @@ SHADER_UNIFORMS: Dict[str, Tuple[str, ...]] = {
         # cell_fragment.glsl
         'text_contrast', 'text_gamma_adjustment', 'sprites', 'color_sprites',
         # cell_vertex.glsl
+        # row_offset moved into the CellRenderData block upstream (c680adcde),
+        # so it is no longer a standalone uniform on either backend.
         'gamma_lut', 'draw_bg_bitfield', 'sprite_decorations_map',
-        'color_sprite_decorations_map', 'row_offset',
+        'color_sprite_decorations_map',
     ),
     'graphics': (
         # graphics_fragment.glsl

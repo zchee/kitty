@@ -733,7 +733,6 @@ slot_fv(int program, GLint s, float *dest, int n) {
 static void
 fill_cell_draw_uniforms(int program, MetalCellDrawUniforms *u) {
     u->draw_bg_bitfield = uniform_stores[program].values[CELL_U_draw_bg_bitfield].u[0];
-    u->row_offset = slot_f(program, CELL_U_row_offset, 0);
     u->text_contrast = slot_f(program, CELL_U_text_contrast, 0);
     u->text_gamma_adjustment = slot_f(program, CELL_U_text_gamma_adjustment, 0);
 }
@@ -1730,7 +1729,7 @@ draw_quad(bool blend, unsigned instance_count) {
                 }
             }
         }
-        // Per-draw uniforms (draw_bg_bitfield, row_offset, etc.) → buffer index 2
+        // Per-draw uniforms (draw_bg_bitfield, text contrast/gamma) → buffer index 2
         MetalCellDrawUniforms cell_draw;
         fill_cell_draw_uniforms(current_program, &cell_draw);
         [mtl_current_encoder setVertexBytes:&cell_draw length:sizeof(cell_draw) atIndex:2];

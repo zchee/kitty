@@ -700,6 +700,20 @@ struct GPUCellRenderData {
     GLuint color_sprites_xnum, color_sprites_ynum, color_atlas_active;
 };
 
+// Drift gate: the Metal backend reads this exact buffer back as
+// MetalCellRenderData (kitty/metal_uniforms.h, included verbatim by
+// cell_shaders.metal). A field inserted HERE shifts every later member on that
+// side only, and the asserts over there -- which pin MetalCellRenderData against
+// hardcoded byte offsets -- cannot see it. Upstream adding fg_override_threshold
+// and row_offset to the block did exactly that, silently. Pin the pair.
+_Static_assert(sizeof(struct GPUCellRenderData) == sizeof(MetalCellRenderData), "GPUCellRenderData and MetalCellRenderData sizes drifted");
+_Static_assert(offsetof(struct GPUCellRenderData, fg_override_threshold) == offsetof(MetalCellRenderData, fg_override_threshold), "fg_override_threshold offset drifted");
+_Static_assert(offsetof(struct GPUCellRenderData, row_offset) == offsetof(MetalCellRenderData, row_offset), "row_offset offset drifted");
+_Static_assert(offsetof(struct GPUCellRenderData, dim_opacity) == offsetof(MetalCellRenderData, dim_opacity), "dim_opacity offset drifted");
+_Static_assert(offsetof(struct GPUCellRenderData, bg_colors0) == offsetof(MetalCellRenderData, bg_colors0), "bg_colors offset drifted");
+_Static_assert(offsetof(struct GPUCellRenderData, bg_opacities0) == offsetof(MetalCellRenderData, bg_opacities0), "bg_opacities offset drifted");
+_Static_assert(offsetof(struct GPUCellRenderData, color_sprites_xnum) == offsetof(MetalCellRenderData, color_sprites_xnum), "R8-atlas block offset drifted");
+
 // D4: per-VAO shadow of the last GPUCellRenderData actually written to the GPU
 // buffer. Lets cell_update_uniform_block() elide the map+write (which on the
 // Metal backend advances the persistent buffer ring and copies-forward the slot
