@@ -78,8 +78,11 @@ CONFIG_MATRIX: dict[str, list[str]] = {
     # texture exactly 1:1 (every sample lands on a texel centre), which makes it
     # structurally blind to the sampler FILTER -- the W3e review measured an
     # 11.07% pixel delta between nearest and linear on this layout that no
-    # other config can see. Locks filter (nearest by default) and the
-    # REPEAT_CLAMP wrap the scaled layouts use.
+    # other config can see. Locks ONLY the filter (nearest by default). It does
+    # not exercise wrap: scaled has tiled=0, so texcoords stay within [0,1] and
+    # no sample ever leaves the texture. Border semantics are unlockable with
+    # this asset regardless -- its edge texels are fully transparent, so
+    # clamp-to-border and clamp-to-edge coincide (ADR-0030 SS9.1).
     "bgimage-scaled": [f"background_image={BGIMAGE_ASSET}", "background_image_layout=scaled"],
     # W27 P3.6 / GLSL-freeze-out stage 0 (risk R4): coverage for the GRAPHICS
     # and ROUNDED_RECT programs, previously exercised by no golden config, and
