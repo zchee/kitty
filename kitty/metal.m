@@ -514,10 +514,12 @@ _Static_assert(sizeof(((MetalTintUniforms*)0)->tint_color) == TINT_FRAGMENT_BUFS
 // fan's own triangulation: a fan (v0,v1,v2,v3) is {v0,v1,v2} + {v0,v2,v3},
 // split on the v0-v2 diagonal, and a strip (s0,s1,s2,s3) splits on s1-s2, so
 // only a permutation putting v0 and v2 in the middle reproduces it. The
-// hand-written shaders are NOT consistent about this -- cell and border use
-// {2,1,3,0}, which splits on the other diagonal, while tint used {1,2,0,3} --
-// and they get away with it because a rectangle is convex, so both
-// triangulations rasterize the same pixels. That stops being true for a quad
+// hand-written shaders are NOT consistent about this -- cell, border and blit
+// use {2,1,3,0}, which splits on the other diagonal, while tint used {1,2,0,3}
+// -- and they get away with it because a rectangle is convex, so both
+// triangulations rasterize the same pixels. {1,2,0,3} also reproduces the fan's
+// winding, so this path no longer leans on the unstated invariant that nothing
+// here ever calls setCullMode. That stops being true for a quad
 // that is not a parallelogram, or as soon as a corner varying is not affine in
 // position, which is why the generated path uses the faithful one rather than
 // the one border happened to have.
