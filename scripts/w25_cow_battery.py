@@ -72,7 +72,7 @@ STUBBED_BANNER = (
 def _make_harness():
     """Return a BaseTest instance usable as a create_screen() factory."""
     sys.path.insert(0, str(REPO_ROOT))
-    from kitty_tests import BaseTest
+    from kitty_tests.base import BaseTest
 
     class _Harness(BaseTest):
         def runTest(self) -> None:  # required by unittest.TestCase.__init__

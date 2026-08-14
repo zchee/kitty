@@ -36,7 +36,7 @@ import os
 import subprocess
 import sys
 
-from . import BaseTest, parse_bytes
+from .base import BaseTest, parse_bytes
 
 # Screen geometry shared by the roundtrip test and the battery driver.
 # Wide/tall enough for DECSTBM region rotation (needs >= 4 lines) and
@@ -301,7 +301,7 @@ def run_share_subprocess(body: str, share: str = '1') -> dict:
     script = (
         'import json, sys\n'
         f'sys.path.insert(0, {_REPO_ROOT!r})\n'
-        'from kitty_tests import BaseTest, parse_bytes\n'
+        'from kitty_tests.base import BaseTest, parse_bytes\n'
         'from kitty_tests.slot_cow import COLS, LINES, SCROLLBACK, feed, setup_screen_with_history\n'
         't = BaseTest()\n'
         's = t.create_screen(cols=COLS, lines=LINES, scrollback=SCROLLBACK)\n'

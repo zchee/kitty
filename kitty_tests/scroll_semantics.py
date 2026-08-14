@@ -19,7 +19,7 @@ from pathlib import Path
 
 from kitty.window import as_text
 
-from . import BaseTest, parse_bytes
+from .base import BaseTest, parse_bytes
 
 GOLDEN_PATH = Path(__file__).parent / 'scroll_semantics.golden.json'
 

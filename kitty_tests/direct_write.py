@@ -19,7 +19,7 @@ from contextlib import suppress
 
 from kitty.fast_data_types import ChildMonitor, direct_write_counters
 
-from . import BaseTest
+from .base import BaseTest
 
 # ChildMonitor is one-per-process (the C layer keeps a static the_monitor
 # pointer and dealloc does not clear it), so the instance is created once

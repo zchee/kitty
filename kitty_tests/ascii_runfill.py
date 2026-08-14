@@ -15,7 +15,7 @@ import random
 
 from kitty.fast_data_types import set_ascii_runfill_enabled, set_wide_runfill_enabled, test_wide_runfill_fast_class
 
-from . import BaseTest, parse_bytes
+from .base import BaseTest, parse_bytes
 
 DECAWM_OFF = b'\x1b[?7l'
 DECAWM_ON = b'\x1b[?7h'

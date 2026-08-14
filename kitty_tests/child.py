@@ -7,7 +7,7 @@ import subprocess
 from kitty.child import memory_used_by_process_tree_rooted_at
 from kitty.constants import is_macos, kitty_exe
 
-from . import BaseTest
+from .base import BaseTest
 
 
 class ChildMemoryTest(BaseTest):
