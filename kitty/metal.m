@@ -3910,14 +3910,16 @@ void metal_gl_copy_tex_image_2d(GLenum target, int level, GLenum internalformat,
     MetalTexture *t = get_texture(tex_id);
     if (!t) return;
 
-    // Resolve the copy source FIRST so the destination can share its pixel
-    // format. The capture offscreen is BGRA8; with a hardcoded RGBA8
-    // destination the blit still EXECUTES (same bytes per pixel) but the
-    // copied bytes are read through the wrong component order downstream --
-    // a deterministic, exact R/B transposition in every thumbnail (W3f
-    // finding F3: proved by a zero-delta compare against an R/B-swapped
-    // baseline; the garbage/variance half of the defect lived in
-    // metal_gl_read_pixels, not here).
+    // Resolve the copy source FIRST: the destination must be created in the
+    // source's own pixel format. The capture offscreen (and the drawable) is
+    // BGRA8, and a hardcoded RGBA8 destination did NOT fail the blit -- same
+    // bytes-per-pixel, so on this driver the copy ran and the frame's bytes
+    // landed in a texture that reads them back R/B transposed. Measured on
+    // the W3f screenshot-thumb gate: byte-stable across runs, exactly the
+    // correct image with R and B swapped (max 243 on 0.99% of the settled
+    // scene). Format-mismatched blits are undefined regardless of what this
+    // driver happens to do, which is why the destination inherits
+    // source.pixelFormat.
     id<MTLTexture> source = nil;
     if (bound_framebuffer && bound_framebuffer < MAX_FRAMEBUFFERS && framebuffers[bound_framebuffer].render_target) {
         source = framebuffers[bound_framebuffer].render_target;
@@ -4046,14 +4048,16 @@ void metal_gl_read_pixels(int x, int y, int width, int height, GLenum format, GL
         }
         // The caller's contract is GL_RGBA/GL_UNSIGNED_BYTE (4 B/px, RGBA
         // order). The source is whatever the bound target really is: the
-        // thumbnail scratch FBO is RGBA16Unorm (8 B/px), and the old
-        // unconditional bytesPerRow = width*4 read was the ENTIRE garbage
-        // half of the W3f thumbnail defect -- all of the noise signature and
-        // every bit of the run-to-run variance (verifier isolation B2) --
-        // and, worse, an out-of-bounds heap WRITE: getBytes deposits
-        // (h-1)*w*4 + w*8 bytes into the caller's w*h*4 buffer, overflowing
-        // by w*4 bytes per drag thumbnail (F8). The capture offscreen is
-        // BGRA8 (needs an R/B swizzle for RGBA).
+        // thumbnail scratch FBO is RGBA16Unorm (8 B/px) and the capture
+        // offscreen is BGRA8 (needs an R/B swizzle for RGBA).
+        // W3f: passing bytesPerRow = width*4 for the 8 B/px target did not
+        // interleave half-pixels and did not overflow the caller's buffer --
+        // getBytes with a stride under width*bytesPerPixel writes NOTHING AT
+        // ALL (0xA5 canary: 0 of 540000 bytes touched, 3/3 runs). The
+        // caller's never-initialized buffer was therefore what reached the
+        // PNG encoder, and tabs.py hands it to start_drag_with_data as the
+        // macOS drag image -- that is where "undefined memory, different
+        // every run" actually came from.
         switch (source.pixelFormat) {
             case MTLPixelFormatRGBA16Unorm: {
                 uint16_t *wide = malloc((size_t)width * height * 8);
