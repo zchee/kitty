@@ -4,15 +4,14 @@
  *
  * Distributed under terms of the GPL3 license.
  *
- * MSL port of tint, trail, rounded_rect vertex/fragment shaders
+ * MSL port of the trail and rounded_rect vertex/fragment shaders
  */
 
 #include <metal_stdlib>
 using namespace metal;
-// W27 GLSL-freezeout stage 1 (D4): pins TintUniforms/TrailUniforms/
-// RoundedRectUniforms (below) against the C-side MetalTintUniforms/
-// MetalTrailUniforms/MetalRoundedRectUniforms (metal.m/metal_uniforms.h) at
-// compile time.
+// W27 GLSL-freezeout stage 1 (D4): pins TrailUniforms/RoundedRectUniforms
+// (below) against the C-side MetalTrailUniforms/MetalRoundedRectUniforms
+// (metal.m/metal_uniforms.h) at compile time.
 #include "metal_uniforms.h"
 
 inline float4 vec4_premul(float3 rgb, float a) { return float4(rgb * a, a); }
@@ -23,43 +22,9 @@ inline float4 alpha_blend(float4 over, float4 under) {
     return float4(combined_color, alpha);
 }
 
-// ==== TINT SHADER ====
-
-struct TintUniforms {
-    float4 tint_color;
-    float4 edges;
-};
-static_assert(sizeof(TintUniforms) == sizeof(MetalTintUniforms),
-              "TintUniforms drifted from MetalTintUniforms");
-
-struct TintVertexOut {
-    float4 position [[position]];
-};
-
-// Strip mapping: fan(LT,LB,RB,RT) → strip(LB,RB,LT,RT)
-vertex TintVertexOut tint_vertex(
-    uint vid [[vertex_id]],
-    constant TintUniforms& uniforms [[buffer(0)]]
-) {
-    TintVertexOut out;
-    float l = uniforms.edges[0], t = uniforms.edges[1];
-    float r = uniforms.edges[2], b = uniforms.edges[3];
-    const float2 pos_map[4] = {
-        float2(l, b),  // strip 0: LB
-        float2(r, b),  // strip 1: RB
-        float2(l, t),  // strip 2: LT
-        float2(r, t),  // strip 3: RT
-    };
-    out.position = float4(pos_map[vid], 0, 1);
-    return out;
-}
-
-fragment float4 tint_fragment(
-    TintVertexOut in [[stage_in]],
-    constant TintUniforms& uniforms [[buffer(0)]]
-) {
-    return uniforms.tint_color;
-}
+// W3c: tint's two stages now come from kitty/shaders/tint.slang. They could go
+// whole because this file declares no function constants, so there was no
+// fork-owned colour epilogue to keep behind.
 
 // ==== TRAIL SHADER ====
 

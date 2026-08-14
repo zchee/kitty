@@ -11,5 +11,12 @@
 #define BORDER_VERTEX_ATTR_rect_color 1
 #define BORDER_VERTEX_ATTR_BUFFER 3
 
+#define TINT_FRAGMENT_BUF_entryPointParams 0
+#define TINT_FRAGMENT_BUFSZ_entryPointParams 16u
+
+#define TINT_VERTEX_BUF_entryPointParams 0
+#define TINT_VERTEX_BUFSZ_entryPointParams 16u
+
 #define BORDER_VERTEX_IS_SLANG 1
-#define KITTY_SLANG_VERTEX_SHADERS 1
+#define TINT_VERTEX_IS_SLANG 1
+#define KITTY_SLANG_VERTEX_SHADERS 2

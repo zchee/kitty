@@ -497,6 +497,10 @@ _Static_assert(sizeof(((MetalBorderUniforms*)0)->colors) == BORDER_VERTEX_BUFSZ_
     "border colors[] no longer fills border.slang's Colors block");
 _Static_assert(sizeof(((MetalBorderUniforms*)0)->background_opacity) == BORDER_VERTEX_BUFSZ_globalParams,
     "border.slang's global uniform block is no longer just background_opacity");
+_Static_assert(sizeof(((MetalTintUniforms*)0)->edges) == TINT_VERTEX_BUFSZ_entryPointParams,
+    "tint.slang's vertex no longer reads exactly edges");
+_Static_assert(sizeof(((MetalTintUniforms*)0)->tint_color) == TINT_FRAGMENT_BUFSZ_entryPointParams,
+    "tint.slang's fragment no longer reads exactly tint_color");
 
 // Every quad here is a 4-vertex GL_TRIANGLE_FAN in GL, and Metal has no fan
 // primitive, so the hand-written shaders bake the permutation into their
@@ -522,20 +526,29 @@ ensure_fan_to_strip_index_buffer(void) {
 // Which programs render from a slang-generated vertex shader. The program ids
 // live in shaders.c's enum, not in a header, so this cannot be derived from
 // slang.py's METAL_SHADERS -- and the goldens would not catch the omission for
-// every shader (the config matrix does not exercise blit, screenshot, tint or
+// every shader (the config matrix does not exercise blit, screenshot or
 // rounded_rect, so migrating one of those and forgetting it here would render
-// bowties against a green gate). So the generated header gates both directions:
+// bowties against a green gate; tint IS covered, via progress-bar's track).
+// So the generated header gates both directions:
 // the per-shader marker below catches a removal or a swap, and the count catches
 // an addition, which no marker of its own would make anything here react to.
-_Static_assert(KITTY_SLANG_VERTEX_SHADERS == 1,
+_Static_assert(KITTY_SLANG_VERTEX_SHADERS == 2,
     "a vertex shader was added to METAL_SHADERS in slang.py -- add its program id to program_uses_fan_vertex_order()");
 #ifndef BORDER_VERTEX_IS_SLANG
 #error "border's vertex is no longer generated -- drop program 4 from program_uses_fan_vertex_order()"
 #endif
+#ifndef TINT_VERTEX_IS_SLANG
+#error "tint's vertex is no longer generated -- drop program 9 from program_uses_fan_vertex_order()"
+#endif
 
 static bool
 program_uses_fan_vertex_order(int program) {
-    return program == 4;  // BORDERS, from border.slang
+    // The permutation is the same for every one of these even though their fan
+    // orders differ (border's starts at right-top, tint's at left-top): for any
+    // four vertices in cyclic order around a quad, {2,1,3,0} yields a strip
+    // whose two triangles are the two the fan describes.
+    return program == 4 ||   // BORDERS, from border.slang
+           program == 9;     // TINT, from tint.slang
 }
 
 static MTLVertexDescriptor*
@@ -1927,10 +1940,15 @@ draw_quad(bool blend, unsigned instance_count) {
             [mtl_current_encoder setFragmentTexture:textures[bound_tex_2d[1]].texture atIndex:0];
         }
     } else if (current_program == 9) {
+        // tint.slang takes its uniforms as entry-point parameters, so slang gives
+        // each stage its own block holding only what that stage reads -- unlike
+        // the hand-written pair, which shared one struct across both.
         MetalTintUniforms tint_u;
         fill_tint_uniforms(current_program, &tint_u);
-        [mtl_current_encoder setVertexBytes:&tint_u length:sizeof(tint_u) atIndex:0];
-        [mtl_current_encoder setFragmentBytes:&tint_u length:sizeof(tint_u) atIndex:0];
+        [mtl_current_encoder setVertexBytes:tint_u.edges length:sizeof(tint_u.edges)
+                                    atIndex:TINT_VERTEX_BUF_entryPointParams];
+        [mtl_current_encoder setFragmentBytes:tint_u.tint_color length:sizeof(tint_u.tint_color)
+                                      atIndex:TINT_FRAGMENT_BUF_entryPointParams];
     } else if (current_program == 10) {
         // C5: MetalTrailUniforms (float3 trail_color 16-aligned so trail_opacity
         // lands at 64); see fill_trail_uniforms + metal_uniforms.h assert.
