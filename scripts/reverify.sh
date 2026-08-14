@@ -36,30 +36,44 @@ echo "== BUILD EXIT=$BUILD_EXIT warnings=$WARNINGS"
 echo "== $(grep -E 'Linking Metal shader library' "$OUT/build.log" | tail -1)"
 [ "$BUILD_EXIT" = 0 ] || fail "build exit $BUILD_EXIT"
 [ "$WARNINGS" = 0 ] || fail "$WARNINGS build warnings"
+# glsl-uniforms.h is an orphan build product no compilation unit includes,
+# regenerated every build and permanently dirty — beads
+# kitty-glsl-uniforms-dirty-wp2 tracks it (W3h review F9 spent the time so
+# the next reader does not have to).
 DIRTY=$(git -C "$WT" status --short | grep -v 'kitty/glsl-uniforms.h')
 [ -z "$DIRTY" ] || fail "worktree dirty beyond glsl-uniforms.h: $DIRTY"
 
 echo "== goldens vs baseline (threshold 0)"
-( cd "$WT" && ./scripts/metal-golden.py capture --output-dir "$OUT/goldens" >/dev/null 2>&1 )
-( cd "$WT" && ./scripts/metal-golden.py compare "$BASE" "$OUT/goldens" --threshold 0 > "$OUT/compare.json" 2>/dev/null )
-python3.14 - "$OUT/compare.json" <<'PY' || FAILED=1
-import json, re, sys
-raw = open(sys.argv[1]).read()
-d = json.loads(re.search(r'\{.*\}', raw, re.S).group(0))["results"]
-bad = {k: v.get("max_diff", v.get("error", "?")) for k, v in sorted(d.items())
-       if v.get("max_diff", 1) != 0}
-n = len(d)
-if bad:
-    print(f"  FAIL: {len(bad)}/{n} configs nonzero/error: {bad}")
-    raise SystemExit(1)
-print(f"  {n}/{n} configs at max_diff=0")
-PY
-echo "== matrix size from source: $(cd "$WT" && python3.14 -c '
+# The expected matrix size comes from CONFIG_MATRIX by AST and GATES the
+# compare below (W3h review F5: a compare over a silently-short capture set
+# printed a self-referential "n/n at 0" and reached PASS — the pass-shaped
+# failure this script was chartered to eliminate, reintroduced one line from
+# its own remedy).
+MATRIX=$(cd "$WT" && python3.14 -c '
 import ast
 src = open("scripts/metal-golden.py").read()
 for n in ast.parse(src).body:
     if isinstance(n, ast.AnnAssign) and getattr(n.target, "id", "") == "CONFIG_MATRIX":
-        print(len(n.value.keys))')"
+        print(len(n.value.keys))')
+echo "== matrix size from source: $MATRIX"
+( cd "$WT" && ./scripts/metal-golden.py capture --output-dir "$OUT/goldens" >/dev/null 2>&1 )
+( cd "$WT" && ./scripts/metal-golden.py compare "$BASE" "$OUT/goldens" --threshold 0 > "$OUT/compare.json" 2>/dev/null )
+python3.14 - "$OUT/compare.json" "$MATRIX" <<'PY' || FAILED=1
+import json, re, sys
+raw = open(sys.argv[1]).read()
+expected = int(sys.argv[2])
+d = json.loads(re.search(r'\{.*\}', raw, re.S).group(0))["results"]
+bad = {k: v.get("max_diff", v.get("error", "?")) for k, v in sorted(d.items())
+       if v.get("max_diff", 1) != 0}
+n = len(d)
+if n != expected:
+    print(f"  FAIL: compared {n} configs but CONFIG_MATRIX declares {expected}")
+    raise SystemExit(1)
+if bad:
+    print(f"  FAIL: {len(bad)}/{n} configs nonzero/error: {bad}")
+    raise SystemExit(1)
+print(f"  {n}/{n} configs at max_diff=0 (n gated against the declared matrix)")
+PY
 
 echo "== starvation probe (nudge disabled -> expect NO thumbnail + the F5 string)"
 python3.14 - "$WT" <<'PY'

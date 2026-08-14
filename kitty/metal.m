@@ -568,6 +568,24 @@ _Static_assert(offsetof(MetalGraphicsUniforms, extra_alpha) == GRAPHICS_FORK_VER
     "graphics_fork.slang's vertex block is no longer exactly the two rect arrays");
 _Static_assert(sizeof(MetalGraphicsUniforms) - offsetof(MetalGraphicsUniforms, extra_alpha) == GRAPHICS_FORK_FRAGMENT_BUFSZ_entryPointParams,
     "the MetalGraphicsUniforms tail no longer fills graphics_fork.slang's fragment block");
+// W3h review F4: the push site binds every variant through the DEFAULT
+// variant's macros, which is only sound while the variants agree with it.
+// Pin that agreement so a slangc that reassigned one variant's slot or
+// resized its block fails the build instead of binding silently wrong.
+_Static_assert(GRAPHICS_FORK_VERTEX_PREMULT_BUF_entryPointParams == GRAPHICS_FORK_VERTEX_BUF_entryPointParams &&
+               GRAPHICS_FORK_VERTEX_ALPHA_MASK_BUF_entryPointParams == GRAPHICS_FORK_VERTEX_BUF_entryPointParams &&
+               GRAPHICS_FORK_VERTEX_PREMULT_BUFSZ_entryPointParams == GRAPHICS_FORK_VERTEX_BUFSZ_entryPointParams &&
+               GRAPHICS_FORK_VERTEX_ALPHA_MASK_BUFSZ_entryPointParams == GRAPHICS_FORK_VERTEX_BUFSZ_entryPointParams,
+    "a graphics_fork VERTEX variant disagrees with the default's binding slot or block size");
+_Static_assert(GRAPHICS_FORK_FRAGMENT_PREMULT_BUF_entryPointParams == GRAPHICS_FORK_FRAGMENT_BUF_entryPointParams &&
+               GRAPHICS_FORK_FRAGMENT_ALPHA_MASK_BUF_entryPointParams == GRAPHICS_FORK_FRAGMENT_BUF_entryPointParams &&
+               GRAPHICS_FORK_FRAGMENT_PREMULT_BUFSZ_entryPointParams == GRAPHICS_FORK_FRAGMENT_BUFSZ_entryPointParams &&
+               GRAPHICS_FORK_FRAGMENT_ALPHA_MASK_BUFSZ_entryPointParams == GRAPHICS_FORK_FRAGMENT_BUFSZ_entryPointParams &&
+               GRAPHICS_FORK_FRAGMENT_PREMULT_TEX_image == GRAPHICS_FORK_FRAGMENT_TEX_image &&
+               GRAPHICS_FORK_FRAGMENT_ALPHA_MASK_TEX_image == GRAPHICS_FORK_FRAGMENT_TEX_image &&
+               GRAPHICS_FORK_FRAGMENT_PREMULT_SAMP_image == GRAPHICS_FORK_FRAGMENT_SAMP_image &&
+               GRAPHICS_FORK_FRAGMENT_ALPHA_MASK_SAMP_image == GRAPHICS_FORK_FRAGMENT_SAMP_image,
+    "a graphics_fork FRAGMENT variant disagrees with the default's binding slots or block size");
 _Static_assert(sizeof(((MetalScreenshotUniforms*)0)->src_size) == SCREENSHOT_FRAGMENT_BUFSZ_entryPointParams,
     "screenshot.slang's fragment no longer reads exactly src_size");
 _Static_assert(offsetof(MetalTrailUniforms, y_coords) == 16 &&
