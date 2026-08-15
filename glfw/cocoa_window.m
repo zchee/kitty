@@ -4196,9 +4196,17 @@ glfwCocoaSetWindowChrome(
     int background_blur,
     unsigned int hide_window_decorations,
     bool show_text_in_titlebar,
-    int color_space,
     float background_opacity,
     bool resizable) {
+    // NOTE: upstream's signature carries an `int color_space` parameter
+    // between show_text_in_titlebar and background_opacity. The fork excises
+    // it on BOTH sides of the ABI (this definition, the kitty/glfw-wrapper.h
+    // typedef, and the kitty/glfw.c caller): on the Metal backend the
+    // CAMetalLayer owns the colorspace (see metal_context.m). Keeping the
+    // parameter in the definition only, as the first merge resolution did,
+    // skews the dlsym-loaded call -- the callee reads `resizable` from stack
+    // garbage, the window loses NSWindowStyleMaskResizable, and macOS
+    // fullscreen stops resizing the window (the Phase-D fullscreen incident).
     @autoreleasepool {
         _GLFWwindow *window = (_GLFWwindow *)w;
         if (window->ns.layer_shell.is_active) return;
@@ -4285,9 +4293,9 @@ glfwCocoaSetWindowChrome(
         [nsw setTitleVisibility:(show_text_in_titlebar) ? NSWindowTitleVisible : NSWindowTitleHidden];
         // Deliberately no [nsw setColorSpace:] here: on the Metal backend the
         // CAMetalLayer owns the colorspace (see metal_context.m), and letting
-        // the NSWindow fight it double-converts the output. color_space is
-        // accepted for API parity with the GL platforms.
-        (void)color_space;
+        // the NSWindow fight it double-converts the output (the upstream
+        // color_space parameter is excised from this ABI, see the NOTE at the
+        // top of this function).
         window->resizable = resizable;
         debug(
             "Window Chrome state:\n\tbackground: %s\n\tappearance: %s\n\t"
