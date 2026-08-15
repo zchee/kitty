@@ -162,8 +162,8 @@ graphics protocol.
 
 `Yazi <https://github.com/sxyazi/yazi>`_
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-Blazing fast terminal file manager, with built-in kitty graphics protocol support
-(implemented both Classic protocol and Unicode placeholders).
+Blazing fast terminal file manager, with built-in kitty graphics protocol
+support, Drag and Drop protocol and OSC 5522 clipboard protocol support.
 
 .. _tool_clifm:
 
@@ -185,6 +185,13 @@ graphics protocol.
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 Text-mode dual panel (orthodox) file manager and also terminal emulator, uses
 the kitty graphics and keyboard protocols (both as client and as terminal)
+
+.. _tool_elio:
+
+`elio <https://github.com/elio-fm/elio>`_
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Batteries-included terminal file manager with previews using kitty's graphics
+protocol, and native support for its Drag and Drop protocol.
 
 
 System and data visualisation tools

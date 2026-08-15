@@ -78,10 +78,16 @@ class TestGLFW(BaseTest):
         with self.subTest(has_window_scaling=False):
             has_window_scaling = False
             metrics = {
-                'width': 200, 'height': 100,
-                'framebuffer_width': 200, 'framebuffer_height': 100,
-                'xscale': 2.0, 'yscale': 2.0, 'xdpi': 192.0, 'ydpi': 192.0,
-                'cell_width': 8, 'cell_height': 16
+                'width': 200,
+                'height': 100,
+                'framebuffer_width': 200,
+                'framebuffer_height': 100,
+                'xscale': 2.0,
+                'yscale': 2.0,
+                'xdpi': 192.0,
+                'ydpi': 192.0,
+                'cell_width': 8,
+                'cell_height': 16,
             }
             t(80 * metrics['cell_width'], 100, 80)
             t(80 * metrics['cell_width'] + metrics['width'], 100, 80, incremental=True)

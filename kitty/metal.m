@@ -1185,6 +1185,49 @@ unbind_program(void) {
     current_program = -1;
 }
 
+// Upstream's metadata-driven uniform API (the GL arm implements it in gl.c
+// from the layout dicts Python passes to compile_program). The Metal shim
+// answers from the compiled-in layouts instead: names resolve through the
+// value-store slot system and block introspection through block_index() /
+// block_size(), so set_program_layout() has nothing to store.
+GLint
+program_uniform_location(int program, const char *name) {
+    return get_uniform_location(program, name);
+}
+
+GLint
+try_program_uniform_location(int program, const char *name) {
+    return get_uniform_location(program, name);
+}
+
+UniformBlock
+program_uniform_block(int program, const char *name) {
+    GLuint bidx = block_index(program, name);
+    return (UniformBlock){.size = block_size(program, bidx), .index = (GLint)bidx};
+}
+
+ArrayInformation
+get_uniform_array_information(int program, const char *name) {
+    return (ArrayInformation){
+        .offset = get_uniform_information(program, name, GL_UNIFORM_OFFSET),
+        .stride = get_uniform_information(program, name, GL_UNIFORM_ARRAY_STRIDE),
+        .size = get_uniform_information(program, name, GL_UNIFORM_SIZE),
+    };
+}
+
+ArrayInformation
+program_uniform_array(int program, const char *name) {
+    return get_uniform_array_information(program, name);
+}
+
+void
+set_program_layout(int program, PyObject *metadata) {
+    (void)program; (void)metadata;
+}
+
+void
+free_program_layouts(void) {}
+
 // ----- Buffers -----
 
 // D1: persistent fenced buffer ring. Each frequently-written logical buffer
@@ -1365,10 +1408,32 @@ add_buffer_to_vao(ssize_t vao_idx, GLenum usage) {
 }
 
 void
-add_attribute_to_vao(int p, ssize_t vao_idx, const char *name, GLint size, GLenum data_type, GLsizei stride, void *offset, GLuint divisor) {
-    (void)p; (void)vao_idx; (void)name; (void)size; (void)data_type; (void)stride; (void)offset; (void)divisor;
+add_attribute_to_vao(ssize_t vao_idx, int location, GLint size, GLenum data_type, GLsizei stride, void *offset, GLuint divisor) {
+    (void)vao_idx; (void)location; (void)size; (void)data_type; (void)stride; (void)offset; (void)divisor;
     // In Metal, vertex attributes are configured via MTLVertexDescriptor during pipeline creation.
     // This is a no-op stub; the actual vertex descriptor is built in compile_shaders().
+}
+
+void
+set_vao_attribute(ssize_t vao_idx, size_t buffer_idx, int location, GLint size, GLenum data_type, GLsizei stride, void *offset, GLuint divisor) {
+    (void)vao_idx; (void)buffer_idx; (void)location; (void)size; (void)data_type; (void)stride; (void)offset; (void)divisor;
+    // Attribute pointers are baked into the pipeline vertex descriptors on
+    // Metal, so repointing them is meaningless here (same as add_attribute_to_vao).
+}
+
+void
+copy_vao_buffer_region(ssize_t vao_idx, size_t src_bufnum, GLintptr src_off, size_t dst_bufnum, GLintptr dst_off, GLsizeiptr size) {
+    (void)vao_idx; (void)src_bufnum; (void)src_off; (void)dst_bufnum; (void)dst_off; (void)size;
+    // The only caller (draw_window_padding) is gated off on this backend; the
+    // fenced buffer rings hand out fresh slots per map, so a GL-style
+    // buffer-to-buffer region copy has no faithful equivalent yet. Fail loud
+    // rather than silently rendering stale data if a new caller appears.
+    fatal("copy_vao_buffer_region: not implemented on the Metal backend");
+}
+
+GLint
+program_attribute_location(int program, const char *name) {
+    return attrib_location(program, name);
 }
 
 void

@@ -8,12 +8,14 @@
 
 #include "data-types.h"
 
-typedef struct { int x; } PARSER_STATE_HANDLE;
+typedef struct {
+    int x;
+} PARSER_STATE_HANDLE;
 
 typedef struct Parser {
     PyObject_HEAD
 
-    PARSER_STATE_HANDLE *state;
+        PARSER_STATE_HANDLE *state;
 } Parser;
 
 typedef struct ParseData {
@@ -50,9 +52,9 @@ typedef struct ParseData {
 } ParseData;
 
 // The must only be called on the main thread
-Parser* alloc_vt_parser(id_type window_id);
-void free_vt_parser(Parser*);
-void reset_vt_parser(Parser*);
+Parser *alloc_vt_parser(id_type window_id);
+void free_vt_parser(Parser *);
+void reset_vt_parser(Parser *);
 
 
 // SPSC transport contract (no internal lock): the three producer calls

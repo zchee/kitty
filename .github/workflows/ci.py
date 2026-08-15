@@ -342,12 +342,27 @@ def main() -> None:
         subprocess.check_call(['go', 'install', 'golang.org/x/vuln/cmd/govulncheck@latest'])
         subprocess.check_call(['govulncheck', '-mode=binary', 'kitty/launcher/kitten'])
         subprocess.check_call(['govulncheck', './...'])
-    elif action == 'gofmt':
+    elif action == 'check_code_formatting':
         q = subprocess.check_output('gofmt -s -l tools kittens'.split()).decode()
         if q.strip():
             q = '\n'.join(filter(lambda x: not x.rstrip().endswith('_generated.go'), q.strip().splitlines())).strip()
             if q:
                 raise SystemExit(q)
+        if subprocess.run(['ruff', 'format', '--check']).returncode != 0:
+            raise SystemExit('Some Python files are not formatted correctly')
+        c_files = subprocess.check_output(['git', 'ls-files', '*.c', '*.h', '*.m']).decode().split()
+        if c_files and subprocess.run(['clang-format', '--dry-run', '--Werror'] + c_files).returncode != 0:
+            raise SystemExit('Some C/ObjC files are not formatted correctly')
+        slang_files = subprocess.check_output(['git', 'ls-files', '*.slang']).decode().split()
+        badly_formatted_slang = []
+        for sf in slang_files:
+            assume_name = os.path.basename(sf) + '.cs'
+            with open(sf, 'rb') as f:
+                result = subprocess.run(['clang-format', '--style=file:.clang-format-for-slang', '--Werror', '-n', f'--assume-filename={assume_name}'], stdin=f)
+            if result.returncode != 0:
+                badly_formatted_slang.append(sf)
+        if badly_formatted_slang:
+            raise SystemExit('Some .slang files are not formatted correctly:\n' + '\n'.join(badly_formatted_slang))
     elif action == 'check-dependencies':
         check_dependencies()
     else:
