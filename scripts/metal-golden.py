@@ -114,14 +114,15 @@ CONFIG_MATRIX: dict[str, list[str]] = {
     # This is the only config that executes SCREENSHOT_PROGRAM -- every other
     # golden uses the KITTY_METAL_DUMP_FRAME offscreen read, which bypasses it.
     "screenshot-thumb": [],
-    # W3i gate: the ONLY config whose pixels flow through the BORDERS program
-    # (program 4 — the border_fork fragment). Measured by magenta-replacing
-    # the default border_fork variant: every other config stayed at 0 (no
-    # padding, one tab, one window = zero border rects; and the default
-    # background is pure black, on which the encode is a fixed point).
+    # W3i gate: the only config that can DISCRIMINATE the border epilogue.
+    # Under a magenta default variant (review F2's corrected numbers): this
+    # config moves 63,181 px; default-opaque (and its byte-identical
+    # cursor_trail) moves 1,501 px — the two 1-px border strips, 901+601-1,
+    # which exist everywhere but draw black-on-black where the encode is a
+    # fixed point; layered configs select the LINEAR variant and stay 0.
     # Padding rects draw the window-background placeholder through the
     # border vertex, so a non-black background makes the epilogue's encode
-    # branch observable.
+    # branch observable at scale.
     "borders-padding": ["window_padding_width=20", "background=#404040"],
     # W3i: the alpha-mask overlay golden (env lever in CONFIG_ENV; magenta
     # teeth 15,656 px on the digit quad, determinism x2 = 0).

@@ -12,8 +12,8 @@
 using namespace metal;
 
 // W27 P3.4: the sRGB transfer pair and the target-space vocabulary now live in
-// one place, shared with cell_shaders.metal, border_shaders.metal and the C
-// side that specializes these fragments.
+// one place, shared with cell_shaders.metal and the C side (border_shaders.metal
+// shared it too until its W3i retirement into generated border_fork variants).
 #include "color_transfer.metal.h"
 // W27 GLSL-freezeout stage 1 (D4): pins BlitUniforms/ScreenshotUniforms
 // (below) against the C-side MetalBlitUniforms/MetalScreenshotUniforms

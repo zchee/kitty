@@ -828,15 +828,27 @@ def check_border_fork_epilogue_pin() -> None:
     base = os.path.dirname(os.path.abspath(__file__))
     header = open(os.path.join(base, '..', 'color_transfer.metal.h')).read()
     wrapper = open(os.path.join(base, 'border_fork.slang')).read()
+    header_rows = []
     for row in ('KITTY_SRGB_TO_P3_R0', 'KITTY_SRGB_TO_P3_R1', 'KITTY_SRGB_TO_P3_R2'):
         m = re.search(rf'#define {row} (.+)', header)
         if m is None:
             raise SystemExit(f'{row} missing from color_transfer.metal.h -- the border_fork epilogue pin cannot run')
-        triple = m.group(1).strip()
-        if f'float3({triple})' not in wrapper:
-            raise SystemExit(
-                f'border_fork.slang has drifted from color_transfer.metal.h: '
-                f'float3({triple}) [{row}] not found verbatim in the wrapper')
+        header_rows.append(m.group(1).strip())
+    # W3i review F1: substring membership was PERMUTATION-BLIND -- swapping two
+    # matrix rows between the dot() slots kept every row "present" and the pin
+    # green, while every P3-tagged drawable would render permuted primaries
+    # (the same shape as W3f's shipped R/B transposition, and no golden can
+    # see it: only the never-captured wide-arm variants run this matrix). The
+    # comparison is therefore ORDERED: the wrapper's dot() rows must equal the
+    # header's R0/R1/R2 sequence exactly.
+    body = re.search(r'float3 srgb_to_p3\b.*?\{(.*?)\n\}', wrapper, re.S)
+    if body is None:
+        raise SystemExit('border_fork.slang: srgb_to_p3 not found -- the epilogue pin cannot run')
+    wrapper_rows = [r.strip() for r in re.findall(r'dot\(float3\(([^)]*)\)', body.group(1))]
+    if wrapper_rows != header_rows:
+        raise SystemExit(
+            'border_fork.slang has drifted from color_transfer.metal.h: srgb_to_p3 dot() rows must '
+            f'equal KITTY_SRGB_TO_P3_R0/R1/R2 in order; header={header_rows} wrapper={wrapper_rows}')
 
 
 def commands_to_compile_to_metal(sources: dict[str, SlangFile], build_dir: str, dest_dir: str) -> Iterator[Command]:
