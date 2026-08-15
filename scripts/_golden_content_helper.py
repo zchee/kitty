@@ -68,6 +68,13 @@ def _disable_tty_echo() -> None:
 def main() -> int:
     _disable_tty_echo()
     out = sys.stdout
+    # Pin the OS window title. The default title is the helper's argv, which
+    # embeds the interpreter path (sys.executable differs between the live
+    # worktree and reverify's frozen worktrees), and upstream's window
+    # selection UI renders the title as row-0 text when the alpha-mask
+    # lever pins the overlay -- an environment-dependent 265 px delta until
+    # this line made it deterministic (ADR-0039).
+    out.write("\x1b]2;metal-golden\x07")
     out.write(_CLEAR_HOME)
 
     out.write("".join(f"\x1b[{c}mAB{_RESET}" for c in _SIXTEEN_COLOR_FG))
