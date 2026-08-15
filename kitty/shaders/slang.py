@@ -873,18 +873,45 @@ def ensure_color_fork_module() -> None:
               'commit it if the header change was intentional', file=sys.stderr)
     # Absence guard (measured in W3j round 2: a wrapper-local definition
     # legally SHADOWS the imported one -- slang raises no redefinition error
-    # -- so the module alone cannot stop a twin). Unlike the retired
-    # presence pins, absence cannot be comment-parked: defining any
-    # colour-maths function in a wrapper AT ALL is the failure.
+    # -- so the module alone cannot stop a twin). SCOPE, stated exactly
+    # (round-2 R2-F1): this is NAME-KEYED on the srgb_to_p3*/linear2srgb*
+    # stems -- it closes accidental drift, same-name shadows and name-family
+    # twins, and cannot see deliberately new math under an unrelated name or
+    # written inline; that residual is out of reach of ANY textual gate and
+    # is closed only by golden coverage of the wide-arm variants (bead
+    # kitty-zhi). Absence cannot be comment-parked: the pre-filter strips
+    # BOTH comment forms before matching.
     base = os.path.dirname(os.path.abspath(__file__))
     for name in ('border_fork.slang', 'cell.slang'):
-        text = re.sub(r'//[^\n]*', '', open(os.path.join(base, name)).read())
+        text = open(os.path.join(base, name)).read()
+        text = re.sub(r'/\*.*?\*/', '', text, flags=re.S)
+        text = re.sub(r'//[^\n]*', '', text)
         m = re.search(r'float3?\s+(srgb_to_p3\w*|linear2srgb\w*)\s*\(', text)
         if m:
             raise SystemExit(
                 f'{name} defines a local {m.group(1)}: colour maths must come from '
                 f'the linear2srgb / {COLOR_FORK_MODULE} modules only -- a local '
                 'definition silently shadows the imported canonical one')
+    # Transfer-equivalence assert (round-2 R2-F3): color_transfer.metal.h is
+    # FORK-created -- upstream has no MSL header to keep in sync -- so the
+    # header's scalar linear2srgb and upstream's linear2srgb.slang module are
+    # two authorities the FORK must hold together. Compare their transfer
+    # constants as floats; a divergence is a build failure, not a silent
+    # whole-gamma split between hand-written and generated shaders.
+    header_text = open(os.path.join(base, '..', 'color_transfer.metal.h')).read()
+    module_text = open(os.path.join(base, 'linear2srgb.slang')).read()
+    def transfer_constants(text: str, fn_pattern: str) -> list[float]:
+        m2 = re.search(fn_pattern + r'.*?\{(.*?)\n\}', text, re.S)
+        if m2 is None:
+            raise SystemExit('transfer-equivalence assert cannot find the scalar linear2srgb body')
+        return sorted(float(tok) for tok in re.findall(r'(\d+\.\d+)f?', m2.group(1)))
+    h_consts = transfer_constants(header_text, r'inline float\s*\nlinear2srgb\(float x\)')
+    m_consts = transfer_constants(module_text, r'public float linear2srgb\(float x\)')
+    if h_consts != m_consts:
+        raise SystemExit(
+            'color_transfer.metal.h and linear2srgb.slang disagree on the sRGB transfer '
+            f'constants: header={h_consts} module={m_consts} -- the fork owns BOTH files '
+            'and they must stay numerically identical')
 
 
 def commands_to_compile_to_metal(sources: dict[str, SlangFile], build_dir: str, dest_dir: str) -> Iterator[Command]:
