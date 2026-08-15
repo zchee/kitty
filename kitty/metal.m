@@ -986,6 +986,24 @@ init_uniforms(int program) {
     // We still maintain the uniform array for API compatibility with shaders.c
     // but locations are just sequential indices.
     p->num_of_uniforms = 0;
+    // Pre-register every uniform name in the generated enum order so the slot
+    // get_uniform_location() assigns equals the <CLASS>_U_<name> enumerator the
+    // draw-time fills index with (the C5 contract below). The fork's shaders.c
+    // used to establish this order through its program-layout caches; upstream
+    // removed those, so the shim owns the ordering contract itself now.
+    // Program indices follow the shaders.c enum (same mapping as pso_get below).
+    switch (program) {
+        case 0: case 1: case 2: { CellUniforms u; get_uniform_locations_cell(program, &u); break; }
+        case 4: { BorderUniforms u; get_uniform_locations_border(program, &u); break; }
+        case 5: case 6: case 7: { GraphicsUniforms u; get_uniform_locations_graphics(program, &u); break; }
+        case 8: { BgimageUniforms u; get_uniform_locations_bgimage(program, &u); break; }
+        case 9: { TintUniforms u; get_uniform_locations_tint(program, &u); break; }
+        case 10: { TrailUniforms u; get_uniform_locations_trail(program, &u); break; }
+        case 11: { BlitUniforms u; get_uniform_locations_blit(program, &u); break; }
+        case 12: { ScreenshotUniforms u; get_uniform_locations_screenshot(program, &u); break; }
+        case 13: { Rounded_rectUniforms u; get_uniform_locations_rounded_rect(program, &u); break; }
+        default: break; // 3 == CELL_PROGRAM_SENTINEL; 14/15 (padding/custom-end) have no Metal pipelines
+    }
 }
 
 GLint

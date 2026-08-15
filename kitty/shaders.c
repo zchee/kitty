@@ -662,6 +662,10 @@ init_cell_program(void) {
         UniformBlock glut = program_uniform_block(PADDING_PROGRAM, "GammaLUT");
         glUniformBlockBinding(program_id(PADDING_PROGRAM), glut.index, GAMMA_LUT_BINDING_POINT);
     }
+#ifndef KITTY_BACKEND_METAL
+    // OpenGL only: the Metal attrib_location stub answers 0 for every name
+    // (bindings live in the pipeline vertex descriptors), so this check would
+    // always trip there.
 #define C(name, expected)                                                                                                                     \
     {                                                                                                                                         \
         int aloc = attrib_location(PADDING_PROGRAM, #name);                                                                                   \
@@ -671,6 +675,7 @@ init_cell_program(void) {
     C(sprite_idx, 1);
     C(is_selected, 2);
 #undef C
+#endif
 
     // The gamma LUT is a constant, shared amongst all the programs that use it via a single UBO.
     if (shader_globals_vao_idx == -1) {
@@ -681,6 +686,18 @@ init_cell_program(void) {
         void *gamma_lut_buf = alloc_and_map_vao_buffer(shader_globals_vao_idx, gamma_lut_buf_size, GAMMA_LUT_GLOBAL_BUFFER, false);
         const ArrayInformation a = program_uniform_array(CELL_PROGRAM, "gamma_lut");
         write_float_array_to_ubo(gamma_lut_buf, srgb_lut, arraysz(srgb_lut), &a);
+#ifdef KITTY_BACKEND_METAL
+        // The Metal shim builds its resident gamma-LUT buffer (M5c) from a
+        // glUniform1fv capture, not from the GammaLUT UBO written above (that
+        // block never reaches the hand-written MSL). The fork's init fed it
+        // through the per-program layout caches; feed the capture directly.
+        for (int i = CELL_PROGRAM; i < CELL_PROGRAM_SENTINEL; i++) {
+            bind_program(i);
+            glUniform1fv(program_uniform_location(i, "gamma_lut"), arraysz(srgb_lut), srgb_lut);
+        }
+        bind_program(BORDERS_PROGRAM);
+        glUniform1fv(program_uniform_location(BORDERS_PROGRAM, "gamma_lut"), arraysz(srgb_lut), srgb_lut);
+#endif
         unmap_vao_buffer(shader_globals_vao_idx, GAMMA_LUT_GLOBAL_BUFFER);
         // The border colors change on every draw, but are shared amongst all border VAOs (only one is ever drawn at a time)
         alloc_vao_buffer(shader_globals_vao_idx, border_colors.size, BORDER_COLORS_GLOBAL_BUFFER, GL_STREAM_DRAW);
