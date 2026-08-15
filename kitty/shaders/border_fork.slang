@@ -32,30 +32,18 @@
 // Mirrors TARGET_SPACE_* in kitty/color_transfer.metal.h: ENCODE_SRGB 0,
 // LINEAR 1, ROP_ENCODES 2. Only the ENCODE comparison is branched on —
 // LINEAR and ROP_ENCODES both mean "emit linear" here.
+import linear2srgb;
+import color_fork_generated;
+
 extern static const int target_color_space = 0;
 extern static const bool target_primaries_is_p3 = false;
 
 static const int TARGET_SPACE_ENCODE_SRGB = 0;
 
-float linear2srgb(float x) {
-    float lower = 12.92f * x;
-    float upper = 1.055f * pow(x, 1.0f / 2.4f) - 0.055f;
-    return lerp(lower, upper, step(0.0031308f, x));
-}
-
-// Linear sRGB-primaries -> linear Display-P3-primaries; max(0) is the P3
-// gamut floor for extended-range input. This function and linear2srgb above
-// are a CHECKED RENDERING of slang.py's canonical_epilogue_functions()
-// (matrix rows read from kitty/color_transfer.metal.h) -- the build fails
-// with the expected block printed if this text deviates in ANY way (W3j
-// Lane 0, closing W3i F9's swizzle/assembly/floor blindness).
-float3 srgb_to_p3(float3 c) {
-    float3 r = float3(
-        dot(float3(0.8224621512240581, 0.17753784877594204, 0.0), c),
-        dot(float3(0.03319409290511077, 0.9668059070948892, 0.0), c),
-        dot(float3(0.017085122152083325, 0.07240728088998424, 0.9105075969579324), c));
-    return max(r, float3(0.0));
-}
+// Colour maths comes from modules, never from local copies (W3j round-1 F2:
+// every textual pin over a live copy lost -- the copy must not exist):
+// linear2srgb from upstream's module, srgb_to_p3 from the fork's generated
+// module (rendered from kitty/color_transfer.metal.h at every build).
 
 [shader("fragment")]
 float4 fragment_main(float4 color_premul : COLOR_PREMUL) : SV_Target {

@@ -7,6 +7,7 @@
 
 import utils;
 import hsluv;
+import color_fork_generated;
 import alpha_blend;
 import linear2srgb;
 
@@ -551,16 +552,6 @@ float4 calculate_premul_foreground_from_sprites(
 
 float4 adjust_foreground_contrast_with_background(float4 text_fg, float3 bg, float text_contrast, float text_gamma_adjustment) {
     return foreground_contrast(text_fg, bg, text_contrast, text_gamma_adjustment);
-}
-
-// Linear sRGB-primaries -> linear Display-P3-primaries; max(0) is the P3
-// gamut floor for extended-range input.
-float3 srgb_to_p3(float3 c) {
-    float3 r = float3(
-        dot(float3(0.8224621512240581, 0.17753784877594204, 0.0), c),
-        dot(float3(0.03319409290511077, 0.9668059070948892, 0.0), c),
-        dot(float3(0.017085122152083325, 0.07240728088998424, 0.9105075969579324), c));
-    return max(r, float3(0.0));
 }
 
 [shader("fragment")]
