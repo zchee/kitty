@@ -127,6 +127,17 @@ CONFIG_MATRIX: dict[str, list[str]] = {
     # W3i: the alpha-mask overlay golden (env lever in CONFIG_ENV; magenta
     # teeth 15,656 px on the digit quad, determinism x2 = 0).
     "alpha-mask": [],
+    # W3k (bead kitty-zhi): the wide-arm golden -- the capture offscreen
+    # becomes RGBA16Float (CONFIG_ENV lever), so the epilogue resolvers select
+    # the LINEAR+P3 variants and the colour matrix renders UNDER this pixel
+    # gate. The background is SATURATED, not grey, and that is load-bearing:
+    # the P3 matrix rows each sum to 1, so achromatic pixels are invariant
+    # under ANY row permutation -- a grey border surface made the border_fork
+    # T4 twin structurally invisible (measured: 0 px on grey, then detected on
+    # chroma). Gate-first proofs: a one-digit header-matrix perturbation moved
+    # 602,430 px (cell text chroma) while every sRGB config stayed exactly 0;
+    # readback is deterministic half->8bit quantization (x2 = 0 measured).
+    "wide-p3": ["window_padding_width=20", "background=#c03050"],
 }
 
 # Configs whose golden artifact is the thumbnail lever's output (value =
@@ -143,7 +154,7 @@ THUMB_CONFIGS: dict[str, str] = {"screenshot-thumb": "0.5"}
 # never imports), so the assert fires at capture/compare EXECUTION, not
 # during reverify's count read -- the two readers are complementary; do
 # not "fix" the constant into the AST path.
-EXPECT_CONFIG_MATRIX = 13
+EXPECT_CONFIG_MATRIX = 14
 assert len(CONFIG_MATRIX) == EXPECT_CONFIG_MATRIX, (
     f"CONFIG_MATRIX has {len(CONFIG_MATRIX)} configs but EXPECT_CONFIG_MATRIX declares "
     f"{EXPECT_CONFIG_MATRIX} -- update the constant in the same change that alters the matrix"
@@ -170,6 +181,8 @@ CONFIG_ENV: dict[str, dict[str, str]] = {
     # supplies damage nudges for this lever, same starvation as the
     # thumbnail's (boss.py lever comment).
     "alpha-mask": {"KITTY_METAL_TEST_WINDOW_CHAR": "3"},
+    # W3k: the wide-arm capture lever (see CONFIG_MATRIX entry).
+    "wide-p3": {"KITTY_METAL_CAPTURE_FORMAT": "rgba16f"},
 }
 
 

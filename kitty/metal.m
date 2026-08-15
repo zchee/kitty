@@ -119,16 +119,34 @@ metal_capture_to_offscreen(void) {
     return metal_dump_frame_path() != NULL || global_state.thumbnail_callback.os_window != 0;
 }
 
+// W3k (bead kitty-zhi): the capture offscreen's format, default BGRA8. With
+// KITTY_METAL_CAPTURE_FORMAT=rgba16f the offscreen becomes RGBA16Float, so
+// the epilogue resolvers select the wide/P3 variants (LINEAR + P3) and the
+// colour matrix renders UNDER a pixel gate for the first time — the semantic
+// closure of the colour-drift class four textual gates could not provide.
+static MTLPixelFormat
+capture_offscreen_format(void) {
+    static MTLPixelFormat fmt = MTLPixelFormatBGRA8Unorm;
+    static bool checked = false;
+    if (!checked) {
+        const char *p = getenv("KITTY_METAL_CAPTURE_FORMAT");
+        if (p && strcmp(p, "rgba16f") == 0) fmt = MTLPixelFormatRGBA16Float;
+        checked = true;
+    }
+    return fmt;
+}
+
 // The pixel format of the frame's final colour target: the CAMetalLayer's
 // drawable (the W27 P3.2 candidate, default BGRA8Unorm) or, in capture mode,
-// the readable BGRA8 offscreen that stands in for it. Keeping the capture
-// target at BGRA8 keeps the golden dump and the thumbnail read-back on their
-// 8-bit assumption under every candidate, and — because the shader encode is
-// selected per attachment format, not per process — makes the capture path a
-// permanently correct sRGB control arm even while the real drawable is wide.
+// the readable offscreen that stands in for it. The capture default stays
+// BGRA8 — the golden dump and thumbnail read-back keep their 8-bit assumption
+// under every candidate, and because the shader encode is selected per
+// attachment format this is a permanently correct sRGB control arm — except
+// under the W3k wide lever above, which deliberately swaps the whole capture
+// path onto the wide/P3 variants.
 static MTLPixelFormat
 drawable_attachment_format(void) {
-    return metal_capture_to_offscreen() ? MTLPixelFormatBGRA8Unorm : kitty_drawable_pixel_format();
+    return metal_capture_to_offscreen() ? capture_offscreen_format() : kitty_drawable_pixel_format();
 }
 
 // Metal global state
@@ -217,9 +235,10 @@ static bool layered_pass_active = false;                // inside a layered pass
 // every existing counter. Steady state is 0 once the cache is per window.
 static uint64_t metal_layered_surface_creates = 0;
 // One resolve PSO per (att0, att1) format pair. att1 is the drawable's (the W27
-// P3.2 candidate) or the BGRA8 capture offscreen's — two; att0 is the SDR or the
-// EDR working-surface format (P4.2) — two. Four in the worst case.
-static struct { MTLPixelFormat att0_fmt, att1_fmt; id<MTLRenderPipelineState> pso; } layers_resolve_psos[4];
+// P3.2 candidate), the BGRA8 capture offscreen's, or the W3k rgba16f wide
+// capture offscreen's — three; att0 is the SDR or the EDR working-surface
+// format (P4.2) — two. Six in the worst case (overflow stays fail-loud below).
+static struct { MTLPixelFormat att0_fmt, att1_fmt; id<MTLRenderPipelineState> pso; } layers_resolve_psos[6];
 
 // Active texture unit tracking. GL keeps an independent binding per
 // (unit, target) pair — upload paths freely bind GL_TEXTURE_2D on whatever
@@ -2940,7 +2959,9 @@ ensure_dump_offscreen(void) {
     }
     if (dump_offscreen_base && dump_offscreen_w == w && dump_offscreen_h == h) return true;
     [dump_offscreen_base release]; dump_offscreen_base = nil;
-    MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+    // W3k: the format follows the capture lever (BGRA8 default; RGBA16Float for
+    // the wide-p3 golden, whose readback path decodes half floats below).
+    MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:capture_offscreen_format()
                                                                                     width:w height:h mipmapped:NO];
     // RenderTarget so it can be the layered pass's att1 / the opaque drawable
     // stand-in; Shared so the harness can getBytes it directly.
@@ -3064,7 +3085,7 @@ ensure_layers_resolve_pso(MTLPixelFormat att0_fmt, MTLPixelFormat att1_fmt) {
             return pso;
         }
     }
-    log_error("Metal: layers resolve PSO cache overflow");  // unreachable: at most 2 att0 x 2 att1 formats
+    log_error("Metal: layers resolve PSO cache overflow");  // unreachable: at most 2 att0 x 3 att1 formats
     [pso release];
     return nil;
 }
@@ -3269,11 +3290,33 @@ dump_offscreen_frame(id<MTLCommandBuffer> cb, const char *path) {
     size_t w = tex.width, h = tex.height;
     uint32_t *data = malloc(w * h * 4);
     if (!data) return;
+    if (tex.pixelFormat == MTLPixelFormatRGBA16Float) {
+        // W3k wide-p3 readback: 8 B/px half floats, already RGBA-ordered.
+        // Deterministic quantization — clamp to [0,1] and round-half-away via
+        // lrintf — is the whole contract: the golden needs stability and
+        // sensitivity, not precision (a matrix-row drift moves linear-P3
+        // values by whole-percent magnitudes, far above 1/255).
+        _Float16 *half_px = malloc(w * h * 8);
+        if (!half_px) { free(data); return; }
+        [tex getBytes:half_px bytesPerRow:w * 8 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+        METAL_TRACE("dump: read wide offscreen %zux%zu\n", w, h);
+        for (size_t i = 0; i < w * h; i++) {
+            uint32_t px = 0;
+            for (int c = 0; c < 4; c++) {
+                float v = (float)half_px[i * 4 + c];
+                v = fminf(fmaxf(v, 0.0f), 1.0f);
+                px |= ((uint32_t)lrintf(v * 255.0f)) << (c * 8);
+            }
+            data[i] = px;
+        }
+        free(half_px);
+    } else {
     [tex getBytes:data bytesPerRow:w * 4 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
     METAL_TRACE("dump: read offscreen %zux%zu\n", w, h);
     for (size_t i = 0; i < w * h; i++) { // BGRA -> RGBA for the PNG encoder
         uint32_t px = data[i];
         data[i] = (px & 0xff00ff00u) | ((px & 0xffu) << 16) | ((px >> 16) & 0xffu);
+    }
     }
     size_t sz = 0;
     const char *png = png_from_32bit_rgba((const char*)data, w, h, &sz, false);
