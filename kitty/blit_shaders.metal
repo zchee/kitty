@@ -4,95 +4,25 @@
  *
  * Distributed under terms of the GPL3 license.
  *
- * MSL port of blit_vertex.glsl + blit_fragment.glsl + blit_common.glsl
- * Also includes screenshot_vertex.glsl + screenshot_fragment.glsl
+ * The layers-resolve pass (M1 single-pass layered rendering). The blit and
+ * screenshot entries this file once carried both migrated to generated MSL
+ * (kitty/shaders/blit_fork.slang, kitty/shaders/screenshot.slang).
  */
 
 #include <metal_stdlib>
 using namespace metal;
 
 // W27 P3.4: the sRGB transfer pair and the target-space vocabulary now live in
-// one place, shared with cell_shaders.metal and the C side (border_shaders.metal
-// shared it too until its W3i retirement into generated border_fork variants).
+// one place, shared with the C side and the generated shader modules.
 #include "color_transfer.metal.h"
-// W27 GLSL-freezeout stage 1 (D4): pins BlitUniforms/ScreenshotUniforms
-// (below) against the C-side MetalBlitUniforms/MetalScreenshotUniforms
-// (metal.m/metal_uniforms.h) at compile time.
-#include "metal_uniforms.h"
 
-// ---- Blit uniforms ----
-
-struct BlitUniforms {
-    float4 src_rect;   // left, top, right, bottom in texture coords
-    float4 dest_rect;  // left, top, right, bottom in NDC
-};
-static_assert(sizeof(BlitUniforms) == sizeof(MetalBlitUniforms),
-              "BlitUniforms drifted from MetalBlitUniforms");
-
-struct BlitVertexOut {
-    float4 position [[position]];
-    float2 texcoord;
-};
-
-// Vertex position mapping: GLSL uses GL_TRIANGLE_FAN with 4 verts
-// Metal uses triangle strip. Reorder: fan(0,1,2,3) = (RT,RB,LB,LT) → strip(LT,RT,LB,RB)
-//
-// GLSL blit_common.glsl vertex_pos_map:
-//   0: (right, top)
-//   1: (right, bottom)
-//   2: (left, bottom)
-//   3: (left, top)
-//
-// For triangle strip we need: LB, RB, LT, RT → indices 2, 1, 3, 0
-// Which maps to: (left,bottom), (right,bottom), (left,top), (right,top)
-
-constant int2 blit_pos_map[4] = {
-    int2(0, 3),  // left, bottom  → src_rect[left], src_rect[bottom]
-    int2(2, 3),  // right, bottom → src_rect[right], src_rect[bottom]
-    int2(0, 1),  // left, top     → src_rect[left], src_rect[top]
-    int2(2, 1),  // right, top    → src_rect[right], src_rect[top]
-};
-
-// The C callers bake GL's bottom-up texture orientation into src_rect
-// (e.g. stop_os_window_rendering passes top=sy, bottom=0). Metal render
-// passes write the layers FBO and the drawable top-down, so the texcoord
-// y endpoints must be swapped to cancel that flip. dest_rect (NDC) is
-// orientation-independent and keeps the original mapping.
-constant int2 blit_tex_map[4] = {
-    int2(0, 1),  // left, bottom  → v from src_rect[top]
-    int2(2, 1),  // right, bottom → v from src_rect[top]
-    int2(0, 3),  // left, top     → v from src_rect[bottom]
-    int2(2, 3),  // right, top    → v from src_rect[bottom]
-};
-
-// ---- Blit Vertex Shader ----
-
-vertex BlitVertexOut blit_vertex(
-    uint vid [[vertex_id]],
-    constant BlitUniforms& uniforms [[buffer(0)]]
-) {
-    BlitVertexOut out;
-    int2 pos = blit_pos_map[vid];
-    int2 tex = blit_tex_map[vid];
-    out.texcoord = float2(uniforms.src_rect[tex.x], uniforms.src_rect[tex.y]);
-    out.position = float4(uniforms.dest_rect[pos.x], uniforms.dest_rect[pos.y], 0, 1);
-    return out;
-}
-
-// ---- Blit Fragment Shader ----
-// Converts from linear premultiplied → sRGB premultiplied for final output
-
-fragment float4 blit_fragment(
-    BlitVertexOut in [[stage_in]],
-    texture2d<float> image [[texture(0)]]
-) {
-    constexpr sampler s(mag_filter::nearest, min_filter::nearest);
-    float4 color_premul = image.sample(s, in.texcoord);
-    // Unpremultiply, convert linear→sRGB, re-premultiply
-    float3 rgb = color_premul.a > 0.0f ? color_premul.rgb / color_premul.a : float3(0.0f);
-    float3 srgb = linear2srgb(rgb);
-    return float4(srgb * color_premul.a, color_premul.a);
-}
+// The blit vertex+fragment pair now comes from kitty/shaders/blit_fork.slang
+// (the tenth migration -- generated MSL entries blit_fork_vertex/_fragment).
+// The wrapper carries the fork deltas the retired pair encoded: the texcoord
+// y-flip (Metal writes source textures top-down), the alpha==0 unpremultiply
+// guard, and nearest sampling (now a runtime sampler from metal.m's cache).
+// MetalBlitUniforms (metal_uniforms.h) is pinned against the generated
+// entry-params block in metal.m.
 
 // W3f: the screenshot vertex+fragment pair now comes from
 // kitty/shaders/screenshot.slang (generated MSL keeps the same entry-point

@@ -1069,6 +1069,11 @@ METAL_SHADERS: MappingProxyType[str, MetalShader] = MappingProxyType({
     # instanceCount — the exact composition BORDERS has shipped since W3b
     # (generated fan vertex + per-instance data, ADR-0032 §8 F7).
     'graphics_fork': MetalShader(frozenset({Stage.vertex, Stage.fragment}), VertexOrder.fan),
+    # blit_fork (the tenth migration): upstream blit.slang with the fork's
+    # texcoord y-flip (Metal writes source textures top-down), split
+    # texture/sampler, and the alpha==0 unpremultiply guard. Fan like the
+    # rest: upstream's blit_common corner order through the index remap.
+    'blit_fork': MetalShader(frozenset({Stage.vertex, Stage.fragment}), VertexOrder.fan),
     # cell_fork (Phase C, ADR-0038): the fork-owned cell wrapper, NOT upstream
     # cell.slang (whose combined samplers trip defect B on the Metal emitter —
     # ADR-0035 §2 — and which carries neither the F1 colored atlas, the P3.5b

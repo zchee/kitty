@@ -31,10 +31,10 @@
 // place of the old find_uniform_slot() string-literal lookups.
 #include "uniforms_generated.h"
 // W3b: the buffer/attribute indices and block sizes slangc chose for the
-// shaders generated from kitty/shaders/*.slang. Written by slang.py and kept in
-// the tree for the same reason glsl-uniforms.h is: the C extension is compiled
-// before the shader build can run, so the header has to already exist. The
-// asserts below catch a slangc that re-assigns one.
+// shaders generated from kitty/shaders/*.slang. Written by slang.py but kept
+// COMMITTED in the tree: the C extension is compiled before the shader build
+// can run (which itself runs through the built kitty binary), so the header
+// has to already exist. The asserts below catch a slangc that re-assigns one.
 #include "metal-bindings.h"
 #include "state.h"
 #include "png-reader.h"
@@ -672,9 +672,14 @@ _Static_assert(sizeof(MetalCellRenderData) == CELL_FORK_VERTEX_BUFSZ_crd,
     "cell_fork.slang's CellRenderData block no longer matches MetalCellRenderData");
 _Static_assert(sizeof(MetalCellDrawUniforms) == CELL_FORK_VERTEX_BUFSZ_entryPointParams + CELL_FORK_FRAGMENT_BUFSZ_entryPointParams,
     "the cell_fork entry-params split no longer covers MetalCellDrawUniforms");
-_Static_assert(KITTY_SLANG_VERTEX_SHADERS == 8,
+_Static_assert(KITTY_SLANG_VERTEX_SHADERS == 9,
     "a vertex shader was added to METAL_SHADERS in slang.py -- declare its VertexOrder there and map "
     "its program id below");
+#ifndef BLIT_FORK_VERTEX_IS_GENERATED
+#error "blit_fork's vertex is no longer generated -- program 11 below selects its entries by name"
+#endif
+_Static_assert(sizeof(MetalBlitUniforms) == BLIT_FORK_VERTEX_BUFSZ_entryPointParams,
+    "blit_fork.slang's entry params no longer match MetalBlitUniforms");
 _Static_assert(GRAPHICS_FORK_VERTEX_SPECIALIZATIONS == 3 && GRAPHICS_FORK_FRAGMENT_SPECIALIZATIONS == 3,
     "graphics_fork's variant set changed size -- the three PSO cases below select entry names per variant");
 #ifndef BORDER_VERTEX_IS_GENERATED
@@ -728,6 +733,7 @@ program_uses_fan_vertex_order(int program) {
         case 8: return BGIMAGE_VERTEX_ORDER_FAN;        // BGIMAGE, from bgimage.slang
         case 9: return TINT_VERTEX_ORDER_FAN;           // TINT, from tint.slang
         case 10: return TRAIL_VERTEX_ORDER_FAN;         // TRAIL, from trail.slang
+        case 11: return BLIT_FORK_VERTEX_ORDER_FAN;     // BLIT, from blit_fork.slang (fork wrapper)
         case 12: return SCREENSHOT_VERTEX_ORDER_FAN;    // SCREENSHOT, from screenshot.slang
         case 13: return ROUNDED_RECT_VERTEX_ORDER_FAN;  // ROUNDED_RECT, from rounded_rect.slang
         default: return false;
@@ -953,7 +959,7 @@ build_pso(int program, bool blend, MTLPixelFormat fmt, bool layered, MTLPixelFor
         case 8: return create_pipeline_state(@"bgimage_vertex", @"bgimage_fragment", blend, nil, fmt, layered, att1_fmt, nil);
         case 9: return create_pipeline_state(@"tint_vertex", @"tint_fragment", blend, nil, fmt, layered, att1_fmt, nil);
         case 10: return create_pipeline_state(@"trail_vertex", @"trail_fragment", blend, nil, fmt, layered, att1_fmt, nil);
-        case 11: return create_pipeline_state(@"blit_vertex", @"blit_fragment", blend, nil, fmt, layered, att1_fmt, nil);
+        case 11: return create_pipeline_state(@"blit_fork_vertex", @"blit_fork_fragment", blend, nil, fmt, layered, att1_fmt, nil);
         case 12: return create_pipeline_state(@"screenshot_vertex", @"screenshot_fragment", blend, nil, fmt, layered, att1_fmt, nil);
         case 13: return create_pipeline_state(@"rounded_rect_vertex", @"rounded_rect_fragment", blend, nil, fmt, layered, att1_fmt, nil);
         default: return nil; // 3 == CELL_PROGRAM_SENTINEL, never drawn
@@ -2343,13 +2349,16 @@ draw_quad(bool blend, unsigned instance_count) {
                                        length:sizeof(MetalTrailUniforms) - offsetof(MetalTrailUniforms, cursor_edge_x)
                                       atIndex:TRAIL_FRAGMENT_BUF_entryPointParams];
     } else if (current_program == 11) {
+        // blit_fork.slang: src/dest rects are the vertex entry params; the
+        // fragment takes only the texture + a runtime sampler (nearest+clamp,
+        // matching the retired constexpr sampler).
         MetalBlitUniforms blit_u;
         fill_blit_uniforms(current_program, &blit_u);
-        [mtl_current_encoder setVertexBytes:&blit_u length:sizeof(blit_u) atIndex:0];
-        [mtl_current_encoder setFragmentBytes:&blit_u length:sizeof(blit_u) atIndex:0];
+        [mtl_current_encoder setVertexBytes:&blit_u length:sizeof(blit_u) atIndex:BLIT_FORK_VERTEX_BUF_entryPointParams];
         if (bound_tex_2d[1] && bound_tex_2d[1] < MAX_TEXTURES && textures[bound_tex_2d[1]].texture) {
-            [mtl_current_encoder setFragmentTexture:textures[bound_tex_2d[1]].texture atIndex:0];
+            [mtl_current_encoder setFragmentTexture:textures[bound_tex_2d[1]].texture atIndex:BLIT_FORK_FRAGMENT_TEX_image];
         }
+        [mtl_current_encoder setFragmentSamplerState:sampler_state_for(false, GL_CLAMP_TO_EDGE) atIndex:BLIT_FORK_FRAGMENT_SAMP_image];
     } else if (current_program == 13) {
         // rounded_rect.slang's vertex takes no uniforms at all (its rect and
         // pos_map are baked in), so only the fragment block is pushed. The
