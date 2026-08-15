@@ -654,6 +654,18 @@ _Static_assert(GRAPHICS_FORK_VERTEX_SPECIALIZATIONS == 3 && GRAPHICS_FORK_FRAGME
 #ifndef BORDER_VERTEX_IS_GENERATED
 #error "border's vertex is no longer generated -- drop program 4 below"
 #endif
+// W3i: border's fragment renders from border_fork.slang variants (the
+// epilogue seam, ADR-0034). The count pins the four reachable
+// (transfer, primaries) pairs the case-4 switch selects by name.
+// IS_GENERATED is a vertex-stage marker; for this fragment-only shader the
+// _SPECIALIZATIONS define is the generation marker AND the count — the same
+// define the W3h review identified as the one that actually guards.
+#ifndef BORDER_FORK_FRAGMENT_SPECIALIZATIONS
+#error "border_fork's fragment is no longer generated -- program 4 below selects its variants by name"
+#else
+_Static_assert(BORDER_FORK_FRAGMENT_SPECIALIZATIONS == 4,
+    "border_fork's variant set changed size -- program 4 below selects entry names per (transfer, primaries) pair");
+#endif
 #ifndef TINT_VERTEX_IS_GENERATED
 #error "tint's vertex is no longer generated -- drop program 9 below"
 #endif
@@ -852,10 +864,25 @@ build_pso(int program, bool blend, MTLPixelFormat fmt, bool layered, MTLPixelFor
             return create_pipeline_state(@"cell_vertex", @"cell_fragment", blend, cell_vertex_descriptor(), fmt, layered, att1_fmt, fc);
         }
         case 4: {
-            MTLFunctionConstantValues *fc = [[MTLFunctionConstantValues alloc] init];
-            [fc setConstantValue:&target_color_space type:MTLDataTypeInt atIndex:0]; // TARGET_COLOR_SPACE
-            [fc setConstantValue:&target_primaries_is_p3 type:MTLDataTypeBool atIndex:1]; // TARGET_PRIMARIES_IS_P3
-            return create_pipeline_state(@"border_vertex", @"border_fragment", blend, border_vertex_descriptor(), fmt, layered, att1_fmt, fc);
+            // W3i (ADR-0034 §2): the epilogue's two function constants became
+            // slang build-time specializations of the fork wrapper
+            // (border_fork.slang). Selection transcribes the SAME resolver
+            // outputs the fc path consumed; the two unreachable pairs of the
+            // (transfer, primaries) product fail loud here instead of
+            // silently compiling. rop_p3 is byte-identical to linear_p3
+            // today (the shader branches only on ENCODE) — kept distinct so
+            // this switch stays a transcription, not a hidden coupling.
+            NSString *frag = nil;
+            if (!target_primaries_is_p3 && target_color_space == TARGET_SPACE_ENCODE_SRGB) frag = @"border_fork_fragment";
+            else if (!target_primaries_is_p3 && target_color_space == TARGET_SPACE_LINEAR) frag = @"border_fork_fragment_linear";
+            else if (target_primaries_is_p3 && target_color_space == TARGET_SPACE_LINEAR) frag = @"border_fork_fragment_linear_p3";
+            else if (target_primaries_is_p3 && target_color_space == TARGET_SPACE_ROP_ENCODES) frag = @"border_fork_fragment_rop_p3";
+            else {
+                log_error("Metal: unreachable (target_color_space=%d, primaries_is_p3=%d) pair for the border PSO",
+                          target_color_space, target_primaries_is_p3);
+                return nil;
+            }
+            return create_pipeline_state(@"border_vertex", frag, blend, border_vertex_descriptor(), fmt, layered, att1_fmt, nil);
         }
         // W3h: the three graphics programs are slang build-time specializations
         // of the fork wrapper (graphics_fork.slang) — the runtime function

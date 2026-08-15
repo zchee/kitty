@@ -56,7 +56,11 @@
 // drawable needs exactly one primaries conversion, applied to linear values at
 // the same per-attachment exit where the transfer is decided:
 //
-//   cell_fragment / border_fragment   direct-to-drawable draws
+//   cell_fragment / border_fork_fragment*   direct-to-drawable draws (W3i:
+//                                     border's epilogue is compiled variants
+//                                     of border_fork.slang, which duplicates
+//                                     the matrix below under slang.py's
+//                                     build-time pin)
 //   layers_resolve_fragment           the whole layered stack, once per pixel
 //   drawable_clear_color()            the C-side consumer (kitty/metal.m)
 //

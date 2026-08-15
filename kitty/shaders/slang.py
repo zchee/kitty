@@ -287,6 +287,19 @@ class SlangFile(NamedTuple):
                 yield s()
                 yield s('alpha_mask', is_alpha_mask='true')
                 yield s('premult', texture_is_not_premultiplied='true')
+            case 'border_fork.slang':
+                # W3i (ADR-0034 §2): the epilogue's reachable half of the
+                # (transfer, primaries) product — metal.m's resolvers can
+                # produce only these four pairs; the unreachable two fail
+                # loud at the PSO site. rop_p3 is byte-identical to
+                # linear_p3 today (the shader branches only on ENCODE),
+                # kept distinct so C-side selection transcribes
+                # target_color_space_for() instead of embedding
+                # "ROP==LINEAR in this shader" as a hidden coupling.
+                yield s()
+                yield s('linear', target_color_space='1')
+                yield s('linear_p3', target_color_space='1', target_primaries_is_p3='true')
+                yield s('rop_p3', target_color_space='2', target_primaries_is_p3='true')
             case 'cell.slang':
                 d = cell_variant()
                 seen = set()
@@ -789,6 +802,12 @@ METAL_SHADERS: MappingProxyType[str, MetalShader] = MappingProxyType({
     # instanceCount — the exact composition BORDERS has shipped since W3b
     # (generated fan vertex + per-instance data, ADR-0032 §8 F7).
     'graphics_fork': MetalShader(frozenset({Stage.vertex, Stage.fragment}), VertexOrder.fan),
+    # W3i: FRAGMENT-ONLY (the first) — border's vertex stays generated from
+    # upstream border.slang above; this fork wrapper carries only the colour
+    # epilogue upstream cannot express. The VertexOrder is inert for a
+    # fragment-only entry (the relay consults vertex shaders); fan recorded
+    # to match the border vertex it pairs with.
+    'border_fork': MetalShader(frozenset({Stage.fragment}), VertexOrder.fan),
 })
 
 # Slang names every entry point vertex_main/fragment_main, which would collide
@@ -797,6 +816,27 @@ METAL_SHADERS: MappingProxyType[str, MetalShader] = MappingProxyType({
 def metal_function_name(shader: str, stage: Stage, specialization: str = '') -> str:
     ans = f'{shader}_{stage.value}'
     return f'{ans}_{specialization}' if specialization else ans
+
+
+def check_border_fork_epilogue_pin() -> None:
+    ''' W3i (ADR-0034 §2): border_fork.slang duplicates the P3 matrix rows
+    from kitty/color_transfer.metal.h (slang cannot include MSL headers), and
+    the golden gate cannot see them drift — goldens exercise only the
+    ENCODE_SRGB variant (capture offscreen pinned to BGRA8), while the matrix
+    runs only in the P3 variants. This pin makes drift a BUILD failure: each
+    header row must appear verbatim in the wrapper. '''
+    base = os.path.dirname(os.path.abspath(__file__))
+    header = open(os.path.join(base, '..', 'color_transfer.metal.h')).read()
+    wrapper = open(os.path.join(base, 'border_fork.slang')).read()
+    for row in ('KITTY_SRGB_TO_P3_R0', 'KITTY_SRGB_TO_P3_R1', 'KITTY_SRGB_TO_P3_R2'):
+        m = re.search(rf'#define {row} (.+)', header)
+        if m is None:
+            raise SystemExit(f'{row} missing from color_transfer.metal.h -- the border_fork epilogue pin cannot run')
+        triple = m.group(1).strip()
+        if f'float3({triple})' not in wrapper:
+            raise SystemExit(
+                f'border_fork.slang has drifted from color_transfer.metal.h: '
+                f'float3({triple}) [{row}] not found verbatim in the wrapper')
 
 
 def commands_to_compile_to_metal(sources: dict[str, SlangFile], build_dir: str, dest_dir: str) -> Iterator[Command]:
@@ -809,6 +849,7 @@ def commands_to_compile_to_metal(sources: dict[str, SlangFile], build_dir: str, 
     the build. '''
     if sys.platform != 'darwin':
         return
+    check_border_fork_epilogue_pin()
     for base_dest, base_build, slang_module, cmd, sfile in iter_entry_point_shaders(sources, build_dir, dest_dir):
         shader = METAL_SHADERS.get(os.path.basename(base_dest))
         if shader is None:
