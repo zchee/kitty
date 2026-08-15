@@ -2724,6 +2724,23 @@ wakeup_main_loop(void) {
 // every way it can change (multiple glfwShowWindow/glfwHideWindow call sites, no
 // dedicated visibility-changed callback), so it stays a live query --
 // conservative: fall back to querying when unsure.
+
+// W3i (operator request, ADR-0034): golden captures render to the capture
+// offscreen (KITTY_METAL_DUMP_FRAME replaces the drawable), so the occlusion
+// skip -- an energy optimization for windows nobody can see -- starves the
+// very frames the capture exists to read. Wave-20 P0's answer was to force
+// focus onto every spawned capture window, which steals the operator's focus
+// once per config per capture run. In dump mode, rendering while occluded is
+// the POINT; this cached check joins redraw_count inside the
+// allow_occluded_forced_redraw arm, so like that exception it lifts only the
+// RENDER gate and the visibility-reports protocol never sees it.
+static bool
+render_while_occluded_for_capture(void) {
+    static int cached = -1;
+    if (cached < 0) { const char *p = getenv("KITTY_METAL_DUMP_FRAME"); cached = (p && p[0]) ? 1 : 0; }
+    return cached == 1;
+}
+
 static bool
 window_is_showable(OSWindow *w, bool allow_occluded_forced_redraw) {
     if (w->is_iconified || !glfwGetWindowAttrib(w->handle, GLFW_VISIBLE)) return false;
@@ -2743,7 +2760,9 @@ window_is_showable(OSWindow *w, bool allow_occluded_forced_redraw) {
     // would otherwise report itself VISIBLE to its child and flip back on the
     // next frame — a spurious event pair describing something that never
     // happened on screen.
-    if (w->is_occluded && !(allow_occluded_forced_redraw && w->redraw_count)) return false;
+    if (w->is_occluded
+            && !(allow_occluded_forced_redraw && (w->redraw_count || render_while_occluded_for_capture())))
+        return false;
     return true;
 }
 

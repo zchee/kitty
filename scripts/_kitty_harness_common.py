@@ -20,6 +20,8 @@ throwaway kitty windows:
 
 from __future__ import annotations
 
+import ctypes
+import functools
 import os
 import platform
 import re
@@ -259,6 +261,39 @@ def get_peak_rss_mb(samples_kb: list[int]) -> float | None:
     return (max(samples_kb) / 1024.0) if samples_kb else None
 
 
+@functools.lru_cache(maxsize=1)
+def _offmain_display_position() -> str | None:
+    """Top-left-plus-margin of a non-main display as a kitty --position value
+    ("XxY", global top-left display coordinates), or None when the machine has
+    a single display or KITTY_HARNESS_ON_MAIN=1 opts out. Resolved once per
+    process via CoreGraphics (ctypes; no pyobjc — see the pyobjc-damage note
+    in the W28 memory)."""
+    if os.environ.get("KITTY_HARNESS_ON_MAIN"):
+        return None
+    try:
+        cg = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+
+        class _CGRect(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double),
+                        ("w", ctypes.c_double), ("h", ctypes.c_double)]
+
+        cg.CGDisplayBounds.restype = _CGRect
+        cg.CGDisplayBounds.argtypes = [ctypes.c_uint32]
+        n = ctypes.c_uint32()
+        ids = (ctypes.c_uint32 * 16)()
+        if cg.CGGetActiveDisplayList(16, ids, ctypes.byref(n)) != 0:
+            return None
+        main = cg.CGMainDisplayID()
+        for i in range(n.value):
+            if ids[i] == main:
+                continue
+            b = cg.CGDisplayBounds(ids[i])
+            return f"{int(b.x) + 50}x{int(b.y) + 50}"
+    except OSError:
+        return None
+    return None
+
+
 def spawn_kitty(
     argv_command: list[str] | None = None,
     *,
@@ -287,9 +322,15 @@ def spawn_kitty(
     callers may override via extra_kitty_opts.
     """
     require_kitty_binary()
+    placement = _offmain_display_position()
     argv = [
         str(KITTY_BINARY),
         "-c", "NONE",
+        # W3i operator directive (2026-08-15): test windows land on the
+        # non-main display (the LG UltraFine) when one is present, so capture
+        # runs never flash windows over the operator's working screen. Native
+        # kitty --position; opt out per-run with KITTY_HARNESS_ON_MAIN=1.
+        *(["--position", placement] if placement else []),
         "-o", "macos_quit_when_last_window_closed=yes",
         "-o", "update_check_interval=0",
         "-o", "remember_window_size=no",

@@ -208,12 +208,18 @@ def capture_config(name: str, opts: list[str], output_dir: Path, timeout: float,
     # differ by max_diff≈204 in the cursor cell (Wave-2 finding, re-hit in
     # Wave-20 P0; see .omc/golden/RECAPTURE-NOTES.md).
     full_opts = ["cursor_blink_interval=0", "cursor_shape_unfocused=unchanged", *opts]
-    # take_focus=True is load-bearing (Wave-20 P0 finding): an unfocused
-    # spawn fully occluded by the user's windows renders ZERO frames (kitty's
-    # occlusion skip), so KITTY_METAL_DUMP_FRAME never fires and the capture
-    # silently produces nothing — or, at a display-attach boundary, a single
-    # empty (all-black) frame. The Wave-2/3 reference driver pinned focus for
-    # the same reason ("golden_capture_focus_pinned").
+    # take_focus=False (W3i, operator request): captures no longer steal the
+    # operator's focus. Wave-20 P0 pinned focus because an unfocused spawn
+    # fully occluded by the user's windows rendered ZERO frames (kitty's
+    # occlusion skip starving the dump); the render gate now lifts the
+    # occlusion skip itself whenever KITTY_METAL_DUMP_FRAME is set
+    # (render_while_occluded_for_capture in kitty/glfw.c) — rendering goes to
+    # the capture offscreen anyway, so an occluded capture window rendering
+    # is the point, not waste. Focus-dependent VISUALS stay pinned by the
+    # opts above; at the flip, A/Bs across the full matrix measured
+    # max_diff=0 on every config for BOTH new axes -- focused vs unfocused,
+    # and XDR-main vs LG-placed (the capture offscreen is display-independent
+    # by construction; ADR-0034).
     helper_argv = [sys.executable, str(CONTENT_HELPER)]
     scene = CONFIG_SCENE.get(name)
     if scene:
@@ -226,7 +232,7 @@ def capture_config(name: str, opts: list[str], output_dir: Path, timeout: float,
             **CONFIG_ENV.get(name, {}), **(env or {}),
         },
         extra_kitty_opts=full_opts,
-        take_focus=True,
+        take_focus=False,
     )
     timed_out = False
     try:
