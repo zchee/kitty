@@ -818,14 +818,16 @@ def metal_function_name(shader: str, stage: Stage, specialization: str = '') -> 
     return f'{ans}_{specialization}' if specialization else ans
 
 
-def canonical_epilogue_functions() -> str:
-    ''' The ONE authority for the fork epilogue's colour maths in slang: the
-    transfer scalars are this template (mirroring color_transfer.metal.h's
-    scalar triple, f-suffixed so codegen stays byte-identical to the retired
-    hand-written MSL), and the P3 matrix rows are read from the header's
-    KITTY_SRGB_TO_P3_R* defines at check time. Every fork wrapper must carry
-    this block VERBATIM (checked by check_fork_epilogue_pin below), so the
-    wrapper copy is a checked rendering, not a second source of truth. '''
+def canonical_epilogue_functions() -> dict[str, str]:
+    ''' The ONE authority for the fork epilogue's colour maths in slang,
+    rendered as named blocks: 'transfer' is the scalar linear2srgb template
+    (mirroring color_transfer.metal.h's scalar triple, f-suffixed so codegen
+    stays byte-identical to the retired hand-written MSL), 'matrix' is
+    srgb_to_p3 with the rows read from the header's KITTY_SRGB_TO_P3_R*
+    defines at check time. Each file in FORK_EPILOGUE_WRAPPERS must carry its
+    required blocks VERBATIM (check_fork_epilogue_pin below), so every slang
+    copy is a checked rendering, not a second source of truth. (The
+    hand-written MSL needs no pin: it #includes the header directly.) '''
     base = os.path.dirname(os.path.abspath(__file__))
     header = open(os.path.join(base, '..', 'color_transfer.metal.h')).read()
     rows = []
@@ -834,22 +836,29 @@ def canonical_epilogue_functions() -> str:
         if m is None:
             raise SystemExit(f'{row} missing from color_transfer.metal.h -- the fork epilogue pin cannot run')
         rows.append(m.group(1).strip())
-    return f'''float linear2srgb(float x) {{
+    return {
+        'transfer': '''float linear2srgb(float x) {
     float lower = 12.92f * x;
     float upper = 1.055f * pow(x, 1.0f / 2.4f) - 0.055f;
     return lerp(lower, upper, step(0.0031308f, x));
-}}
-
-float3 srgb_to_p3(float3 c) {{
+}''',
+        'matrix': f'''float3 srgb_to_p3(float3 c) {{
     float3 r = float3(
         dot(float3({rows[0]}), c),
         dot(float3({rows[1]}), c),
         dot(float3({rows[2]}), c));
     return max(r, float3(0.0));
-}}'''
+}}''',
+    }
 
 
-FORK_EPILOGUE_WRAPPERS = ('border_fork.slang',)
+# file -> required canonical blocks. border_fork carries both (its transfer is
+# a local copy matching the retired MSL bit-exactly); cell.slang carries only
+# the matrix (its transfer comes from upstream's linear2srgb module import).
+FORK_EPILOGUE_WRAPPERS: dict[str, tuple[str, ...]] = {
+    'border_fork.slang': ('transfer', 'matrix'),
+    'cell.slang': ('matrix',),
+}
 
 
 def check_fork_epilogue_pin() -> None:
@@ -868,14 +877,14 @@ def check_fork_epilogue_pin() -> None:
     def normalize(text: str) -> str:
         return re.sub(r'\s+', ' ', re.sub(r'//[^\n]*', '', text)).strip()
     canonical = canonical_epilogue_functions()
-    want = normalize(canonical)
     base = os.path.dirname(os.path.abspath(__file__))
-    for name in FORK_EPILOGUE_WRAPPERS:
-        wrapper = open(os.path.join(base, name)).read()
-        if want not in normalize(wrapper):
-            raise SystemExit(
-                f'{name} has drifted from the canonical epilogue block (rendered from '
-                f'color_transfer.metal.h). Replace its linear2srgb/srgb_to_p3 with exactly:\n\n{canonical}')
+    for name, required in FORK_EPILOGUE_WRAPPERS.items():
+        wrapper = normalize(open(os.path.join(base, name)).read())
+        for block in required:
+            if normalize(canonical[block]) not in wrapper:
+                raise SystemExit(
+                    f'{name} has drifted from the canonical epilogue "{block}" block (rendered '
+                    f'from color_transfer.metal.h). Replace the function with exactly:\n\n{canonical[block]}')
 
 
 def commands_to_compile_to_metal(sources: dict[str, SlangFile], build_dir: str, dest_dir: str) -> Iterator[Command]:

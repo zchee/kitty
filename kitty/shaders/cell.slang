@@ -16,6 +16,13 @@ extern static const uint FG_OVERRIDE_ALGO;
 extern static const bool TEXT_NEW_GAMMA;
 extern static const bool ONLY_FOREGROUND;
 extern static const bool ONLY_BACKGROUND;
+// Colour-managed output transform for backends whose drawables are wide-gamut
+// or linear (identity by default, so unspecialized builds behave exactly as
+// before): TARGET_COLOR_SPACE 0 = encode sRGB in-shader, 1 = emit linear
+// light, 2 = the render target encodes. TARGET_PRIMARIES_IS_P3 converts the
+// linear sRGB-primaries pipeline output to Display-P3 primaries at the exit.
+extern static const int TARGET_COLOR_SPACE = 1;
+extern static const bool TARGET_PRIMARIES_IS_P3 = false;
 
 // Inputs {{{
 struct CellRenderData
@@ -50,7 +57,11 @@ struct GammaLUT {
 ConstantBuffer<GammaLUT> glt;
 #define gamma_lut glt.gamma_lut
 
-uniform Sampler2D<uint4> sprite_decorations_map;
+// A plain (non-combined) texture: this map is only ever fetched by integer
+// texel index, never sampled, and slang's Metal emitter mis-lowers
+// non-sampling operations on combined Sampler2D resources ("indirection
+// requires pointer operand"). Plain Texture2D fetches lower correctly.
+uniform Texture2D<uint4> sprite_decorations_map;
 //
 
 // Kept at file scope: slang's Metal emitter pointerizes the parameter list of
@@ -243,7 +254,9 @@ struct CellData {
     ColorPair cursor;
 };
 
-struct VertexOutput {
+// public: allows a wrapping shader (e.g. a colour-managing backend) to import
+// this module and compose with its entry points.
+public struct VertexOutput {
     float4 position : SV_Position;
 
     float3 background;
@@ -375,7 +388,7 @@ float3 override_foreground_color(float3 over, float3 under, float colored_sprite
 // }}}
 
 [shader("vertex")]
-VertexOutput vertex_main(
+public VertexOutput vertex_main(
     [[vk::location(0)]] uint3 colors,
     [[vk::location(1)]] uint2 sprite_idx,
     [[vk::location(2)]] uint  is_selected,
@@ -470,7 +483,13 @@ VertexOutput vertex_main(
     return vo;
 }
 
-uniform Sampler2DArray sprites;
+// Separate texture + sampler (not a combined Sampler2DArray): the underline
+// exclusion lookup fetches by integer texel index, and slang's Metal emitter
+// mis-lowers non-sampling operations on combined resources ("indirection
+// requires pointer operand"). Separate declarations lower correctly for
+// both the sampled and the fetched accesses.
+uniform Texture2DArray sprites;
+uniform SamplerState sprites_sampler;
 // Scaling factor for the extra text-alpha adjustment for luminance-difference.
 static const float text_gamma_scaling = 0.5;
 
@@ -508,7 +527,7 @@ float4 foreground_contrast(float4 over, float3 under, float text_contrast, float
 float4 load_text_foreground_color(float3 sprite_pos, float colored_sprite, float3 cell_foreground) {
     // For colored sprites use the color from the sprite rather than the text foreground
     // Return non-premultiplied foreground color
-    float4 text_fg = sprites.Sample(sprite_pos);
+    float4 text_fg = sprites.Sample(sprites_sampler, sprite_pos);
     return float4(lerp(cell_foreground, text_fg.xyz, colored_sprite), text_fg.w);
 }
 
@@ -522,13 +541,13 @@ float4 calculate_premul_foreground_from_sprites(
     sprites.GetDimensions(width, height, layer);
     float3 sz = float3(float(width), float(height), float(layer));
 
-    float underline_alpha = sprites.Sample(underline_pos).w;
+    float underline_alpha = sprites.Sample(sprites_sampler, underline_pos).w;
     int3 fetch_coord = int3(int(sprite_pos.x * sz.x), int(underline_exclusion_pos), int(sprite_pos.z));
     float underline_exclusion = sprites[fetch_coord].w;
 
     underline_alpha *= 1.0 - underline_exclusion;
-    float strike_alpha = sprites.Sample(strike_pos).w;
-    float cursor_alpha = sprites.Sample(cursor_pos).w;
+    float strike_alpha = sprites.Sample(sprites_sampler, strike_pos).w;
+    float cursor_alpha = sprites.Sample(sprites_sampler, cursor_pos).w;
 
     float combined_alpha = min(text_fg.w + strike_alpha, 1.0);
 
@@ -544,8 +563,18 @@ float4 adjust_foreground_contrast_with_background(float4 text_fg, float3 bg, flo
     return foreground_contrast(text_fg, bg, text_contrast, text_gamma_adjustment);
 }
 
+// Linear sRGB-primaries -> linear Display-P3-primaries; max(0) is the P3
+// gamut floor for extended-range input.
+float3 srgb_to_p3(float3 c) {
+    float3 r = float3(
+        dot(float3(0.8224621512240581, 0.17753784877594204, 0.0), c),
+        dot(float3(0.03319409290511077, 0.9668059070948892, 0.0), c),
+        dot(float3(0.017085122152083325, 0.07240728088998424, 0.9105075969579324), c));
+    return max(r, float3(0.0));
+}
+
 [shader("fragment")]
-float4 fragment_main(
+public float4 fragment_main(
     VertexOutput vo,
     uniform float text_contrast,
     uniform float text_gamma_adjustment,
@@ -562,6 +591,15 @@ float4 fragment_main(
             text_fg, vo.decoration_fg, vo.cursor_color_premult, vo.effective_text_alpha);
         if (ONLY_FOREGROUND) ans_premul = text_fg_premul;
         else ans_premul = alpha_blend_premul(text_fg_premul, ans_premul);
+    }
+    // Primaries before transfer (the linear-space matrix commutes with the
+    // premultiplied alpha and with a linear ROP blend).
+    if (TARGET_PRIMARIES_IS_P3) ans_premul.rgb = srgb_to_p3(ans_premul.rgb);
+    if (TARGET_COLOR_SPACE == 0) {
+        // Clamp first (a unorm sRGB render target clamps to [0,1] before
+        // encoding) so pow() never sees a negative operand.
+        float3 encoded = clamp(ans_premul.rgb, 0.0f, 1.0f);
+        ans_premul.rgb = float3(linear2srgb(encoded.r), linear2srgb(encoded.g), linear2srgb(encoded.b));
     }
     return ans_premul;
 }
