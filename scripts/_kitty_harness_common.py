@@ -327,6 +327,7 @@ def spawn_kitty(
     *,
     extra_env: dict[str, str] | None = None,
     extra_kitty_opts: list[str] | None = None,
+    config_path: str | Path | None = None,
     stdout: Any = subprocess.DEVNULL,
     stderr: Any = subprocess.DEVNULL,
     take_focus: bool = False,
@@ -338,6 +339,14 @@ def spawn_kitty(
     argv_command, if given, runs as the foreground child (kitty's default
     shell otherwise). extra_kitty_opts are additional `-o key=value`
     overrides, appended after the mandatory ones (so they win on conflict).
+
+    config_path REPLACES the `-c NONE` with a real config file, for the gates
+    that must exercise config-FILE semantics rather than CLI overrides -- the
+    two are not interchangeable: `env` entries reach the option store either
+    way, but only a file can be rewritten and re-read, which is what a
+    config-reload test needs. Appending a second `--config` is NOT an
+    alternative: kitty honours the leading NONE and the file is never read
+    (measured -- a `background #ff0000` file changed nothing).
 
     By default the window does NOT steal focus / become the active window
     (KITTY_NO_INITIAL_ACTIVATE=1): rapidly spawned/killed test windows staying
@@ -353,7 +362,7 @@ def spawn_kitty(
     placement = _offmain_display_position()
     argv = [
         str(KITTY_BINARY),
-        "-c", "NONE",
+        "-c", str(config_path) if config_path else "NONE",
         # W3i operator directive (2026-08-15): test windows land on the
         # non-main display (the LG UltraFine) when one is present, so capture
         # runs never flash windows over the operator's working screen. Native

@@ -204,7 +204,42 @@ class LoadShaderPrograms:
             or (opts.text_composition_strategy == 'legacy') != self.text_old_gamma
         )
 
+    def push_text_edr_boost(self) -> None:
+        """Resolve the EDR text-boost lever and hand it to the renderer.
+
+        Resolved here rather than with getenv() on the C side because
+        kitty.conf's ``env`` directive populates the CHILD process environment
+        only (``set_default_env`` in boss.py), so a value set that way never
+        reaches kitty's own environment -- and under a GUI launch, whose parent
+        is launchd, exporting into that environment is awkward enough that the
+        config file is the only comfortable place to set this. The process
+        environment therefore wins, and the config is the fallback.
+
+        Called on startup and again on every config reload, so editing the
+        setting takes effect (and removing it stops taking effect) without a
+        restart. Nothing is cached across calls: the whole point is that the
+        second call can lower the value back to 1.0.
+        """
+        from kitty.fast_data_types import set_text_edr_boost
+        from kitty.options.utils import DELETE_ENV_VAR
+
+        name = 'KITTY_METAL_TEXT_EDR_BOOST'
+        raw = os.environ.get(name)
+        if raw is None:
+            configured = self.get_options().env.get(name)
+            if configured is not None and configured != DELETE_ENV_VAR:
+                raw = configured
+        boost = 1.0
+        if raw:
+            try:
+                boost = float(raw)
+            except ValueError:
+                log_error(f'Ignoring invalid {name}={raw!r}: not a number')
+                boost = 1.0
+        set_text_edr_boost(boost)
+
     def recompile_if_needed(self) -> None:
+        self.push_text_edr_boost()
         if self.needs_recompile:
             self(allow_recompile=True)
         else:
@@ -213,6 +248,7 @@ class LoadShaderPrograms:
                 self.compile_custom_shaders(allow_recompile=True)
 
     def __call__(self, allow_recompile: bool = False) -> None:
+        self.push_text_edr_boost()
         default_cell_variant = cell_variant()
         opts = self.get_options()
         self.text_old_gamma = opts.text_composition_strategy == 'legacy'

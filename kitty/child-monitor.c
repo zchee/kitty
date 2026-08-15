@@ -1709,6 +1709,16 @@ prepare_to_render_os_window(
         static int force_edr = -1;
         if (force_edr < 0) { const char *s = getenv("KITTY_METAL_FORCE_EDR"); force_edr = (s && s[0] == '1') ? 1 : 0; }
         bool want_edr = force_edr == 1 || os_window->has_hdr_content;
+#ifdef KITTY_BACKEND_METAL
+        // The EDR text boost needs the same pipeline HDR images need, but its
+        // content test is the config, not the frame: text is on screen
+        // essentially always, so setting the lever makes engagement PERMANENT
+        // rather than episodic. That is the opt-in price and it is why the
+        // lever is off by default -- engaged compositing puts SDR through the
+        // system tone-map (~7.7 LSB, the P4.1 pre-check above) and keeps the
+        // layered surface on the half-float format for every frame.
+        want_edr = want_edr || metal_text_edr_boost_wanted();
+#endif
         if (want_edr != os_window->edr_engaged) {
             glfwCocoaSetEDREnabled(os_window->handle, want_edr);
             os_window->edr_engaged = want_edr;

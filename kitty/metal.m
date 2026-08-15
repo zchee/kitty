@@ -223,6 +223,27 @@ static MTLPixelFormat mtl_current_enc_fmt = MTLPixelFormatInvalid;
 static bool edr_frame_engaged = false;
 static float edr_frame_headroom = 1.0f;
 static inline MTLPixelFormat layered_work_fmt(void) { return edr_frame_engaged ? LAYERED_WORK_FMT_EDR : LAYERED_WORK_FMT; }
+// The EDR text-boost lever: how far above SDR reference white resolved text
+// foregrounds are scaled. Set from KITTY_METAL_TEXT_EDR_BOOST, or from the same
+// name in kitty.conf's `env` -- both resolved on the Python side, because that
+// is where the config's env dict lives (it never reaches this process's own
+// environment: `env` populates CHILD process environments only). Pushed at
+// startup and on every config reload, so the setting takes effect and stops
+// taking effect live. 1.0 means the feature is off.
+static float text_edr_boost_lever = 1.0f;
+
+// The per-draw multiplier the cell fragments actually receive. Two clamps, both
+// load-bearing: only while THIS frame has EDR engaged (otherwise >1.0 would be
+// crushed by the compositor rather than displayed, and every SDR frame must
+// stay byte-identical), and never beyond the headroom the display grants right
+// now -- that number moves with the brightness slider, so anything cached at
+// startup would clip the bright end instead of clamping it.
+static inline float
+effective_text_edr_boost(void) {
+    if (!edr_frame_engaged || text_edr_boost_lever <= 1.0f) return 1.0f;
+    const float headroom = edr_frame_headroom >= 1.0f ? edr_frame_headroom : 1.0f;
+    return text_edr_boost_lever < headroom ? text_edr_boost_lever : headroom;
+}
 static bool layered_pass_active = false;                // inside a layered pass? (per window: saved with the slot)
 // H2 (W28.4a): the memoryless att0 working surface and its (w, h, fmt) cache key
 // live in MetalWindowSlot, not here. As file-scope globals they formed a single
@@ -1144,6 +1165,16 @@ fill_cell_draw_uniforms(int program, MetalCellDrawUniforms *u) {
     u->draw_bg_bitfield = uniform_stores[program].values[CELL_U_draw_bg_bitfield].u[0];
     u->text_contrast = slot_f(program, CELL_U_text_contrast, 0);
     u->text_gamma_adjustment = slot_f(program, CELL_U_text_gamma_adjustment, 0);
+    u->text_edr_boost = effective_text_edr_boost();
+    // The only numeric evidence channel for a magnitude the goldens cannot
+    // see: the capture arm renders BGRA8 sRGB and quantizes to 8 bits, so a
+    // boosted glyph and a clipped one are the same pixels there. Silent at
+    // 1.0, so an unset lever costs one comparison and no output.
+    if (u->text_edr_boost != 1.0f) {
+        METAL_TRACE("text_edr_boost: effective=%.4f lever=%.4f headroom=%.4f engaged=%d prog=%d\n",
+                    (double)u->text_edr_boost, (double)text_edr_boost_lever,
+                    (double)edr_frame_headroom, edr_frame_engaged, program);
+    }
 }
 
 static void
@@ -2245,7 +2276,7 @@ draw_quad(bool blend, unsigned instance_count) {
         MetalCellDrawUniforms cell_draw;
         fill_cell_draw_uniforms(current_program, &cell_draw);
         [mtl_current_encoder setVertexBytes:&cell_draw.draw_bg_bitfield length:sizeof(cell_draw.draw_bg_bitfield) atIndex:CELL_FORK_VERTEX_BUF_entryPointParams];
-        [mtl_current_encoder setFragmentBytes:&cell_draw.text_contrast length:sizeof(float) * 2 atIndex:CELL_FORK_FRAGMENT_BUF_entryPointParams];
+        [mtl_current_encoder setFragmentBytes:&cell_draw.text_contrast length:sizeof(float) * 3 atIndex:CELL_FORK_FRAGMENT_BUF_entryPointParams];
         // The generated fragment takes a runtime sampler (the hand-written
         // MSL's constexpr nearest+clamp sampler moved to the W3e cache).
         [mtl_current_encoder setFragmentSamplerState:sampler_state_for(false, GL_CLAMP_TO_EDGE) atIndex:CELL_FORK_FRAGMENT_SAMP_sprite];
@@ -3265,6 +3296,17 @@ ensure_layered_work_surface(NSUInteger w, NSUInteger h) {
 // frame; the headroom is recorded for diagnostics and to keep the two halves of
 // the tone-map policy (shader clamp target vs layer capability) reading from one
 // source. Idempotent, so the caller can invoke it unconditionally.
+void
+metal_set_text_edr_boost(float boost) {
+    // Anything not strictly above 1.0 (including NaN, which fails the compare)
+    // means off. No pipeline rebuild: the boost is a per-draw uniform, not a
+    // function constant, so a config reload costs nothing but this store.
+    text_edr_boost_lever = boost > 1.0f ? boost : 1.0f;
+}
+
+bool
+metal_text_edr_boost_wanted(void) { return text_edr_boost_lever > 1.0f; }
+
 void
 metal_set_edr_frame_state(bool engaged, float headroom) {
     edr_frame_engaged = engaged;

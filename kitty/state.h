@@ -730,6 +730,7 @@ void metal_set_link_drawable(void *drawable);  // Phase 4 (L1): link-delivered d
 bool metal_immediate_encode_enabled(void);      // true under timer pace (L2 intrinsic); neutered under the CAMetalDisplayLink driver
 void metal_forget_layer(void *layer);           // window teardown: free the per-window state slot
 void metal_set_edr_frame_state(bool engaged, float headroom);  // W27 P4.2: EDR-capable layered working surface
+bool metal_text_edr_boost_wanted(void);         // the EDR text-boost lever: text alone asks for the EDR pipeline
 // H3 (W28.4a): run one tick's whole per-OS-window render loop inside a single
 // autorelease pool, draining the frame's autoreleased Metal objects at the end
 // of the tick instead of leaving them to AppKit's runloop pool. The loop is

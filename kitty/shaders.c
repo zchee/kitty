@@ -3514,6 +3514,23 @@ compile_program(PyObject UNUSED *self, PyObject *args) {
 // them by scraping the preprocessed GLSL back apart (which made kitty/*.glsl
 // load-bearing for Metal rendering config). Defined for both backends so the
 // Python caller stays backend-agnostic.
+// The EDR text-boost lever. Resolved on the Python side because kitty.conf's
+// `env` dict lives there and never reaches this process's environment, then
+// pushed here on startup and on every config reload. Defined for both backends
+// so the Python caller stays backend-agnostic; the GL arm has no EDR pipeline
+// to boost into, so it discards the value.
+static PyObject*
+set_text_edr_boost(PyObject UNUSED *self, PyObject *args) {
+    float boost;
+    if (!PyArg_ParseTuple(args, "f", &boost)) return NULL;
+#ifdef KITTY_BACKEND_METAL
+    metal_set_text_edr_boost(boost);
+#else
+    (void)boost;
+#endif
+    Py_RETURN_NONE;
+}
+
 static PyObject*
 set_cell_shader_opts(PyObject UNUSED *self, PyObject *args) {
     int do_fg_override, fg_override_algo, text_new_gamma;
@@ -3564,6 +3581,7 @@ sprite_map_set_limits(PyObject UNUSED *self, PyObject *args) {
 static PyMethodDef module_methods[] = {
     M(compile_program, METH_VARARGS),
     M(set_cell_shader_opts, METH_VARARGS),
+    M(set_text_edr_boost, METH_VARARGS),
     M(sprite_map_set_limits, METH_VARARGS),
     MW(create_vao, METH_NOARGS),
     MW(gpu_driver_version_string, METH_NOARGS),

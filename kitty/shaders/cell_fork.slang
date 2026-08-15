@@ -358,7 +358,8 @@ adjust_foreground_contrast_with_background(float4 text_fg, float3 bg, float text
 
 [shader("fragment")]
 float4
-fragment_main(VertexOutput vo, uniform float text_contrast, uniform float text_gamma_adjustment, )
+fragment_main(VertexOutput vo, uniform float text_contrast, uniform float text_gamma_adjustment,
+              uniform float text_edr_boost, )
     : SV_Target {
     float4 ans_premul = 0;
     if (!ONLY_FOREGROUND) ans_premul = vo.effective_background_premul;
@@ -367,6 +368,18 @@ fragment_main(VertexOutput vo, uniform float text_contrast, uniform float text_g
         // blend in the foreground color
         float4 text_fg = load_text_foreground_color(vo.sprite_pos, vo.colored_sprite, vo.use_color_atlas, vo.cell_foreground);
         text_fg = adjust_foreground_contrast_with_background(text_fg, vo.background, text_contrast, text_gamma_adjustment);
+        // The EDR text boost (fork lever): scale the RESOLVED foreground above
+        // SDR reference white, so glyphs can use the display's extended range.
+        // Deliberately confined to the two foreground COLOURS: alpha carries
+        // glyph coverage, so boosting it would fight text_composition_strategy
+        // rather than brighten anything; the cursor colour is a surface, not
+        // text; and the background must stay put or the whole window glows.
+        // The C side already clamps the multiplier to this frame's headroom
+        // and hands over exactly 1.0 whenever EDR is not engaged, which is why
+        // this needs no branch and no function constant -- it is arithmetic
+        // that vanishes at 1.0, keeping every variant byte-identical when the
+        // lever is unset.
+        text_fg.rgb *= text_edr_boost;
         float4 text_fg_premul = calculate_premul_foreground_from_sprites(
             vo.sprite_pos,
             vo.underline_pos,
@@ -375,7 +388,7 @@ fragment_main(VertexOutput vo, uniform float text_contrast, uniform float text_g
             vo.underline_exclusion_pos,
             vo.use_color_atlas,
             text_fg,
-            vo.decoration_fg,
+            vo.decoration_fg * text_edr_boost,
             vo.cursor_color_premult,
             vo.effective_text_alpha);
         if (ONLY_FOREGROUND) ans_premul = text_fg_premul;

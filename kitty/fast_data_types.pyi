@@ -548,6 +548,10 @@ def set_cell_shader_opts(
     pass
 
 
+def set_text_edr_boost(boost: float) -> None:
+    pass
+
+
 def set_os_window_chrome(os_window_id: int) -> bool:
     pass
 

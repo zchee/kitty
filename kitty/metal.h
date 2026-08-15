@@ -250,6 +250,13 @@ void metal_resolve_layered_frame(void);
 // >1.0 components survive to the drawable; RGBA16Unorm otherwise).
 void metal_set_edr_frame_state(bool engaged, float headroom);
 
+// The EDR text-boost lever, resolved from the config on the Python side and
+// routed here from set_text_edr_boost() in kitty/shaders.c. metal_text_edr_
+// boost_wanted() is the engagement half: while the lever is set, EDR must be
+// engaged for text alone, so child-monitor's want_edr consults it.
+void metal_set_text_edr_boost(float boost);
+bool metal_text_edr_boost_wanted(void);
+
 // H3 (W28.4a): run one render tick's per-window loop inside a single
 // autorelease pool, with the drain barrier as the pool's last statement. The
 // caller hands the loop over as a callback because @autoreleasepool is

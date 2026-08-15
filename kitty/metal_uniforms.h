@@ -55,6 +55,13 @@ typedef struct MetalCellDrawUniforms {
     uint32 draw_bg_bitfield;
     float text_contrast;
     float text_gamma_adjustment;
+    // The EDR text boost. Unlike the two above it never passes through the
+    // glUniform value store: it is a config-derived renderer setting pushed
+    // straight into metal.m (like the cell function constants), so it is
+    // filled from that global rather than from a uniform slot. 1.0 == off,
+    // which is what every draw sees unless the lever is set AND this frame
+    // has EDR engaged.
+    float text_edr_boost;
 } MetalCellDrawUniforms;
 
 // C5: per-draw uniform structs for the frame-path programs, hoisted out of the
@@ -180,7 +187,11 @@ _Static_assert(offsetof(MetalCellRenderData, cursor_opacity) == 96, "cursor rect
 _Static_assert(offsetof(MetalCellRenderData, bg_colors0) == 120, "opacity block must occupy bytes 96-119");
 _Static_assert(offsetof(MetalCellRenderData, bg_opacities0) == 152, "bg colors must occupy bytes 120-151");
 _Static_assert(offsetof(MetalCellRenderData, color_sprites_xnum) == 184, "R8-atlas block must occupy bytes 184-195");
-_Static_assert(sizeof(MetalCellDrawUniforms) == 12, "MetalCellDrawUniforms layout drifted");
+_Static_assert(sizeof(MetalCellDrawUniforms) == 16, "MetalCellDrawUniforms layout drifted");
+_Static_assert(offsetof(MetalCellDrawUniforms, text_contrast) == 4,
+    "the fragment slice must start right after the vertex block's draw_bg_bitfield");
+_Static_assert(offsetof(MetalCellDrawUniforms, text_edr_boost) == 12,
+    "text_edr_boost must be the third float of the contiguous fragment slice metal.m pushes");
 
 // C5: pin the frame-path uniform structs to their MSL layouts.
 _Static_assert(sizeof(MetalBorderUniforms) == 40, "MetalBorderUniforms layout drifted");
