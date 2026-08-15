@@ -1488,6 +1488,14 @@ SHADER_UNIFORMS: Dict[str, Tuple[str, ...]] = {
         # window's current screen headroom, src_* describe the image being drawn.
         'edr_headroom', 'src_is_hdr', 'src_max_component',
     ),
+    'padding': (
+        # padding_fork.slang vertex entry params, in upstream padding.slang's
+        # declaration order (the fill in metal.m mirrors this into the
+        # MetalPaddingUniforms push).
+        'base_instance', 'instance_step', 'is_horizontal', 'along_count',
+        'across', 'along_start', 'along_step', 'along_clamp',
+        'base_instance2', 'across2',
+    ),
     'rounded_rect': (
         'rect', 'params', 'color', 'background_color',   # rounded_rect_fragment.glsl
         # rounded_rect_vertex.glsl declares no uniforms

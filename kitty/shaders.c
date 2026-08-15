@@ -2176,13 +2176,13 @@ draw_window_padding(const UIRenderData *ui, Window *window, ssize_t vao_idx, boo
     // and one the vertical pair (left+right). Each draw packs its strip cells into
     // a dedicated buffer so the VAO needs no per-strip reconfiguration. The shader
     // selects per-strip geometry and cell indices branch-free via lerp.
-#ifdef KITTY_BACKEND_METAL
-    // The padding fill draw needs PADDING_PROGRAM (no Metal pipeline yet) and
-    // GPU-side vao-buffer region copies the fenced rings cannot express, so the
-    // feature is inert on this backend until it is ported.
-    (void)ui; (void)window; (void)vao_idx; (void)for_final_output;
-    return;
-#else
+    //
+    // Both backends share the geometry, the uniform pushes and the draws. They
+    // differ in how the shader reaches cell data: the GL arm packs the strip
+    // cells into dedicated instanced-attribute buffers (GPU region copies for
+    // rows, a CPU gather for columns), while the Metal arm's padding_fork.slang
+    // fetches the live cell/selection streams by grid index in the vertex, so
+    // the packing (and the attribute repointing around it) is GL-only.
     if (!window || OPT(padding_fill_strategy) != PADDING_FILL_NEIGHBORING_CELL) return;
     const unsigned int cl = window->size_mismatch_padding.left, ct = window->size_mismatch_padding.top, cr = window->size_mismatch_padding.right,
                        cb = window->size_mismatch_padding.bottom;
@@ -2208,8 +2208,10 @@ draw_window_padding(const UIRenderData *ui, Window *window, ssize_t vao_idx, boo
     bind_vao_uniform_buffer(vao_idx, color_table_buffer, COLOR_TABLE_BINDING_POINT);
     if (for_final_output) glEnable(GL_FRAMEBUFFER_SRGB);
 
+#ifndef KITTY_BACKEND_METAL
     // Point instanced attributes at the padding-specific buffers once for both draws.
     configure_padding_vao_attributes(vao_idx);
+#endif
 
 #define PL(x) program_uniform_location(PADDING_PROGRAM, #x)
 
@@ -2217,6 +2219,7 @@ draw_window_padding(const UIRenderData *ui, Window *window, ssize_t vao_idx, boo
     // Cell data is packed contiguously via GPU-side copies (no CPU round-trip).
     if (ct || cb) {
         const unsigned int nH = (ct ? 1u : 0u) + (cb ? 1u : 0u);
+#ifndef KITTY_BACKEND_METAL
         alloc_vao_buffer(vao_idx, (GLsizeiptr)(sizeof(GPUCell) * nH * columns), padding_cell_data_buffer, GL_DYNAMIC_DRAW);
         alloc_vao_buffer(vao_idx, (GLsizeiptr)(sizeof(GLubyte) * nH * columns), padding_selection_buffer, GL_DYNAMIC_DRAW);
 
@@ -2254,6 +2257,7 @@ draw_window_padding(const UIRenderData *ui, Window *window, ssize_t vao_idx, boo
                 (GLintptr)(sizeof(GLubyte) * sidx * columns),
                 (GLsizeiptr)(columns * sizeof(GLubyte)));
         }
+#endif
 
         // Strip-0 is top (or bottom when only bottom exists); strip-1 is bottom.
         // For a single-strip draw base_instance2/across2 equal strip-0 values so
@@ -2278,6 +2282,7 @@ draw_window_padding(const UIRenderData *ui, Window *window, ssize_t vao_idx, boo
     // CPU-side by mapping the buffer for reading, then upload in one shot.
     if (cl || cr) {
         const unsigned int nV = (cl ? 1u : 0u) + (cr ? 1u : 0u);
+#ifndef KITTY_BACKEND_METAL
         // VLA sizes: lines is bounded by the window height / cell height (~<500).
         GPUCell gathered_cells[2 * lines];
         GLubyte gathered_sel[2 * lines];
@@ -2306,6 +2311,7 @@ draw_window_padding(const UIRenderData *ui, Window *window, ssize_t vao_idx, boo
         dst = alloc_and_map_vao_buffer(vao_idx, (GLsizeiptr)(sizeof(GLubyte) * nV * lines), padding_selection_buffer, false);
         memcpy(dst, gathered_sel, sizeof(GLubyte) * nV * lines);
         unmap_vao_buffer(vao_idx, padding_selection_buffer);
+#endif
 
         const unsigned int base0 = top_row * columns + (cl ? 0u : (columns - 1u));
         const unsigned int base1 = top_row * columns + (columns - 1u);
@@ -2324,12 +2330,13 @@ draw_window_padding(const UIRenderData *ui, Window *window, ssize_t vao_idx, boo
 
 #undef PL
     if (for_final_output) glDisable(GL_FRAMEBUFFER_SRGB);
+#ifndef KITTY_BACKEND_METAL
     // Restore the canonical cell attribute layout so subsequent cell rendering is unaffected.
     configure_cell_vao_attributes(vao_idx, 0u, 1u);
+#endif
     unbind_program();
 #undef NX
 #undef NY
-#endif
 }
 
 static void

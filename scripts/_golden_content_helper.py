@@ -166,6 +166,30 @@ def main() -> int:
         for i in range(len(specs)):
             out.write(f"\x1b[48;5;{16 + i}m    \x1b[0m")
 
+    elif scene == "padding":
+        # Padding-fill port gate scene: every cell gets a NON-default
+        # saturated background, so the compensatory padding strips (which
+        # copy the bg of their neighboring cell) are forced to differ from
+        # the window background whenever the strategy is neighboring_cell.
+        # Colors vary along BOTH axes (4-column blocks, row-shifted phase)
+        # so an indexing error in either strip axis moves pixels, not just
+        # an on/off. Autowrap off: rows are clipped, not wrapped, so the
+        # painted grid never reflows whatever the window geometry.
+        # Text inside the blocks keeps the capture above the emptiness
+        # heuristic's 32-unique-color floor (flat blocks alone yield ~10) and
+        # brings fg-over-colored-bg antialiasing under this gate as a bonus.
+        bg_palette = (196, 46, 21, 226, 129, 51, 208, 87)
+        fg_palette = (231, 16, 201, 18, 190, 52, 27, 235)
+        out.write("\x1b[?7l")
+        for row in range(45):
+            out.write(f"\x1b[{row + 1};1H")
+            for block in range(38):  # 38 * 4 = 152 columns, clipped at the margin
+                bg = bg_palette[(row + block) % len(bg_palette)]
+                fg = fg_palette[(row + 3 * block) % len(fg_palette)]
+                out.write(f"\x1b[48;5;{bg};38;5;{fg}mAg<>")
+            out.write(_RESET)
+        out.write("\x1b[?7h")
+
     # Fixed final cursor position, deterministic across every config in the
     # matrix, so cursor rendering itself is part of the reproducible frame.
     out.write("\x1b[10;1H")

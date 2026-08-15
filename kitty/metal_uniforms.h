@@ -153,6 +153,24 @@ typedef struct MetalRoundedRectUniforms {
     float background_color[4];
 } MetalRoundedRectUniforms;
 
+// Laid out to mirror padding_fork.slang's vertex entryPointParams block (the
+// declaration order of the uniform parameters, which is upstream
+// padding.slang's), pushed whole as one contiguous blob. _pad0 is MSL's
+// alignment hole before the 8-aligned across2 float2.
+typedef struct MetalPaddingUniforms {
+    uint32 base_instance;
+    uint32 instance_step;
+    uint32 is_horizontal;
+    uint32 along_count;
+    float across[2];
+    float along_start;
+    float along_step;
+    float along_clamp[2];
+    uint32 base_instance2;
+    uint32 _pad0;
+    float across2[2];
+} MetalPaddingUniforms;
+
 #ifndef __METAL_VERSION__
 _Static_assert(sizeof(MetalCellRenderData) == 196, "MetalCellRenderData must match the GPUCellRenderData layout in shaders.c");
 _Static_assert(offsetof(MetalCellRenderData, default_fg) == 12, "selection flags must occupy bytes 0-11");

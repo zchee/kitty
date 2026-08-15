@@ -388,7 +388,13 @@ static int current_program = -1;
 // format: the drawable is BGRA8Unorm with an sRGB view for FRAMEBUFFER_SRGB
 // parity, and the layers FBO is RGBA16Unorm, so a single PSO per program
 // cannot cover all render passes (see kitty/metal-pipeline-design.md).
-#define NUM_PROGRAMS 14
+// MUST cover shaders.c's full program enum (through CUSTOM_END; the enum is
+// file-local there, so this count cannot be derived). The guards in pso_get()
+// and draw_quad() compare against it, and an undersized value does not fail:
+// it silently drops every draw of the excess programs AND lets LTO fold their
+// `program == N` dispatch/PSO branches to dead code, so the miss leaves no
+// runtime trace at all (the padding-fill port lost a day to exactly that).
+#define NUM_PROGRAMS 16
 // W27 P4.2 raised this from 8: att0 for a layered pass is now per-frame (SDR
 // RGBA16Unorm / EDR RGBA16Float), which doubles the layered variants. A cell
 // program can now want 2 (drawable, non-layered) + 2 (thumbnail-capture FBO,
@@ -672,9 +678,25 @@ _Static_assert(sizeof(MetalCellRenderData) == CELL_FORK_VERTEX_BUFSZ_crd,
     "cell_fork.slang's CellRenderData block no longer matches MetalCellRenderData");
 _Static_assert(sizeof(MetalCellDrawUniforms) == CELL_FORK_VERTEX_BUFSZ_entryPointParams + CELL_FORK_FRAGMENT_BUFSZ_entryPointParams,
     "the cell_fork entry-params split no longer covers MetalCellDrawUniforms");
-_Static_assert(KITTY_SLANG_VERTEX_SHADERS == 9,
+_Static_assert(KITTY_SLANG_VERTEX_SHADERS == 10,
     "a vertex shader was added to METAL_SHADERS in slang.py -- declare its VertexOrder there and map "
     "its program id below");
+#ifndef PADDING_FORK_VERTEX_IS_GENERATED
+#error "padding_fork's vertex is no longer generated -- program 14 below selects its variants by name"
+#endif
+_Static_assert(PADDING_FORK_VERTEX_SPECIALIZATIONS == 4,
+    "padding_fork's variant set changed size -- program 14 below selects entry names per (transfer, primaries) pair");
+_Static_assert(sizeof(MetalPaddingUniforms) == PADDING_FORK_VERTEX_BUFSZ_entryPointParams,
+    "padding_fork.slang's entry params no longer match MetalPaddingUniforms");
+// The padding draw binds the SAME VAO ring slots the cell programs render
+// from (live cells, selection, CellRenderData, ColorTable + wide table at the
+// fixed offset), so both wrappers must keep importing one background_fork
+// module with identical block layouts.
+_Static_assert(PADDING_FORK_VERTEX_BUFSZ_crd == CELL_FORK_VERTEX_BUFSZ_crd
+               && PADDING_FORK_VERTEX_BUFSZ_ctb == CELL_FORK_VERTEX_BUFSZ_ctb,
+    "background_fork's blocks diverged between cell_fork and padding_fork -- the padding draw binds the cell VAO's buffers");
+_Static_assert(sizeof(GPUCell) == PADDING_FORK_VERTEX_BUFSZ_cells,
+    "padding_fork.slang's PaddingGPUCell no longer matches the GPUCell stream it indexes");
 #ifndef BLIT_FORK_VERTEX_IS_GENERATED
 #error "blit_fork's vertex is no longer generated -- program 11 below selects its entries by name"
 #endif
@@ -736,6 +758,7 @@ program_uses_fan_vertex_order(int program) {
         case 11: return BLIT_FORK_VERTEX_ORDER_FAN;     // BLIT, from blit_fork.slang (fork wrapper)
         case 12: return SCREENSHOT_VERTEX_ORDER_FAN;    // SCREENSHOT, from screenshot.slang
         case 13: return ROUNDED_RECT_VERTEX_ORDER_FAN;  // ROUNDED_RECT, from rounded_rect.slang
+        case 14: return PADDING_FORK_VERTEX_ORDER_FAN;  // PADDING, from padding_fork.slang (fork wrapper)
         default: return false;
     }
 }
@@ -962,7 +985,27 @@ build_pso(int program, bool blend, MTLPixelFormat fmt, bool layered, MTLPixelFor
         case 11: return create_pipeline_state(@"blit_fork_vertex", @"blit_fork_fragment", blend, nil, fmt, layered, att1_fmt, nil);
         case 12: return create_pipeline_state(@"screenshot_vertex", @"screenshot_fragment", blend, nil, fmt, layered, att1_fmt, nil);
         case 13: return create_pipeline_state(@"rounded_rect_vertex", @"rounded_rect_fragment", blend, nil, fmt, layered, att1_fmt, nil);
-        default: return nil; // 3 == CELL_PROGRAM_SENTINEL, never drawn
+        case 14: {
+            // padding_fork.slang: the same four (transfer, primaries)
+            // build-time variants as border_fork above, selected by the same
+            // resolver outputs; the two unreachable pairs fail loud.
+            const char *target = NULL;
+            if (!target_primaries_is_p3 && target_color_space == TARGET_SPACE_ENCODE_SRGB) target = "";
+            else if (!target_primaries_is_p3 && target_color_space == TARGET_SPACE_LINEAR) target = "_linear";
+            else if (target_primaries_is_p3 && target_color_space == TARGET_SPACE_LINEAR) target = "_linear_p3";
+            else if (target_primaries_is_p3 && target_color_space == TARGET_SPACE_ROP_ENCODES) target = "_rop_p3";
+            else {
+                log_error("Metal: unreachable (target_color_space=%d, primaries_is_p3=%d) pair for the padding PSO",
+                          target_color_space, target_primaries_is_p3);
+                return nil;
+            }
+            char vname[64], fname[64];
+            snprintf(vname, sizeof(vname), "padding_fork_vertex%s", target);
+            snprintf(fname, sizeof(fname), "padding_fork_fragment%s", target);
+            return create_pipeline_state([NSString stringWithUTF8String:vname], [NSString stringWithUTF8String:fname],
+                                         blend, nil, fmt, layered, att1_fmt, nil);
+        }
+        default: return nil; // 3 == CELL_PROGRAM_SENTINEL, never drawn; 15 == CUSTOM_END, inert on this backend
     }
 }
 
@@ -1042,7 +1085,8 @@ init_uniforms(int program) {
         case 11: { BlitUniforms u; get_uniform_locations_blit(program, &u); break; }
         case 12: { ScreenshotUniforms u; get_uniform_locations_screenshot(program, &u); break; }
         case 13: { Rounded_rectUniforms u; get_uniform_locations_rounded_rect(program, &u); break; }
-        default: break; // 3 == CELL_PROGRAM_SENTINEL; 14/15 (padding/custom-end) have no Metal pipelines
+        case 14: { PaddingUniforms u; get_uniform_locations_padding(program, &u); break; }
+        default: break; // 3 == CELL_PROGRAM_SENTINEL; 15 (custom-end) has no Metal pipeline
     }
 }
 
@@ -1186,6 +1230,21 @@ fill_rounded_rect_uniforms(int program, MetalRoundedRectUniforms *u) {
     slot_fv(program, ROUNDED_RECT_U_params, u->params, 2);
     slot_fv(program, ROUNDED_RECT_U_color, u->color, 4);
     slot_fv(program, ROUNDED_RECT_U_background_color, u->background_color, 4);
+}
+
+static void
+fill_padding_uniforms(int program, MetalPaddingUniforms *u) {
+    memset(u, 0, sizeof(*u));
+    u->base_instance = uniform_stores[program].values[PADDING_U_base_instance].u[0];
+    u->instance_step = uniform_stores[program].values[PADDING_U_instance_step].u[0];
+    u->is_horizontal = uniform_stores[program].values[PADDING_U_is_horizontal].u[0];
+    u->along_count = uniform_stores[program].values[PADDING_U_along_count].u[0];
+    slot_fv(program, PADDING_U_across, u->across, 2);
+    u->along_start = slot_f(program, PADDING_U_along_start, 0);
+    u->along_step = slot_f(program, PADDING_U_along_step, 0);
+    slot_fv(program, PADDING_U_along_clamp, u->along_clamp, 2);
+    u->base_instance2 = uniform_stores[program].values[PADDING_U_base_instance2].u[0];
+    slot_fv(program, PADDING_U_across2, u->across2, 2);
 }
 
 // Number of entries in the ColorTable UBO: NUM_COLORS + MARK_MASK + MARK_MASK + 2
@@ -1484,10 +1543,12 @@ set_vao_attribute(ssize_t vao_idx, size_t buffer_idx, int location, GLint size, 
 void
 copy_vao_buffer_region(ssize_t vao_idx, size_t src_bufnum, GLintptr src_off, size_t dst_bufnum, GLintptr dst_off, GLsizeiptr size) {
     (void)vao_idx; (void)src_bufnum; (void)src_off; (void)dst_bufnum; (void)dst_off; (void)size;
-    // The only caller (draw_window_padding) is gated off on this backend; the
-    // fenced buffer rings hand out fresh slots per map, so a GL-style
-    // buffer-to-buffer region copy has no faithful equivalent yet. Fail loud
-    // rather than silently rendering stale data if a new caller appears.
+    // The only caller (draw_window_padding's GL-arm packing) is #ifndef-gated
+    // off this backend -- the Metal arm's padding_fork fetches the live
+    // streams by grid index instead. The fenced buffer rings hand out fresh
+    // slots per map, so a GL-style buffer-to-buffer region copy has no
+    // faithful equivalent yet. Fail loud rather than silently rendering stale
+    // data if a new caller appears.
     fatal("copy_vao_buffer_region: not implemented on the Metal backend");
 }
 
@@ -2367,6 +2428,38 @@ draw_quad(bool blend, unsigned instance_count) {
         fill_rounded_rect_uniforms(current_program, &rr_u);
         [mtl_current_encoder setFragmentBytes:&rr_u length:sizeof(rr_u)
                                       atIndex:ROUNDED_RECT_FRAGMENT_BUF_entryPointParams];
+    } else if (current_program == 14) {
+        // padding_fork.slang: colours the compensatory padding strips from the
+        // LIVE streams of the bound cell VAO, fetched by grid index in the
+        // vertex -- the GL arm's GPU packing (copy_vao_buffer_region) has no
+        // faithful equivalent on the fenced rings and is unnecessary here.
+        // Slot layout matches the cell programs': [0]=GPUCell stream,
+        // [1]=selection bytes (read as words), [2]=CellRenderData ring slot,
+        // [3]=ColorTable + wide table at the fixed offset past the packed
+        // uint region. The fragment takes no uniforms (the epilogue axes are
+        // build-time variants). Its entry has no vertex attributes, so the
+        // bindings are the logical slang buffer indices, no descriptor.
+        if (current_bound_vao >= 0) {
+            MetalVAO *vao = &vaos[current_bound_vao];
+            if (vao->num_buffers > 0 && buffers[vao->buffers[0]].mtl_buffer) {
+                [mtl_current_encoder setVertexBuffer:buffers[vao->buffers[0]].mtl_buffer offset:0 atIndex:PADDING_FORK_VERTEX_BUF_cells];
+            }
+            if (vao->num_buffers > 1 && buffers[vao->buffers[1]].mtl_buffer) {
+                [mtl_current_encoder setVertexBuffer:buffers[vao->buffers[1]].mtl_buffer offset:0 atIndex:PADDING_FORK_VERTEX_BUF_selection_words];
+            }
+            if (vao->num_buffers > 2 && buffers[vao->buffers[2]].mtl_buffer) {
+                [mtl_current_encoder setVertexBuffer:buffers[vao->buffers[2]].mtl_buffer offset:0 atIndex:PADDING_FORK_VERTEX_BUF_crd];
+            }
+            if (vao->num_buffers > 3 && buffers[vao->buffers[3]].mtl_buffer) {
+                [mtl_current_encoder setVertexBuffer:buffers[vao->buffers[3]].mtl_buffer offset:0 atIndex:PADDING_FORK_VERTEX_BUF_ctb];
+                [mtl_current_encoder setVertexBuffer:buffers[vao->buffers[3]].mtl_buffer offset:PADDING_FORK_VERTEX_BUFSZ_ctb atIndex:PADDING_FORK_VERTEX_BUF_wct];
+            }
+        }
+        id<MTLBuffer> pad_glut = ensure_gamma_lut_buffer();
+        if (pad_glut) [mtl_current_encoder setVertexBuffer:pad_glut offset:0 atIndex:PADDING_FORK_VERTEX_BUF_glt];
+        MetalPaddingUniforms pad_u;
+        fill_padding_uniforms(current_program, &pad_u);
+        [mtl_current_encoder setVertexBytes:&pad_u length:sizeof(pad_u) atIndex:PADDING_FORK_VERTEX_BUF_entryPointParams];
     }
 
     // A generated vertex shader keeps upstream's fan order, so it is drawn

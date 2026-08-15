@@ -410,6 +410,13 @@ class SlangFile(NamedTuple):
                         raise Exception('Variant names for cell shader not unique')
                     seen.add(name)
                     yield s(name, **variant)
+            case 'padding_fork.slang':
+                # The four (transfer, primaries) target pairs, border_fork's
+                # naming; no other axes (padding has no fg path).
+                yield s()
+                yield s('linear', target_color_space='1')
+                yield s('linear_p3', target_color_space='1', target_primaries_is_p3='true')
+                yield s('rop_p3', target_color_space='2', target_primaries_is_p3='true')
             case 'cell_fork.slang':
                 # Phase C (ADR-0038): upstream cell.slang's axes crossed with
                 # the border_fork epilogue pairs (ADR-0034 §2). Names are
@@ -1069,6 +1076,12 @@ METAL_SHADERS: MappingProxyType[str, MetalShader] = MappingProxyType({
     # instanceCount — the exact composition BORDERS has shipped since W3b
     # (generated fan vertex + per-instance data, ADR-0032 §8 F7).
     'graphics_fork': MetalShader(frozenset({Stage.vertex, Stage.fragment}), VertexOrder.fan),
+    # padding_fork (kitty-ijm): upstream padding.slang fetching the live
+    # cell/selection buffers by true grid index (the fenced rings cannot
+    # express the GL arm's vao region copies), through the fork background
+    # module for wide-table colour parity, with the cell epilogue's four
+    # target variants. Fan like the rest (pad_pos_map is cell_pos_map).
+    'padding_fork': MetalShader(frozenset({Stage.vertex, Stage.fragment}), VertexOrder.fan),
     # blit_fork (the tenth migration): upstream blit.slang with the fork's
     # texcoord y-flip (Metal writes source textures top-down), split
     # texture/sampler, and the alpha==0 unpremultiply guard. Fan like the
@@ -1332,7 +1345,7 @@ def parse_metal_bindings(msl: str, stage: Stage, prefix: str) -> MetalBindings:
     _, signature = entry_point_declaration(msl, stage)
     buffers: dict[str, Any] = {}
     blocks: dict[str, int] = {}
-    matches = list(re.finditer(r'(\w+)\s+(?:constant|device)\s*\*\s*(\w+)\s*\[\[buffer\((\d+)\)\]\]', signature))
+    matches = list(re.finditer(r'(\w+)\s+(?:const\s+)?(?:constant|device)\s*\*\s*(\w+)\s*\[\[buffer\((\d+)\)\]\]', signature))
     # Counted against the raw occurrences, not tested for emptiness: an
     # all-or-nothing guard misses the partial case where slangc changes its
     # spelling for one parameter kind and the regex silently skips just that one.
@@ -1341,8 +1354,15 @@ def parse_metal_bindings(msl: str, stage: Stage, prefix: str) -> MetalBindings:
             f'{prefix}: the entry signature declares {signature.count("[[buffer(")} buffer parameters '
             f'but only {len(matches)} were recognised -- slangc changed its spelling')
     for m in matches:
-        size = msl_struct_size(structs[m.group(1)])
-        blocks[m.group(1)] = size
+        if m.group(1) in structs:
+            size = msl_struct_size(structs[m.group(1)])
+            blocks[m.group(1)] = size
+        else:
+            # A primitive-element device array (StructuredBuffer<uint> etc.)
+            # has no struct declaration to size; the recorded size is the
+            # ELEMENT size, and the runtime-length buffer bound there is the
+            # caller's to size (padding_fork's live cell/selection streams).
+            size, _ = msl_type_size_align(m.group(1))
         add_binding(buffers, strip_slang_suffix(m.group(2)), (int(m.group(3)), size), prefix)
     attributes: dict[str, Any] = {}
     if m := re.search(r'(\w+)\s+\w+\s*\[\[stage_in\]\]', signature):
@@ -1369,6 +1389,23 @@ def parse_metal_bindings(msl: str, stage: Stage, prefix: str) -> MetalBindings:
         return found
 
     return MetalBindings(prefix, buffers, attributes, indexed_params('texture'), indexed_params('sampler'), blocks, '', stage, '')
+
+
+def constify_readonly_device_buffers(msl: str) -> str:
+    ''' Qualify every device-space buffer pointer const.
+
+    slangc's Metal emitter types StructuredBuffer parameters as plain
+    `device*` even though the slang side of that type is read-only, and
+    Metal warns about every writable resource in a non-void vertex
+    function (padding_fork's live cell/selection streams). No slang
+    source in this tree declares an RW buffer, so const is the truth
+    today; if one ever appears, writing through the const pointer is a
+    compile ERROR in that .metal -- loud, unlike the silent mis-fire
+    class internalize_msl_helpers documents -- and this pass then needs
+    a per-buffer exemption. The (?!const\\b) guard keeps the in-place,
+    mtime-gated rewrite idempotent.
+    '''
+    return re.sub(r'\b(?!const\b)(\w+)( device\*)', r'\1 const\2', msl)
 
 
 def internalize_msl_helpers(msl: str, entry: str) -> str:
@@ -1431,6 +1468,7 @@ def fixup_metal_files(dest_dir: str, dest: str = 'kitty/metal-bindings.h') -> No
         fn = metal_function_name(shader, stage, specialization)
         msl = re.sub(rf'\b{entry_point_declaration(msl, stage)[0]}\b', fn, msl)
         msl = internalize_msl_helpers(msl, fn)
+        msl = constify_readonly_device_buffers(msl)
         bindings = parse_metal_bindings(msl, stage, fn.upper())._replace(shader=shader, specialization=specialization)
         # The BUFSZ defines pin the C side against slang.py's MODEL of MSL
         # layout; a wrong model would leave C and the #define agreeing and both

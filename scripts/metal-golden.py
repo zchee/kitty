@@ -149,6 +149,17 @@ CONFIG_MATRIX: dict[str, list[str]] = {
     # bg-only cell passes run and their rm1/rm2 variants come under the gate.
     # Self-evidencing: the D-2 nil-PSO probe MUST move this config (verified).
     "cell-layered": [f"window_logo_path={REPO_ROOT / 'logo' / 'kitty-128.png'}", "window_logo_position=center"],
+    # Padding-fill port gate: the ONLY config that draws PADDING_PROGRAM (the
+    # compensatory size-mismatch strips, inert unless padding_fill_strategy
+    # deviates from its 'background' default -- so every other config is
+    # structurally blind to this program). The scene paints every cell with a
+    # saturated non-default background (see the helper), which makes each
+    # strip copy a color the default strategy would never paint there.
+    # Introduction proof (perturb-and-require-movement): a default-strategy
+    # probe capture of the same scene must differ from this config's capture,
+    # which simultaneously proves the harness geometry HAS nonzero
+    # size-mismatch padding.
+    "padding-fill": ["padding_fill_strategy=neighboring_cell"],
 }
 
 # Configs whose golden artifact is the thumbnail lever's output (value =
@@ -165,7 +176,7 @@ THUMB_CONFIGS: dict[str, str] = {"screenshot-thumb": "0.5"}
 # never imports), so the assert fires at capture/compare EXECUTION, not
 # during reverify's count read -- the two readers are complementary; do
 # not "fix" the constant into the AST path.
-EXPECT_CONFIG_MATRIX = 15
+EXPECT_CONFIG_MATRIX = 16
 assert len(CONFIG_MATRIX) == EXPECT_CONFIG_MATRIX, (
     f"CONFIG_MATRIX has {len(CONFIG_MATRIX)} configs but EXPECT_CONFIG_MATRIX declares "
     f"{EXPECT_CONFIG_MATRIX} -- update the constant in the same change that alters the matrix"
@@ -178,6 +189,7 @@ CONFIG_SCENE: dict[str, str] = {
     "progress-bar": "progress",
     "palette-oklch": "palette",
     "hdr-ramp": "hdr-ramp",
+    "padding-fill": "padding",
 }
 
 # Extra environment for specific configs (merged into the sanitized spawn env).
