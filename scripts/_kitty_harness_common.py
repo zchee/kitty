@@ -263,13 +263,22 @@ def get_peak_rss_mb(samples_kb: list[int]) -> float | None:
 
 @functools.lru_cache(maxsize=1)
 def _offmain_display_position() -> str | None:
-    """Top-left-plus-margin of a non-main display as a kitty --position value
-    ("XxY", global top-left display coordinates), or None when the machine has
-    a single display or KITTY_HARNESS_ON_MAIN=1 opts out. Resolved once per
-    process via CoreGraphics (ctypes; no pyobjc — see the pyobjc-damage note
-    in the W28 memory)."""
+    """Top-left-plus-margin of the TARGET test display as a kitty --position
+    value ("XxY", global top-left display coordinates), or None when the
+    machine has a single display or KITTY_HARNESS_ON_MAIN=1 opts out.
+
+    Target selection (W3j operator directive, 2026-08-15): displays are
+    matched BY NAME — the operator's multi-monitor topology moves (the LG
+    HDR 5K portrait panel appeared between W3i and W3j, stealing the old
+    "first non-main" pick) — preferring the name that contains
+    KITTY_HARNESS_DISPLAY (default "LG UltraFine"), falling back to any
+    non-main display. Names come from system_profiler (one subprocess,
+    cached for the process); bounds from CoreGraphics via ctypes (no pyobjc
+    — see the pyobjc-damage note in the W28 memory). Name↔bounds are
+    correlated by pixel size."""
     if os.environ.get("KITTY_HARNESS_ON_MAIN"):
         return None
+    want = os.environ.get("KITTY_HARNESS_DISPLAY", "LG UltraFine").lower()
     try:
         cg = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
 
@@ -284,14 +293,33 @@ def _offmain_display_position() -> str | None:
         if cg.CGGetActiveDisplayList(16, ids, ctypes.byref(n)) != 0:
             return None
         main = cg.CGMainDisplayID()
+        offmain = []
         for i in range(n.value):
             if ids[i] == main:
                 continue
             b = cg.CGDisplayBounds(ids[i])
-            return f"{int(b.x) + 50}x{int(b.y) + 50}"
+            offmain.append(b)
+        if not offmain:
+            return None
+        wanted_sizes = set()
+        try:
+            import json as _json
+            out = subprocess.run(
+                ["system_profiler", "SPDisplaysDataType", "-json"],
+                capture_output=True, text=True, timeout=15).stdout
+            for g in _json.loads(out).get("SPDisplaysDataType", []):
+                for m in g.get("spdisplays_ndrvs", []):
+                    if want in (m.get("_name") or "").lower():
+                        px = (m.get("_spdisplays_pixels") or "").replace(" ", "")
+                        if "x" in px:
+                            w, _, h = px.partition("x")
+                            wanted_sizes.add((int(w), int(h)))
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
+        target = next((b for b in offmain if (int(b.w), int(b.h)) in wanted_sizes), offmain[0])
+        return f"{int(target.x) + 50}x{int(target.y) + 50}"
     except OSError:
         return None
-    return None
 
 
 def spawn_kitty(
