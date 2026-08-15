@@ -43,9 +43,12 @@ float linear2srgb(float x) {
     return lerp(lower, upper, step(0.0031308f, x));
 }
 
-// Linear sRGB-primaries -> linear Display-P3-primaries; rows pinned against
-// KITTY_SRGB_TO_P3_R0/R1/R2 in kitty/color_transfer.metal.h by slang.py.
-// max(0) is the P3 gamut floor for extended-range input.
+// Linear sRGB-primaries -> linear Display-P3-primaries; max(0) is the P3
+// gamut floor for extended-range input. This function and linear2srgb above
+// are a CHECKED RENDERING of slang.py's canonical_epilogue_functions()
+// (matrix rows read from kitty/color_transfer.metal.h) -- the build fails
+// with the expected block printed if this text deviates in ANY way (W3j
+// Lane 0, closing W3i F9's swizzle/assembly/floor blindness).
 float3 srgb_to_p3(float3 c) {
     float3 r = float3(
         dot(float3(0.8224621512240581, 0.17753784877594204, 0.0), c),

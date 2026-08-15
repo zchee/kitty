@@ -818,37 +818,64 @@ def metal_function_name(shader: str, stage: Stage, specialization: str = '') -> 
     return f'{ans}_{specialization}' if specialization else ans
 
 
-def check_border_fork_epilogue_pin() -> None:
-    ''' W3i (ADR-0034 §2): border_fork.slang duplicates the P3 matrix rows
-    from kitty/color_transfer.metal.h (slang cannot include MSL headers), and
-    the golden gate cannot see them drift — goldens exercise only the
-    ENCODE_SRGB variant (capture offscreen pinned to BGRA8), while the matrix
-    runs only in the P3 variants. This pin makes drift a BUILD failure: each
-    header row must appear verbatim in the wrapper. '''
+def canonical_epilogue_functions() -> str:
+    ''' The ONE authority for the fork epilogue's colour maths in slang: the
+    transfer scalars are this template (mirroring color_transfer.metal.h's
+    scalar triple, f-suffixed so codegen stays byte-identical to the retired
+    hand-written MSL), and the P3 matrix rows are read from the header's
+    KITTY_SRGB_TO_P3_R* defines at check time. Every fork wrapper must carry
+    this block VERBATIM (checked by check_fork_epilogue_pin below), so the
+    wrapper copy is a checked rendering, not a second source of truth. '''
     base = os.path.dirname(os.path.abspath(__file__))
     header = open(os.path.join(base, '..', 'color_transfer.metal.h')).read()
-    wrapper = open(os.path.join(base, 'border_fork.slang')).read()
-    header_rows = []
+    rows = []
     for row in ('KITTY_SRGB_TO_P3_R0', 'KITTY_SRGB_TO_P3_R1', 'KITTY_SRGB_TO_P3_R2'):
         m = re.search(rf'#define {row} (.+)', header)
         if m is None:
-            raise SystemExit(f'{row} missing from color_transfer.metal.h -- the border_fork epilogue pin cannot run')
-        header_rows.append(m.group(1).strip())
-    # W3i review F1: substring membership was PERMUTATION-BLIND -- swapping two
-    # matrix rows between the dot() slots kept every row "present" and the pin
-    # green, while every P3-tagged drawable would render permuted primaries
-    # (the same shape as W3f's shipped R/B transposition, and no golden can
-    # see it: only the never-captured wide-arm variants run this matrix). The
-    # comparison is therefore ORDERED: the wrapper's dot() rows must equal the
-    # header's R0/R1/R2 sequence exactly.
-    body = re.search(r'float3 srgb_to_p3\b.*?\{(.*?)\n\}', wrapper, re.S)
-    if body is None:
-        raise SystemExit('border_fork.slang: srgb_to_p3 not found -- the epilogue pin cannot run')
-    wrapper_rows = [r.strip() for r in re.findall(r'dot\(float3\(([^)]*)\)', body.group(1))]
-    if wrapper_rows != header_rows:
-        raise SystemExit(
-            'border_fork.slang has drifted from color_transfer.metal.h: srgb_to_p3 dot() rows must '
-            f'equal KITTY_SRGB_TO_P3_R0/R1/R2 in order; header={header_rows} wrapper={wrapper_rows}')
+            raise SystemExit(f'{row} missing from color_transfer.metal.h -- the fork epilogue pin cannot run')
+        rows.append(m.group(1).strip())
+    return f'''float linear2srgb(float x) {{
+    float lower = 12.92f * x;
+    float upper = 1.055f * pow(x, 1.0f / 2.4f) - 0.055f;
+    return lerp(lower, upper, step(0.0031308f, x));
+}}
+
+float3 srgb_to_p3(float3 c) {{
+    float3 r = float3(
+        dot(float3({rows[0]}), c),
+        dot(float3({rows[1]}), c),
+        dot(float3({rows[2]}), c));
+    return max(r, float3(0.0));
+}}'''
+
+
+FORK_EPILOGUE_WRAPPERS = ('border_fork.slang',)
+
+
+def check_fork_epilogue_pin() -> None:
+    ''' W3i F1 closed row permutation with an ordered-row compare; W3i round-2
+    F9 showed the CLASS is wider -- input swizzle (c -> c.bgr), permuted
+    assembly destinations, a deleted max(0) gamut floor all passed, and no
+    golden can see any of them (the matrix runs only in the never-captured
+    wide-arm variants; capture pins the BGRA8 offscreen). Per that review's
+    charter ("widening the regex is the third iteration of the same textual
+    approach and will lose the next round"), this is NOT a fragment matcher:
+    the whole canonical function block is RENDERED from the header
+    (canonical_epilogue_functions) and each fork wrapper must contain it
+    verbatim, modulo comments and whitespace. Any textual deviation -- the
+    three F9 vectors included -- fails the build and prints the expected
+    block; a shadowing second definition is a slang redefinition error. '''
+    def normalize(text: str) -> str:
+        return re.sub(r'\s+', ' ', re.sub(r'//[^\n]*', '', text)).strip()
+    canonical = canonical_epilogue_functions()
+    want = normalize(canonical)
+    base = os.path.dirname(os.path.abspath(__file__))
+    for name in FORK_EPILOGUE_WRAPPERS:
+        wrapper = open(os.path.join(base, name)).read()
+        if want not in normalize(wrapper):
+            raise SystemExit(
+                f'{name} has drifted from the canonical epilogue block (rendered from '
+                f'color_transfer.metal.h). Replace its linear2srgb/srgb_to_p3 with exactly:\n\n{canonical}')
 
 
 def commands_to_compile_to_metal(sources: dict[str, SlangFile], build_dir: str, dest_dir: str) -> Iterator[Command]:
@@ -861,7 +888,7 @@ def commands_to_compile_to_metal(sources: dict[str, SlangFile], build_dir: str, 
     the build. '''
     if sys.platform != 'darwin':
         return
-    check_border_fork_epilogue_pin()
+    check_fork_epilogue_pin()
     for base_dest, base_build, slang_module, cmd, sfile in iter_entry_point_shaders(sources, build_dir, dest_dir):
         shader = METAL_SHADERS.get(os.path.basename(base_dest))
         if shader is None:
