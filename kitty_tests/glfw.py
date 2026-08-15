@@ -23,11 +23,13 @@ class TestGLFW(BaseTest):
         from kitty.utils import macos_version
 
         lib_path = glfw_path('cocoa')
-        # kitty_exe() '+runpy' instead of sys.executable -c: under upstream's
+        # A real python interpreter, not sys.executable: under upstream's
         # parallel runner the workers ARE the kitty binary, where '-c' means
-        # --config and this probe hung as a terminal (lib_path rides the
-        # script text since +runpy passes no argv).
-        from kitty.constants import kitty_exe
+        # --config and this probe hung as a terminal. _real_python() resolves
+        # a plain CPython (see kitty_tests.slot_cow); lib_path is embedded in
+        # the script text rather than passed as argv so the call site is
+        # interpreter-agnostic.
+        from kitty_tests.slot_cow import _real_python
         script = dedent(f'''
             import ctypes
             import sys
@@ -41,7 +43,7 @@ class TestGLFW(BaseTest):
             func.restype = ctypes.c_int
             print(func())
         ''')
-        proc = subprocess.run([kitty_exe(), '+runpy', script], capture_output=True, text=True)
+        proc = subprocess.run([_real_python(), '-c', script], capture_output=True, text=True)
         if proc.returncode != 0:
             self.skipTest('Unable to query Cocoa display link backend: ' + proc.stderr.strip())
         backend_text = proc.stdout.strip()

@@ -283,6 +283,21 @@ def compare_snapshot_to_shadow(s, shadow: list, reader: str = 'stubbed') -> dict
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def _real_python() -> str:
+    # Upstream's parallel test runner executes workers INSIDE the kitty binary
+    # (kitty +runpy), so sys.executable is kitty there. This subprocess body
+    # creates a Screen and reads slot-share stats, which must run under a plain
+    # CPython -- kitty's embedded interpreter brings up runtime state that
+    # perturbs those stats (measured: 6/13 SHARE-arm deltas shift under
+    # kitty +runpy, all pass under real python). Resolve a real interpreter;
+    # sys.executable is correct only when it is not itself kitty.
+    import shutil
+    exe_base = os.path.basename(sys.executable).lower()
+    if 'python' in exe_base:
+        return sys.executable
+    return shutil.which('python3.14') or shutil.which('python3') or sys.executable
+
+
 def run_share_subprocess(body: str, share: str = '1') -> dict:
     """Run `body` in a fresh subprocess with KITTY_PAUSE_SNAPSHOT_SHARE=`share`.
 
@@ -313,9 +328,8 @@ def run_share_subprocess(body: str, share: str = '1') -> dict:
     # (+runpy), so sys.executable is kitty there and '-c' would mean --config:
     # the subprocess became a terminal waiting forever. kitty_exe() '+runpy'
     # works identically under both the in-kitty workers and a plain python run.
-    from kitty.constants import kitty_exe
     proc = subprocess.run(
-        [kitty_exe(), '+runpy', script], cwd=_REPO_ROOT, env=env,
+        [_real_python(), '-c', script], cwd=_REPO_ROOT, env=env,
         capture_output=True, text=True, timeout=60,
     )
     if proc.returncode != 0:
