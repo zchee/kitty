@@ -3514,11 +3514,15 @@ compile_program(PyObject UNUSED *self, PyObject *args) {
 // them by scraping the preprocessed GLSL back apart (which made kitty/*.glsl
 // load-bearing for Metal rendering config). Defined for both backends so the
 // Python caller stays backend-agnostic.
-// The EDR text-boost lever. Resolved on the Python side because kitty.conf's
-// `env` dict lives there and never reaches this process's environment, then
-// pushed here on startup and on every config reload. Defined for both backends
-// so the Python caller stays backend-agnostic; the GL arm has no EDR pipeline
-// to boost into, so it discards the value.
+
+// The EDR text-boost lever, a SEPARATE channel from the function constants
+// documented above: this one is an ordinary per-draw uniform, not a
+// specialization, so pushing it rebuilds no pipelines. Resolved on the Python
+// side because kitty.conf's `env` dict lives there and never reaches this
+// process's environment, then pushed here on startup and on every config
+// reload. Defined for both backends so the Python caller stays
+// backend-agnostic; the GL arm has no EDR pipeline to boost into, so it
+// discards the value.
 static PyObject*
 set_text_edr_boost(PyObject UNUSED *self, PyObject *args) {
     float boost;

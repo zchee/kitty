@@ -238,9 +238,21 @@ static float text_edr_boost_lever = 1.0f;
 // stay byte-identical), and never beyond the headroom the display grants right
 // now -- that number moves with the brightness slider, so anything cached at
 // startup would clip the bright end instead of clamping it.
+// Is the lever both set and showable? Eligibility belongs in the SAME test as
+// the lever value because engagement has two doors: the config lever below and
+// KITTY_METAL_FORCE_EDR, which sets edr_frame_engaged on any format while
+// glfwCocoaSetEDREnabled quietly no-ops on one that cannot carry >1.0.
+// Boosting into that gap does not merely fail to brighten -- the epilogue
+// clamps per channel, so a colour whose channels scale past 1.0 unevenly comes
+// out HUE-SHIFTED (#ff8000 at 2x clamps to yellow).
+static inline bool
+text_edr_boost_active(void) {
+    return text_edr_boost_lever > 1.0f && kitty_drawable_edr_eligible();
+}
+
 static inline float
 effective_text_edr_boost(void) {
-    if (!edr_frame_engaged || text_edr_boost_lever <= 1.0f) return 1.0f;
+    if (!edr_frame_engaged || !text_edr_boost_active()) return 1.0f;
     const float headroom = edr_frame_headroom >= 1.0f ? edr_frame_headroom : 1.0f;
     return text_edr_boost_lever < headroom ? text_edr_boost_lever : headroom;
 }
@@ -1168,9 +1180,14 @@ fill_cell_draw_uniforms(int program, MetalCellDrawUniforms *u) {
     u->text_edr_boost = effective_text_edr_boost();
     // The only numeric evidence channel for a magnitude the goldens cannot
     // see: the capture arm renders BGRA8 sRGB and quantizes to 8 bits, so a
-    // boosted glyph and a clipped one are the same pixels there. Silent at
-    // 1.0, so an unset lever costs one comparison and no output.
-    if (u->text_edr_boost != 1.0f) {
+    // boosted glyph and a clipped one are the same pixels there. Reported on
+    // CHANGE rather than per draw, so the evidence is complete without one
+    // line per cell draw per window per frame; and skipped for program 2
+    // (CELL_BG, whose rm1 variants DCE the uniform entirely), which would
+    // otherwise report a value that draw provably ignores.
+    static float last_traced_boost = -1.0f;
+    if (u->text_edr_boost != 1.0f && program != 2 && u->text_edr_boost != last_traced_boost) {
+        last_traced_boost = u->text_edr_boost;
         METAL_TRACE("text_edr_boost: effective=%.4f lever=%.4f headroom=%.4f engaged=%d prog=%d\n",
                     (double)u->text_edr_boost, (double)text_edr_boost_lever,
                     (double)edr_frame_headroom, edr_frame_engaged, program);
@@ -3305,7 +3322,12 @@ metal_set_text_edr_boost(float boost) {
 }
 
 bool
-metal_text_edr_boost_wanted(void) { return text_edr_boost_lever > 1.0f; }
+metal_text_edr_boost_wanted(void) {
+    // Engaging for an inert boost would buy nothing and still cost everything
+    // engagement costs: the system tone-map over all SDR content, and the
+    // half-float working surface every frame.
+    return text_edr_boost_active();
+}
 
 void
 metal_set_edr_frame_state(bool engaged, float headroom) {

@@ -252,8 +252,10 @@ void metal_set_edr_frame_state(bool engaged, float headroom);
 
 // The EDR text-boost lever, resolved from the config on the Python side and
 // routed here from set_text_edr_boost() in kitty/shaders.c. metal_text_edr_
-// boost_wanted() is the engagement half: while the lever is set, EDR must be
-// engaged for text alone, so child-monitor's want_edr consults it.
+// boost_wanted() is the engagement half, consulted by child-monitor's
+// want_edr: it is true while the lever is set AND the drawable format can
+// actually carry >1.0, so text alone engages EDR only where that buys
+// something.
 void metal_set_text_edr_boost(float boost);
 bool metal_text_edr_boost_wanted(void);
 
