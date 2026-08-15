@@ -900,18 +900,29 @@ def ensure_color_fork_module() -> None:
     # whole-gamma split between hand-written and generated shaders.
     header_text = open(os.path.join(base, '..', 'color_transfer.metal.h')).read()
     module_text = open(os.path.join(base, 'linear2srgb.slang')).read()
-    def transfer_constants(text: str, fn_pattern: str) -> list[float]:
+    def transfer_constants(text: str, fn_pattern: str, what: str) -> list[float]:
         m2 = re.search(fn_pattern + r'.*?\{(.*?)\n\}', text, re.S)
         if m2 is None:
-            raise SystemExit('transfer-equivalence assert cannot find the scalar linear2srgb body')
-        return sorted(float(tok) for tok in re.findall(r'(\d+\.\d+)f?', m2.group(1)))
-    h_consts = transfer_constants(header_text, r'inline float\s*\nlinear2srgb\(float x\)')
-    m_consts = transfer_constants(module_text, r'public float linear2srgb\(float x\)')
-    if h_consts != m_consts:
-        raise SystemExit(
-            'color_transfer.metal.h and linear2srgb.slang disagree on the sRGB transfer '
-            f'constants: header={h_consts} module={m_consts} -- the fork owns BOTH files '
-            'and they must stay numerically identical')
+            raise SystemExit(f'transfer-equivalence assert cannot find {what} '
+                             '(a signature reflow? widen the pattern here)')
+        # ORDERED, not a multiset (round-3 R3-1: sorted() was permutation-blind
+        # -- swapping 12.92 and 1.055 inside the function left the multiset
+        # identical while the transfer became a whole-gamma error).
+        return [float(tok) for tok in re.findall(r'(\d+\.\d+)f?', m2.group(1))]
+    # Both scalar transfer functions (round-3 R3-2 extended coverage from one);
+    # the vector forms share the scalars' constants and remain a recorded
+    # residual -- a vector-only header edit is golden-visible, unlike these.
+    for what, hdr_pat, mod_pat in (
+        ('scalar linear2srgb', r'inline float\s+linear2srgb\(float x\)', r'public float\s+linear2srgb\(float x\)'),
+        ('scalar srgb2linear', r'inline float\s+srgb2linear\(float x\)', r'public float\s+srgb2linear\(float x\)'),
+    ):
+        h_consts = transfer_constants(header_text, hdr_pat, f'the header {what} body')
+        m_consts = transfer_constants(module_text, mod_pat, f'the module {what} body')
+        if h_consts != m_consts:
+            raise SystemExit(
+                f'color_transfer.metal.h and linear2srgb.slang disagree on {what} '
+                f'(ordered compare): header={h_consts} module={m_consts} -- the fork owns '
+                'BOTH files and they must stay numerically identical')
 
 
 def commands_to_compile_to_metal(sources: dict[str, SlangFile], build_dir: str, dest_dir: str) -> Iterator[Command]:
