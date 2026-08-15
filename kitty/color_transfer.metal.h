@@ -10,7 +10,8 @@
 // W27 P3.4. Two things live here, and they are here together on purpose:
 //
 //   1. The sRGB transfer pair, which used to be copy-pasted into
-//      cell_shaders.metal, border_shaders.metal and blit_shaders.metal.
+//      blit_shaders.metal and the generated shaders (cell via
+//      cell_fork.slang since Phase C; border via border_fork.slang).
 //   2. The TARGET COLOR SPACE vocabulary shared by the MSL fragments and the C
 //      side that specializes them (kitty/metal.m).
 //

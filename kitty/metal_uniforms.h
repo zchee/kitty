@@ -8,7 +8,7 @@
 #pragma once
 
 // Struct definitions shared between the C shim (metal.m) and the Metal
-// shaders (cell_shaders.metal). Every member is a 4-byte scalar, so the C
+// shaders (cell_fork.slang's crd block since Phase C). Every member is a 4-byte scalar, so the C
 // natural layout, the MSL layout and the GLSL std140 layout (which packs
 // consecutive scalars without padding) are all identical. Do NOT add vector
 // types or manual padding here: the authoritative layout is the C writer

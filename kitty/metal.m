@@ -665,7 +665,14 @@ ensure_fan_to_strip_index_buffer(void) {
 // So the generated header gates both directions:
 // the per-shader marker below catches a removal or a swap, and the count catches
 // an addition, which no marker of its own would make anything here react to.
-_Static_assert(KITTY_SLANG_VERTEX_SHADERS == 7,
+#ifndef CELL_FORK_VERTEX_IS_GENERATED
+#error "cell_fork's vertex is no longer generated -- programs 0-2 above select its variants by name"
+#endif
+_Static_assert(sizeof(MetalCellRenderData) == CELL_FORK_VERTEX_BUFSZ_crd,
+    "cell_fork.slang's CellRenderData block no longer matches MetalCellRenderData");
+_Static_assert(sizeof(MetalCellDrawUniforms) == CELL_FORK_VERTEX_BUFSZ_entryPointParams + CELL_FORK_FRAGMENT_BUFSZ_entryPointParams,
+    "the cell_fork entry-params split no longer covers MetalCellDrawUniforms");
+_Static_assert(KITTY_SLANG_VERTEX_SHADERS == 8,
     "a vertex shader was added to METAL_SHADERS in slang.py -- declare its VertexOrder there and map "
     "its program id below");
 _Static_assert(GRAPHICS_FORK_VERTEX_SPECIALIZATIONS == 3 && GRAPHICS_FORK_FRAGMENT_SPECIALIZATIONS == 3,
@@ -713,6 +720,8 @@ _Static_assert(BORDER_FORK_FRAGMENT_SPECIALIZATIONS == 4,
 static bool
 program_uses_fan_vertex_order(int program) {
     switch (program) {
+        case 0: case 1: case 2:
+            return CELL_FORK_VERTEX_ORDER_FAN;          // CELL x3, from cell_fork.slang (fork wrapper)
         case 4: return BORDER_VERTEX_ORDER_FAN;         // BORDERS, from border.slang
         case 5: case 6: case 7:
             return GRAPHICS_FORK_VERTEX_ORDER_FAN;      // GRAPHICS x3, from graphics_fork.slang (fork wrapper)
@@ -748,24 +757,28 @@ cell_vertex_descriptor(void) {
     static MTLVertexDescriptor *cell_vd = nil;
     if (!cell_vd) {
         cell_vd = [[MTLVertexDescriptor alloc] init];
-        // Buffer 0: GPUCell data — attribute 0: colors (uvec3 = fg, bg, decoration_fg)
-        cell_vd.attributes[0].format = MTLVertexFormatUInt3;
-        cell_vd.attributes[0].offset = offsetof(GPUCell, fg);
-        cell_vd.attributes[0].bufferIndex = 0;
+        // Phase C (ADR-0038): attribute locations and the instance-stream
+        // buffer indices come from the generated bindings — slangc owns 0..4
+        // for cell_fork's constant blocks, so the two instance streams take
+        // the first free indices after them.
+        // GPUCell stream — attribute 0: colors (uvec3 = fg, bg, decoration_fg)
+        cell_vd.attributes[CELL_FORK_VERTEX_ATTR_colors].format = MTLVertexFormatUInt3;
+        cell_vd.attributes[CELL_FORK_VERTEX_ATTR_colors].offset = offsetof(GPUCell, fg);
+        cell_vd.attributes[CELL_FORK_VERTEX_ATTR_colors].bufferIndex = CELL_FORK_VERTEX_ATTR_BUFFER;
         // attribute 1: sprite_idx (uvec2 = sprite_idx, attrs)
-        cell_vd.attributes[1].format = MTLVertexFormatUInt2;
-        cell_vd.attributes[1].offset = offsetof(GPUCell, sprite_idx);
-        cell_vd.attributes[1].bufferIndex = 0;
-        cell_vd.layouts[0].stride = sizeof(GPUCell);
-        cell_vd.layouts[0].stepFunction = MTLVertexStepFunctionPerInstance;
-        cell_vd.layouts[0].stepRate = 1;
-        // Buffer 1: selection data — attribute 2: is_selected (uint8)
-        cell_vd.attributes[2].format = MTLVertexFormatUChar;
-        cell_vd.attributes[2].offset = 0;
-        cell_vd.attributes[2].bufferIndex = 5;
-        cell_vd.layouts[5].stride = 1; // 1 byte per cell
-        cell_vd.layouts[5].stepFunction = MTLVertexStepFunctionPerInstance;
-        cell_vd.layouts[5].stepRate = 1;
+        cell_vd.attributes[CELL_FORK_VERTEX_ATTR_sprite_idx].format = MTLVertexFormatUInt2;
+        cell_vd.attributes[CELL_FORK_VERTEX_ATTR_sprite_idx].offset = offsetof(GPUCell, sprite_idx);
+        cell_vd.attributes[CELL_FORK_VERTEX_ATTR_sprite_idx].bufferIndex = CELL_FORK_VERTEX_ATTR_BUFFER;
+        cell_vd.layouts[CELL_FORK_VERTEX_ATTR_BUFFER].stride = sizeof(GPUCell);
+        cell_vd.layouts[CELL_FORK_VERTEX_ATTR_BUFFER].stepFunction = MTLVertexStepFunctionPerInstance;
+        cell_vd.layouts[CELL_FORK_VERTEX_ATTR_BUFFER].stepRate = 1;
+        // Selection stream — attribute 2: is_selected (uint8)
+        cell_vd.attributes[CELL_FORK_VERTEX_ATTR_is_selected].format = MTLVertexFormatUChar;
+        cell_vd.attributes[CELL_FORK_VERTEX_ATTR_is_selected].offset = 0;
+        cell_vd.attributes[CELL_FORK_VERTEX_ATTR_is_selected].bufferIndex = CELL_FORK_VERTEX_ATTR_BUFFER + 1;
+        cell_vd.layouts[CELL_FORK_VERTEX_ATTR_BUFFER + 1].stride = 1; // 1 byte per cell
+        cell_vd.layouts[CELL_FORK_VERTEX_ATTR_BUFFER + 1].stepFunction = MTLVertexStepFunctionPerInstance;
+        cell_vd.layouts[CELL_FORK_VERTEX_ATTR_BUFFER + 1].stepRate = 1;
     }
     return cell_vd;
 }
@@ -869,18 +882,34 @@ build_pso(int program, bool blend, MTLPixelFormat fmt, bool layered, MTLPixelFor
     const bool target_primaries_is_p3 = target_primaries_is_p3_for(fmt, layered);
     switch (program) {
         case 0: case 1: case 2: {
-            MTLFunctionConstantValues *fc = [[MTLFunctionConstantValues alloc] init];
-            bool only_fg = (program == 1);
-            bool only_bg = (program == 2);
-            [fc setConstantValue:&only_fg type:MTLDataTypeBool atIndex:0]; // ONLY_FOREGROUND
-            [fc setConstantValue:&only_bg type:MTLDataTypeBool atIndex:1]; // ONLY_BACKGROUND
-            [fc setConstantValue:&cell_shader_opts.do_fg_override type:MTLDataTypeBool atIndex:2]; // DO_FG_OVERRIDE
-            [fc setConstantValue:&cell_shader_opts.fg_override_algo type:MTLDataTypeInt atIndex:3]; // FG_OVERRIDE_ALGO
-            [fc setConstantValue:&cell_shader_opts.fg_override_threshold type:MTLDataTypeFloat atIndex:4]; // FG_OVERRIDE_THRESHOLD
-            [fc setConstantValue:&cell_shader_opts.text_new_gamma type:MTLDataTypeBool atIndex:5]; // TEXT_NEW_GAMMA
-            [fc setConstantValue:&target_color_space type:MTLDataTypeInt atIndex:6]; // TARGET_COLOR_SPACE
-            [fc setConstantValue:&target_primaries_is_p3 type:MTLDataTypeBool atIndex:7]; // TARGET_PRIMARIES_IS_P3
-            return create_pipeline_state(@"cell_vertex", @"cell_fragment", blend, cell_vertex_descriptor(), fmt, layered, att1_fmt, fc);
+            // Phase C (ADR-0038): cell renders from the generated fork wrapper
+            // (cell_fork.slang) — the hand-written MSL's eight function
+            // constants became slang build-time variants. RENDER_MODE follows
+            // upstream's slang.py mapping (CELL=0, CELL_BG=1, CELL_FG=2 —
+            // note the PROGRAM id order is FG before BG, so 1<->2 swap here).
+            // The fg-override threshold rides crd.fg_override_threshold now
+            // (a uniform, filled by shaders.c), so only the algo selector and
+            // the gamma flag pick variants; bg-only collapses both (its
+            // variant set is a0og only). Target selection transcribes the
+            // same resolvers as border_fork below.
+            unsigned rm = program == 0 ? 0u : (program == 1 ? 2u : 1u);
+            int algo = (rm != 1u && cell_shader_opts.do_fg_override) ? cell_shader_opts.fg_override_algo : 0;
+            const char *gamma = (rm != 1u && cell_shader_opts.text_new_gamma) ? "ng" : "og";
+            const char *target = NULL;
+            if (!target_primaries_is_p3 && target_color_space == TARGET_SPACE_ENCODE_SRGB) target = "";
+            else if (!target_primaries_is_p3 && target_color_space == TARGET_SPACE_LINEAR) target = "_linear";
+            else if (target_primaries_is_p3 && target_color_space == TARGET_SPACE_LINEAR) target = "_linear_p3";
+            else if (target_primaries_is_p3 && target_color_space == TARGET_SPACE_ROP_ENCODES) target = "_rop_p3";
+            else {
+                log_error("Metal: unreachable (target_color_space=%d, primaries_is_p3=%d) pair for the cell PSO",
+                          target_color_space, target_primaries_is_p3);
+                return nil;
+            }
+            char vname[64], fname[64];
+            snprintf(vname, sizeof(vname), "cell_fork_vertex_rm%ua%d%s%s", rm, algo, gamma, target);
+            snprintf(fname, sizeof(fname), "cell_fork_fragment_rm%ua%d%s%s", rm, algo, gamma, target);
+            return create_pipeline_state([NSString stringWithUTF8String:vname], [NSString stringWithUTF8String:fname],
+                                         blend, cell_vertex_descriptor(), fmt, layered, att1_fmt, nil);
         }
         case 4: {
             // W3i (ADR-0034 §2): the epilogue's two function constants became
@@ -909,10 +938,15 @@ build_pso(int program, bool blend, MTLPixelFormat fmt, bool layered, MTLPixelFor
         // POLARITY (measured the hard way — the first mapping inverted 5/6 and
         // moved the graphics golden by 65): upstream's axis is
         // texture_is_NOT_premultiplied, the fork's old fc was IS_premultiplied.
-        // legacy.py is the canonical mirror: GRAPHICS_PROGRAM compiles with
-        // TEXTURE_IS_NOT_PREMULTIPLIED=1 (the 'premult' variant — it DOES the
-        // premultiply), GRAPHICS_PREMULT_PROGRAM with =0 (the default variant
-        // — sources already premultiplied, no-op).
+        // The canonical mirror is the graphics_fork case in
+        // kitty/shaders/slang.py (legacy.py is gone post-merge): the wrapper's
+        // default is texture_is_not_premultiplied=false and its 'premult'
+        // variant sets it true. So GRAPHICS_PROGRAM takes the _premult entries
+        // (=true — it DOES the premultiply) and GRAPHICS_PREMULT_PROGRAM the
+        // default entries (=false — sources already premultiplied, no-op).
+        // NOTE the suffix means the OPPOSITE define value on the GL arm
+        // (upstream graphics.slang defaults to true and its 'premult' variant
+        // sets false); each arm is internally consistent.
         case 5: return create_pipeline_state(@"graphics_fork_vertex_premult", @"graphics_fork_fragment_premult", blend, nil, fmt, layered, att1_fmt, nil);
         case 6: return create_pipeline_state(@"graphics_fork_vertex", @"graphics_fork_fragment", blend, nil, fmt, layered, att1_fmt, nil);
         case 7: return create_pipeline_state(@"graphics_fork_vertex_alpha_mask", @"graphics_fork_fragment_alpha_mask", blend, nil, fmt, layered, att1_fmt, nil);
@@ -1185,6 +1219,8 @@ block_index(int program, const char *name) {
 // time at a fixed byte offset -- see the ColorTable bind site below), so the
 // buffer this size drives must be grown to fit both regions.
 #define METAL_WIDE_COLOR_TABLE_BYTES (METAL_COLOR_TABLE_ENTRIES * 4u * sizeof(float))
+_Static_assert(METAL_WIDE_COLOR_TABLE_BYTES == CELL_FORK_VERTEX_BUFSZ_wct,
+    "cell_fork.slang's wide table block no longer matches METAL_WIDE_COLOR_TABLE_BYTES");
 
 GLint
 block_size(int program, GLuint bidx) {
@@ -2092,53 +2128,59 @@ draw_quad(bool blend, unsigned instance_count) {
         // Cell programs — bind GPUCell data, selection, uniform block, gamma_lut
         if (current_bound_vao >= 0) {
             MetalVAO *vao = &vaos[current_bound_vao];
-            // Buffer 0: GPUCell data (vertex attribute buffer)
+            // GPUCell instance stream (vertex descriptor's first stream)
             if (vao->num_buffers > 0) {
                 ssize_t buf_idx = vao->buffers[0];
                 if (buffers[buf_idx].mtl_buffer) {
-                    [mtl_current_encoder setVertexBuffer:buffers[buf_idx].mtl_buffer offset:0 atIndex:0];
+                    [mtl_current_encoder setVertexBuffer:buffers[buf_idx].mtl_buffer offset:0 atIndex:CELL_FORK_VERTEX_ATTR_BUFFER];
                 }
             }
-            // Buffer 1 (selection) → Metal buffer index 5
+            // Selection stream (second instance stream)
             if (vao->num_buffers > 1) {
                 ssize_t buf_idx = vao->buffers[1];
                 if (buffers[buf_idx].mtl_buffer) {
-                    [mtl_current_encoder setVertexBuffer:buffers[buf_idx].mtl_buffer offset:0 atIndex:5];
+                    [mtl_current_encoder setVertexBuffer:buffers[buf_idx].mtl_buffer offset:0 atIndex:CELL_FORK_VERTEX_ATTR_BUFFER + 1];
                 }
             }
-            // Buffer 2 (uniform block = CellRenderData + color_table) → Metal buffer index 1
+            // CellRenderData UBO ring slot -> cell_fork's crd block
             if (vao->num_buffers > 2) {
                 ssize_t buf_idx = vao->buffers[2];
                 if (buffers[buf_idx].mtl_buffer) {
-                    [mtl_current_encoder setVertexBuffer:buffers[buf_idx].mtl_buffer offset:0 atIndex:1];
+                    [mtl_current_encoder setVertexBuffer:buffers[buf_idx].mtl_buffer offset:0 atIndex:CELL_FORK_VERTEX_BUF_crd];
                 }
             }
         }
-        // Gamma LUT → buffer index 3 (M5c: bind the resident buffer instead of
-        // copying 1 KB into the command stream via setVertexBytes every draw)
+        // Gamma LUT (M5c: bind the resident buffer instead of copying 1 KB
+        // into the command stream via setVertexBytes every draw)
         id<MTLBuffer> glut = ensure_gamma_lut_buffer();
-        if (glut) [mtl_current_encoder setVertexBuffer:glut offset:0 atIndex:3];
-        // Buffer 3 (ColorTable UBO, packed uint[]) → Metal buffer index 4
+        if (glut) [mtl_current_encoder setVertexBuffer:glut offset:0 atIndex:CELL_FORK_VERTEX_BUF_glt];
+        // ColorTable UBO (packed uint[]) -> ctb
         if (current_bound_vao >= 0) {
             MetalVAO *vao = &vaos[current_bound_vao];
             if (vao->num_buffers > 3) {
                 ssize_t buf_idx = vao->buffers[3];
                 if (buffers[buf_idx].mtl_buffer) {
-                    [mtl_current_encoder setVertexBuffer:buffers[buf_idx].mtl_buffer offset:0 atIndex:4];
+                    [mtl_current_encoder setVertexBuffer:buffers[buf_idx].mtl_buffer offset:0 atIndex:CELL_FORK_VERTEX_BUF_ctb];
                     // W27 P3.5b: the wide-gamut colour carrier's float4 table
                     // shares this same MTLBuffer, at the fixed byte offset
                     // just past the packed uint region (see block_size() /
-                    // METAL_WIDE_COLOR_TABLE_BYTES above) -> Metal buffer
-                    // index 6.
-                    [mtl_current_encoder setVertexBuffer:buffers[buf_idx].mtl_buffer offset:1056 atIndex:6];
+                    // METAL_WIDE_COLOR_TABLE_BYTES above) -> cell_fork's wct.
+                    [mtl_current_encoder setVertexBuffer:buffers[buf_idx].mtl_buffer offset:1056 atIndex:CELL_FORK_VERTEX_BUF_wct];
                 }
             }
         }
-        // Per-draw uniforms (draw_bg_bitfield, text contrast/gamma) → buffer index 2
+        // Per-draw uniforms: the generated entry params. draw_bg_bitfield is
+        // the vertex block; the contrast/gamma float pair (contiguous in
+        // MetalCellDrawUniforms) is the fragment block. bg-only variants have
+        // no vertex params block (DCE) and fg-only no bitfield consumer —
+        // binding a block a variant lacks is legal and ignored.
         MetalCellDrawUniforms cell_draw;
         fill_cell_draw_uniforms(current_program, &cell_draw);
-        [mtl_current_encoder setVertexBytes:&cell_draw length:sizeof(cell_draw) atIndex:2];
-        [mtl_current_encoder setFragmentBytes:&cell_draw length:sizeof(cell_draw) atIndex:2];
+        [mtl_current_encoder setVertexBytes:&cell_draw.draw_bg_bitfield length:sizeof(cell_draw.draw_bg_bitfield) atIndex:CELL_FORK_VERTEX_BUF_entryPointParams];
+        [mtl_current_encoder setFragmentBytes:&cell_draw.text_contrast length:sizeof(float) * 2 atIndex:CELL_FORK_FRAGMENT_BUF_entryPointParams];
+        // The generated fragment takes a runtime sampler (the hand-written
+        // MSL's constexpr nearest+clamp sampler moved to the W3e cache).
+        [mtl_current_encoder setFragmentSamplerState:sampler_state_for(false, GL_CLAMP_TO_EDGE) atIndex:CELL_FORK_FRAGMENT_SAMP_sprite];
 
         // Bind textures: unit 0 = mono sprite atlas (2D array), unit 2 = mono
         // decorations map. F1: unit 3 = colored sprite atlas (fragment+vertex

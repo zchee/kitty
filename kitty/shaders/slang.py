@@ -357,7 +357,7 @@ class SlangFile(NamedTuple):
     def defines(self) -> MappingProxyType[str, str]:
         ans = {}
         match os.path.basename(self.path):
-            case 'background.slang' | 'cell.slang':
+            case 'background.slang' | 'cell.slang' | 'cell_fork.slang':
                 ans['MARK_MASK'] = str(MARK_MASK)
                 ans['REVERSE_SHIFT'] = str(REVERSE)
                 ans['STRIKE_SHIFT'] = str(STRIKETHROUGH)
@@ -410,6 +410,32 @@ class SlangFile(NamedTuple):
                         raise Exception('Variant names for cell shader not unique')
                     seen.add(name)
                     yield s(name, **variant)
+            case 'cell_fork.slang':
+                # Phase C (ADR-0038): upstream cell.slang's axes crossed with
+                # the border_fork epilogue pairs (ADR-0034 §2). Names are
+                # composed, not hashed, so metal.m selects entries by
+                # snprintf instead of a generated hash table:
+                # rm{RENDER_MODE}a{FG_OVERRIDE_ALGO}{og|ng}[_linear|_linear_p3|_rop_p3].
+                # ONLY_BACKGROUND (rm=1) has no foreground path, so the fg
+                # axes collapse there to a0/og.
+                targets = (
+                    ('', {}),
+                    ('linear', {'target_color_space': '1'}),
+                    ('linear_p3', {'target_color_space': '1', 'target_primaries_is_p3': 'true'}),
+                    ('rop_p3', {'target_color_space': '2', 'target_primaries_is_p3': 'true'}),
+                )
+                cf_seen = set()
+                for variant in cell_variations():
+                    v = dict(variant)
+                    if v['RENDER_MODE'] == '1' and (v['FG_OVERRIDE_ALGO'] != '0' or v['TEXT_NEW_GAMMA'] != 'false'):
+                        continue
+                    base = f"rm{v['RENDER_MODE']}a{v['FG_OVERRIDE_ALGO']}" + ('ng' if v['TEXT_NEW_GAMMA'] == 'true' else 'og')
+                    for tname, tover in targets:
+                        name = f'{base}_{tname}' if tname else base
+                        if name in cf_seen:
+                            raise Exception('Variant names for cell_fork shader not unique')
+                        cf_seen.add(name)
+                        yield s(name, **v, **tover)
             case _:
                 yield s()
 
@@ -1043,6 +1069,13 @@ METAL_SHADERS: MappingProxyType[str, MetalShader] = MappingProxyType({
     # instanceCount — the exact composition BORDERS has shipped since W3b
     # (generated fan vertex + per-instance data, ADR-0032 §8 F7).
     'graphics_fork': MetalShader(frozenset({Stage.vertex, Stage.fragment}), VertexOrder.fan),
+    # cell_fork (Phase C, ADR-0038): the fork-owned cell wrapper, NOT upstream
+    # cell.slang (whose combined samplers trip defect B on the Metal emitter —
+    # ADR-0035 §2 — and which carries neither the F1 colored atlas, the P3.5b
+    # wide table, nor the colour epilogue). Fan, like every generated vertex:
+    # upstream's cell_pos_map order drawn through the fan->strip index remap
+    # with instanceCount.
+    'cell_fork': MetalShader(frozenset({Stage.vertex, Stage.fragment}), VertexOrder.fan),
     # W3i: FRAGMENT-ONLY (the first) — border's vertex stays generated from
     # upstream border.slang above; this fork wrapper carries only the colour
     # epilogue upstream cannot express. The VertexOrder is inert for a
@@ -1437,6 +1470,54 @@ def fixup_metal_files(dest_dir: str, dest: str = 'kitty/metal-bindings.h') -> No
     # DISTINCT shaders, matching metal.m's program-mapping concern) catches a
     # new shader, and _SPECIALIZATIONS (emitted per stage once a shader has
     # more than its default variant) catches a variant set changing size.
+    # cell_fork: metal.m binds all 52 variants through ONE canonical define
+    # set (CELL_FORK_VERTEX_* / CELL_FORK_FRAGMENT_*), selecting only the
+    # entry NAME per variant. That is sound only while slangc assigns every
+    # variant the same binding table, so the uniformity is asserted here and
+    # a divergence fails the build instead of binding one variant's buffers
+    # to another's indices.
+    cf_bindings = [b for b in all_bindings if b.shader == 'cell_fork']
+    for cf_stage in (Stage.vertex, Stage.fragment):
+        group = [b for b in cf_bindings if b.stage is cf_stage]
+        if not group:
+            continue
+        # Coherence, not identity: RENDER_MODE variants legitimately DROP
+        # resources (bg-only has no textures, fg-only no vertex params) and
+        # binding at an index a variant does not declare is legal in Metal.
+        # What must hold for a single canonical table: a name never moves
+        # between indices across variants, and no index serves two names.
+        union_bufs: dict[str, tuple[int, int]] = {}
+        union_attrs: dict[str, int] = {}
+        union_tex: dict[str, int] = {}
+        union_samp: dict[str, int] = {}
+        for b in group:
+            for dst, src in ((union_bufs, b.buffers), (union_attrs, b.attributes), (union_tex, b.textures), (union_samp, b.samplers)):
+                for name, val in src.items():
+                    if dst.setdefault(name, val) != val:
+                        raise SystemExit(f'cell_fork {cf_stage.name}: {name!r} binds at both '
+                                         f'{dst[name]} and {val} across variants; per-variant binding needed')
+        buf_indices = [i for i, _ in union_bufs.values()]
+        if len(set(buf_indices)) != len(buf_indices):
+            raise SystemExit(f'cell_fork {cf_stage.name}: two buffer names share one index across variants')
+        canon = f'CELL_FORK_{cf_stage.name.upper()}'
+        lines.append('')
+        lines.append(f'// canonical union (coherent across all {len(group)} {cf_stage.name} variants; '
+                     'variants may omit entries, never move them)')
+        for name, (index, size) in sorted(union_bufs.items()):
+            lines.append(f'#define {canon}_BUF_{name} {index}')
+            lines.append(f'#define {canon}_BUFSZ_{name} {size}u')
+        for name, index in sorted(union_attrs.items()):
+            lines.append(f'#define {canon}_ATTR_{name} {index}')
+        for name, index in sorted(union_tex.items()):
+            lines.append(f'#define {canon}_TEX_{name} {index}')
+        for name, index in sorted(union_samp.items()):
+            lines.append(f'#define {canon}_SAMP_{name} {index}')
+        if union_attrs:
+            lines.append(f'#define {canon}_ATTR_BUFFER {max((i for i, _ in union_bufs.values()), default=-1) + 1}')
+        if cf_stage is Stage.vertex:
+            cf_order = METAL_SHADERS['cell_fork'].vertex_order
+            lines.append(f'#define {canon}_IS_GENERATED 1')
+            lines.append(f'#define {canon}_ORDER_FAN {1 if cf_order is VertexOrder.fan else 0}')
     # W3h step 0: the old endswith('_VERTEX') prefix filter silently excluded
     # specialized vertex entries from all three guarantees (W3g review, F5).
     vertex_bindings = [b for b in all_bindings if b.stage is Stage.vertex]
