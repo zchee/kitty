@@ -89,7 +89,7 @@ python3.14 - "$WT" <<'PY'
 import pathlib, sys
 p = pathlib.Path(sys.argv[1]) / "scripts/_golden_content_helper.py"
 t = p.read_text()
-cand = '    if os.environ.get("KITTY_METAL_TEST_THUMBNAIL"):'
+cand = '    if os.environ.get("KITTY_METAL_TEST_THUMBNAIL") or os.environ.get("KITTY_METAL_TEST_WINDOW_CHAR"):'
 if t.count(cand) == 1:
     p.write_text(t.replace(cand, "    if False:  # REVERIFY: nudge disabled")); print("  nudge disabled")
 else:
