@@ -123,6 +123,9 @@ CONFIG_MATRIX: dict[str, list[str]] = {
     # border vertex, so a non-black background makes the epilogue's encode
     # branch observable.
     "borders-padding": ["window_padding_width=20", "background=#404040"],
+    # W3i: the alpha-mask overlay golden (env lever in CONFIG_ENV; magenta
+    # teeth 15,656 px on the digit quad, determinism x2 = 0).
+    "alpha-mask": [],
 }
 
 # Configs whose golden artifact is the thumbnail lever's output (value =
@@ -139,7 +142,7 @@ THUMB_CONFIGS: dict[str, str] = {"screenshot-thumb": "0.5"}
 # never imports), so the assert fires at capture/compare EXECUTION, not
 # during reverify's count read -- the two readers are complementary; do
 # not "fix" the constant into the AST path.
-EXPECT_CONFIG_MATRIX = 12
+EXPECT_CONFIG_MATRIX = 13
 assert len(CONFIG_MATRIX) == EXPECT_CONFIG_MATRIX, (
     f"CONFIG_MATRIX has {len(CONFIG_MATRIX)} configs but EXPECT_CONFIG_MATRIX declares "
     f"{EXPECT_CONFIG_MATRIX} -- update the constant in the same change that alters the matrix"
@@ -160,6 +163,12 @@ CONFIG_ENV: dict[str, dict[str, str]] = {
     # moves with the panel and its brightness slider).
     "hdr-ramp": {"KITTY_METAL_EDR_HEADROOM_OVERRIDE": "2.0"},
     "cursor-trail-pinned": {"KITTY_METAL_TEST_PIN_TRAIL": "1"},
+    # W3i gate (bead kitty-alpha-mask-golden-ik5): pins the window-selection
+    # letter overlay so GRAPHICS_ALPHA_MASK_PROGRAM (case 7, the last
+    # graphics_fork variant with no golden) renders every frame. The helper
+    # supplies damage nudges for this lever, same starvation as the
+    # thumbnail's (boss.py lever comment).
+    "alpha-mask": {"KITTY_METAL_TEST_WINDOW_CHAR": "3"},
 }
 
 

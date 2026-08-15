@@ -456,6 +456,21 @@ class Boss:
             path, _, scale = thumb_spec.partition(':')
             self._metal_test_thumbnail_path = path
             add_timer(partial(self._metal_test_thumbnail_fire, float(scale or '0.25')), 1.5, False)
+        window_char = os.environ.get('KITTY_METAL_TEST_WINDOW_CHAR')
+        if window_char:
+            # W3i gate lever (ADR-0034 Lane 2): GRAPHICS_ALPHA_MASK_PROGRAM's
+            # production triggers are the window-selection letter overlay and
+            # the live-resize text, both transient and interaction-driven —
+            # unreachable from a headless golden run. Setting the selection
+            # char at startup pins the overlay for the window's whole life,
+            # so the alpha-mask variant's pixels become a comparable golden.
+            # The same draw path as visual window selection (draw_window_number),
+            # no timer needed: the overlay renders on every frame once set.
+            add_timer(partial(self._metal_test_window_char_fire, window_char[0]), 1.0, False)
+
+    def _metal_test_window_char_fire(self, ch: str, timer_id: int | None = None) -> None:
+        for window in self.all_windows:
+            window.screen.set_window_char(ch)
 
     def _metal_test_thumbnail_fire(self, scale: float, timer_id: int | None = None) -> None:
         if self.os_window_map:

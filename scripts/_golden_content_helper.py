@@ -167,12 +167,15 @@ def main() -> int:
     # Hold the settled frame steady long enough for the harness to capture
     # it via KITTY_METAL_DUMP_FRAME (which dumps every frame while set, so
     # the on-disk PNG at any moment during this sleep reflects this content).
-    if os.environ.get("KITTY_METAL_TEST_THUMBNAIL"):
+    if os.environ.get("KITTY_METAL_TEST_THUMBNAIL") or os.environ.get("KITTY_METAL_TEST_WINDOW_CHAR"):
         # W3f: the boss-side thumbnail lever (armed at t=1.5s) only marks the
         # window dirty, and an idle Metal window renders again only on new
         # damage -- the production trigger (drag) rides its own event stream.
         # Rewrite one blank cell (visually inert, still damage) a few times so
         # render passes occur and one of them serves the pending request.
+        # W3i: the window-char lever (armed at t=1.0s) starves the same way --
+        # set_window_char marks the screen dirty from a GLFW timer, outside
+        # the tick -- so it shares these nudges.
         for _ in range(4):
             time.sleep(0.6)
             out.write("\x1b[24;80H \x1b[10;1H")
