@@ -57,11 +57,7 @@ struct GammaLUT {
 ConstantBuffer<GammaLUT> glt;
 #define gamma_lut glt.gamma_lut
 
-// A plain (non-combined) texture: this map is only ever fetched by integer
-// texel index, never sampled, and slang's Metal emitter mis-lowers
-// non-sampling operations on combined Sampler2D resources ("indirection
-// requires pointer operand"). Plain Texture2D fetches lower correctly.
-uniform Texture2D<uint4> sprite_decorations_map;
+uniform Sampler2D<uint4> sprite_decorations_map;
 //
 
 // Kept at file scope: slang's Metal emitter pointerizes the parameter list of
@@ -483,13 +479,7 @@ public VertexOutput vertex_main(
     return vo;
 }
 
-// Separate texture + sampler (not a combined Sampler2DArray): the underline
-// exclusion lookup fetches by integer texel index, and slang's Metal emitter
-// mis-lowers non-sampling operations on combined resources ("indirection
-// requires pointer operand"). Separate declarations lower correctly for
-// both the sampled and the fetched accesses.
-uniform Texture2DArray sprites;
-uniform SamplerState sprites_sampler;
+uniform Sampler2DArray sprites;
 // Scaling factor for the extra text-alpha adjustment for luminance-difference.
 static const float text_gamma_scaling = 0.5;
 
@@ -527,7 +517,7 @@ float4 foreground_contrast(float4 over, float3 under, float text_contrast, float
 float4 load_text_foreground_color(float3 sprite_pos, float colored_sprite, float3 cell_foreground) {
     // For colored sprites use the color from the sprite rather than the text foreground
     // Return non-premultiplied foreground color
-    float4 text_fg = sprites.Sample(sprites_sampler, sprite_pos);
+    float4 text_fg = sprites.Sample(sprite_pos);
     return float4(lerp(cell_foreground, text_fg.xyz, colored_sprite), text_fg.w);
 }
 
@@ -541,13 +531,13 @@ float4 calculate_premul_foreground_from_sprites(
     sprites.GetDimensions(width, height, layer);
     float3 sz = float3(float(width), float(height), float(layer));
 
-    float underline_alpha = sprites.Sample(sprites_sampler, underline_pos).w;
+    float underline_alpha = sprites.Sample(underline_pos).w;
     int3 fetch_coord = int3(int(sprite_pos.x * sz.x), int(underline_exclusion_pos), int(sprite_pos.z));
     float underline_exclusion = sprites[fetch_coord].w;
 
     underline_alpha *= 1.0 - underline_exclusion;
-    float strike_alpha = sprites.Sample(sprites_sampler, strike_pos).w;
-    float cursor_alpha = sprites.Sample(sprites_sampler, cursor_pos).w;
+    float strike_alpha = sprites.Sample(strike_pos).w;
+    float cursor_alpha = sprites.Sample(cursor_pos).w;
 
     float combined_alpha = min(text_fg.w + strike_alpha, 1.0);
 
