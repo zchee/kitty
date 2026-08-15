@@ -309,8 +309,13 @@ def run_share_subprocess(body: str, share: str = '1') -> dict:
     )
     env = dict(os.environ)
     env['KITTY_PAUSE_SNAPSHOT_SHARE'] = share
+    # Upstream's parallel test runner executes workers inside the kitty binary
+    # (+runpy), so sys.executable is kitty there and '-c' would mean --config:
+    # the subprocess became a terminal waiting forever. kitty_exe() '+runpy'
+    # works identically under both the in-kitty workers and a plain python run.
+    from kitty.constants import kitty_exe
     proc = subprocess.run(
-        [sys.executable, '-c', script], cwd=_REPO_ROOT, env=env,
+        [kitty_exe(), '+runpy', script], cwd=_REPO_ROOT, env=env,
         capture_output=True, text=True, timeout=60,
     )
     if proc.returncode != 0:

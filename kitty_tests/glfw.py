@@ -23,12 +23,17 @@ class TestGLFW(BaseTest):
         from kitty.utils import macos_version
 
         lib_path = glfw_path('cocoa')
-        script = dedent('''
+        # kitty_exe() '+runpy' instead of sys.executable -c: under upstream's
+        # parallel runner the workers ARE the kitty binary, where '-c' means
+        # --config and this probe hung as a terminal (lib_path rides the
+        # script text since +runpy passes no argv).
+        from kitty.constants import kitty_exe
+        script = dedent(f'''
             import ctypes
             import sys
 
             try:
-                lib = ctypes.CDLL(sys.argv[1])
+                lib = ctypes.CDLL({lib_path!r})
             except OSError as e:
                 print(e, file=sys.stderr)
                 sys.exit(1)
@@ -36,7 +41,7 @@ class TestGLFW(BaseTest):
             func.restype = ctypes.c_int
             print(func())
         ''')
-        proc = subprocess.run([sys.executable, '-c', script, lib_path], capture_output=True, text=True)
+        proc = subprocess.run([kitty_exe(), '+runpy', script], capture_output=True, text=True)
         if proc.returncode != 0:
             self.skipTest('Unable to query Cocoa display link backend: ' + proc.stderr.strip())
         backend_text = proc.stdout.strip()
