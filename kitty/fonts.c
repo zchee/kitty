@@ -337,12 +337,21 @@ font_group_for(double font_sz_in_pts, double logical_dpi_x, double logical_dpi_y
 // pre-F1 behavior. Default (unset) uses the split R8-mono + RGBA-color atlases.
 bool
 r8_sprite_atlas_enabled(void) {
+#ifndef KITTY_BACKEND_METAL
+    // Post-merge (ADR-0038) the GL arm renders upstream's cell pipeline,
+    // which samples colored glyphs from the single RGBA atlas; the split
+    // R8-mono + RGBA-color pair is a Metal-arm optimization (cell_fork.slang
+    // knows both). Keeping GL on upstream's atlas model closes the
+    // transitional mismatch bead (kitty-bfk).
+    return false;
+#else
     static int cached = -1;
     if (cached < 0) {
         const char *v = getenv("KITTY_NO_R8_SPRITE_ATLAS");
         cached = (v && v[0] && strcmp(v, "0") != 0) ? 0 : 1;
     }
     return cached == 1;
+#endif
 }
 
 void
