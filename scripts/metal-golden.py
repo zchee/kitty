@@ -114,6 +114,15 @@ CONFIG_MATRIX: dict[str, list[str]] = {
     # This is the only config that executes SCREENSHOT_PROGRAM -- every other
     # golden uses the KITTY_METAL_DUMP_FRAME offscreen read, which bypasses it.
     "screenshot-thumb": [],
+    # W3i gate: the ONLY config whose pixels flow through the BORDERS program
+    # (program 4 — the border_fork fragment). Measured by magenta-replacing
+    # the default border_fork variant: every other config stayed at 0 (no
+    # padding, one tab, one window = zero border rects; and the default
+    # background is pure black, on which the encode is a fixed point).
+    # Padding rects draw the window-background placeholder through the
+    # border vertex, so a non-black background makes the epilogue's encode
+    # branch observable.
+    "borders-padding": ["window_padding_width=20", "background=#404040"],
 }
 
 # Configs whose golden artifact is the thumbnail lever's output (value =
@@ -130,7 +139,7 @@ THUMB_CONFIGS: dict[str, str] = {"screenshot-thumb": "0.5"}
 # never imports), so the assert fires at capture/compare EXECUTION, not
 # during reverify's count read -- the two readers are complementary; do
 # not "fix" the constant into the AST path.
-EXPECT_CONFIG_MATRIX = 11
+EXPECT_CONFIG_MATRIX = 12
 assert len(CONFIG_MATRIX) == EXPECT_CONFIG_MATRIX, (
     f"CONFIG_MATRIX has {len(CONFIG_MATRIX)} configs but EXPECT_CONFIG_MATRIX declares "
     f"{EXPECT_CONFIG_MATRIX} -- update the constant in the same change that alters the matrix"
