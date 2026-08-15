@@ -1496,9 +1496,13 @@ def fixup_metal_files(dest_dir: str, dest: str = 'kitty/metal-bindings.h') -> No
                     if dst.setdefault(name, val) != val:
                         raise SystemExit(f'cell_fork {cf_stage.name}: {name!r} binds at both '
                                          f'{dst[name]} and {val} across variants; per-variant binding needed')
-        buf_indices = [i for i, _ in union_bufs.values()]
-        if len(set(buf_indices)) != len(buf_indices):
-            raise SystemExit(f'cell_fork {cf_stage.name}: two buffer names share one index across variants')
+        # No two distinct names may share an index within a kind (buffers,
+        # textures, samplers, attributes all have their own [[n]] namespaces).
+        for kind, m in (('buffer', {n: i for n, (i, _) in union_bufs.items()}),
+                        ('texture', union_tex), ('sampler', union_samp), ('attribute', union_attrs)):
+            idxs = list(m.values())
+            if len(set(idxs)) != len(idxs):
+                raise SystemExit(f'cell_fork {cf_stage.name}: two {kind} names share one index across variants')
         canon = f'CELL_FORK_{cf_stage.name.upper()}'
         lines.append('')
         lines.append(f'// canonical union (coherent across all {len(group)} {cf_stage.name} variants; '

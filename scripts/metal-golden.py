@@ -138,6 +138,17 @@ CONFIG_MATRIX: dict[str, list[str]] = {
     # 602,430 px (cell text chroma) while every sRGB config stayed exactly 0;
     # readback is deterministic half->8bit quantization (x2 = 0 measured).
     "wide-p3": ["window_padding_width=20", "background=#c03050"],
+    # Phase D-2 (finding M1): the ONLY config that drives draw_cells_with_layers,
+    # i.e. that actually executes CELL_FG_PROGRAM (rm2) and CELL_BG_PROGRAM
+    # (rm1). Every other config renders the whole cell through the single
+    # CELL_PROGRAM (rm0) non-layered path, so before this entry the goldens
+    # proved cell_fork.slang byte-identical to the retired MSL for rm0 ONLY --
+    # a swap inversion or a nil PSO on programs 1/2 moved ZERO pixels (measured,
+    # D-2). A window logo forces w->window_logo.id, which makes
+    # screen_needs_rendering_in_layers() true every frame, so the fg-only and
+    # bg-only cell passes run and their rm1/rm2 variants come under the gate.
+    # Self-evidencing: the D-2 nil-PSO probe MUST move this config (verified).
+    "cell-layered": [f"window_logo_path={REPO_ROOT / 'logo' / 'kitty-128.png'}", "window_logo_position=center"],
 }
 
 # Configs whose golden artifact is the thumbnail lever's output (value =
@@ -154,7 +165,7 @@ THUMB_CONFIGS: dict[str, str] = {"screenshot-thumb": "0.5"}
 # never imports), so the assert fires at capture/compare EXECUTION, not
 # during reverify's count read -- the two readers are complementary; do
 # not "fix" the constant into the AST path.
-EXPECT_CONFIG_MATRIX = 14
+EXPECT_CONFIG_MATRIX = 15
 assert len(CONFIG_MATRIX) == EXPECT_CONFIG_MATRIX, (
     f"CONFIG_MATRIX has {len(CONFIG_MATRIX)} configs but EXPECT_CONFIG_MATRIX declares "
     f"{EXPECT_CONFIG_MATRIX} -- update the constant in the same change that alters the matrix"

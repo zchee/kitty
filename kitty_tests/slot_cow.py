@@ -295,7 +295,14 @@ def _real_python() -> str:
     exe_base = os.path.basename(sys.executable).lower()
     if 'python' in exe_base:
         return sys.executable
-    return shutil.which('python3.14') or shutil.which('python3') or sys.executable
+    found = shutil.which('python3.14') or shutil.which('python3')
+    if not found:
+        # Fail loud rather than fall back to sys.executable -- that is kitty
+        # here, the exact binary this function exists to avoid; running the
+        # body under it silently reintroduces the perturbed stats.
+        raise AssertionError('run_share_subprocess needs a real python interpreter on PATH '
+                             '(python3.14 or python3); sys.executable is the kitty binary here')
+    return found
 
 
 def run_share_subprocess(body: str, share: str = '1') -> dict:
@@ -324,10 +331,10 @@ def run_share_subprocess(body: str, share: str = '1') -> dict:
     )
     env = dict(os.environ)
     env['KITTY_PAUSE_SNAPSHOT_SHARE'] = share
-    # Upstream's parallel test runner executes workers inside the kitty binary
-    # (+runpy), so sys.executable is kitty there and '-c' would mean --config:
-    # the subprocess became a terminal waiting forever. kitty_exe() '+runpy'
-    # works identically under both the in-kitty workers and a plain python run.
+    # A real python (_real_python), never sys.executable: under upstream's
+    # parallel runner the workers ARE the kitty binary, where '-c' means
+    # --config (the subprocess would hang as a terminal) and kitty's runtime
+    # perturbs the slot-share stats this body measures.
     proc = subprocess.run(
         [_real_python(), '-c', script], cwd=_REPO_ROOT, env=env,
         capture_output=True, text=True, timeout=60,

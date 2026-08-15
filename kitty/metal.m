@@ -2165,15 +2165,16 @@ draw_quad(bool blend, unsigned instance_count) {
                     // shares this same MTLBuffer, at the fixed byte offset
                     // just past the packed uint region (see block_size() /
                     // METAL_WIDE_COLOR_TABLE_BYTES above) -> cell_fork's wct.
-                    [mtl_current_encoder setVertexBuffer:buffers[buf_idx].mtl_buffer offset:1056 atIndex:CELL_FORK_VERTEX_BUF_wct];
+                    [mtl_current_encoder setVertexBuffer:buffers[buf_idx].mtl_buffer offset:CELL_FORK_VERTEX_BUFSZ_ctb atIndex:CELL_FORK_VERTEX_BUF_wct];
                 }
             }
         }
         // Per-draw uniforms: the generated entry params. draw_bg_bitfield is
         // the vertex block; the contrast/gamma float pair (contiguous in
-        // MetalCellDrawUniforms) is the fragment block. bg-only variants have
-        // no vertex params block (DCE) and fg-only no bitfield consumer —
-        // binding a block a variant lacks is legal and ignored.
+        // MetalCellDrawUniforms) is the fragment block. Variants that DCE'd a
+        // block (bg-only drops the fragment entry-params entirely; fg-only has
+        // no bg cells to bitfield) still get bound here -- binding a block a
+        // variant lacks is legal Metal and ignored.
         MetalCellDrawUniforms cell_draw;
         fill_cell_draw_uniforms(current_program, &cell_draw);
         [mtl_current_encoder setVertexBytes:&cell_draw.draw_bg_bitfield length:sizeof(cell_draw.draw_bg_bitfield) atIndex:CELL_FORK_VERTEX_BUF_entryPointParams];
