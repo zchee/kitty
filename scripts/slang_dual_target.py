@@ -131,21 +131,29 @@ TOOL = "slang-dual-target"
 # -D name -> kitty.fast_data_types attribute, per shader file. Copied in
 # structure (not in values) from SlangFile.defines in kitty/shaders/slang.py;
 # the values themselves are read from the extension module at runtime.
+_CELL_FAMILY_DEFINES: dict[str, str] = {
+    "MARK_MASK": "MARK_MASK",
+    "REVERSE_SHIFT": "REVERSE",
+    "STRIKE_SHIFT": "STRIKETHROUGH",
+    "DIM_SHIFT": "DIM",
+    "BLINK_SHIFT": "BLINK",
+    "DECORATION_SHIFT": "DECORATION",
+    "MARK_SHIFT": "MARK",
+    "DECORATION_MASK": "DECORATION_MASK",
+    "COLOR_NOT_SET": "COLOR_NOT_SET",
+    "COLOR_IS_SPECIAL": "COLOR_IS_SPECIAL",
+    "COLOR_IS_INDEX": "COLOR_IS_INDEX",
+    "COLOR_IS_RGB": "COLOR_IS_RGB",
+}
+# Post-merge the define-consuming surface widened: background.slang carries the
+# cell family's table/attr layout (SlangFile.defines gives it the same set),
+# padding imports background from source here (module-less compile), and
+# cell_fork is the fork wrapper mirroring cell. One shared dict, four names.
 DEFINES: dict[str, dict[str, str]] = {
-    "cell": {
-        "MARK_MASK": "MARK_MASK",
-        "REVERSE_SHIFT": "REVERSE",
-        "STRIKE_SHIFT": "STRIKETHROUGH",
-        "DIM_SHIFT": "DIM",
-        "BLINK_SHIFT": "BLINK",
-        "DECORATION_SHIFT": "DECORATION",
-        "MARK_SHIFT": "MARK",
-        "DECORATION_MASK": "DECORATION_MASK",
-        "COLOR_NOT_SET": "COLOR_NOT_SET",
-        "COLOR_IS_SPECIAL": "COLOR_IS_SPECIAL",
-        "COLOR_IS_INDEX": "COLOR_IS_INDEX",
-        "COLOR_IS_RGB": "COLOR_IS_RGB",
-    },
+    "cell": _CELL_FAMILY_DEFINES,
+    "cell_fork": _CELL_FAMILY_DEFINES,
+    "background": _CELL_FAMILY_DEFINES,
+    "padding": _CELL_FAMILY_DEFINES,
 }
 
 # Representative value for a defaultless `extern static const`, by variable
