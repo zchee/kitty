@@ -29,6 +29,18 @@ echo "== worktree at $(git -C "$WT" rev-parse HEAD)"
 
 export PATH="$HOME/sdk/go1.26.6/bin:/opt/local/slang/bin:$PATH"
 export PKG_CONFIG_PATH="$(printf %s: /opt/homebrew/opt/*/lib/pkgconfig)${PKG_CONFIG_PATH:-}"
+# W3j operator directive: captures land on the operator's chosen test display
+# even when the WORKTREE's harness predates name-aware selection (frozen SHAs
+# carry "first non-main", which a topology change can point at the wrong
+# panel). kitty's --position is last-wins and every campaign-era harness
+# appends KITTY_HARNESS_PASS_ARGS after its own flags, so exporting a second
+# --position here overrides the worktree's pick. Resolved by the MAIN tree's
+# name-aware helper; appended so caller-set PASS_ARGS still apply first.
+TEST_DISPLAY_POS="$(cd "$ROOT" && PYTHONPATH=scripts python3.14 -c \
+  'from _kitty_harness_common import _offmain_display_position as f; p=f(); print(p or "")' 2>/dev/null)"
+if [ -n "$TEST_DISPLAY_POS" ]; then
+    export KITTY_HARNESS_PASS_ARGS="${KITTY_HARNESS_PASS_ARGS:+$KITTY_HARNESS_PASS_ARGS;}--position=$TEST_DISPLAY_POS"
+fi
 ( cd "$WT" && python3.14 setup.py build > "$OUT/build.log" 2>&1 )
 BUILD_EXIT=$?
 WARNINGS=$(grep -ciE 'warning' "$OUT/build.log")
