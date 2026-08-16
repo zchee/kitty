@@ -22,7 +22,7 @@ from itertools import chain, product
 from types import MappingProxyType
 from typing import Any, Callable, Iterable, Iterator, Literal, NamedTuple, TypedDict, TypeGuard
 
-from kitty.constants import read_kitty_resource, shaders_dir, slangc
+from kitty.constants import is_macos, read_kitty_resource, shaders_dir, slangc
 from kitty.fast_data_types import (
     ANIMATION_SAMPLE_WAIT,
     BGIMAGE_PROGRAM,
@@ -330,7 +330,8 @@ class LoadShaderPrograms:
             else:
                 try:
                     pipeline = merge_pipelines(slot_pipelines)
-                    vert, frag, metadata = build_custom_shader_pipeline_glsl(pipeline)
+                    build = build_custom_shader_pipeline_msl if is_macos else build_custom_shader_pipeline_glsl
+                    vert, frag, metadata = build(pipeline)
                     # print(vert, file=open('/tmp/sample.vert', 'w'))
                     # print(frag, file=open('/tmp/sample.frag', 'w'))
                 except Exception as e:
@@ -2083,6 +2084,25 @@ def merge_pipelines(pipelines: list[Pipeline]) -> Pipeline:
     }
 
 
+def run_slangc_to_file(cmd: list[str], src: bytes, output: str, name: str, cwd: str | None = None) -> subprocess.CompletedProcess[bytes]:
+    ''' A runtime slangc invocation whose success signal is the OUTPUT FILE,
+    not the exit status. Inside a live kitty the process reaper can swallow
+    the child's status before subprocess collects it, and Python then reports
+    returncode 0 for a FAILED compile -- at which point a stale output from a
+    previous pipeline gets silently linked into the chain (measured: a broken
+    user shader served the previous pipeline's compiled m_0_0 module, i.e. the
+    prior custom shader kept rendering under the new config). Deleting the
+    output first and requiring it to exist after makes a failed compile loud
+    no matter what returncode claims.
+    '''
+    with suppress(FileNotFoundError):
+        os.remove(output)
+    cp = subprocess.run(cmd, input=src, capture_output=True, cwd=cwd)
+    if cp.returncode != 0 or not os.path.exists(output):
+        raise SlangFailed(name, cp)
+    return cp
+
+
 def build_custom_shader_pipeline_ir(pipeline: Pipeline, cache_dir: str, invocation_tracker: set[tuple[str, ...]]) -> tuple[tuple[str, ...], str]:
     slot = pipeline['slot']
     slot_module_name = f'{slot.replace("-", "_")}'
@@ -2109,9 +2129,7 @@ def build_custom_shader_pipeline_ir(pipeline: Pipeline, cache_dir: str, invocati
     if not cache_ok:
         cmd = bc + ['-module-name', 'kitty_custom_shader_types', '-o', j('kitty-custom-shader-types.slang-module'), '--', '-']
         invocation_tracker.add(tuple(cmd))
-        cp = subprocess.run(cmd, input=ct_shader, capture_output=True)
-        if cp.returncode != 0:
-            raise SlangFailed('custom-types.slang', cp)
+        run_slangc_to_file(cmd, ct_shader, j('kitty-custom-shader-types.slang-module'), 'custom-types.slang')
         ct_key_path = j('ct.key')
         with open(ct_key_path, 'wb') as f:
             f.write(ct_key)
@@ -2150,9 +2168,7 @@ def build_custom_shader_pipeline_ir(pipeline: Pipeline, cache_dir: str, invocati
             inc = ['-I', import_dir] if import_dir else []
             cmd = bc + inc + [f'-Dfragment_main={entry_point(g_idx, s_idx)}', '-module-name', modname, '-o', module_file, '--', '-']
             invocation_tracker.add(tuple(cmd))
-            cp = subprocess.run(cmd, input=src, capture_output=True)
-            if cp.returncode != 0:
-                raise SlangFailed(name, cp)
+            run_slangc_to_file(cmd, src, module_file, name)
             mtime = max(mtime, os.stat(module_file).st_mtime_ns)
     # Generate group-branched PIPELINE code.
     # sRGB conversion is emitted in every group's branch, gated on the convert_to_srgb
@@ -2177,30 +2193,36 @@ def build_custom_shader_pipeline_ir(pipeline: Pipeline, cache_dir: str, invocati
             inc.extend(('-I', x))
         cmd = bc + inc + ['-module-name', slot_module_name, '-o', ans, '--', '-']
         invocation_tracker.add(tuple(cmd))
-        cp = subprocess.run(cmd, cwd=tdir, capture_output=True, input=mod_src.encode())
-        if cp.returncode != 0:
-            raise SlangFailed(f'{slot}.slang', cp)
+        run_slangc_to_file(cmd, mod_src.encode(), ans, f'{slot}.slang', cwd=tdir)
 
     with open(slot_key_file, 'wb') as f:
         f.write(slot_key)
     return tuple(import_dirs), ans
 
 
-def module_wrapper_for_slot(slot: str) -> bytes:
-    return """
+def module_wrapper_for_slot(slot: str, flip_y: bool = False) -> bytes:
+    # flip_y is the Metal channel's coordinate bridge: the chain's intermediate
+    # textures are kept in GL memory orientation (row 0 = screen bottom) so
+    # that user shader code -- t.pos math, csd UV fields, raw .Sample calls --
+    # keeps upstream's bottom-left-origin contract verbatim. Negating the
+    # emitted NDC y makes every chain draw rasterize bottom-up into its
+    # target; metal.m's seed blit puts the rendered frame into that
+    # orientation and its final resolve flips back to the drawable.
+    ypos = '-c[3]' if flip_y else 'c[3]'
+    return f"""
 #language slang 2026
 import MODULE;
 
-struct VertexOutput {
+struct VertexOutput {{
     float2 texcoord : TEXCOORD;
     float4 position : SV_Position;
-};
+}};
 
 [shader("vertex")]
-VertexOutput vmain_wrap(uint vertex_id : SV_VertexID) {
+VertexOutput vmain_wrap(uint vertex_id : SV_VertexID) {{
     float4 c = pipeline_vertex_main(vertex_id);
-    return {float2(c[0], c[1]), float4(c[2], c[3], 0, 1)};
-}
+    return {{float2(c[0], c[1]), float4(c[2], {ypos}, 0, 1)}};
+}}
 
 [shader("fragment")]
 float4 fmain_wrap(
@@ -2209,9 +2231,9 @@ float4 fmain_wrap(
     uniform float4 viewport,
     uniform float animation_progress,
     uniform bool convert_to_srgb
-) : SV_Target {
+) : SV_Target {{
     return pipeline_fragment_main(texcoord, group, viewport, animation_progress, convert_to_srgb);
-}
+}}
         """.replace('MODULE', slot.replace('-', '_')).encode()
 
 
@@ -2278,6 +2300,114 @@ def build_custom_shader_pipeline_glsl(
             fixup_opengl_files((fragment, vertex))
         with open(vertex) as vf, open(fragment) as ff:
             m = glsl_metadata_for_shader(metadata)
+            m['pipeline'] = pipeline
+            return vf.read(), ff.read(), m
+
+
+def fixup_custom_end_metal_files(vertex: str, fragment: str, metadata: str) -> None:
+    ''' Rename the entry points to the fixed names metal.m binds by, apply the
+    const qualification Metal's validator wants, and publish the binding
+    indices slangc chose. The indices are an output of the compiler, not a
+    contract, so they travel in the metadata instead of being assumed at the
+    bind site. internalize_msl_helpers is deliberately absent: each runtime
+    library is its own newLibraryWithSource compile, so there is no cross-TU
+    link for exported helpers to collide in. The json write comes last on
+    purpose -- it is the mtime gate for the whole fixup, so an interrupted run
+    recompiles instead of serving half-fixed files (the stale padding_fork
+    lesson).
+    '''
+    bindings: dict[str, Any] = {}
+    for path, stage, entry, fixed_name in (
+        (vertex, Stage.vertex, 'vmain_wrap', 'custom_end_vertex'),
+        (fragment, Stage.fragment, 'fmain_wrap', 'custom_end_fragment'),
+    ):
+        with open(path) as f:
+            msl = f.read()
+        # \b keeps slang's derived names (fmain_wrap_0 and friends) untouched.
+        msl = re.sub(rf'\b{entry}\b', fixed_name, msl)
+        msl = constify_readonly_device_buffers(msl)
+        mb = parse_metal_bindings(msl, stage, f'CUSTOM_END_{stage.name.upper()}')
+        d: dict[str, Any] = mb._asdict()
+        d['stage'] = str(mb.stage)
+        bindings[str(stage)] = d
+        write_if_changed(path, msl)
+    with open(metadata, 'w') as f:
+        json.dump({'metal_bindings': bindings}, f, indent=2, sort_keys=True)
+
+
+def build_custom_shader_pipeline_msl(
+    pipeline: Pipeline, cache_dir: str = '', invocation_tracker: set[tuple[str, ...]] | None = None
+) -> tuple[str, str, dict[str, Any]]:
+    ''' The Metal sibling of build_custom_shader_pipeline_glsl: same composed
+    IR module, same version-stamped cache and file lock, -target metal. The
+    consumer is metal.m's runtime newLibraryWithSource compile, so slangc is
+    the only translator on both backends and the fixup passes are shared with
+    the build-time channel.
+    '''
+    import kitty.constants as kc
+
+    cache_dir = os.path.join(cache_dir or kc.cache_dir(), 'shaders')
+    os.makedirs(cache_dir, exist_ok=True)
+    if invocation_tracker is None:
+        invocation_tracker = set()
+
+    with lock_with_file(
+        os.path.join(cache_dir, 'lock'),
+    ):
+        import_dirs, slang_module_path = build_custom_shader_pipeline_ir(pipeline, cache_dir, invocation_tracker)
+        msl_dir = os.path.join(os.path.dirname(os.path.dirname(slang_module_path)), 'msl')
+        os.makedirs(msl_dir, exist_ok=True)
+        module_mtime = safe_mtime(slang_module_path)
+        slot = pipeline['slot']
+        vertex = os.path.join(msl_dir, f'{slot}.vert.metal')
+        fragment = os.path.join(msl_dir, f'{slot}.frag.metal')
+        metadata = os.path.join(msl_dir, f'{slot}.metal.json')
+        if module_mtime > safe_mtime(metadata):
+            inc = []
+            for x in import_dirs:
+                inc.extend(('-I', x))
+            cmd = (
+                list(slangc())
+                + inc
+                + [
+                    '-warnings-as-errors',
+                    'all',
+                    '-line-directive-mode',
+                    'none',
+                    '-lang',
+                    'slang',
+                    '-target',
+                    'metal',
+                ]
+            )
+            vcmd = cmd + ['-stage', 'vertex', '-entry', 'vmain_wrap', '-o', vertex, '--', '-']
+            fcmd = cmd + ['-stage', 'fragment', '-entry', 'fmain_wrap', '-o', fragment, '--', '-']
+            src = module_wrapper_for_slot(slot, flip_y=True)
+            invocation_tracker.add(tuple(vcmd))
+            invocation_tracker.add(tuple(fcmd))
+            # Success is judged by the output files, same as run_slangc_to_file:
+            # inside a live kitty the reaper can swallow the child status and a
+            # stale cached .metal would be served as this pipeline's chain.
+            for stale in (vertex, fragment):
+                with suppress(FileNotFoundError):
+                    os.remove(stale)
+            v = subprocess.Popen(vcmd, stderr=subprocess.PIPE, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
+            f = subprocess.Popen(fcmd, stderr=subprocess.PIPE, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
+            assert v.stdin is not None and f.stdin is not None
+            assert v.stderr is not None and f.stderr is not None
+            v.stdin.write(src), v.stdin.close()
+            f.stdin.write(src), f.stdin.close()
+            try:
+                if (rc := v.wait()) != 0 or not os.path.exists(vertex):
+                    raise SlangFailed(f'{slot}.vert.metal', subprocess.CompletedProcess(vcmd, rc or 1, stderr=v.stderr.read()))
+                if (rc := f.wait()) != 0 or not os.path.exists(fragment):
+                    raise SlangFailed(f'{slot}.frag.metal', subprocess.CompletedProcess(fcmd, rc or 1, stderr=f.stderr.read()))
+            finally:
+                v.stderr.close()
+                f.stderr.close()
+            fixup_custom_end_metal_files(vertex, fragment, metadata)
+        with open(vertex) as vf, open(fragment) as ff, open(metadata) as mf:
+            m: dict[str, Any] = json.load(mf)
             m['pipeline'] = pipeline
             return vf.read(), ff.read(), m
 

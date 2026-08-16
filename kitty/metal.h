@@ -245,6 +245,32 @@ void metal_forget_layer(void *layer);       // window teardown: free the per-win
 // keeps the FBO+blit path.
 void metal_begin_layered_frame(void);
 void metal_resolve_layered_frame(void);
+
+// Custom-end chain (kitty-luv): upstream's custom_shaders post-processing pass,
+// runtime-compiled from the MSL slang.py emits (build_custom_shader_pipeline_msl)
+// via newLibraryWithSource. The binding indices are slangc OUTPUT parsed per
+// compile by Python (parse_metal_bindings), never assumed at the bind site;
+// shaders.c transcribes them from the compile_program metadata into this struct
+// and metal_compile_custom_end refuses activation on any size/index surprise
+// (loud, inert -- kitty keeps rendering).
+typedef struct CustomEndBindings {
+    int vert_csd_buf;                // vertex-stage KittyCustomShaderData [[buffer(n)]]
+    int frag_csd_buf, frag_epp_buf;  // fragment-stage csd + entryPointParams buffers
+    int tex[4], smp[4];              // backbuffer/a/b/persist [[texture(n)]] / [[sampler(n)]]
+    unsigned csd_size, epp_size;     // parsed MSL cbuffer byte sizes
+} CustomEndBindings;
+bool metal_compile_custom_end(const char *vert_src, const char *frag_src, const CustomEndBindings *b, unsigned expected_csd_size);
+// On custom-end frames the layered pass renders att0 into a STORED sampleable
+// surface instead of the memoryless tile-only one (set before
+// metal_begin_layered_frame, per frame), the in-pass resolve is skipped
+// (metal_end_layered_frame_stored), the frame is mirrored into the shared
+// backbuffer texture in GL memory orientation (metal_custom_end_seed) for the
+// chain to sample, and the chain's final texture reaches the drawable through
+// the target-space-aware mirror resolve (metal_resolve_custom_end).
+void metal_set_layered_frame_stored(bool stored);
+void metal_end_layered_frame_stored(void);
+bool metal_custom_end_seed(unsigned dest_fbo_id, unsigned vw, unsigned vh);
+void metal_resolve_custom_end(unsigned final_tex_id, float sx, float sy, unsigned vw, unsigned vh);
 // W27 P4.2: publish the OS window's EDR state for the frame about to be encoded.
 // Selects the layered working-surface format (RGBA16Float while engaged, so
 // >1.0 components survive to the drawable; RGBA16Unorm otherwise).
@@ -303,6 +329,11 @@ void metal_gl_tex_parameteri(GLenum target, GLenum pname, GLint param);
 #define glCopyImageSubData(...) metal_gl_copy_image_sub_data(__VA_ARGS__)
 #define glGenFramebuffers(n, ids) metal_gl_gen_framebuffers(n, ids)
 #define glFramebufferTexture2D(...) metal_gl_framebuffer_texture_2d(__VA_ARGS__)
+// Raw viewport for the custom-end chain (run_custom_end_shader draws into
+// GL-memory-oriented textures, where GL's row addressing holds verbatim).
+// Everything else goes through the save/restore_viewport wrappers.
+#define glViewport(x, y, w, h) metal_gl_viewport(x, y, w, h)
+void metal_gl_viewport(GLint x, GLint y, GLsizei w, GLsizei h);
 #define glReadPixels(...) metal_gl_read_pixels(__VA_ARGS__)
 static inline void metal_gl_uniform_block_binding(GLuint program, GLuint uniformBlockIndex, GLuint uniformBlockBinding) { (void)program; (void)uniformBlockIndex; (void)uniformBlockBinding; }
 #define glUniformBlockBinding metal_gl_uniform_block_binding

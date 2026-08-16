@@ -9,15 +9,17 @@ import shutil
 import subprocess
 import tempfile
 
-from kitty.constants import slangc
+from kitty.constants import is_macos, slangc
 from kitty.shaders.slang import (
     EntryPoint,
     SlangFile,
     Stage,
     build_custom_shader_pipeline_glsl,
+    build_custom_shader_pipeline_msl,
     build_import_graph,
     clear_caches,
     custom_shader,
+    parse_pipeline,
     parse_pipeline_definition,
     parse_slang_text,
     parse_var_directive,
@@ -446,6 +448,75 @@ fsMain(VertexOutput vo) : SV_Target { return float4(0); }
 
         if failures:
             self.fail('Custom shader compilation failures:\n' + '\n'.join(failures))
+
+        with open(_CACHE_FILE, 'w') as f:
+            json.dump({'hash': current_hash}, f)
+
+    def test_all_custom_shaders_compile_msl(self) -> None:
+        # The Metal runtime channel (kitty-luv): every shipped standalone
+        # shader AND every shipped .pipeline must come through
+        # build_custom_shader_pipeline_msl with the renamed entry points and a
+        # complete metal_bindings block, because that is exactly what
+        # compile_program's Metal arm validates before activation. Darwin-only:
+        # the channel exists for newLibraryWithSource, and the GLSL sibling
+        # above already covers the shared IR composition elsewhere.
+        if not is_macos:
+            self.skipTest('the MSL custom-shader channel is Metal-only')
+        if not shutil.which(slangc()[0]):
+            self.skipTest(f'slangc ({slangc()[0]}) not found in PATH')
+
+        if __file__ and os.path.isdir((local := os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.cache'))):
+            cache_base = local
+        else:
+            cache_base = tempfile.gettempdir()
+        cache_base = os.path.join(cache_base, 'kitty-test-cache')
+        os.makedirs(cache_base, exist_ok=True)
+        _CACHE_FILE = os.path.join(cache_base, 'custom-shaders-msl-test.json')
+        current_hash = self._content_hash()
+        try:
+            with open(_CACHE_FILE) as f:
+                if json.load(f).get('hash') == current_hash:
+                    return
+        except (OSError, json.JSONDecodeError, KeyError):
+            pass
+
+        pkg = ir.files('kitty.shaders.custom')
+        shader_names = sorted(
+            entry.name[: -len('.slang')]
+            for entry in pkg.iterdir()
+            if entry.name.endswith('.slang') and entry.name[: -len('.slang')] not in _SUPPORT_SHADER_NAMES
+        )
+        pipeline_names = sorted(entry.name[: -len('.pipeline')] for entry in pkg.iterdir() if entry.name.endswith('.pipeline'))
+
+        def check_one(name: str, pipeline: dict, cache_dir: str, failures: list[str]) -> None:
+            try:
+                vert_src, frag_src, metadata = build_custom_shader_pipeline_msl(pipeline, cache_dir=cache_dir)
+            except Exception as e:
+                failures.append(f'{name}: {e}')
+                return
+            if 'custom_end_vertex' not in vert_src:
+                failures.append(f'{name}: vertex entry not renamed')
+            if 'custom_end_fragment' not in frag_src:
+                failures.append(f'{name}: fragment entry not renamed')
+            mb = metadata.get('metal_bindings') or {}
+            frag = mb.get('fragment') or {}
+            for key, want in (('buffers', ('csd', 'entryPointParams')), ('textures', ('backbuffer', 'a', 'b', 'persist')), ('samplers', ('backbuffer',))):
+                have = frag.get(key) or {}
+                for w in want:
+                    if w not in have:
+                        failures.append(f'{name}: metal_bindings fragment {key} lacks {w}')
+
+        with tempfile.TemporaryDirectory() as cache_dir:
+            failures: list[str] = []
+            clear_caches()
+            for name in shader_names:
+                check_one(name, parse_pipeline_definition(['startgroup', f'shaders {name}', 'endgroup'], name), cache_dir, failures)
+            for name in pipeline_names:
+                check_one(name, parse_pipeline(name), cache_dir, failures)
+            clear_caches()
+
+        if failures:
+            self.fail('Custom shader MSL compilation failures:\n' + '\n'.join(failures))
 
         with open(_CACHE_FILE, 'w') as f:
             json.dump({'hash': current_hash}, f)

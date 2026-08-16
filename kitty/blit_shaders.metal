@@ -87,3 +87,52 @@ fragment LayersResolveOut layers_resolve_fragment(float4 work [[color(0)]]) {
     }
     return o;
 }
+
+// ---- Custom-end chain bridge passes (kitty-luv) ----
+// The runtime-compiled custom_shaders chain keeps its intermediate textures in
+// GL memory orientation (row 0 = screen bottom) so user shader code inherits
+// upstream's bottom-left-origin coordinate contract unmodified (t.pos, the UV
+// fields in KittyCustomShaderData, raw .Sample calls). Two hand-written passes
+// bridge that orientation to the Metal world, which renders top-down:
+//
+//  - seed: stored layered working surface (top-down) -> the shared backbuffer
+//    texture, vertically mirrored into GL orientation. Runs once per
+//    custom-end frame, replacing nothing (the in-pass layers resolve is
+//    skipped on these frames).
+//  - resolve: the chain's final texture (GL orientation) -> the drawable /
+//    capture offscreen, mirrored back AND carrying the same target-space
+//    epilogue as layers_resolve above (in-shader sRGB encode for the plain
+//    8-bit targets, linear + P3 primaries for the wide arms). This pass is
+//    what replaces the layers resolve; the GL arm instead lets its last group
+//    encode sRGB itself, which would be wrong on a linear-tagged drawable.
+//
+// Both sample with an exact nearest sampler: same-size mirroring must move
+// rows, never filter them. Both reuse layers_resolve_vertex's fullscreen
+// triangle and read raster position directly.
+
+fragment float4 custom_end_seed_fragment(
+    float4 pos [[position]],
+    texture2d<float, access::sample> src [[texture(0)]],
+    constant float2 &dims [[buffer(0)]])  // viewport (vw, vh) == source size
+{
+    constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::nearest);
+    float2 uv = pos.xy / dims;
+    return src.sample(s, float2(uv.x, 1.0f - uv.y));
+}
+
+fragment float4 custom_end_resolve_fragment(
+    float4 pos [[position]],
+    texture2d<float, access::sample> src [[texture(0)]],
+    constant float4 &params [[buffer(0)]])  // (vw, vh, sx, sy): viewport size and
+                                            // the occupied fraction of the shared texture
+{
+    constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::nearest);
+    float2 uv = pos.xy / params.xy;
+    float4 work = src.sample(s, float2(uv.x * params.z, (1.0f - uv.y) * params.w));
+    if (TARGET_PRIMARIES_IS_P3) work.rgb = srgb_to_p3(work.rgb);
+    if (target_encodes_in_shader(TARGET_COLOR_SPACE)) {
+        float3 rgb = work.a > 0.0f ? work.rgb / work.a : float3(0.0f);
+        return float4(linear2srgb(rgb) * work.a, work.a);
+    }
+    return work;
+}

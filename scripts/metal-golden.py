@@ -160,6 +160,19 @@ CONFIG_MATRIX: dict[str, list[str]] = {
     # which simultaneously proves the harness geometry HAS nonzero
     # size-mismatch padding.
     "padding-fill": ["padding_fill_strategy=neighboring_cell"],
+    # Custom-end port gate (kitty-luv): the ONLY config that activates the
+    # custom_shaders CUSTOM_END chain -- runtime slangc-to-MSL compile,
+    # newLibraryWithSource, the seed/chain/resolve bridge passes and the
+    # program-15 draw dispatch all execute nowhere else. The shipped
+    # `negative` pipeline is a pure per-pixel colour inversion: no time,
+    # mouse, or animation inputs, so the capture is deterministic (x2 = 0
+    # measured at introduction). Introduction proofs: this capture must
+    # DIFFER from default-opaque on the same scene (movement -- inversion
+    # moves every non-mid-grey pixel), and the identity cross-check ran a
+    # passthrough user shader against the no-shader control at max_diff 1
+    # (one extra RGBA16Unorm quantization hop), proving the bridge neither
+    # flips, scales, nor double-transforms.
+    "custom-negative": ["custom_shaders=negative"],
 }
 
 # Configs whose golden artifact is the thumbnail lever's output (value =
@@ -176,7 +189,7 @@ THUMB_CONFIGS: dict[str, str] = {"screenshot-thumb": "0.5"}
 # never imports), so the assert fires at capture/compare EXECUTION, not
 # during reverify's count read -- the two readers are complementary; do
 # not "fix" the constant into the AST path.
-EXPECT_CONFIG_MATRIX = 16
+EXPECT_CONFIG_MATRIX = 17
 assert len(CONFIG_MATRIX) == EXPECT_CONFIG_MATRIX, (
     f"CONFIG_MATRIX has {len(CONFIG_MATRIX)} configs but EXPECT_CONFIG_MATRIX declares "
     f"{EXPECT_CONFIG_MATRIX} -- update the constant in the same change that alters the matrix"

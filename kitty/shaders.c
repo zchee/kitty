@@ -12,10 +12,9 @@
 #include <stddef.h>
 #include <string.h>
 #include "animation.h"
-#ifndef KITTY_BACKEND_METAL
-// Static parser helpers, consumed only by the GL-only custom-end pipeline parser.
+// Static parser helpers, consumed by the custom-end pipeline parser (common to
+// both backends since the kitty-luv Metal port).
 #include "animation-parse.h"
-#endif
 #include "text-cache.h"
 #include "tupleobject.h"
 #include "window_logo.h"
@@ -2682,6 +2681,120 @@ blank_os_window(OSWindow *osw) {
     blank_canvas(effective_os_window_alpha(osw), color, true);
 }
 
+// The indirect render-target set custom end shaders draw through (and, on
+// GL, the layered FBO itself): the shared backbuffer texture with its
+// per-window FBO, the ping-pong extra, and the named a/b/persist textures.
+// Verbatim from the GL arm of start_os_window_rendering; the Metal arm calls
+// it only on custom-end frames (the seed blit fills the backbuffer texture
+// there and the chain runs through these targets via the GL shims).
+static void
+ensure_layered_render_targets(OSWindow *os_window) {
+    // Ensure the global shared texture is large enough for this window
+    if (global_state.layers_render_texture.width < os_window->viewport_width || global_state.layers_render_texture.height < os_window->viewport_height) {
+        if (global_state.layers_render_texture.texture_id) free_texture(&global_state.layers_render_texture.texture_id);
+        if (global_state.layers_render_texture.framebuffer_id) free_framebuffer(&global_state.layers_render_texture.framebuffer_id);
+        if (global_state.layers_render_texture.extra_texture_id) free_texture(&global_state.layers_render_texture.extra_texture_id);
+        if (global_state.layers_render_texture.extra_texture_setup_fbo_id) free_framebuffer(&global_state.layers_render_texture.extra_texture_setup_fbo_id);
+        if (global_state.layers_render_texture.texture_a_id) free_texture(&global_state.layers_render_texture.texture_a_id);
+        if (global_state.layers_render_texture.texture_a_fbo_id) free_framebuffer(&global_state.layers_render_texture.texture_a_fbo_id);
+        if (global_state.layers_render_texture.texture_b_id) free_texture(&global_state.layers_render_texture.texture_b_id);
+        if (global_state.layers_render_texture.texture_b_fbo_id) free_framebuffer(&global_state.layers_render_texture.texture_b_fbo_id);
+        unsigned new_w = (unsigned)MAX(global_state.layers_render_texture.width, os_window->viewport_width);
+        unsigned new_h = (unsigned)MAX(global_state.layers_render_texture.height, os_window->viewport_height);
+        setup_texture_as_render_target(new_w, new_h, &global_state.layers_render_texture.texture_id, &global_state.layers_render_texture.framebuffer_id);
+        global_state.layers_render_texture.width = (int)new_w;
+        global_state.layers_render_texture.height = (int)new_h;
+        global_state.layers_render_texture.texture_generation++;
+    }
+    // Create per-window framebuffer if needed and attach the global texture to it
+    if (!os_window->indirect_output.framebuffer_id) glGenFramebuffers(1, &os_window->indirect_output.framebuffer_id);
+    if (os_window->indirect_output.attached_texture_generation != global_state.layers_render_texture.texture_generation) {
+        bind_framebuffer_for_output(os_window->indirect_output.framebuffer_id);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, global_state.layers_render_texture.texture_id, 0);
+        os_window->indirect_output.attached_texture_generation = global_state.layers_render_texture.texture_generation;
+    }
+#ifdef KITTY_BACKEND_METAL
+    // The redirected last group cannot draw to the drawable mid-chain on this
+    // backend, so the ping-pong extra is needed even for single-group
+    // pipelines (it is the last group's render target).
+    const bool need_extra = true;
+#else
+    const bool need_extra = custom_shaders.end.num_groups > 1;
+#endif
+    if (need_extra) {
+        // Lazily create the global shared extra texture (ping-pong target for multi-group end shaders)
+        if (!global_state.layers_render_texture.extra_texture_id) {
+            setup_texture_as_render_target(
+                (unsigned)global_state.layers_render_texture.width,
+                (unsigned)global_state.layers_render_texture.height,
+                &global_state.layers_render_texture.extra_texture_id,
+                &global_state.layers_render_texture.extra_texture_setup_fbo_id);
+        }
+        // Create/re-attach per-window extra FBO when generation changes
+        if (os_window->indirect_output.extra_fbo_generation != global_state.layers_render_texture.texture_generation) {
+            if (os_window->indirect_output.extra_fbo_id) free_framebuffer(&os_window->indirect_output.extra_fbo_id);
+            glGenFramebuffers(1, &os_window->indirect_output.extra_fbo_id);
+            bind_framebuffer_for_output(os_window->indirect_output.extra_fbo_id);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, global_state.layers_render_texture.extra_texture_id, 0);
+            os_window->indirect_output.extra_fbo_generation = global_state.layers_render_texture.texture_generation;
+        }
+    }
+    // Named texture A: global shared, per-window FBO
+    if (custom_shaders.end.textures & (1u << CUSTOM_SHADER_TEXTURE_A)) {
+        if (!global_state.layers_render_texture.texture_a_id) {
+            setup_texture_as_render_target(
+                (unsigned)global_state.layers_render_texture.width,
+                (unsigned)global_state.layers_render_texture.height,
+                &global_state.layers_render_texture.texture_a_id,
+                &global_state.layers_render_texture.texture_a_fbo_id);
+        }
+        if (os_window->indirect_output.fbo_a_generation != global_state.layers_render_texture.texture_generation) {
+            if (os_window->indirect_output.fbo_a_id) free_framebuffer(&os_window->indirect_output.fbo_a_id);
+            glGenFramebuffers(1, &os_window->indirect_output.fbo_a_id);
+            bind_framebuffer_for_output(os_window->indirect_output.fbo_a_id);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, global_state.layers_render_texture.texture_a_id, 0);
+            os_window->indirect_output.fbo_a_generation = global_state.layers_render_texture.texture_generation;
+        }
+    } else {
+        if (os_window->indirect_output.fbo_a_id) free_framebuffer(&os_window->indirect_output.fbo_a_id);
+    }
+    // Named texture B: global shared, per-window FBO
+    if (custom_shaders.end.textures & (1u << CUSTOM_SHADER_TEXTURE_B)) {
+        if (!global_state.layers_render_texture.texture_b_id) {
+            setup_texture_as_render_target(
+                (unsigned)global_state.layers_render_texture.width,
+                (unsigned)global_state.layers_render_texture.height,
+                &global_state.layers_render_texture.texture_b_id,
+                &global_state.layers_render_texture.texture_b_fbo_id);
+        }
+        if (os_window->indirect_output.fbo_b_generation != global_state.layers_render_texture.texture_generation) {
+            if (os_window->indirect_output.fbo_b_id) free_framebuffer(&os_window->indirect_output.fbo_b_id);
+            glGenFramebuffers(1, &os_window->indirect_output.fbo_b_id);
+            bind_framebuffer_for_output(os_window->indirect_output.fbo_b_id);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, global_state.layers_render_texture.texture_b_id, 0);
+            os_window->indirect_output.fbo_b_generation = global_state.layers_render_texture.texture_generation;
+        }
+    } else {
+        if (os_window->indirect_output.fbo_b_id) free_framebuffer(&os_window->indirect_output.fbo_b_id);
+    }
+    // Named texture persist: per-window, recreated when global texture dimensions change
+    if (custom_shaders.end.textures & (1u << CUSTOM_SHADER_TEXTURE_PERSIST)) {
+        if (os_window->persist_texture_generation != global_state.layers_render_texture.texture_generation) {
+            if (os_window->persist_texture_id) free_texture(&os_window->persist_texture_id);
+            if (os_window->persist_fbo_id) free_framebuffer(&os_window->persist_fbo_id);
+            setup_texture_as_render_target(
+                (unsigned)global_state.layers_render_texture.width,
+                (unsigned)global_state.layers_render_texture.height,
+                &os_window->persist_texture_id,
+                &os_window->persist_fbo_id);
+            os_window->persist_texture_generation = global_state.layers_render_texture.texture_generation;
+        }
+    } else {
+        if (os_window->persist_texture_id) free_texture(&os_window->persist_texture_id);
+        if (os_window->persist_fbo_id) free_framebuffer(&os_window->persist_fbo_id);
+    }
+}
+
 static void
 start_os_window_rendering(OSWindow *os_window, Tab *tab) {
     // note that during live resize rendering is done in layers
@@ -2696,106 +2809,17 @@ start_os_window_rendering(OSWindow *os_window, Tab *tab) {
         // onto the drawable in the same pass — no RGBA16 DRAM FBO, no separate BLIT
         // pass (~123 MB/frame round trip and the 2nd pass eliminated). The
         // save_viewport here balances the restore_viewport in stop.
+        // Custom-end frames render att0 into a STORED sampleable surface and
+        // need the indirect targets the chain draws through (allocated via
+        // the GL shims); plain frames keep the memoryless tile-only surface.
+        const bool custom_end_frame = custom_shaders.end.active && os_window->has_active_custom_shaders;
+        if (custom_end_frame) ensure_layered_render_targets(os_window);
+        metal_set_layered_frame_stored(custom_end_frame);
         metal_begin_layered_frame();
         save_viewport_using_bottom_left_origin(0, 0, os_window->viewport_width, os_window->viewport_height);
         draw_bg_image(os_window, tab);
 #else
-        // Ensure the global shared texture is large enough for this window
-        if (global_state.layers_render_texture.width < os_window->viewport_width || global_state.layers_render_texture.height < os_window->viewport_height) {
-            if (global_state.layers_render_texture.texture_id) free_texture(&global_state.layers_render_texture.texture_id);
-            if (global_state.layers_render_texture.framebuffer_id) free_framebuffer(&global_state.layers_render_texture.framebuffer_id);
-            if (global_state.layers_render_texture.extra_texture_id) free_texture(&global_state.layers_render_texture.extra_texture_id);
-            if (global_state.layers_render_texture.extra_texture_setup_fbo_id) free_framebuffer(&global_state.layers_render_texture.extra_texture_setup_fbo_id);
-            if (global_state.layers_render_texture.texture_a_id) free_texture(&global_state.layers_render_texture.texture_a_id);
-            if (global_state.layers_render_texture.texture_a_fbo_id) free_framebuffer(&global_state.layers_render_texture.texture_a_fbo_id);
-            if (global_state.layers_render_texture.texture_b_id) free_texture(&global_state.layers_render_texture.texture_b_id);
-            if (global_state.layers_render_texture.texture_b_fbo_id) free_framebuffer(&global_state.layers_render_texture.texture_b_fbo_id);
-            unsigned new_w = (unsigned)MAX(global_state.layers_render_texture.width, os_window->viewport_width);
-            unsigned new_h = (unsigned)MAX(global_state.layers_render_texture.height, os_window->viewport_height);
-            setup_texture_as_render_target(new_w, new_h, &global_state.layers_render_texture.texture_id, &global_state.layers_render_texture.framebuffer_id);
-            global_state.layers_render_texture.width = (int)new_w;
-            global_state.layers_render_texture.height = (int)new_h;
-            global_state.layers_render_texture.texture_generation++;
-        }
-        // Create per-window framebuffer if needed and attach the global texture to it
-        if (!os_window->indirect_output.framebuffer_id) glGenFramebuffers(1, &os_window->indirect_output.framebuffer_id);
-        if (os_window->indirect_output.attached_texture_generation != global_state.layers_render_texture.texture_generation) {
-            bind_framebuffer_for_output(os_window->indirect_output.framebuffer_id);
-            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, global_state.layers_render_texture.texture_id, 0);
-            os_window->indirect_output.attached_texture_generation = global_state.layers_render_texture.texture_generation;
-        }
-        if (custom_shaders.end.num_groups > 1) {
-            // Lazily create the global shared extra texture (ping-pong target for multi-group end shaders)
-            if (!global_state.layers_render_texture.extra_texture_id) {
-                setup_texture_as_render_target(
-                    (unsigned)global_state.layers_render_texture.width,
-                    (unsigned)global_state.layers_render_texture.height,
-                    &global_state.layers_render_texture.extra_texture_id,
-                    &global_state.layers_render_texture.extra_texture_setup_fbo_id);
-            }
-            // Create/re-attach per-window extra FBO when generation changes
-            if (os_window->indirect_output.extra_fbo_generation != global_state.layers_render_texture.texture_generation) {
-                if (os_window->indirect_output.extra_fbo_id) free_framebuffer(&os_window->indirect_output.extra_fbo_id);
-                glGenFramebuffers(1, &os_window->indirect_output.extra_fbo_id);
-                bind_framebuffer_for_output(os_window->indirect_output.extra_fbo_id);
-                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, global_state.layers_render_texture.extra_texture_id, 0);
-                os_window->indirect_output.extra_fbo_generation = global_state.layers_render_texture.texture_generation;
-            }
-        }
-        // Named texture A: global shared, per-window FBO
-        if (custom_shaders.end.textures & (1u << CUSTOM_SHADER_TEXTURE_A)) {
-            if (!global_state.layers_render_texture.texture_a_id) {
-                setup_texture_as_render_target(
-                    (unsigned)global_state.layers_render_texture.width,
-                    (unsigned)global_state.layers_render_texture.height,
-                    &global_state.layers_render_texture.texture_a_id,
-                    &global_state.layers_render_texture.texture_a_fbo_id);
-            }
-            if (os_window->indirect_output.fbo_a_generation != global_state.layers_render_texture.texture_generation) {
-                if (os_window->indirect_output.fbo_a_id) free_framebuffer(&os_window->indirect_output.fbo_a_id);
-                glGenFramebuffers(1, &os_window->indirect_output.fbo_a_id);
-                bind_framebuffer_for_output(os_window->indirect_output.fbo_a_id);
-                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, global_state.layers_render_texture.texture_a_id, 0);
-                os_window->indirect_output.fbo_a_generation = global_state.layers_render_texture.texture_generation;
-            }
-        } else {
-            if (os_window->indirect_output.fbo_a_id) free_framebuffer(&os_window->indirect_output.fbo_a_id);
-        }
-        // Named texture B: global shared, per-window FBO
-        if (custom_shaders.end.textures & (1u << CUSTOM_SHADER_TEXTURE_B)) {
-            if (!global_state.layers_render_texture.texture_b_id) {
-                setup_texture_as_render_target(
-                    (unsigned)global_state.layers_render_texture.width,
-                    (unsigned)global_state.layers_render_texture.height,
-                    &global_state.layers_render_texture.texture_b_id,
-                    &global_state.layers_render_texture.texture_b_fbo_id);
-            }
-            if (os_window->indirect_output.fbo_b_generation != global_state.layers_render_texture.texture_generation) {
-                if (os_window->indirect_output.fbo_b_id) free_framebuffer(&os_window->indirect_output.fbo_b_id);
-                glGenFramebuffers(1, &os_window->indirect_output.fbo_b_id);
-                bind_framebuffer_for_output(os_window->indirect_output.fbo_b_id);
-                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, global_state.layers_render_texture.texture_b_id, 0);
-                os_window->indirect_output.fbo_b_generation = global_state.layers_render_texture.texture_generation;
-            }
-        } else {
-            if (os_window->indirect_output.fbo_b_id) free_framebuffer(&os_window->indirect_output.fbo_b_id);
-        }
-        // Named texture persist: per-window, recreated when global texture dimensions change
-        if (custom_shaders.end.textures & (1u << CUSTOM_SHADER_TEXTURE_PERSIST)) {
-            if (os_window->persist_texture_generation != global_state.layers_render_texture.texture_generation) {
-                if (os_window->persist_texture_id) free_texture(&os_window->persist_texture_id);
-                if (os_window->persist_fbo_id) free_framebuffer(&os_window->persist_fbo_id);
-                setup_texture_as_render_target(
-                    (unsigned)global_state.layers_render_texture.width,
-                    (unsigned)global_state.layers_render_texture.height,
-                    &os_window->persist_texture_id,
-                    &os_window->persist_fbo_id);
-                os_window->persist_texture_generation = global_state.layers_render_texture.texture_generation;
-            }
-        } else {
-            if (os_window->persist_texture_id) free_texture(&os_window->persist_texture_id);
-            if (os_window->persist_fbo_id) free_framebuffer(&os_window->persist_fbo_id);
-        }
+        ensure_layered_render_targets(os_window);
         set_framebuffer_to_use_for_output(os_window->indirect_output.framebuffer_id);
         bind_framebuffer_for_output(0);
         save_viewport_using_bottom_left_origin(0, 0, os_window->viewport_width, os_window->viewport_height);
@@ -2805,36 +2829,43 @@ start_os_window_rendering(OSWindow *os_window, Tab *tab) {
     }
 }
 
-#ifndef KITTY_BACKEND_METAL
-// Custom end shaders never activate on the Metal backend (see compile_program),
-// so their GL render pass is compiled out there.
+// At file scope (not function-local) because the Metal arm of compile_program
+// asserts the runtime-parsed MSL UBO size against sizeof() of this struct at
+// compile-accept time — a slangc that changes the KittyCustomShaderData layout
+// then refuses activation loudly instead of feeding the shader skewed bytes.
+struct GPUCustomEndData {
+    float src_rect[4];
+    float dest_rect[4];
+    float background[4];
+    float foreground[4];
+    float active_window_background[4];
+    float mouse_pos[4];
+    float mouse_button_pressed[4];
+    float active_window_geometry[4];
+    float bell_window_geometry[4];
+    float central_area[4];
+    float cursor_trail_corners_x[4];
+    float cursor_trail_corners_y[4];
+    float cursor_trail_edge[4];
+    float cursor_trail_prev_edge[4];
+    float cursor_color[4];
+    float cursor_trail_color[4];
+    uint32_t viewport_size_pixels[2];
+    float mouse_pointer_hidden;
+    float cursor_trail_state;
+    float timestamp, last_rendered_at;
+    uint32_t frame_counter;
+    float cursor_trail_change_time;
+};
+
+// The custom-end render pass. On GL this draws directly; on Metal the chain
+// runs between metal_custom_end_seed (which mirrors the stored layered frame
+// into the shared backbuffer texture in GL memory orientation) and
+// metal_resolve_custom_end (which mirrors the final texture onto the drawable
+// with the target-space epilogue). The group loop itself is shared.
 static void
 run_custom_end_shader(OSWindow *os_window, float sx, float sy, monotonic_t now) {
     bind_program(CUSTOM_END_PROGRAM);
-    struct GPUCustomEndData {
-        float src_rect[4];
-        float dest_rect[4];
-        float background[4];
-        float foreground[4];
-        float active_window_background[4];
-        float mouse_pos[4];
-        float mouse_button_pressed[4];
-        float active_window_geometry[4];
-        float bell_window_geometry[4];
-        float central_area[4];
-        float cursor_trail_corners_x[4];
-        float cursor_trail_corners_y[4];
-        float cursor_trail_edge[4];
-        float cursor_trail_prev_edge[4];
-        float cursor_color[4];
-        float cursor_trail_color[4];
-        uint32_t viewport_size_pixels[2];
-        float mouse_pointer_hidden;
-        float cursor_trail_state;
-        float timestamp, last_rendered_at;
-        uint32_t frame_counter;
-        float cursor_trail_change_time;
-    };
     struct GPUCustomEndData *d = (struct GPUCustomEndData *)map_vao_buffer_for_write_only(
         custom_end_vao_idx, 0, 0, program_uniform_block(CUSTOM_END_PROGRAM, "KittyCustomShaderData").size);
     memset(d, 0, sizeof(struct GPUCustomEndData));
@@ -3013,6 +3044,12 @@ run_custom_end_shader(OSWindow *os_window, float sx, float sy, monotonic_t now) 
     // Ping-pong state: when true, backbuffer = texture_id and the ping-pong
     // target is extra_texture_id; toggled each time a group outputs to DEFAULT.
     bool backbuffer_is_main = true;
+#ifdef KITTY_BACKEND_METAL
+    // What the mirror resolve reads after the loop. Starts at the seeded
+    // backbuffer so a frame where no group draws (all animated, all inactive)
+    // still resolves the rendered frame instead of leaving the drawable blank.
+    GLuint metal_final_tex = global_state.layers_render_texture.texture_id;
+#endif
 
     struct AnimCacheEntry {
         Animation *curve;
@@ -3052,8 +3089,17 @@ run_custom_end_shader(OSWindow *os_window, float sx, float sy, monotonic_t now) 
 
         // Set the output framebuffer
         if (is_last) {
+#ifdef KITTY_BACKEND_METAL
+            // The last group draws into the ping-pong slot with NO encode; the
+            // mirror resolve after the loop puts it on the drawable. The GL
+            // arm's in-chain sRGB encode assumes an sRGB-encoded framebuffer
+            // 0, which the wide (linear-tagged) drawable arms are not.
+            bind_framebuffer_for_output(backbuffer_is_main ? os_window->indirect_output.extra_fbo_id : os_window->indirect_output.framebuffer_id);
+            metal_final_tex = backbuffer_is_main ? global_state.layers_render_texture.extra_texture_id : global_state.layers_render_texture.texture_id;
+#else
             set_framebuffer_to_use_for_output(0);
             bind_framebuffer_for_output(0);
+#endif
         } else if (cg->output_texture != CUSTOM_SHADER_TEXTURE_DEFAULT) {
             // Output to named texture; backbuffer is unchanged for the next group
             bind_framebuffer_for_output(named_tex_fbos[cg->output_texture]);
@@ -3067,11 +3113,17 @@ run_custom_end_shader(OSWindow *os_window, float sx, float sy, monotonic_t now) 
         float vp_x, vp_y, vp_w, vp_h;
         if (is_last) {
             // Last group always covers the full screen region
+#ifdef KITTY_BACKEND_METAL
+            // Texture-space target: the live-resize offset belongs to the
+            // drawable and is applied by the mirror resolve, not here.
+            glViewport(0, 0, vw, vh);
+#else
             if (os_window->live_resize.in_progress) {
                 glViewport(0, os_window->live_resize.height - vh, vw, vh);
             } else {
                 glViewport(0, 0, vw, vh);
             }
+#endif
             vp_x = 0.f;
             vp_y = 0.f;
             vp_w = 1.f;
@@ -3116,12 +3168,20 @@ run_custom_end_shader(OSWindow *os_window, float sx, float sy, monotonic_t now) 
         glUniform1i(group_loc, (GLint)g);
         glUniform4f(viewport_loc, vp_x, vp_y, vp_w, vp_h);
         glUniform1f(anim_progress_loc, anim_progress);
+#ifdef KITTY_BACKEND_METAL
+        glUniform1i(convert_to_srgb_loc, 0);  // the mirror resolve owns the encode
+#else
         glUniform1i(convert_to_srgb_loc, is_last ? 1 : 0);
+#endif
         // debug_rendering("Custom shader draw group %u: anim_progress=%.4f viewport=(%.2f,%.2f,%.2f,%.2f)\n", g, anim_progress, vp_x, vp_y, vp_w, vp_h);
         draw_quad(false, 0);
     }
-}
+#ifdef KITTY_BACKEND_METAL
+    set_framebuffer_to_use_for_output(0);
+    bind_framebuffer_for_output(0);
+    metal_resolve_custom_end(metal_final_tex, sx, sy, (unsigned)vw, (unsigned)vh);
 #endif
+}
 
 static void
 stop_os_window_rendering(OSWindow *os_window, Tab *tab, Window *active_window, monotonic_t now) {
@@ -3133,11 +3193,35 @@ stop_os_window_rendering(OSWindow *os_window, Tab *tab, Window *active_window, m
         // (in-shader linear->sRGB, replacing the BLIT pass) and end it.
         // restore_viewport balances the save in start_os_window_rendering;
         // draw_resizing_text (live resize only) then draws on the drawable in a
-        // normal pass. Custom end shaders never activate on this backend (see
-        // compile_program), so the resolve is unconditional.
-        metal_resolve_layered_frame();
-        restore_viewport();
-        if (os_window->live_resize.in_progress) draw_resizing_text(os_window);
+        // normal pass. On a custom-end frame the in-pass resolve is replaced by
+        // the chain: end the (stored) pass, mirror the frame into the shared
+        // backbuffer texture, run the shared group loop, and let its trailing
+        // mirror resolve reach the drawable. The seed can only fail on a
+        // broken framebuffer table; the fallback then no-ops the resolve (the
+        // pass already ended) and the next frame recovers.
+        bool ran_custom_end = false;
+        if (custom_shaders.end.active && os_window->has_active_custom_shaders) {
+            metal_end_layered_frame_stored();
+            float sx = global_state.layers_render_texture.width > 0 ? (float)os_window->viewport_width / (float)global_state.layers_render_texture.width : 1.f;
+            float sy = global_state.layers_render_texture.height > 0 ? (float)os_window->viewport_height / (float)global_state.layers_render_texture.height : 1.f;
+            if (metal_custom_end_seed(os_window->indirect_output.framebuffer_id,
+                                      (unsigned)os_window->viewport_width, (unsigned)os_window->viewport_height)) {
+                restore_viewport();
+                if (os_window->live_resize.in_progress)
+                    save_viewport_using_top_left_origin(0, 0, os_window->viewport_width, os_window->viewport_height, os_window->live_resize.height);
+                run_custom_end_shader(os_window, sx, sy, now);
+                if (os_window->live_resize.in_progress) {
+                    restore_viewport();
+                    draw_resizing_text(os_window);
+                }
+                ran_custom_end = true;
+            }
+        }
+        if (!ran_custom_end) {
+            metal_resolve_layered_frame();
+            restore_viewport();
+            if (os_window->live_resize.in_progress) draw_resizing_text(os_window);
+        }
 #else
         float sx = global_state.layers_render_texture.width > 0 ? (float)os_window->viewport_width / (float)global_state.layers_render_texture.width : 1.f;
         float sy = global_state.layers_render_texture.height > 0 ? (float)os_window->viewport_height / (float)global_state.layers_render_texture.height : 1.f;
@@ -3291,10 +3375,9 @@ free_custom_shader_pipeline(CustomShaderPipeline *p) {
     }
 }
 
-#ifndef KITTY_BACKEND_METAL
-// The pipeline-definition parser feeds compile_program's GL-only custom-end
-// arm; free_custom_shader_pipeline above stays common (the clear path runs on
-// both backends).
+// The pipeline-definition parser feeds compile_program's custom-end arms on
+// BOTH backends now (kitty-luv: the Metal arm activates through
+// transfer_pipeline_to_struct too); only attach_shaders below stays GL-only.
 static NamedTexture
 named_texture_from_str(const char *s) {
     if (strcmp(s, "a") == 0) return CUSTOM_SHADER_TEXTURE_A;
@@ -3410,6 +3493,7 @@ transfer_pipeline_to_struct(PyObject *pg, CustomShaderPipeline *p) {
     return true;
 }
 
+#ifndef KITTY_BACKEND_METAL
 static bool
 attach_shaders(PyObject *sources, GLuint program_id, GLenum shader_type) {
     RAII_ALLOC(const GLchar *, c_sources, calloc(PyTuple_GET_SIZE(sources), sizeof(GLchar *)));
@@ -3425,6 +3509,60 @@ attach_shaders(PyObject *sources, GLuint program_id, GLenum shader_type) {
     if (shader_id == 0) return false;
     glAttachShader(program_id, shader_id);
     glDeleteShader(shader_id);
+    return true;
+}
+#endif
+
+#ifdef KITTY_BACKEND_METAL
+// Transcribe the binding indices slang.py parsed out of the emitted MSL
+// (metadata['metal_bindings'], written by build_custom_shader_pipeline_msl)
+// into the struct metal_compile_custom_end validates. Anything missing or
+// oddly shaped refuses activation: the indices are compiler OUTPUT verified
+// per compile, never an assumption at the bind site.
+static bool
+custom_end_binding_entry(PyObject *d, const char *key, int *idx, unsigned *size) {
+    PyObject *e = PyDict_GetItemString(d, key);
+    if (!e || !PySequence_Check(e) || PySequence_Size(e) != 2) return false;
+    RAII_PyObject(i0, PySequence_GetItem(e, 0));
+    RAII_PyObject(i1, PySequence_GetItem(e, 1));
+    if (!i0 || !i1 || !PyLong_Check(i0) || !PyLong_Check(i1)) return false;
+    *idx = (int)PyLong_AsLong(i0);
+    if (size) *size = (unsigned)PyLong_AsUnsignedLong(i1);
+    return true;
+}
+
+static bool
+custom_end_binding_int(PyObject *d, const char *key, int *out) {
+    PyObject *e = PyDict_GetItemString(d, key);
+    if (!e || !PyLong_Check(e)) return false;
+    *out = (int)PyLong_AsLong(e);
+    return true;
+}
+
+static bool
+custom_end_bindings_from_metadata(PyObject *metadata, CustomEndBindings *b) {
+    memset(b, 0, sizeof(*b));
+    PyObject *mb = PyDict_GetItemString(metadata, "metal_bindings");
+    PyObject *frag = mb && PyDict_Check(mb) ? PyDict_GetItemString(mb, "fragment") : NULL;
+    PyObject *vert = mb && PyDict_Check(mb) ? PyDict_GetItemString(mb, "vertex") : NULL;
+    PyObject *fbufs = frag && PyDict_Check(frag) ? PyDict_GetItemString(frag, "buffers") : NULL;
+    PyObject *vbufs = vert && PyDict_Check(vert) ? PyDict_GetItemString(vert, "buffers") : NULL;
+    PyObject *ftex = frag && PyDict_Check(frag) ? PyDict_GetItemString(frag, "textures") : NULL;
+    PyObject *fsmp = frag && PyDict_Check(frag) ? PyDict_GetItemString(frag, "samplers") : NULL;
+    unsigned vert_csd_size = 0;
+    bool ok = fbufs && PyDict_Check(fbufs) && vbufs && PyDict_Check(vbufs) &&
+        ftex && PyDict_Check(ftex) && fsmp && PyDict_Check(fsmp) &&
+        custom_end_binding_entry(fbufs, "csd", &b->frag_csd_buf, &b->csd_size) &&
+        custom_end_binding_entry(fbufs, "entryPointParams", &b->frag_epp_buf, &b->epp_size) &&
+        custom_end_binding_entry(vbufs, "csd", &b->vert_csd_buf, &vert_csd_size);
+    static const char *named[4] = {"backbuffer", "a", "b", "persist"};
+    for (int i = 0; ok && i < 4; i++)
+        ok = custom_end_binding_int(ftex, named[i], &b->tex[i]) && custom_end_binding_int(fsmp, named[i], &b->smp[i]);
+    if (!ok || (vert_csd_size && vert_csd_size != b->csd_size)) {
+        log_error("custom end: the metal_bindings metadata is missing or malformed -- refusing activation");
+        PyErr_Clear();
+        return false;
+    }
     return true;
 }
 #endif
@@ -3497,6 +3635,35 @@ compile_program(PyObject UNUSED *self, PyObject *args) {
         PyObject *pg = PyDict_GetItemString(metadata, "pipeline");
         if (pg && !transfer_pipeline_to_struct(pg, &custom_shaders.end)) {
             glDeleteProgram(program->id);
+            return NULL;
+        }
+        custom_shaders.end.active = true;
+    }
+#endif
+#ifdef KITTY_BACKEND_METAL
+    if (which == CUSTOM_END_PROGRAM) {
+        // Mirror of the GL activation arm above (kitty-luv): the chain goes
+        // active only after the runtime MSL compile and every binding/size
+        // check accept it. Failure raises like a GL link failure, so the
+        // Python caller's error path deactivates through the shared
+        // empty-tuple call and kitty keeps rendering.
+        free_custom_shader_pipeline(&custom_shaders.end);
+        zero_at_ptr(&custom_shaders.end);
+        CustomEndBindings b;
+        const char *vert_src = PyTuple_GET_SIZE(vertex_shaders) ? PyUnicode_AsUTF8(PyTuple_GET_ITEM(vertex_shaders, 0)) : NULL;
+        const char *frag_src = PyTuple_GET_SIZE(fragment_shaders) ? PyUnicode_AsUTF8(PyTuple_GET_ITEM(fragment_shaders, 0)) : NULL;
+        PyObject *pg = PyDict_GetItemString(metadata, "pipeline");
+        bool ok = vert_src && frag_src && pg &&
+            custom_end_bindings_from_metadata(metadata, &b) &&
+            metal_compile_custom_end(vert_src, frag_src, &b, (unsigned)sizeof(struct GPUCustomEndData)) &&
+            transfer_pipeline_to_struct(pg, &custom_shaders.end);
+        if (!ok) {
+            free_custom_shader_pipeline(&custom_shaders.end);
+            zero_at_ptr(&custom_shaders.end);
+            if (!PyErr_Occurred())
+                PyErr_SetString(PyExc_ValueError, "Failed to load the custom end shader chain on the Metal backend (see error log)");
+            glDeleteProgram(program->id);
+            program->id = 0;
             return NULL;
         }
         custom_shaders.end.active = true;

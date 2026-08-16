@@ -465,6 +465,111 @@ invalidate_cell_pipeline_states(void) {
     }
 }
 
+// ---- Custom end (kitty-luv): runtime-compiled post-processing chain ----
+// The custom_shaders feature's shaders are user-authored .slang files composed
+// and lowered to MSL by slang.py at CONFIG time (not build time), so the
+// library is compiled here with newLibraryWithSource. Everything below is the
+// stash that survives between compile (config load/reload) and draw.
+
+// The custom-end program's index in kitty/shaders.c's program enum. Restated
+// numerically like build_pso's index comment below; shaders.c owns the enum.
+#define CUSTOM_END_PROGRAM_IDX 15
+
+// entryPointParams mirror of the wrapper's fragment scalars, in slangc's MSL
+// cbuffer layout: int at 0, float4 at 16 (16-byte alignment), float at 32,
+// 1-byte bool at 36, struct rounded to 48. metal_compile_custom_end refuses
+// activation when the parsed MSL size disagrees with this struct.
+typedef struct {
+    int32_t group;
+    int32_t pad0_[3];
+    float viewport[4];
+    float animation_progress;
+    uint8_t convert_to_srgb;
+    uint8_t pad1_[11];
+} MetalCustomEndParams;
+_Static_assert(sizeof(MetalCustomEndParams) == 48, "MetalCustomEndParams no longer matches the wrapper's MSL entryPointParams layout");
+
+// Slot contract for uniform_stores[15], established by init_uniforms case 15
+// (the C5 pattern; custom-end is runtime-compiled so it has no generated enum).
+enum { CUSTOM_END_U_group = 0, CUSTOM_END_U_viewport = 1, CUSTOM_END_U_animation_progress = 2, CUSTOM_END_U_convert_to_srgb = 3 };
+
+static id<MTLLibrary> custom_end_vert_lib = nil, custom_end_frag_lib = nil;
+static id<MTLFunction> custom_end_vert_fn = nil, custom_end_frag_fn = nil;
+static CustomEndBindings custom_end_bindings;
+static bool custom_end_runtime_ready = false;
+
+// A config reload compiles a NEW library: the PSOs built from the old
+// functions must go with it or pso_get serves stale shaders (PSO cache
+// poisoning, plan risk table).
+static void
+invalidate_custom_end_pipeline_states(void) {
+    size_t base = (size_t)CUSTOM_END_PROGRAM_IDX * PSO_VARIANTS_PER_PROGRAM;
+    for (size_t i = base; i < base + PSO_VARIANTS_PER_PROGRAM; i++) {
+        if (pso_cache[i].in_use) {
+            [pso_cache[i].pso release];
+            pso_cache[i] = (PSOCacheEntry){0};
+        }
+    }
+}
+
+bool
+metal_compile_custom_end(const char *vert_src, const char *frag_src, const CustomEndBindings *b, unsigned expected_csd_size) {
+    // Tear down the previous chain FIRST so every failure path below leaves the
+    // feature cleanly inert and leak-free (pre-mortem #3: a user iterating on a
+    // shader must not accumulate libraries/PSOs).
+    custom_end_runtime_ready = false;
+    invalidate_custom_end_pipeline_states();
+    [custom_end_vert_fn release]; custom_end_vert_fn = nil;
+    [custom_end_frag_fn release]; custom_end_frag_fn = nil;
+    [custom_end_vert_lib release]; custom_end_vert_lib = nil;
+    [custom_end_frag_lib release]; custom_end_frag_lib = nil;
+    if (!mtl_device || !vert_src || !frag_src) return false;
+    if (b->csd_size != expected_csd_size) {
+        log_error("Metal: custom end shaders rejected: MSL KittyCustomShaderData is %u bytes but the C fill writes %u -- slangc changed the layout",
+                  b->csd_size, expected_csd_size);
+        return false;
+    }
+    if (b->epp_size != (unsigned)sizeof(MetalCustomEndParams)) {
+        log_error("Metal: custom end shaders rejected: MSL entryPointParams is %u bytes but the C push writes %zu -- slangc changed the layout",
+                  b->epp_size, sizeof(MetalCustomEndParams));
+        return false;
+    }
+    const double t0 = CACurrentMediaTime();
+    const size_t vbytes = strlen(vert_src), fbytes = strlen(frag_src);
+    NSError *error = nil;
+    custom_end_vert_lib = [mtl_device newLibraryWithSource:[NSString stringWithUTF8String:vert_src] options:nil error:&error];
+    if (!custom_end_vert_lib) {
+        log_error("Metal: custom end vertex shader failed to compile: %s",
+                  error ? [[error localizedDescription] UTF8String] : "unknown error");
+        return false;
+    }
+    error = nil;
+    custom_end_frag_lib = [mtl_device newLibraryWithSource:[NSString stringWithUTF8String:frag_src] options:nil error:&error];
+    if (!custom_end_frag_lib) {
+        log_error("Metal: custom end fragment shader failed to compile: %s",
+                  error ? [[error localizedDescription] UTF8String] : "unknown error");
+        [custom_end_vert_lib release]; custom_end_vert_lib = nil;
+        return false;
+    }
+    custom_end_vert_fn = [custom_end_vert_lib newFunctionWithName:@"custom_end_vertex"];
+    custom_end_frag_fn = [custom_end_frag_lib newFunctionWithName:@"custom_end_fragment"];
+    if (!custom_end_vert_fn || !custom_end_frag_fn) {
+        log_error("Metal: custom end entry points missing from the runtime library (fixup drift?)");
+        [custom_end_vert_fn release]; custom_end_vert_fn = nil;
+        [custom_end_frag_fn release]; custom_end_frag_fn = nil;
+        [custom_end_vert_lib release]; custom_end_vert_lib = nil;
+        [custom_end_frag_lib release]; custom_end_frag_lib = nil;
+        return false;
+    }
+    custom_end_bindings = *b;
+    custom_end_runtime_ready = true;
+    METAL_TRACE("custom_end: compiled %zu+%zu byte runtime chain in %.1f ms (csd v%d/f%d sz=%u, epp f%d, tex=%d/%d/%d/%d)\n",
+                vbytes, fbytes, (CACurrentMediaTime() - t0) * 1e3,
+                b->vert_csd_buf, b->frag_csd_buf, b->csd_size, b->frag_epp_buf,
+                b->tex[0], b->tex[1], b->tex[2], b->tex[3]);
+    return true;
+}
+
 // W27 P3.4 (chain 2). Python resolves these from the config
 // (text_composition_strategy, text_fg_override_threshold) and hands them over
 // directly. Before this they were recovered by string-scraping the `#define`s
@@ -792,6 +897,10 @@ program_uses_fan_vertex_order(int program) {
         case 12: return SCREENSHOT_VERTEX_ORDER_FAN;    // SCREENSHOT, from screenshot.slang
         case 13: return ROUNDED_RECT_VERTEX_ORDER_FAN;  // ROUNDED_RECT, from rounded_rect.slang
         case 14: return PADDING_FORK_VERTEX_ORDER_FAN;  // PADDING, from padding_fork.slang (fork wrapper)
+        // CUSTOM_END: runtime-compiled, so no generated ORDER define. The
+        // wrapper vertex indexes pipeline.slang's vertex_pos_map, whose corner
+        // rotation (RT, RB, LB, LT) is fan order; a raw strip draws a bowtie.
+        case CUSTOM_END_PROGRAM_IDX: return true;
         default: return false;
     }
 }
@@ -1038,7 +1147,36 @@ build_pso(int program, bool blend, MTLPixelFormat fmt, bool layered, MTLPixelFor
             return create_pipeline_state([NSString stringWithUTF8String:vname], [NSString stringWithUTF8String:fname],
                                          blend, nil, fmt, layered, att1_fmt, nil);
         }
-        default: return nil; // 3 == CELL_PROGRAM_SENTINEL, never drawn; 15 == CUSTOM_END, inert on this backend
+        case CUSTOM_END_PROGRAM_IDX: {
+            // Custom end: the functions come from the runtime-compiled
+            // libraries (metal_compile_custom_end), not the metallib. The
+            // vertex is SV_VertexID-only (nil vertex descriptor) and the chain
+            // draws with blending disabled — draw_quad(false, 0) in
+            // run_custom_end_shader — but the blend argument is honored for
+            // parity with create_pipeline_state.
+            if (!custom_end_runtime_ready) return nil;
+            MTLRenderPipelineDescriptor *d = [[MTLRenderPipelineDescriptor alloc] init];
+            d.vertexFunction = custom_end_vert_fn;
+            d.fragmentFunction = custom_end_frag_fn;
+            d.colorAttachments[0].pixelFormat = fmt;
+            if (layered) d.colorAttachments[1].pixelFormat = att1_fmt;  // unreachable: the chain draws after the layered pass ends
+            if (blend) {
+                d.colorAttachments[0].blendingEnabled = YES;
+                d.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+                d.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+                d.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+                d.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+            }
+            NSError *error = nil;
+            id<MTLRenderPipelineState> pso = [mtl_device newRenderPipelineStateWithDescriptor:d error:&error];
+            [d release];
+            if (!pso) {
+                log_error("Metal: failed to build custom end PSO: %s",
+                          error ? [[error localizedDescription] UTF8String] : "unknown error");
+            }
+            return pso;
+        }
+        default: return nil; // 3 == CELL_PROGRAM_SENTINEL, never drawn
     }
 }
 
@@ -1119,7 +1257,17 @@ init_uniforms(int program) {
         case 12: { ScreenshotUniforms u; get_uniform_locations_screenshot(program, &u); break; }
         case 13: { Rounded_rectUniforms u; get_uniform_locations_rounded_rect(program, &u); break; }
         case 14: { PaddingUniforms u; get_uniform_locations_padding(program, &u); break; }
-        default: break; // 3 == CELL_PROGRAM_SENTINEL; 15 (custom-end) has no Metal pipeline
+        case CUSTOM_END_PROGRAM_IDX: {
+            // Runtime-compiled, so no generated enum: this registration order
+            // IS the slot contract the CUSTOM_END_U_* enumerators above index.
+            // shaders.c resolves the same names via program_uniform_location
+            // (init_custom_programs, run_custom_end_shader) and always finds
+            // these pre-registered slots.
+            static const char *names[] = { "group", "viewport", "animation_progress", "convert_to_srgb", "backbuffer", "a", "b", "persist" };
+            for (size_t i = 0; i < arraysz(names); i++) get_uniform_location(program, names[i]);
+            break;
+        }
+        default: break; // 3 == CELL_PROGRAM_SENTINEL, never drawn
     }
 }
 
@@ -1324,6 +1472,9 @@ GLuint
 block_index(int program, const char *name) {
     (void)program;
     if (name && strcmp(name, "ColorTable") == 0) return 1;
+    // Custom end: the runtime chain's UBO. Size is a slangc output parsed at
+    // compile time, not a compiled-in layout, hence the registry entry.
+    if (name && strcmp(name, "KittyCustomShaderData") == 0) return 2;
     return 0; // CellRenderData (and any other block)
 }
 
@@ -1339,6 +1490,10 @@ GLint
 block_size(int program, GLuint bidx) {
     (void)program;
     if (bidx == 1) return (GLint)(METAL_COLOR_TABLE_ENTRIES * sizeof(uint32_t) + METAL_WIDE_COLOR_TABLE_BYTES);
+    // 0 while no custom end chain is accepted: init_custom_programs then
+    // allocates an empty UBO it never maps (run_custom_end_shader only runs
+    // when the chain is active, which implies an accepted compile).
+    if (bidx == 2) return custom_end_runtime_ready ? (GLint)custom_end_bindings.csd_size : 0;
     return sizeof(MetalCellRenderData);
 }
 
@@ -1965,6 +2120,15 @@ restore_viewport(void) {
     mtl_viewport = saved_viewports.items[--saved_viewports.used];
 }
 
+// Raw glViewport shim for the custom-end chain: its targets are GL-memory-
+// oriented textures (row 0 = screen bottom), where GL's row addressing holds
+// verbatim, so the rect transfers with no conversion — the same convention the
+// save_* wrappers above use.
+void
+metal_gl_viewport(GLint x, GLint y, GLsizei w, GLsizei h) {
+    mtl_viewport = (MTLViewport){(double)x, (double)y, (double)w, (double)h, 0, 1};
+}
+
 // ----- Drawing -----
 
 static int dq_log_count = 0;
@@ -2508,6 +2672,45 @@ draw_quad(bool blend, unsigned instance_count) {
         MetalPaddingUniforms pad_u;
         fill_padding_uniforms(current_program, &pad_u);
         [mtl_current_encoder setVertexBytes:&pad_u length:sizeof(pad_u) atIndex:PADDING_FORK_VERTEX_BUF_entryPointParams];
+    } else if (current_program == CUSTOM_END_PROGRAM_IDX) {
+        // Custom end chain draw (run_custom_end_shader). Every index below is
+        // the slangc output parsed at compile-accept time
+        // (custom_end_bindings); pso_get already refused the draw when no
+        // runtime chain is loaded, so the stash is valid here.
+        // KittyCustomShaderData UBO: the ring buffer of the VAO shaders.c
+        // bound via bind_vao_uniform_buffer, filled by
+        // map_vao_buffer_for_write_only just before the group loop. The
+        // wrapper vertex reads csd too (src/dest rects), hence both stages.
+        if (current_bound_vao >= 0) {
+            MetalVAO *vao = &vaos[current_bound_vao];
+            if (vao->num_buffers > 0 && buffers[vao->buffers[0]].mtl_buffer) {
+                id<MTLBuffer> csd = buffers[vao->buffers[0]].mtl_buffer;
+                [mtl_current_encoder setVertexBuffer:csd offset:0 atIndex:custom_end_bindings.vert_csd_buf];
+                [mtl_current_encoder setFragmentBuffer:csd offset:0 atIndex:custom_end_bindings.frag_csd_buf];
+            }
+        }
+        // The four wrapper scalars, marshalled from the value store per the
+        // init_uniforms case-15 registration order (the C5 slot contract).
+        MetalCustomEndParams epp = {
+            .group = uniform_stores[current_program].values[CUSTOM_END_U_group].i[0],
+            .animation_progress = uniform_stores[current_program].values[CUSTOM_END_U_animation_progress].f[0],
+            .convert_to_srgb = uniform_stores[current_program].values[CUSTOM_END_U_convert_to_srgb].i[0] ? 1 : 0,
+        };
+        for (int c = 0; c < 4; c++) epp.viewport[c] = uniform_stores[current_program].values[CUSTOM_END_U_viewport].f[c];
+        [mtl_current_encoder setFragmentBytes:&epp length:sizeof(epp) atIndex:custom_end_bindings.frag_epp_buf];
+        // backbuffer/a/b/persist, bound by run_custom_end_shader through the
+        // glActiveTexture/glBindTexture shims at units GRAPHICS_UNIT (1) and
+        // CUSTOM_END_TEXTURE_{A,B,PERSIST}_UNIT (5/6/7, kitty/shaders.c).
+        static const int ce_units[4] = {1, 5, 6, 7};
+        for (int t = 0; t < 4; t++) {
+            GLuint tid = bound_tex_2d[ce_units[t]];
+            if (tid && tid < MAX_TEXTURES && textures[tid].texture) {
+                [mtl_current_encoder setFragmentTexture:textures[tid].texture atIndex:custom_end_bindings.tex[t]];
+                id<MTLSamplerState> smp = sampler_state_for(textures[tid].filter_linear, textures[tid].wrap);
+                if (smp) [mtl_current_encoder setFragmentSamplerState:smp atIndex:custom_end_bindings.smp[t]];
+                textures[tid].last_drawn_fidx = metal_frame_index;
+            }
+        }
     }
 
     // A generated vertex shader keeps upstream's fan order, so it is drawn
@@ -2685,6 +2888,7 @@ typedef struct {
     id<MTLTexture> layered_work_surface;                 // memoryless att0, sized to this window's drawable
     NSUInteger layered_work_w, layered_work_h;           // its cache key: size...
     MTLPixelFormat layered_work_surface_fmt;             // ...and format (memset 0 == MTLPixelFormatInvalid)
+    bool layered_work_surface_stored;                    // ...and storage: custom-end frames need att0 stored + sampleable
 } MetalWindowSlot;
 #define MAX_METAL_WINDOWS 64
 static MetalWindowSlot metal_windows[MAX_METAL_WINDOWS];
@@ -3279,21 +3483,40 @@ wanted_attachment_format(bool for_clear) {
 // H2: cached per window. current_window_slot is guarded explicitly rather than
 // inferred: metal_set_current_layer(NULL) leaves it NULL, and a layered frame
 // without a window to own the surface has nowhere to cache it.
+static bool layered_frame_stored_mode = false;  // custom-end frames: att0 stored + sampleable (see metal.h)
+
+void
+metal_set_layered_frame_stored(bool stored) {
+    layered_frame_stored_mode = stored;
+}
+
 static bool
 ensure_layered_work_surface(NSUInteger w, NSUInteger h) {
     MetalWindowSlot *s = current_window_slot;
     if (!s || w < 1 || h < 1) return false;
     const MTLPixelFormat want = layered_work_fmt();
-    if (s->layered_work_surface && s->layered_work_w == w && s->layered_work_h == h && s->layered_work_surface_fmt == want) return true;
+    const bool stored = layered_frame_stored_mode;
+    if (s->layered_work_surface && s->layered_work_w == w && s->layered_work_h == h && s->layered_work_surface_fmt == want &&
+        s->layered_work_surface_stored == stored) return true;
     [s->layered_work_surface release]; s->layered_work_surface = nil;
     MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:want
                                                                                     width:w height:h mipmapped:NO];
-    desc.usage = MTLTextureUsageRenderTarget;    // framebuffer-fetch read+write; never sampled
-    desc.storageMode = MTLStorageModeMemoryless; // tile memory only, never DRAM
+    if (stored) {
+        // Custom-end frames: the chain's seed blit SAMPLES this surface after
+        // the layered pass ends, so it must survive the pass (DRAM, stored).
+        // The memoryless bandwidth win is the documented cost of an active
+        // custom shader; the surface reverts on the first frame without one.
+        desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        desc.storageMode = MTLStorageModePrivate;
+    } else {
+        desc.usage = MTLTextureUsageRenderTarget;    // framebuffer-fetch read+write; never sampled
+        desc.storageMode = MTLStorageModeMemoryless; // tile memory only, never DRAM
+    }
     s->layered_work_surface = [mtl_device newTextureWithDescriptor:desc];
     if (!s->layered_work_surface) {
         s->layered_work_w = s->layered_work_h = 0; s->layered_work_surface_fmt = MTLPixelFormatInvalid; return false;
     }
+    s->layered_work_surface_stored = stored;
     // Counted here, on the creation path only -- never on the cache-hit return
     // above, which is the whole point of the measurement.
     metal_layered_surface_creates++;
@@ -3421,7 +3644,10 @@ metal_begin_layered_frame(void) {
     rpd.colorAttachments[0].texture = current_window_slot->layered_work_surface;
     rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
     rpd.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
-    rpd.colorAttachments[0].storeAction = MTLStoreActionDontCare;  // tile-only
+    // Custom-end frames keep att0 (the seed blit samples it after the pass);
+    // otherwise it is tile-only and discarded by the in-pass resolve.
+    rpd.colorAttachments[0].storeAction =
+        current_window_slot->layered_work_surface_stored ? MTLStoreActionStore : MTLStoreActionDontCare;
     rpd.colorAttachments[1].texture = att1;
     // First drawable pass this frame => DontCare (the resolve overwrites 100%);
     // if an earlier pass wrote the drawable (live-resize blank) => Load to keep it.
@@ -3474,6 +3700,135 @@ metal_resolve_layered_frame(void) {
     }
     end_current_encoder();          // stores att1 (drawable); att0 (memoryless) discarded
     layered_pass_active = false;
+}
+
+// Custom-end frames: end the layered pass WITHOUT the in-pass resolve. att0 was
+// opened with storeAction=Store (stored mode), so the rendered frame survives
+// for the seed blit; att1's stored contents are undefined and are fully
+// overwritten by metal_resolve_custom_end at the end of the chain. Safe to call
+// when no layered pass is active (no-op), mirroring metal_resolve_layered_frame.
+void
+metal_end_layered_frame_stored(void) {
+    if (!layered_pass_active) return;
+    end_current_encoder();
+    layered_pass_active = false;
+}
+
+// ---- Custom-end bridge passes (kitty-luv; shaders in kitty/blit_shaders.metal) ----
+// seed: stored working surface (top-down) -> the shared backbuffer texture,
+// mirrored into GL memory orientation, so the chain's textures and user shader
+// coordinates keep upstream's bottom-left contract. resolve: the chain's final
+// texture -> the drawable, mirrored back with the layers_resolve target-space
+// epilogue (this replaces both the in-pass resolve and the GL arm's in-chain
+// sRGB encode, which would be wrong on a linear-tagged drawable).
+
+typedef struct { id<MTLRenderPipelineState> pso; MTLPixelFormat dst_fmt; } CustomEndBridgePSO;
+static CustomEndBridgePSO custom_end_seed_psos[4];
+static CustomEndBridgePSO custom_end_resolve_psos[4];
+
+static id<MTLRenderPipelineState>
+ensure_custom_end_bridge_pso(bool resolve, MTLPixelFormat dst_fmt) {
+    CustomEndBridgePSO *cache = resolve ? custom_end_resolve_psos : custom_end_seed_psos;
+    for (size_t i = 0; i < arraysz(custom_end_seed_psos); i++) {
+        if (cache[i].pso && cache[i].dst_fmt == dst_fmt) return cache[i].pso;
+    }
+    if (!mtl_default_library) return nil;
+    NSError *error = nil;
+    id<MTLFunction> v = [mtl_default_library newFunctionWithName:@"layers_resolve_vertex"];
+    id<MTLFunction> f = nil;
+    if (resolve) {
+        // Same target-space constants as ensure_layers_resolve_pso: this pass
+        // is where custom-end frames get their encode/primaries treatment.
+        MTLFunctionConstantValues *fc = [[MTLFunctionConstantValues alloc] init];
+        const int space = target_color_space_for(dst_fmt, false);
+        const bool p3 = target_primaries_is_p3_for(dst_fmt, false);
+        [fc setConstantValue:&space type:MTLDataTypeInt atIndex:0];  // TARGET_COLOR_SPACE
+        [fc setConstantValue:&p3 type:MTLDataTypeBool atIndex:1];    // TARGET_PRIMARIES_IS_P3
+        f = [mtl_default_library newFunctionWithName:@"custom_end_resolve_fragment" constantValues:fc error:&error];
+        [fc release];
+    } else {
+        f = [mtl_default_library newFunctionWithName:@"custom_end_seed_fragment"];
+    }
+    if (!v || !f) {
+        log_error("Metal: custom end %s shader functions missing from metallib", resolve ? "resolve" : "seed");
+        [v release]; [f release];
+        return nil;
+    }
+    MTLRenderPipelineDescriptor *d = [[MTLRenderPipelineDescriptor alloc] init];
+    d.vertexFunction = v;
+    d.fragmentFunction = f;
+    d.colorAttachments[0].pixelFormat = dst_fmt;
+    id<MTLRenderPipelineState> pso = [mtl_device newRenderPipelineStateWithDescriptor:d error:&error];
+    [d release]; [v release]; [f release];
+    if (!pso) {
+        log_error("Metal: failed to build custom end %s PSO: %s", resolve ? "resolve" : "seed",
+                  error ? [[error localizedDescription] UTF8String] : "unknown error");
+        return nil;
+    }
+    for (size_t i = 0; i < arraysz(custom_end_seed_psos); i++) {
+        if (!cache[i].pso) { cache[i].pso = pso; cache[i].dst_fmt = dst_fmt; return pso; }
+    }
+    log_error("Metal: custom end %s PSO cache overflow", resolve ? "resolve" : "seed");
+    [pso release];
+    return nil;
+}
+
+bool
+metal_custom_end_seed(unsigned dest_fbo_id, unsigned vw, unsigned vh) {
+    const MetalWindowSlot *slot = current_window_slot;
+    if (!slot || !slot->layered_work_surface || !slot->layered_work_surface_stored) return false;
+    if (!(dest_fbo_id && dest_fbo_id < MAX_FRAMEBUFFERS && framebuffers[dest_fbo_id].in_use &&
+          framebuffers[dest_fbo_id].render_target)) return false;
+    id<MTLTexture> dst = framebuffers[dest_fbo_id].render_target;
+    end_current_encoder();
+    if (!ensure_command_buffer()) return false;
+    id<MTLRenderPipelineState> pso = ensure_custom_end_bridge_pso(false, dst.pixelFormat);
+    if (!pso) return false;
+    MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+    rpd.colorAttachments[0].texture = dst;
+    // Texels outside the viewport keep their prior contents (GL FBO parity —
+    // the shared texture can be larger than this window's viewport).
+    rpd.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> enc = [mtl_current_command_buffer renderCommandEncoderWithDescriptor:rpd];
+    if (!enc) return false;
+    metal_pass_count++;
+    [enc setViewport:(MTLViewport){0, 0, (double)vw, (double)vh, 0, 1}];
+    [enc setRenderPipelineState:pso];
+    [enc setFragmentTexture:slot->layered_work_surface atIndex:0];
+    float dims[2] = {(float)vw, (float)vh};
+    [enc setFragmentBytes:dims length:sizeof(dims) atIndex:0];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [enc endEncoding];
+    METAL_TRACE("custom_end: seed %ux%u -> fb %u\n", vw, vh, dest_fbo_id);
+    return true;
+}
+
+void
+metal_resolve_custom_end(unsigned final_tex_id, float sx, float sy, unsigned vw, unsigned vh) {
+    MetalTexture *t = get_texture(final_tex_id);
+    if (!t || !t->texture) return;
+    // The chain's last pass may still be open on a ping-pong target; end it so
+    // this pass observes its writes.
+    end_current_encoder();
+    // shaders.c bound framebuffer 0 before calling, so this targets the
+    // drawable (or the capture offscreen) exactly the way draw_quad would.
+    id<MTLRenderCommandEncoder> enc = begin_render_pass_to_drawable(false);
+    if (!enc) return;
+    id<MTLTexture> target = mtl_current_render_pass.colorAttachments[0].texture;
+    id<MTLRenderPipelineState> pso = ensure_custom_end_bridge_pso(true, target.pixelFormat);
+    if (!pso) return;  // pass stays open; the frame commit ends it
+    [enc setViewport:(MTLViewport){0, 0, (double)vw, (double)vh, 0, 1}];
+    [enc setRenderPipelineState:pso];
+    [enc setFragmentTexture:t->texture atIndex:0];
+    t->last_drawn_fidx = metal_frame_index;
+    float params[4] = {(float)vw, (float)vh, sx, sy};
+    [enc setFragmentBytes:params length:sizeof(params) atIndex:0];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    METAL_TRACE("custom_end: resolve tex %u (sx=%.4f sy=%.4f) fmt=%lu\n",
+                final_tex_id, sx, sy, (unsigned long)target.pixelFormat);
+    // The pass is left open: draw_resizing_text may draw on the drawable next
+    // (live resize); the frame commit ends it.
 }
 
 // W27 P3.2: kitty hands the drawable's clear colour over sRGB-ENCODED and
