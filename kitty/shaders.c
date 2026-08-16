@@ -2687,6 +2687,11 @@ blank_os_window(OSWindow *osw) {
 // Verbatim from the GL arm of start_os_window_rendering; the Metal arm calls
 // it only on custom-end frames (the seed blit fills the backbuffer texture
 // there and the chain runs through these targets via the GL shims).
+// EDR interaction (documented limitation): these targets are GL_RGBA16
+// (unorm), so on an EDR-engaged Metal frame — where the layered working
+// surface is RGBA16Float — the seed blit clamps >1.0 components at the chain
+// boundary. An active custom end chain therefore neutralizes the EDR text
+// boost for that frame; lifting it would take float chain intermediates.
 static void
 ensure_layered_render_targets(OSWindow *os_window) {
     // Ensure the global shared texture is large enough for this window

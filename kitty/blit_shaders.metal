@@ -113,11 +113,15 @@ fragment LayersResolveOut layers_resolve_fragment(float4 work [[color(0)]]) {
 fragment float4 custom_end_seed_fragment(
     float4 pos [[position]],
     texture2d<float, access::sample> src [[texture(0)]],
-    constant float2 &dims [[buffer(0)]])  // viewport (vw, vh) == source size
+    constant float4 &dims [[buffer(0)]])  // (vw, vh, src_w, src_h)
 {
+    // The work surface is DRAWABLE-sized, which during live resize is NOT the
+    // viewport (the GL arm offsets for the same mismatch in its last-group
+    // draw) — so the source is normalized by ITS OWN dims, never the
+    // viewport's, and the y-mirror pivots on the vh-row content band that the
+    // layered pass rendered at the top of the surface.
     constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::nearest);
-    float2 uv = pos.xy / dims;
-    return src.sample(s, float2(uv.x, 1.0f - uv.y));
+    return src.sample(s, float2(pos.x / dims.z, (dims.y - pos.y) / dims.w));
 }
 
 fragment float4 custom_end_resolve_fragment(

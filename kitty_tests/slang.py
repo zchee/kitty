@@ -500,7 +500,14 @@ fsMain(VertexOutput vo) : SV_Target { return float4(0); }
                 failures.append(f'{name}: fragment entry not renamed')
             mb = metadata.get('metal_bindings') or {}
             frag = mb.get('fragment') or {}
-            for key, want in (('buffers', ('csd', 'entryPointParams')), ('textures', ('backbuffer', 'a', 'b', 'persist')), ('samplers', ('backbuffer',))):
+            # The sampler tuple mirrors what activation REQUIRES
+            # (custom_end_bindings_from_metadata wants all four): a slangc
+            # that drops an unused sampler must fail here, not at runtime.
+            for key, want in (
+                ('buffers', ('csd', 'entryPointParams')),
+                ('textures', ('backbuffer', 'a', 'b', 'persist')),
+                ('samplers', ('backbuffer', 'a', 'b', 'persist')),
+            ):
                 have = frag.get(key) or {}
                 for w in want:
                     if w not in have:

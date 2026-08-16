@@ -326,6 +326,12 @@ class LoadShaderPrograms:
         def do(prog: int, slot: str) -> None:
             slot_pipelines = pmap.get(slot)
             if not slot_pipelines:
+                # Every deactivation must also forget the last-built tuple: it
+                # exists to skip REDUNDANT compiles of a still-active chain,
+                # and after a deactivation nothing is active — keeping it made
+                # unset -> re-add of the SAME value skip compile_program and
+                # leave the chain permanently inert until restart.
+                self.last_built_custom_shaders.pop(prog, None)
                 compile_program(prog, (), (), {}, allow_recompile)
             else:
                 try:
@@ -336,6 +342,7 @@ class LoadShaderPrograms:
                     # print(frag, file=open('/tmp/sample.frag', 'w'))
                 except Exception as e:
                     log_error(f'Failed to build custom shader for slot {slot} with error: {e}')
+                    self.last_built_custom_shaders.pop(prog, None)
                     compile_program(prog, (), (), {}, allow_recompile)
                 else:
                     try:
@@ -344,6 +351,7 @@ class LoadShaderPrograms:
                             self.last_built_custom_shaders[prog] = vert, frag, metadata
                     except Exception as e:
                         log_error(f'Failed to load custom shader for slot {slot} with error: {e}')
+                        self.last_built_custom_shaders.pop(prog, None)
                         compile_program(prog, (), (), {}, allow_recompile)
 
         do(CUSTOM_END_PROGRAM, 'end')
@@ -2398,10 +2406,14 @@ def build_custom_shader_pipeline_msl(
             v.stdin.write(src), v.stdin.close()
             f.stdin.write(src), f.stdin.close()
             try:
-                if (rc := v.wait()) != 0 or not os.path.exists(vertex):
-                    raise SlangFailed(f'{slot}.vert.metal', subprocess.CompletedProcess(vcmd, rc or 1, stderr=v.stderr.read()))
-                if (rc := f.wait()) != 0 or not os.path.exists(fragment):
-                    raise SlangFailed(f'{slot}.frag.metal', subprocess.CompletedProcess(fcmd, rc or 1, stderr=f.stderr.read()))
+                # Wait BOTH before judging either: raising on the vertex while
+                # the fragment still runs would leave a zombie writing into a
+                # closed stderr pipe.
+                vrc, frc = v.wait(), f.wait()
+                if vrc != 0 or not os.path.exists(vertex):
+                    raise SlangFailed(f'{slot}.vert.metal', subprocess.CompletedProcess(vcmd, vrc or 1, stderr=v.stderr.read()))
+                if frc != 0 or not os.path.exists(fragment):
+                    raise SlangFailed(f'{slot}.frag.metal', subprocess.CompletedProcess(fcmd, frc or 1, stderr=f.stderr.read()))
             finally:
                 v.stderr.close()
                 f.stderr.close()

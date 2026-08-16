@@ -3796,11 +3796,15 @@ metal_custom_end_seed(unsigned dest_fbo_id, unsigned vw, unsigned vh) {
     [enc setViewport:(MTLViewport){0, 0, (double)vw, (double)vh, 0, 1}];
     [enc setRenderPipelineState:pso];
     [enc setFragmentTexture:slot->layered_work_surface atIndex:0];
-    float dims[2] = {(float)vw, (float)vh};
+    // Source dims travel separately from the viewport: the work surface is
+    // drawable-sized, and during live resize drawableSize != viewport.
+    float dims[4] = {(float)vw, (float)vh,
+                     (float)slot->layered_work_surface.width, (float)slot->layered_work_surface.height};
     [enc setFragmentBytes:dims length:sizeof(dims) atIndex:0];
     [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [enc endEncoding];
-    METAL_TRACE("custom_end: seed %ux%u -> fb %u\n", vw, vh, dest_fbo_id);
+    METAL_TRACE("custom_end: seed %ux%u (src %ux%u) -> fb %u\n", vw, vh,
+                (unsigned)slot->layered_work_surface.width, (unsigned)slot->layered_work_surface.height, dest_fbo_id);
     return true;
 }
 
