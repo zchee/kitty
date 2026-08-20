@@ -181,24 +181,6 @@ _report_params_with_first(PyObject *dump_callback, id_type window_id, const char
 // }}}
 
 // Utils {{{
-static const int64_t digit_multipliers[] = {
-    10000000000000000l,
-    1000000000000000l,
-    100000000000000l,
-    10000000000000l,
-    1000000000000l,
-    100000000000l,
-    10000000000l,
-    1000000000l,
-    100000000l,
-    10000000l,
-    1000000l,
-    100000l,
-    10000l,
-    1000l,
-    100l,
-    1l};
-
 // }}}
 
 // Data structures {{{
@@ -552,18 +534,14 @@ dispatch_osc(PS *self, uint8_t *buf, size_t limit, bool is_extended_osc) {
     break;           \
     }
 
-    int64_t accumulator = 0;
     int code = 0;
     unsigned int i;
     for (i = 0; i < MIN(limit, 5u); i++) {
-        int64_t num = buf[i] - '0';
-        if (num < 0 || num > 9) break;
-        accumulator += num * digit_multipliers[i];
+        uint8_t num = buf[i] - '0';
+        if (num > 9) break;
+        code = code * 10 + num;
     }
-    if (i > 0) {
-        code = accumulator / digit_multipliers[i - 1];
-        if (i < limit && buf[i] == ';') i++;
-    }
+    if (i < limit && buf[i] == ';') i++;
 
     switch (code) {
         case 0:
@@ -839,21 +817,6 @@ csi_letter(unsigned code) {
     return buf;
 }
 
-// Wave-13a P1 kill switch. The default fast path accumulates CSI parameters
-// low-end-first (acc = acc*10 + digit) and drops the per-parameter 64-bit
-// unsigned divide the legacy high-end scheme paid at commit. Setting
-// KITTY_VTP_LEGACY_CSI_PARSE=1 restores the legacy multiply-up-against-
-// digit_multipliers-then-divide-down path so the same binary can A/B the two.
-// Cached function-static getenv (cf. metal.m metal_timer_pace_enabled); the
-// result is fixed for the process, so the per-digit branch is perfectly
-// predicted. Default = fast path (legacy off unless explicitly enabled).
-static bool
-use_legacy_csi_parse(void) {
-    static int state = -1;
-    if (state < 0) { const char *v = getenv("KITTY_VTP_LEGACY_CSI_PARSE"); state = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0; }
-    return state == 1;
-}
-
 static bool
 commit_csi_param(PS *self UNUSED, ParsedCSI *csi) {
     if (!csi->num_digits) return true;
@@ -861,34 +824,28 @@ commit_csi_param(PS *self UNUSED, ParsedCSI *csi) {
         REPORT_ERROR("CSI escape code has too many parameters, ignoring it");
         return false;
     }
-    // Both arms assign mult*(uint64_t value) to an int param, so the overflow
-    // truncation is identical; only how the uint64_t value was accumulated
-    // differs (see csi_add_digit). The fast path already holds the value, so
-    // there is no divide.
-    csi->params[csi->num_params++] = UNLIKELY(use_legacy_csi_parse())
-        ? csi->mult * (csi->accumulator / digit_multipliers[csi->num_digits - 1])
-        : csi->mult * csi->accumulator;
-    csi->num_digits = 0; csi->mult = 1; csi->accumulator = 0;
+    csi->params[csi->num_params++] = csi->mult * (int64_t)csi->accumulator;
+    csi->num_digits = 0;
+    csi->mult = 1;
+    csi->accumulator = 0;
     return true;
 }
 
+#define MAX_CSI_DIGITS 16u
+
 static void
 csi_add_digit(ParsedCSI *csi, uint8_t ch) {
-    if (UNLIKELY(use_legacy_csi_parse())) {
-        if (UNLIKELY(csi->num_digits >= arraysz(digit_multipliers))) return;
-        csi->accumulator += (ch - '0') * digit_multipliers[csi->num_digits++];
-        return;
-    }
-    // Fast path: plain low-end accumulation, no divide and no multiplier table.
-    // Bit-identical to the legacy path for every input (verified exhaustively):
-    // the legacy table capped accumulation at 16 digits and its last slot held
-    // 10^0 instead of 10^1, so the 16th accumulated digit carries 100x weight
-    // rather than 10x. Reproduce both the 16-digit cap and that one 100x step
-    // (num_digits is pre-bumped by a leading '-', exactly as the legacy table
-    // index was) so overflow/clamp output is unchanged.
-    if (UNLIKELY(csi->num_digits >= arraysz(digit_multipliers))) return;  // 16-digit cap
-    csi->accumulator = csi->accumulator * (UNLIKELY(csi->num_digits == arraysz(digit_multipliers) - 1) ? 100u : 10u) + (uint64_t)(ch - '0');
+    if (UNLIKELY(csi->num_digits >= MAX_CSI_DIGITS)) return;
     csi->num_digits++;
+    csi->accumulator = csi->accumulator * 10 + (ch - '0');
+}
+
+static void
+consume_csi_digit_run(ParsedCSI *csi, const uint8_t *buf, size_t *pos, const size_t sz) {
+    // consume a run of parameter digits without re-entering the per-byte state machine
+    size_t p = *pos;
+    while (p < sz && (uint8_t)(buf[p] - '0') <= 9) csi_add_digit(csi, buf[p++]);
+    *pos = p;
 }
 
 static bool
@@ -906,6 +863,7 @@ csi_parse_loop(PS *self, ParsedCSI *csi, const uint8_t *buf, size_t *pos, const 
                         break;
                     case DIGIT:
                         csi_add_digit(csi, ch);
+                        consume_csi_digit_run(csi, buf, pos, sz);
                         csi->state = CSI_BODY;
                         break;
                     case '?':
@@ -973,7 +931,10 @@ csi_parse_loop(PS *self, ParsedCSI *csi, const uint8_t *buf, size_t *pos, const 
                         if (!commit_csi_param(self, csi)) return true;
                         csi->is_sub_param[csi->num_params] = false;
                         break;
-                    case DIGIT: csi_add_digit(csi, ch); break;
+                    case DIGIT:
+                        csi_add_digit(csi, ch);
+                        consume_csi_digit_run(csi, buf, pos, sz);
+                        break;
                     default: REPORT_ERROR("Invalid character in CSI: %s (0x%x), ignoring the sequence", csi_letter(ch), ch); return true;
                 }
                 break;

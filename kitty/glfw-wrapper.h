@@ -889,7 +889,7 @@ typedef enum {
     GLFW_GRAB_CURSOR,
     GLFW_GRABBING_CURSOR,
     GLFW_INVALID_CURSOR,
-    /* end mouse cursor shapes */
+/* end mouse cursor shapes */
 } GLFWCursorShape;
 /*! @} */
 

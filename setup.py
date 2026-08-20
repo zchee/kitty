@@ -36,6 +36,7 @@ def homebrew_prefix() -> str:
     prefix = "/usr/local" if not is_arm else "/opt/homebrew"
     return prefix
 
+
 def check_version_info() -> None:
     with open(os.path.join(src_base, 'pyproject.toml')) as f:
         raw = f.read()
@@ -692,7 +693,6 @@ def init_env(
     if profile:
         cppflags.append('-DWITH_PROFILER')
         cflags.append('-g3')
-        ldflags.append('-lprofiler')
 
     if debug or profile:
         cflags.append('-fno-omit-frame-pointer')
@@ -973,6 +973,16 @@ def get_source_specific_cflags(env: Env, src: str) -> List[str]:
                     ans.append('-x86-use-vzeroupper=0')
                 else:
                     ans.append('-mno-vzeroupper')
+    elif src == 'kitty/simd-string-512.c':
+        # uses native AVX-512 intrinsics, only compiled on x86-64, selected at runtime only when the CPU supports these features
+        if env.binary_arch.isa is ISA.AMD64:
+            ans.extend(('-mavx512f', '-mavx512bw', '-mavx512vl', '-mavx512vbmi2'))
+            # We have manual vzeroupper so prevent compiler from emitting it causing duplicates
+            if env.compiler_type is CompilerType.clang:
+                ans.append('-mllvm')
+                ans.append('-x86-use-vzeroupper=0')
+            else:
+                ans.append('-mno-vzeroupper')
     elif src.startswith('3rdparty/base64/lib/arch/'):
         if env.binary_arch.isa in (ISA.AMD64, ISA.X86):
             q = src.split(os.path.sep)
@@ -1870,8 +1880,6 @@ def build_launcher(args: Options, launcher_dir: str = '.', bundle_type: str = 's
             cflags.extend(sanitize_args)
             ldflags.extend(sanitize_args)
             libs += ['-lasan'] if not is_macos and env.compiler_type is not CompilerType.clang else []
-        if args.profile:
-            libs.append('-lprofiler')
     else:
         cflags.append('-g3' if args.debug else '-O3')
     if bundle_type.endswith('-freeze'):
@@ -2618,7 +2626,7 @@ def option_parser() -> argparse.ArgumentParser:  # {{{
         ' the Python used to run setup.py is queried for these.',
     )
     p.add_argument('--full', dest='incremental', default=Options.incremental, action='store_false', help='Do a full build, even for unchanged files')
-    p.add_argument('--profile', default=Options.profile, action='store_true', help='Use the -pg compile flag to add profiling information')
+    p.add_argument('--profile', default=Options.profile, action='store_true', help='Use compile flags to add profiling information')
     p.add_argument(
         '--libdir-name', default=Options.libdir_name, help='The name of the directory inside --prefix in which to store compiled files. Defaults to "lib"'
     )
