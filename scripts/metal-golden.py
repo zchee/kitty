@@ -173,6 +173,19 @@ CONFIG_MATRIX: dict[str, list[str]] = {
     # (one extra RGBA16Unorm quantization hop), proving the bridge neither
     # flips, scales, nor double-transforms.
     "custom-negative": ["custom_shaders=negative"],
+    # fallback_font gate (ja-font): the ONLY config that populates the user
+    # fallback band -- load_fallback_font()'s pre-OS pass, the four styled
+    # faces per family and the bold/regular selection (Mincho W3 vs W6)
+    # execute nowhere else. The scene (see the helper) renders Japanese
+    # text in regular AND bold rows through the band, since the measurement
+    # font has no CJK coverage. The family is Mincho (serif) deliberately:
+    # the OS fallback picks Hiragino Sans (gothic) for Japanese, so a band
+    # that silently never engaged would reproduce the OS pixels -- measured
+    # at introduction: family="Hiragino Sans" was max_diff=0 against the
+    # no-fallback probe (toothless), Mincho differs. Introduction proofs:
+    # capture x2 byte-identical (determinism), and the no-fallback_font
+    # probe of the same scene DIFFERS (movement).
+    "japanese-fallback": ['fallback_font=family="Hiragino Mincho ProN"'],
 }
 
 # Configs whose golden artifact is the thumbnail lever's output (value =
@@ -189,7 +202,7 @@ THUMB_CONFIGS: dict[str, str] = {"screenshot-thumb": "0.5"}
 # never imports), so the assert fires at capture/compare EXECUTION, not
 # during reverify's count read -- the two readers are complementary; do
 # not "fix" the constant into the AST path.
-EXPECT_CONFIG_MATRIX = 17
+EXPECT_CONFIG_MATRIX = 18
 assert len(CONFIG_MATRIX) == EXPECT_CONFIG_MATRIX, (
     f"CONFIG_MATRIX has {len(CONFIG_MATRIX)} configs but EXPECT_CONFIG_MATRIX declares "
     f"{EXPECT_CONFIG_MATRIX} -- update the constant in the same change that alters the matrix"
@@ -203,6 +216,7 @@ CONFIG_SCENE: dict[str, str] = {
     "palette-oklch": "palette",
     "hdr-ramp": "hdr-ramp",
     "padding-fill": "padding",
+    "japanese-fallback": "japanese",
 }
 
 # Extra environment for specific configs (merged into the sanitized spawn env).

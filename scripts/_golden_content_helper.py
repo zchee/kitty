@@ -166,6 +166,28 @@ def main() -> int:
         for i in range(len(specs)):
             out.write(f"\x1b[48;5;{16 + i}m    \x1b[0m")
 
+    elif scene == "japanese":
+        # Golden for the fallback_font user fallback chain: Japanese text
+        # (hiragana/katakana/kanji) in regular AND bold rows. The harness
+        # measurement font (MonoLisaCode) has no CJK coverage, so every CJK
+        # cell takes the fallback path; with the japanese-fallback config's
+        # fallback_font entry the bold rows must come from the configured
+        # family's bold face (Hiragino Sans W3 vs W6), not a re-query of the
+        # OS. Content from gen_japanese_fixture.generate (deterministic by
+        # seed), sliced per row at fixed offsets so the bytes never drift.
+        # Autowrap off: rows are clipped, not wrapped, whatever the window
+        # geometry.
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from gen_japanese_fixture import generate
+        text = generate(4096, 5361).replace("\n", "")
+        out.write("\x1b[?7l")
+        for row in range(14):
+            out.write(f"\x1b[{row + 7};1H")
+            if row % 2:
+                out.write("\x1b[1m")
+            out.write(text[row * 38:(row + 1) * 38])
+            out.write(_RESET)
+        out.write("\x1b[?7h")
     elif scene == "padding":
         # Padding-fill port gate scene: every cell gets a NON-default
         # saturated background, so the compensatory padding strips (which
