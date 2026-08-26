@@ -122,6 +122,52 @@ This option can be specified multiple times. The syntax is::
 
 
 opt(
+    '+fallback_font',
+    'family="Hiragino Sans"',
+    option_type='fallback_font',
+    add_to_default=False,
+    long_text="""
+An ordered list of fonts to try when the main font (and its bold/italic
+variants) lacks a glyph for some text, consulted *before* asking the operating
+system for a fallback font. Accepts the same :ref:`font specification syntax
+<font_spec_syntax>` as :opt:`font_family`, and like it, resolves the proper
+bold, italic and bold-italic faces for the family automatically, so for
+example Japanese text renders with the correct weight for bold cells. This
+option can be specified multiple times; the first listed entry that actually
+contains glyphs for the text is used. Unlike :opt:`symbol_map`, coverage is
+verified per character: an entry that does not cover the text is skipped and
+lookup falls through, ultimately to the OS font fallback mechanism, so a
+mis-specified font can never cause missing-glyph boxes. Note that an entry
+applies to *every* character the main font lacks, not just a particular
+script: a broad-coverage font such as a CJK family will also capture, e.g.,
+Greek or arrows if the main font misses them and it covers them. Use
+:option:`kitty --debug-font-fallback` to see which characters an entry
+captures. :opt:`symbol_map` takes precedence over this option. For example::
+
+    fallback_font family="Hiragino Sans"
+    fallback_font family="Noto Sans Devanagari"
+""",
+)
+
+opt(
+    '+emoji_font',
+    'family="Noto Color Emoji"',
+    option_type='emoji_font',
+    add_to_default=False,
+    long_text="""
+Like :opt:`fallback_font`, but consulted only for characters rendered with
+emoji presentation. Accepts the same :ref:`font specification syntax
+<font_spec_syntax>` as :opt:`font_family`. Can be specified multiple times;
+the first listed entry that contains a glyph for the emoji is used, and an
+entry lacking the glyph is skipped, falling through to the OS emoji font.
+Only a single face per family is used, since bold/italic do not apply to
+emoji. For example::
+
+    emoji_font family="Noto Color Emoji"
+""",
+)
+
+opt(
     'disable_ligatures',
     'never',
     option_type='disable_ligatures',

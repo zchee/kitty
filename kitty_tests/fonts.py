@@ -562,6 +562,99 @@ class Rendering(FontBaseTest):
         self.ae(coalesce_symbol_maps(q), {(0, 0): 'a', (1, 2): 'c', (3, 9): 'a', (10, 11): 'b', (12, 30): 'a'})
 
 
+@unittest.skipUnless(is_macos, 'The fallback_font tests use macOS system fonts')
+class UserFallback(BaseTest):
+    # The main font for these tests is Menlo, which has no CJK or emoji
+    # coverage, so Japanese text and emoji always take the fallback path.
+
+    def fonts_opts(self, **kw):
+        for key in ('fallback_font', 'emoji_font'):
+            if key in kw:
+                kw[key] = {s: FontSpec.from_setting(s) for s in kw[key]}
+        if 'symbol_map' in kw:
+            kw['symbol_map'] = {r: f for r, f in kw['symbol_map'].items()}
+        return kw
+
+    def expected_ps_name(self, spec: str, bold: bool = False, italic: bool = False) -> str:
+        # mirrors the resolution in create_user_fallback_fonts(): the family's
+        # regular face first, styled faces derived within that family
+        from kitty.fonts.common import get_font_from_spec
+        fs = FontSpec.from_setting(spec)
+        base = get_font_from_spec(fs, monospaced=False)
+        d = get_font_from_spec(fs, bold, italic, resolved_medium_font=base, monospaced=False) if (bold or italic) else base
+        return face_from_descriptor(d).postscript_name()
+
+    def test_current_fonts_bands(self):
+        # AC5: the symbol band length must not absorb the user-fallback or
+        # emoji-fallback bands (regression guard for the derived count that
+        # was computed by band-boundary subtraction in current_fonts())
+        from kitty.fast_data_types import current_fonts
+        sm = {(0x2716, 0x2716): 'Zapf Dingbats'}
+        with setup_for_testing(family='Menlo', extra_opts=self.fonts_opts(symbol_map=sm)):
+            cf = current_fonts()
+            self.ae(len(cf['symbol']), 1)
+            self.ae(len(cf['user_fallback']), 0)
+            self.ae(len(cf['emoji_fallback']), 0)
+        eo = self.fonts_opts(symbol_map=sm, fallback_font=['family="Hiragino Sans"'], emoji_font=['family="Apple Color Emoji"'])
+        with setup_for_testing(family='Menlo', extra_opts=eo):
+            cf = current_fonts()
+            self.ae(len(cf['symbol']), 1)  # AC5: independent of fallback_font entries
+            # AC9: four styled faces per fallback_font family, one per emoji_font family
+            self.ae(len(cf['user_fallback']), 4)
+            self.ae(len(cf['emoji_fallback']), 1)
+
+    def test_fallback_font_style_resolution(self):
+        # AC1 + AC2: regular and bold cells resolve to the family's regular
+        # and bold faces respectively
+        spec = 'family="Hiragino Sans"'
+        with setup_for_testing(family='Menlo', extra_opts=self.fonts_opts(fallback_font=[spec])):
+            regular = get_fallback_font('あ', False, False).postscript_name()
+            bold = get_fallback_font('あ', True, False).postscript_name()
+            self.ae(regular, self.expected_ps_name(spec))  # AC1
+            self.ae(bold, self.expected_ps_name(spec, bold=True))  # AC2
+            self.assertNotEqual(regular, bold)
+
+    def test_fallback_font_coverage_skip(self):
+        # AC3: a first entry that does not cover the text is skipped, not used
+        spec = 'family="Hiragino Sans"'
+        with setup_for_testing(family='Menlo', extra_opts=self.fonts_opts(fallback_font=['family="Courier New"', spec])):
+            self.ae(get_fallback_font('あ', False, False).postscript_name(), self.expected_ps_name(spec))
+
+    def test_fallback_font_ordering(self):
+        # two covering entries: the first listed wins
+        first, second = 'family="Hiragino Sans"', 'family="Hiragino Mincho ProN"'
+        with setup_for_testing(family='Menlo', extra_opts=self.fonts_opts(fallback_font=[first, second])):
+            self.ae(get_fallback_font('あ', False, False).postscript_name(), self.expected_ps_name(first))
+        with setup_for_testing(family='Menlo', extra_opts=self.fonts_opts(fallback_font=[second, first])):
+            self.ae(get_fallback_font('あ', False, False).postscript_name(), self.expected_ps_name(second))
+
+    def test_fallback_font_falls_through_to_os(self):
+        # entries that cover nothing relevant leave behavior identical to no config
+        with setup_for_testing(family='Menlo'):
+            expected = get_fallback_font('あ', False, False).postscript_name()
+        with setup_for_testing(family='Menlo', extra_opts=self.fonts_opts(fallback_font=['family="Courier New"'])):
+            self.ae(get_fallback_font('あ', False, False).postscript_name(), expected)
+
+    def test_emoji_font_fallthrough(self):
+        # AC10: an emoji_font entry lacking the glyph falls through to the OS
+        # emoji font instead of rendering .notdef
+        with setup_for_testing(family='Menlo', extra_opts=self.fonts_opts(emoji_font=['family="Courier New"'])):
+            face = get_fallback_font('🍣', False, False, True)
+            self.ae(face.postscript_name(), 'AppleColorEmoji')
+        with setup_for_testing(family='Menlo', extra_opts=self.fonts_opts(emoji_font=['family="Apple Color Emoji"'])):
+            face = get_fallback_font('🍣', False, False, True)
+            self.ae(face.postscript_name(), 'AppleColorEmoji')
+
+    def test_fallback_font_spec_parsing(self):
+        from kitty.options.utils import fallback_font as parse_fb
+        for setting in ('family="Hiragino Sans"', 'Hiragino Sans', 'postscript_name=HiraginoSans-W3', 'family="Hiragino Sans" style="W6"'):
+            (key, spec), = parse_fb(setting)
+            self.ae(key, setting)
+            self.ae(spec, FontSpec.from_setting(setting))
+        # a hyphenated postscript name survives family_name_to_key
+        self.ae(family_name_to_key('HiraginoSans-W3'), 'HiraginoSans-W3'.lower())
+
+
 def test_chars(chars: str = '╌', sz: int = 128) -> None:
     # kitty +runpy "from kitty.fonts.box_drawing import test_chars; test_chars('XXX')"
     from kitty.fast_data_types import concat_cells, render_box_char, set_send_sprite_to_gpu

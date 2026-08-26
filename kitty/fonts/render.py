@@ -29,7 +29,7 @@ from kitty.typing_compat import CoreTextFont, FontConfigPattern
 from kitty.utils import log_error
 
 from . import family_name_to_key
-from .common import get_font_files
+from .common import get_font_files, get_font_from_spec
 
 if is_macos:
     from .core_text import font_for_family as font_for_family_macos
@@ -164,6 +164,32 @@ def create_narrow_symbols(opts: Options) -> tuple[tuple[int, int, int], ...]:
     return tuple((a, b, v) for (a, b), v in coalesce_symbol_maps(opts.narrow_symbols).items())
 
 
+def create_user_fallback_fonts(opts: Options) -> int:
+    # Resolve each fallback_font spec into its four styled faces, in config
+    # order. The style order must match the C band layout in
+    # load_fallback_font(): first_user_fallback_idx + 4*family + (bold ? 1 : 0) + (italic ? 2 : 0).
+    # Each family's regular face is resolved first and the styled faces are
+    # derived within that family (mirroring how get_font_files derives
+    # bold/italic from the medium font). monospaced=False because fallback
+    # families (CJK especially) are typically proportional -- the same reason
+    # symbol_map's font_for_family matches non-monospace fonts.
+    for spec in opts.fallback_font.values():
+        base = get_font_from_spec(spec, monospaced=False)
+        current_faces.append((base, False, False))
+        for bold, italic in ((True, False), (False, True), (True, True)):
+            font = get_font_from_spec(spec, bold, italic, resolved_medium_font=base, monospaced=False)
+            current_faces.append((font, bold, italic))
+    return len(opts.fallback_font)
+
+
+def create_emoji_fallback_fonts(opts: Options) -> int:
+    # one face per family: bold/italic are ignored for emoji presentation
+    for spec in opts.emoji_font.values():
+        font = get_font_from_spec(spec, monospaced=False)
+        current_faces.append((font, False, False))
+    return len(opts.emoji_font)
+
+
 descriptor_overrides: dict[int, tuple[str, bool, bool]] = {}
 
 
@@ -183,6 +209,16 @@ def dump_font_debug() -> None:
     if ss:
         log_error('Symbol map fonts:')
         for s in ss:
+            log_error('  ' + s.identify_for_debug())
+    uf = cf['user_fallback']
+    if uf:
+        log_error('User fallback fonts (fallback_font):')
+        for s in uf:
+            log_error('  ' + s.identify_for_debug())
+    ef = cf['emoji_fallback']
+    if ef:
+        log_error('Emoji fonts (emoji_font):')
+        for s in ef:
             log_error('  ' + s.identify_for_debug())
 
 
@@ -219,7 +255,13 @@ def set_font_family(opts: Options | None = None, override_font_size: float | Non
     sm = create_symbol_map(opts)
     ns = create_narrow_symbols(opts)
     num_symbol_fonts = len(current_faces) - before
-    set_font_data(descriptor_for_idx, indices['bold'], indices['italic'], indices['bi'], num_symbol_fonts, sm, sz, ns)
+    # band order in current_faces must match initialize_font_group():
+    # symbol_map faces, then fallback_font faces, then emoji_font faces
+    num_user_fallback_families = create_user_fallback_fonts(opts)
+    num_emoji_fallback_families = create_emoji_fallback_fonts(opts)
+    set_font_data(
+        descriptor_for_idx, indices['bold'], indices['italic'], indices['bi'], num_symbol_fonts,
+        num_user_fallback_families, num_emoji_fallback_families, sm, sz, ns)
 
 
 if TYPE_CHECKING:
@@ -236,13 +278,17 @@ class setup_for_testing:
     ynum = 100
     baseline = 0
 
-    def __init__(self, family: str = 'monospace', size: float = 11.0, dpi: float = 96.0, main_face_path: str = ''):
+    def __init__(
+        self, family: str = 'monospace', size: float = 11.0, dpi: float = 96.0, main_face_path: str = '',
+        extra_opts: dict[str, Any] | None = None,
+    ):
         self.family, self.size, self.dpi = family, size, dpi
         self.main_face_path = main_face_path
+        self.extra_opts = extra_opts or {}
 
     def __enter__(self) -> tuple[dict[tuple[int, int, int], bytes], int, int]:
         global descriptor_overrides
-        opts = defaults._replace(font_family=parse_font_spec(self.family), font_size=self.size)
+        opts = defaults._replace(font_family=parse_font_spec(self.family), font_size=self.size, **self.extra_opts)
         set_options(opts)
         sprites = {}
 

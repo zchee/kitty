@@ -341,6 +341,7 @@ def get_font_from_spec(
     family_axis_values: FamilyAxisValues = FamilyAxisValues(),
     resolved_medium_font: Descriptor | None = None,
     match_is_more_specific_than_family: Event = Event(),
+    monospaced: bool = True,
 ) -> Descriptor:
     if not spec.is_system:
         ans = get_fine_grained_font(
@@ -349,6 +350,7 @@ def get_font_from_spec(
             italic,
             resolved_medium_font=resolved_medium_font,
             family_axis_values=family_axis_values,
+            monospaced=monospaced,
             match_is_more_specific_than_family=match_is_more_specific_than_family,
         )
         if spec.features:
@@ -366,7 +368,7 @@ def get_font_from_spec(
                     return v
         else:
             family = 'monospace'
-    return find_best_match(family, bold, italic, ignore_face=resolved_medium_font)
+    return find_best_match(family, bold, italic, ignore_face=resolved_medium_font, monospaced=monospaced)
 
 
 class FontFiles(TypedDict):

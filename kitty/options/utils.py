@@ -1243,6 +1243,18 @@ def narrow_symbols(val: str) -> Iterable[tuple[tuple[int, int], int]]:
         yield x, int(y or 1)
 
 
+def fallback_font(val: str) -> Iterable[tuple[str, FontSpec]]:
+    # keyed by the spec string so duplicate lines coalesce; dicts preserve
+    # insertion order, which is the documented first-listed-wins order
+    spec = FontSpec.from_setting(val)
+    yield spec.as_setting, spec
+
+
+def emoji_font(val: str) -> Iterable[tuple[str, FontSpec]]:
+    spec = FontSpec.from_setting(val)
+    yield spec.as_setting, spec
+
+
 def parse_key_action(action: str, action_type: MapType = MapType.MAP) -> KeyAction:
     parts = action.strip().split(maxsplit=1)
     func = parts[0]
