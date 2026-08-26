@@ -166,6 +166,19 @@ def main() -> int:
         for i in range(len(specs)):
             out.write(f"\x1b[48;5;{16 + i}m    \x1b[0m")
 
+    elif scene == "japanese":
+        # fallback_font golden scene: deterministic pseudo-Japanese text
+        # (gen_japanese_fixture, fixed seed) in regular AND bold, so the
+        # capture exercises the user fallback band's per-style faces (the
+        # harness main font has no CJK coverage; the japanese-fallback config
+        # supplies fallback_font=Hiragino Sans, whose W3/W6 differ). Rows 7-8
+        # keep clear of the legacy content (rows 1-5) and the pinned final
+        # cursor position (row 10).
+        import gen_japanese_fixture
+        text = gen_japanese_fixture.generate(120, seed=27).replace("\n", "")[:28]
+        out.write(f"\x1b[7;1H{text}")
+        out.write(f"\x1b[8;1H\x1b[1m{text}{_RESET}")
+
     elif scene == "padding":
         # Padding-fill port gate scene: every cell gets a NON-default
         # saturated background, so the compensatory padding strips (which

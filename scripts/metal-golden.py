@@ -173,6 +173,13 @@ CONFIG_MATRIX: dict[str, list[str]] = {
     # (one extra RGBA16Unorm quantization hop), proving the bridge neither
     # flips, scales, nor double-transforms.
     "custom-negative": ["custom_shaders=negative"],
+    # fallback_font gate: the ONLY config that populates the user fallback
+    # band (load_fallback_font's pre-OS pass) -- every other config leaves
+    # both band loops zero-iteration. The japanese scene paints deterministic
+    # pseudo-Japanese (fixed seed) in regular AND bold, so both the band's
+    # style-0 and style-1 faces render: the harness main font has no CJK
+    # coverage and Hiragino Sans resolves to distinct W3/W6 faces.
+    "japanese-fallback": ['fallback_font=family="Hiragino Sans"'],
 }
 
 # Configs whose golden artifact is the thumbnail lever's output (value =
@@ -189,7 +196,7 @@ THUMB_CONFIGS: dict[str, str] = {"screenshot-thumb": "0.5"}
 # never imports), so the assert fires at capture/compare EXECUTION, not
 # during reverify's count read -- the two readers are complementary; do
 # not "fix" the constant into the AST path.
-EXPECT_CONFIG_MATRIX = 17
+EXPECT_CONFIG_MATRIX = 18
 assert len(CONFIG_MATRIX) == EXPECT_CONFIG_MATRIX, (
     f"CONFIG_MATRIX has {len(CONFIG_MATRIX)} configs but EXPECT_CONFIG_MATRIX declares "
     f"{EXPECT_CONFIG_MATRIX} -- update the constant in the same change that alters the matrix"
@@ -203,6 +210,7 @@ CONFIG_SCENE: dict[str, str] = {
     "palette-oklch": "palette",
     "hdr-ramp": "hdr-ramp",
     "padding-fill": "padding",
+    "japanese-fallback": "japanese",
 }
 
 # Extra environment for specific configs (merged into the sanitized spawn env).
