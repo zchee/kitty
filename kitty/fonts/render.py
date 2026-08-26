@@ -29,7 +29,15 @@ from kitty.typing_compat import CoreTextFont, FontConfigPattern
 from kitty.utils import log_error
 
 from . import family_name_to_key
-from .common import Descriptor, FamilyAxisValues, get_font_files_and_medium_resolution, get_font_from_spec
+from .common import (
+    FamilyAxisValues,
+    get_axis_values,
+    get_font_files,
+    get_font_from_spec,
+    get_variable_data_for_descriptor,
+    is_actually_variable_despite_fontconfigs_lies,
+    is_variable,
+)
 
 if is_macos:
     from .core_text import font_for_family as font_for_family_macos
@@ -208,18 +216,28 @@ def clear_font_caches() -> None:
     clear_platform_caches()
 
 
-def create_user_fallback_fonts(opts: Options, medium_font: Descriptor, family_axis_values: FamilyAxisValues) -> int:
+def create_user_fallback_fonts(opts: Options) -> int:
     # Resolve each fallback_font spec into its four styled faces, in config
     # order. The append order per family (regular, bold, italic, bi) must match
     # the style offset computed in load_fallback_font() in kitty/fonts.c.
+    # monospaced=False: fallback families (CJK being the motivating case) are
+    # usually proportional, so restricting the search to monospaced fonts
+    # would silently resolve them to Menlo/monospace. Each family is anchored
+    # on its OWN resolved regular face: resolved_medium_font is the anchor for
+    # in-family variable-axis derivation (find_bold_italic_variant keys
+    # variable_map by the anchor's family), so threading the MAIN font's
+    # medium here would crash on a static main font (KeyError) or silently
+    # resolve a variable fallback family's slots to the main font.
     count = 0
     for spec in opts.fallback_font.values():
-        for bold, italic in ((False, False), (True, False), (False, True), (True, True)):
-            # monospaced=False: fallback families (CJK being the motivating
-            # case) are usually proportional, so restricting the search to
-            # monospaced fonts would silently resolve them to Menlo/monospace.
+        regular = get_font_from_spec(spec, monospaced=False)
+        family_axis_values = FamilyAxisValues()
+        if is_variable(regular) or is_actually_variable_despite_fontconfigs_lies(regular):
+            family_axis_values.set_regular_values(get_axis_values(regular, get_variable_data_for_descriptor(regular)))
+        current_faces.append((regular, False, False))
+        for bold, italic in ((True, False), (False, True), (True, True)):
             font = get_font_from_spec(
-                spec, bold, italic, resolved_medium_font=medium_font, family_axis_values=family_axis_values, monospaced=False)
+                spec, bold, italic, resolved_medium_font=regular, family_axis_values=family_axis_values, monospaced=False)
             current_faces.append((font, bold, italic))
         count += 1
     return count
@@ -237,7 +255,7 @@ def set_font_family(opts: Options | None = None, override_font_size: float | Non
     global current_faces, builtin_nerd_font_descriptor
     opts = opts or defaults
     sz = override_font_size or opts.font_size
-    font_map, medium_font, family_axis_values = get_font_files_and_medium_resolution(opts)
+    font_map = get_font_files(opts)
     current_faces = [(font_map['medium'], False, False)]
     ftypes: list[Literal['bold', 'italic', 'bi']] = ['bold', 'italic', 'bi']
     indices = {k: 0 for k in ftypes}
@@ -255,7 +273,7 @@ def set_font_family(opts: Options | None = None, override_font_size: float | Non
     sm = create_symbol_map(opts)
     ns = create_narrow_symbols(opts)
     num_symbol_fonts = len(current_faces) - before
-    num_user_fallback_families = create_user_fallback_fonts(opts, medium_font, family_axis_values)
+    num_user_fallback_families = create_user_fallback_fonts(opts)
     num_emoji_fallback_families = create_emoji_fallback_fonts(opts)
     set_font_data(
         descriptor_for_idx, indices['bold'], indices['italic'], indices['bi'], num_symbol_fonts,

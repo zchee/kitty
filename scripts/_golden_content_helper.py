@@ -176,6 +176,10 @@ def main() -> int:
         # cursor position (row 10).
         import gen_japanese_fixture
         text = gen_japanese_fixture.generate(120, seed=27).replace("\n", "")[:28]
+        # The slice must stay full-length: the pool is ~all 3-byte chars today,
+        # but a reweighting toward halfwidth digits could silently shorten the
+        # scene and shrink what the golden pins.
+        assert len(text) == 28, f"japanese scene text unexpectedly short: {len(text)}"
         out.write(f"\x1b[7;1H{text}")
         out.write(f"\x1b[8;1H\x1b[1m{text}{_RESET}")
 

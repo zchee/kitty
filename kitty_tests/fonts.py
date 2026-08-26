@@ -582,7 +582,8 @@ class FallbackFontChain(BaseTest):
         return setup_for_testing(opts=opts)
 
     def has_family(self, family: str) -> bool:
-        return family_name_to_key(family) in all_fonts_map(False)['family_map']
+        m = all_fonts_map(False)
+        return family_name_to_key(family) in m['family_map'] or family_name_to_key(family) in m['variable_map']
 
     @unittest.skipUnless(is_macos, 'Test uses macOS system fonts')
     def test_fallback_font_current_fonts_bands(self):
@@ -608,6 +609,28 @@ class FallbackFontChain(BaseTest):
             for styles in cf['user_fallback']:
                 self.ae(len(styles), 4)
             self.ae(len(cf['emoji_fallback']), 1)
+        # Removing the entries at runtime (config reload rebuilds the font
+        # group) must leave no residual band
+        with self.setup_ctx(symbol_map_font='Menlo'):
+            cf = current_fonts()
+            self.ae(len(cf['symbol']), 1)
+            self.ae(len(cf['user_fallback']), 0)
+            self.ae(len(cf['emoji_fallback']), 0)
+
+    @unittest.skipUnless(is_macos, 'Test uses macOS system fonts')
+    def test_fallback_font_variable_family(self):
+        # Regression: each fallback family must be anchored on its own
+        # resolved regular face. Threading the main font's medium descriptor
+        # into the resolution made a variable fallback family crash with
+        # KeyError('menlo') on a static main font, or silently resolve every
+        # slot to the main font on a variable main font.
+        if not self.has_family('Noto Sans JP'):
+            self.skipTest('Noto Sans JP is not available')
+        with self.setup_ctx(fallback=('family="Noto Sans JP"',)):
+            names = [f.postscript_name() for f in current_fonts()['user_fallback'][0]]
+            for n in names:
+                self.assertNotIn('Menlo', n)  # never the main font
+            self.assertNotEqual(names[0], names[1])  # regular and bold are distinct faces
 
     @unittest.skipUnless(is_macos, 'Test uses macOS system fonts')
     def test_fallback_font_style_resolution(self):
@@ -665,12 +688,14 @@ class FallbackFontChain(BaseTest):
             self.ae(get_fallback_font('🍣', False, False).postscript_name(), 'AppleColorEmoji')
             self.ae(len(current_fonts()['fallback']), 1)
         # And when the configured font does cover the emoji, the static band
-        # is used and no dynamic fallback font is created
+        # is used and no dynamic fallback font is created. The precondition is
+        # asserted, not branched on: a conditional here would let the positive
+        # half of this test silently go vacuous if the spec stops resolving.
         with self.setup_ctx(emoji=('family="Apple Color Emoji"',)):
             cf = current_fonts()
-            if cf['emoji_fallback'][0].postscript_name() == 'AppleColorEmoji':
-                self.ae(get_fallback_font('🍣', False, False).postscript_name(), 'AppleColorEmoji')
-                self.ae(len(current_fonts()['fallback']), 0)
+            self.ae(cf['emoji_fallback'][0].postscript_name(), 'AppleColorEmoji')
+            self.ae(get_fallback_font('🍣', False, False).postscript_name(), 'AppleColorEmoji')
+            self.ae(len(current_fonts()['fallback']), 0)
 
     def test_fallback_font_spec_parsing(self):
         from kitty.options.utils import fallback_font as fallback_font_parser

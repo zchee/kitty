@@ -762,17 +762,18 @@ iter_fallback_faces(FONTS_DATA_HANDLE fgh, ssize_t *idx) {
 
 static ssize_t
 load_fallback_font(FontGroup *fg, const ListOfChars *lc, bool bold, bool italic, bool emoji_presentation) {
-    if (fg->fallback_fonts_count > 100) {
-        log_error("Too many fallback fonts");
-        return MISSING_FONT;
-    }
     // User-configured fallback chain, consulted before the OS. First entry
     // whose face actually covers the cell text wins; a miss falls through to
     // the OS path below, so behavior with no fallback_font/emoji_font
     // configured is unchanged (both loops are zero-iteration). Returning a
     // static-band index is safe: the caller stores it in fallback_font_map and
     // font_for_cell uses it as a plain fg->fonts[] index, with no dynamic-band
-    // arithmetic applied.
+    // arithmetic applied. This pre-pass runs before the too-many-fallback-fonts
+    // guard below: the bands are bounded by the config and statically
+    // allocated, so a session that exhausted the dynamic budget must still
+    // honor the user's own entries. A miss prints its own marker so
+    // --debug-font-fallback distinguishes "consulted, lacked the glyph" from
+    // "band never consulted".
     if (emoji_presentation) {
         for (size_t i = 0; i < fg->num_emoji_fallback_families; i++) {
             ssize_t idx = fg->first_emoji_fallback_idx + (ssize_t)i;
@@ -781,6 +782,8 @@ load_fallback_font(FontGroup *fg, const ListOfChars *lc, bool bold, bool italic,
                     output_cell_fallback_data(lc, bold, italic, emoji_presentation, fg->fonts[idx].face, "user-emoji-font");
                 return idx;
             }
+            if (global_state.debug_font_fallback)
+                output_cell_fallback_data(lc, bold, italic, emoji_presentation, fg->fonts[idx].face, "user-emoji-font miss");
         }
     } else {
         const size_t style = (bold ? 1u : 0u) | (italic ? 2u : 0u);
@@ -791,7 +794,13 @@ load_fallback_font(FontGroup *fg, const ListOfChars *lc, bool bold, bool italic,
                     output_cell_fallback_data(lc, bold, italic, emoji_presentation, fg->fonts[idx].face, "user-fallback-font");
                 return idx;
             }
+            if (global_state.debug_font_fallback)
+                output_cell_fallback_data(lc, bold, italic, emoji_presentation, fg->fonts[idx].face, "user-fallback-font miss");
         }
+    }
+    if (fg->fallback_fonts_count > 100) {
+        log_error("Too many fallback fonts");
+        return MISSING_FONT;
     }
     ssize_t f;
 

@@ -133,6 +133,10 @@ first listed font that actually covers the text wins. Each entry uses the same
 :ref:`font specification syntax <font_spec_syntax>` as :opt:`font_family`, and
 its bold/italic/bold-italic variants are resolved automatically, so for
 example, bold Japanese text will use the bold face of the configured family.
+The variants are chosen by kitty's own font matcher -- the same one that
+resolves :opt:`bold_font` -- which can pick a different face than the
+operating system's fallback restyling would (for example, on macOS the bold
+face of Hiragino Sans resolves to W5 where the OS restyle uses W6).
 For instance::
 
     fallback_font family="Hiragino Sans"

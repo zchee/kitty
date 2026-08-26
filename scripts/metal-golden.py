@@ -178,7 +178,12 @@ CONFIG_MATRIX: dict[str, list[str]] = {
     # both band loops zero-iteration. The japanese scene paints deterministic
     # pseudo-Japanese (fixed seed) in regular AND bold, so both the band's
     # style-0 and style-1 faces render: the harness main font has no CJK
-    # coverage and Hiragino Sans resolves to distinct W3/W6 faces.
+    # coverage and Hiragino Sans resolves to distinct W3/W5 faces. NOTE the
+    # bold row is what makes this config DISCRIMINATE band-vs-OS at the pixel
+    # level: the band's scorer picks W5 where the OS restyle picks W6 (the
+    # regular row is W3 either way). If the band's bold selection is ever
+    # changed to match the OS restyle, this capture stops distinguishing the
+    # two paths and only the unit tests pin band usage.
     "japanese-fallback": ['fallback_font=family="Hiragino Sans"'],
 }
 
