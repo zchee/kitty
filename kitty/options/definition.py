@@ -120,6 +120,55 @@ This option can be specified multiple times. The syntax is::
 """,
 )
 
+opt(
+    '+fallback_font',
+    'family="Hiragino Sans"',
+    option_type='fallback_font',
+    add_to_default=False,
+    long_text="""
+An ordered list of fonts to try when the main font (and its bold/italic
+variants) does not contain a glyph for some text, consulted *before* asking the
+operating system for a fallback font. Can be specified multiple times; the
+first listed font that actually covers the text wins. Each entry uses the same
+:ref:`font specification syntax <font_spec_syntax>` as :opt:`font_family`, and
+its bold/italic/bold-italic variants are resolved automatically, so for
+example, bold Japanese text will use the bold face of the configured family.
+For instance::
+
+    fallback_font family="Hiragino Sans"
+    fallback_font family="Noto Sans CJK JP"
+
+Unlike :opt:`symbol_map`, an entry is only used if the resolved font actually
+contains glyphs for the text; otherwise the next entry, and finally the
+operating system fallback, is tried, so a font that lacks coverage degrades
+gracefully instead of rendering missing-glyph boxes. Note that :opt:`symbol_map`
+takes precedence over this option for the code points it maps. Also note that
+entries are not restricted to any particular script: a broad-coverage font
+listed here (for example Noto Sans CJK) will be used for *every* character the
+main font misses -- including Greek, Cyrillic or dingbats -- which may not be
+what you want. Use :option:`kitty --debug-font-fallback` to see exactly which
+configured font, if any, is chosen for a particular character.
+""",
+)
+
+opt(
+    '+emoji_font',
+    'family="Noto Color Emoji"',
+    option_type='emoji_font',
+    add_to_default=False,
+    long_text="""
+An ordered list of fonts to try for characters rendered with emoji
+presentation, consulted *before* asking the operating system for an emoji
+font. Can be specified multiple times; the first listed font that actually
+contains the emoji wins, and when none does, the operating system emoji font
+is used, so a font lacking some emoji degrades gracefully. Each entry uses the
+same :ref:`font specification syntax <font_spec_syntax>` as :opt:`font_family`.
+For instance::
+
+    emoji_font family="Noto Color Emoji"
+""",
+)
+
 
 opt(
     'disable_ligatures',

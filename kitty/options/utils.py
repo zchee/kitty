@@ -1243,6 +1243,19 @@ def narrow_symbols(val: str) -> Iterable[tuple[tuple[int, int], int]]:
         yield x, int(y or 1)
 
 
+# Keyed by the spec string so repeated identical entries collapse while config
+# order is preserved (dict insertion order), which is the documented
+# first-listed-wins semantics for the fallback chain.
+def fallback_font(val: str) -> Iterable[tuple[str, FontSpec]]:
+    spec = FontSpec.from_setting(val)
+    yield spec.created_from_string, spec
+
+
+def emoji_font(val: str) -> Iterable[tuple[str, FontSpec]]:
+    spec = FontSpec.from_setting(val)
+    yield spec.created_from_string, spec
+
+
 def parse_key_action(action: str, action_type: MapType = MapType.MAP) -> KeyAction:
     parts = action.strip().split(maxsplit=1)
     func = parts[0]

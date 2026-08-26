@@ -971,6 +971,8 @@ class CurrentFonts(TypedDict):
     italic: FontFace
     bi: FontFace
     symbol: Tuple[FontFace, ...]
+    user_fallback: Tuple[Tuple[FontFace, FontFace, FontFace, FontFace], ...]
+    emoji_fallback: Tuple[FontFace, ...]
     fallback: Tuple[FontFace, ...]
     font_sz_in_pts: float
     logical_dpi_x: float
@@ -1070,6 +1072,8 @@ def set_font_data(
     italic: int,
     bold_italic: int,
     num_symbol_fonts: int,
+    num_user_fallback_families: int,
+    num_emoji_fallback_families: int,
     symbol_maps: Tuple[Tuple[int, int, int], ...],
     font_sz_in_pts: float,
     narrow_symbols: Tuple[Tuple[int, int, int], ...],

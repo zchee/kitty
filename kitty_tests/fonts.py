@@ -14,6 +14,7 @@ from kitty.constants import is_macos, read_kitty_resource
 from kitty.fast_data_types import (
     DECAWM,
     ParsedFontFeature,
+    current_fonts,
     get_fallback_font,
     set_allow_use_of_box_fonts,
     set_ligature_name_cache_enabled,
@@ -560,6 +561,135 @@ class Rendering(FontBaseTest):
         self.ae(coalesce_symbol_maps(q), {(1, 4): 'a', (5, 5): 'b'})
         q = {(0, 30): 'a', (10, 10): 'b', (11, 11): 'b', (2, 2): 'c', (1, 1): 'c'}
         self.ae(coalesce_symbol_maps(q), {(0, 0): 'a', (1, 2): 'c', (3, 9): 'a', (10, 11): 'b', (12, 30): 'a'})
+
+
+class FallbackFontChain(BaseTest):
+    # Tests for the user-configurable fallback chain (fallback_font /
+    # emoji_font): style-aware static bands consulted by load_fallback_font()
+    # before the OS fallback path.
+
+    def setup_ctx(self, main: str = 'family=Menlo', fallback: tuple = (), emoji: tuple = (), symbol_map_font: str = ''):
+        from kitty.options.types import defaults
+        from kitty.options.utils import emoji_font as emoji_font_parser
+        from kitty.options.utils import fallback_font as fallback_font_parser
+        from kitty.options.utils import symbol_map
+
+        opts = defaults._replace(font_family=parse_font_spec(main))
+        opts.fallback_font = {k: v for x in fallback for k, v in fallback_font_parser(x)}
+        opts.emoji_font = {k: v for x in emoji for k, v in emoji_font_parser(x)}
+        if symbol_map_font:
+            opts.symbol_map = dict(symbol_map(f'U+E0A0-U+E0A3 {symbol_map_font}'))
+        return setup_for_testing(opts=opts)
+
+    def has_family(self, family: str) -> bool:
+        return family_name_to_key(family) in all_fonts_map(False)['family_map']
+
+    @unittest.skipUnless(is_macos, 'Test uses macOS system fonts')
+    def test_fallback_font_current_fonts_bands(self):
+        # AC5: the symbol tuple length must equal the number of symbol_map
+        # families regardless of configured fallback entries. Guards the
+        # derived-count bug in current_fonts(): the two new bands sit between
+        # first_symbol_font_idx and first_fallback_font_idx, so counting
+        # symbol fonts by band subtraction would absorb them.
+        with self.setup_ctx(symbol_map_font='Menlo'):
+            cf = current_fonts()
+            self.ae(len(cf['symbol']), 1)
+            self.ae(len(cf['user_fallback']), 0)
+            self.ae(len(cf['emoji_fallback']), 0)
+        with self.setup_ctx(
+            symbol_map_font='Menlo',
+            fallback=('family="Hiragino Sans"', 'family=Menlo'),
+            emoji=('family="Apple Color Emoji"',),
+        ):
+            cf = current_fonts()
+            self.ae(len(cf['symbol']), 1)  # AC5
+            # AC9: band lengths equal the configured family counts
+            self.ae(len(cf['user_fallback']), 2)
+            for styles in cf['user_fallback']:
+                self.ae(len(styles), 4)
+            self.ae(len(cf['emoji_fallback']), 1)
+
+    @unittest.skipUnless(is_macos, 'Test uses macOS system fonts')
+    def test_fallback_font_style_resolution(self):
+        if not self.has_family('Hiragino Sans'):
+            self.skipTest('Hiragino Sans is not available')
+        with self.setup_ctx(fallback=('family="Hiragino Sans"',)):
+            styles = current_fonts()['user_fallback'][0]
+            regular_ps, bold_ps = styles[0].postscript_name(), styles[1].postscript_name()
+            # The family must have a distinct bold face for AC2 to be meaningful
+            self.assertNotEqual(regular_ps, bold_ps)
+            # AC1: regular text uses the regular resolution of the spec
+            self.ae(get_fallback_font('あ', False, False).postscript_name(), regular_ps)
+            # AC2: bold text uses the bold resolution
+            self.ae(get_fallback_font('あ', True, False).postscript_name(), bold_ps)
+            # Both hits came from the static band: no dynamic OS fallback font was created
+            self.ae(len(current_fonts()['fallback']), 0)
+
+    @unittest.skipUnless(is_macos, 'Test uses macOS system fonts')
+    def test_fallback_font_coverage_skip(self):
+        if not self.has_family('Hiragino Sans'):
+            self.skipTest('Hiragino Sans is not available')
+        # AC3: a first entry that does not cover the text is skipped, not used
+        with self.setup_ctx(fallback=('family=Menlo', 'family="Hiragino Sans"')):
+            expected = current_fonts()['user_fallback'][1][0].postscript_name()
+            self.ae(get_fallback_font('あ', False, False).postscript_name(), expected)
+            self.ae(len(current_fonts()['fallback']), 0)
+
+    @unittest.skipUnless(is_macos, 'Test uses macOS system fonts')
+    def test_fallback_font_ordering(self):
+        if not self.has_family('Hiragino Sans') or not self.has_family('Hiragino Mincho ProN'):
+            self.skipTest('Hiragino families are not available')
+        # Two covering entries: the first listed wins
+        with self.setup_ctx(fallback=('family="Hiragino Sans"', 'family="Hiragino Mincho ProN"')):
+            expected = current_fonts()['user_fallback'][0][0].postscript_name()
+            self.ae(get_fallback_font('あ', False, False).postscript_name(), expected)
+        with self.setup_ctx(fallback=('family="Hiragino Mincho ProN"', 'family="Hiragino Sans"')):
+            expected = current_fonts()['user_fallback'][0][0].postscript_name()
+            self.ae(get_fallback_font('あ', False, False).postscript_name(), expected)
+
+    @unittest.skipUnless(is_macos, 'Test uses macOS system fonts')
+    def test_fallback_font_falls_through_to_os(self):
+        # All entries non-covering: the result must equal the no-config result
+        with self.setup_ctx():
+            os_ps = get_fallback_font('あ', False, False).postscript_name()
+        with self.setup_ctx(fallback=('family=Menlo',)):
+            self.ae(get_fallback_font('あ', False, False).postscript_name(), os_ps)
+            # the OS path was used, so a dynamic fallback font was created
+            self.ae(len(current_fonts()['fallback']), 1)
+
+    @unittest.skipUnless(is_macos, 'Test uses macOS system fonts')
+    def test_emoji_font_fallthrough(self):
+        # AC10: an emoji_font lacking the emoji falls through to the OS emoji
+        # font instead of rendering .notdef
+        with self.setup_ctx(emoji=('family=Menlo',)):
+            self.ae(get_fallback_font('🍣', False, False).postscript_name(), 'AppleColorEmoji')
+            self.ae(len(current_fonts()['fallback']), 1)
+        # And when the configured font does cover the emoji, the static band
+        # is used and no dynamic fallback font is created
+        with self.setup_ctx(emoji=('family="Apple Color Emoji"',)):
+            cf = current_fonts()
+            if cf['emoji_fallback'][0].postscript_name() == 'AppleColorEmoji':
+                self.ae(get_fallback_font('🍣', False, False).postscript_name(), 'AppleColorEmoji')
+                self.ae(len(current_fonts()['fallback']), 0)
+
+    def test_fallback_font_spec_parsing(self):
+        from kitty.options.utils import fallback_font as fallback_font_parser
+        d: dict = {}
+        entries = ('family="Hiragino Sans"', 'postscript_name=HiraginoSans-W6', 'family="Hiragino Sans" style=W6', 'Hiragino Sans')
+        for v in entries:
+            d.update(fallback_font_parser(v))
+        specs = list(d.values())
+        self.ae(len(specs), 4)
+        self.ae([s.created_from_string for s in specs], list(entries))  # config order is preserved
+        self.ae(specs[0].family, 'Hiragino Sans')
+        self.ae(specs[1].postscript_name, 'HiraginoSans-W6')
+        self.ae(specs[2].style, 'W6')
+        self.assertTrue(specs[3].is_system)
+        # a duplicate entry collapses instead of growing the chain
+        d.update(fallback_font_parser(entries[0]))
+        self.ae(len(d), 4)
+        # a hyphenated postscript name survives family_name_to_key
+        self.assertIn('-', family_name_to_key('HiraginoSans-W6'))
 
 
 def test_chars(chars: str = '╌', sz: int = 128) -> None:

@@ -29,7 +29,7 @@ from kitty.typing_compat import CoreTextFont, FontConfigPattern
 from kitty.utils import log_error
 
 from . import family_name_to_key
-from .common import get_font_files
+from .common import Descriptor, FamilyAxisValues, get_font_files_and_medium_resolution, get_font_from_spec
 
 if is_macos:
     from .core_text import font_for_family as font_for_family_macos
@@ -184,6 +184,17 @@ def dump_font_debug() -> None:
         log_error('Symbol map fonts:')
         for s in ss:
             log_error('  ' + s.identify_for_debug())
+    uf = cf['user_fallback']
+    if uf:
+        log_error('User fallback fonts:')
+        for styles in uf:
+            for stext, face in zip(('Normal', 'Bold', 'Italic', 'Bold-Italic'), styles):
+                log_error(f'  {stext}:', face.identify_for_debug())
+    ef = cf['emoji_fallback']
+    if ef:
+        log_error('User emoji fonts:')
+        for s in ef:
+            log_error('  ' + s.identify_for_debug())
 
 
 def clear_font_caches() -> None:
@@ -197,11 +208,36 @@ def clear_font_caches() -> None:
     clear_platform_caches()
 
 
+def create_user_fallback_fonts(opts: Options, medium_font: Descriptor, family_axis_values: FamilyAxisValues) -> int:
+    # Resolve each fallback_font spec into its four styled faces, in config
+    # order. The append order per family (regular, bold, italic, bi) must match
+    # the style offset computed in load_fallback_font() in kitty/fonts.c.
+    count = 0
+    for spec in opts.fallback_font.values():
+        for bold, italic in ((False, False), (True, False), (False, True), (True, True)):
+            # monospaced=False: fallback families (CJK being the motivating
+            # case) are usually proportional, so restricting the search to
+            # monospaced fonts would silently resolve them to Menlo/monospace.
+            font = get_font_from_spec(
+                spec, bold, italic, resolved_medium_font=medium_font, family_axis_values=family_axis_values, monospaced=False)
+            current_faces.append((font, bold, italic))
+        count += 1
+    return count
+
+
+def create_emoji_fallback_fonts(opts: Options) -> int:
+    # One face per family: the emoji-presentation path never restyles for
+    # bold/italic, so styled variants would be dead weight.
+    for spec in opts.emoji_font.values():
+        current_faces.append((get_font_from_spec(spec, monospaced=False), False, False))
+    return len(opts.emoji_font)
+
+
 def set_font_family(opts: Options | None = None, override_font_size: float | None = None, add_builtin_nerd_font: bool = False) -> None:
     global current_faces, builtin_nerd_font_descriptor
     opts = opts or defaults
     sz = override_font_size or opts.font_size
-    font_map = get_font_files(opts)
+    font_map, medium_font, family_axis_values = get_font_files_and_medium_resolution(opts)
     current_faces = [(font_map['medium'], False, False)]
     ftypes: list[Literal['bold', 'italic', 'bi']] = ['bold', 'italic', 'bi']
     indices = {k: 0 for k in ftypes}
@@ -219,7 +255,11 @@ def set_font_family(opts: Options | None = None, override_font_size: float | Non
     sm = create_symbol_map(opts)
     ns = create_narrow_symbols(opts)
     num_symbol_fonts = len(current_faces) - before
-    set_font_data(descriptor_for_idx, indices['bold'], indices['italic'], indices['bi'], num_symbol_fonts, sm, sz, ns)
+    num_user_fallback_families = create_user_fallback_fonts(opts, medium_font, family_axis_values)
+    num_emoji_fallback_families = create_emoji_fallback_fonts(opts)
+    set_font_data(
+        descriptor_for_idx, indices['bold'], indices['italic'], indices['bi'], num_symbol_fonts,
+        num_user_fallback_families, num_emoji_fallback_families, sm, sz, ns)
 
 
 if TYPE_CHECKING:
@@ -236,13 +276,18 @@ class setup_for_testing:
     ynum = 100
     baseline = 0
 
-    def __init__(self, family: str = 'monospace', size: float = 11.0, dpi: float = 96.0, main_face_path: str = ''):
+    def __init__(self, family: str = 'monospace', size: float = 11.0, dpi: float = 96.0, main_face_path: str = '', opts: Options | None = None):
         self.family, self.size, self.dpi = family, size, dpi
         self.main_face_path = main_face_path
+        self.opts = opts
 
     def __enter__(self) -> tuple[dict[tuple[int, int, int], bytes], int, int]:
         global descriptor_overrides
-        opts = defaults._replace(font_family=parse_font_spec(self.family), font_size=self.size)
+        if self.opts is None:
+            opts = defaults._replace(font_family=parse_font_spec(self.family), font_size=self.size)
+        else:
+            opts = self.opts
+            self.size = opts.font_size
         set_options(opts)
         sprites = {}
 

@@ -341,6 +341,7 @@ def get_font_from_spec(
     family_axis_values: FamilyAxisValues = FamilyAxisValues(),
     resolved_medium_font: Descriptor | None = None,
     match_is_more_specific_than_family: Event = Event(),
+    monospaced: bool = True,
 ) -> Descriptor:
     if not spec.is_system:
         ans = get_fine_grained_font(
@@ -349,6 +350,7 @@ def get_font_from_spec(
             italic,
             resolved_medium_font=resolved_medium_font,
             family_axis_values=family_axis_values,
+            monospaced=monospaced,
             match_is_more_specific_than_family=match_is_more_specific_than_family,
         )
         if spec.features:
@@ -366,7 +368,7 @@ def get_font_from_spec(
                     return v
         else:
             family = 'monospace'
-    return find_best_match(family, bold, italic, ignore_face=resolved_medium_font)
+    return find_best_match(family, bold, italic, monospaced=monospaced, ignore_face=resolved_medium_font)
 
 
 class FontFiles(TypedDict):
@@ -395,7 +397,10 @@ def is_actually_variable_despite_fontconfigs_lies(d: Descriptor) -> bool:
     return False
 
 
-def get_font_files(opts: Options) -> FontFiles:
+def get_font_files_and_medium_resolution(opts: Options) -> tuple[FontFiles, Descriptor, FamilyAxisValues]:
+    # Returns the resolved medium font and the family axis values alongside
+    # FontFiles so callers that resolve further specs against the medium font
+    # (fallback_font) need not repeat the variable-font probing done here.
     ans: dict[str, Descriptor] = {}
     match_is_more_specific_than_family = Event()
     medium_font = get_font_from_spec(opts.font_family, match_is_more_specific_than_family=match_is_more_specific_than_family)
@@ -450,12 +455,17 @@ def get_font_files(opts: Options) -> FontFiles:
                 return new_font
         return font
 
-    return {
+    font_files: FontFiles = {
         'medium': ans['medium'],
         'bold': ans['bold'],
         'italic': apply_synthetic_matrix(ans['italic'], False, True),
         'bi': apply_synthetic_matrix(ans['bi'], True, True),
     }
+    return font_files, medium_font, family_axis_values
+
+
+def get_font_files(opts: Options) -> FontFiles:
+    return get_font_files_and_medium_resolution(opts)[0]
 
 
 def axis_values_are_equal(defaults: dict[str, float], a: dict[str, float], b: dict[str, float]) -> bool:

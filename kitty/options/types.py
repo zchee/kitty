@@ -358,10 +358,12 @@ option_names = (
     'draw_window_borders_for_single_window',
     'dynamic_background_opacity',
     'editor',
+    'emoji_font',
     'enable_audio_bell',
     'enabled_layouts',
     'env',
     'exe_search_path',
+    'fallback_font',
     'file_transfer_confirmation_bypass',
     'filter_notification',
     'focus_follows_mouse',
@@ -735,8 +737,10 @@ class Options:
     window_title_bar_min_windows: int = 0
     window_title_template: str = '{fmt.fg.red}{bell_symbol}{activity_symbol}{fmt.fg.window}{progress_percent}{title}'
     action_alias: dict[str, str] = {}
+    emoji_font: dict[str, kitty.fonts.FontSpec] = {}
     env: dict[str, str] = {}
     exe_search_path: dict[str, str] = {}
+    fallback_font: dict[str, kitty.fonts.FontSpec] = {}
     filter_notification: dict[str, str] = {}
     font_features: dict[str, tuple[kitty.fast_data_types.ParsedFontFeature, ...]] = {}
     kitten_alias: dict[str, str] = {}
@@ -864,8 +868,10 @@ class Options:
 defaults = Options()
 
 defaults.action_alias = {}
+defaults.emoji_font = {}
 defaults.env = {}
 defaults.exe_search_path = {}
+defaults.fallback_font = {}
 defaults.filter_notification = {}
 defaults.font_features = {}
 defaults.kitten_alias = {}

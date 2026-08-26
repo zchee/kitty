@@ -135,7 +135,14 @@ typedef struct {
     FONTS_DATA_HEAD
     id_type id;
     size_t fonts_capacity, fonts_count, fallback_fonts_count;
-    ssize_t medium_font_idx, bold_font_idx, italic_font_idx, bi_font_idx, first_symbol_font_idx, first_fallback_font_idx;
+    // Static bands between the styled main fonts and the dynamic (OS) fallback
+    // band, in index order: symbol_map faces, then user fallback_font faces
+    // (4 styled faces per configured family), then emoji_font faces (1 face per
+    // family). num_symbol_fonts is stored explicitly; deriving it by band
+    // subtraction would silently absorb the two user bands (see current_fonts).
+    size_t num_symbol_fonts, num_user_fallback_families, num_emoji_fallback_families;
+    ssize_t medium_font_idx, bold_font_idx, italic_font_idx, bi_font_idx, first_symbol_font_idx,
+        first_user_fallback_idx, first_emoji_fallback_idx, first_fallback_font_idx;
     Font *fonts;
     Canvas canvas;
     GPUSpriteTracker sprite_tracker;
@@ -729,12 +736,15 @@ not_found:
 }
 
 static void
-output_cell_fallback_data(const ListOfChars *lc, bool bold, bool italic, bool emoji_presentation, PyObject *face) {
+output_cell_fallback_data(const ListOfChars *lc, bool bold, bool italic, bool emoji_presentation, PyObject *face, const char *source) {
     debug("U+%x ", lc->chars[0]);
     for (unsigned i = 1; i < lc->count; i++) debug("U+%x ", lc->chars[i]);
     if (bold) debug("bold ");
     if (italic) debug("italic ");
     if (emoji_presentation) debug("emoji_presentation ");
+    // source is a stable greppable marker distinguishing a hit in a user
+    // configured band (fallback_font/emoji_font) from an OS fallback hit
+    if (source) debug("[%s] ", source);
     if (PyLong_Check(face)) debug("using previous fallback font at index: ");
     PyObject_Print(face, stderr, 0);
     debug("\n");
@@ -756,6 +766,33 @@ load_fallback_font(FontGroup *fg, const ListOfChars *lc, bool bold, bool italic,
         log_error("Too many fallback fonts");
         return MISSING_FONT;
     }
+    // User-configured fallback chain, consulted before the OS. First entry
+    // whose face actually covers the cell text wins; a miss falls through to
+    // the OS path below, so behavior with no fallback_font/emoji_font
+    // configured is unchanged (both loops are zero-iteration). Returning a
+    // static-band index is safe: the caller stores it in fallback_font_map and
+    // font_for_cell uses it as a plain fg->fonts[] index, with no dynamic-band
+    // arithmetic applied.
+    if (emoji_presentation) {
+        for (size_t i = 0; i < fg->num_emoji_fallback_families; i++) {
+            ssize_t idx = fg->first_emoji_fallback_idx + (ssize_t)i;
+            if (has_cell_text((bool (*)(const void *, char_type))face_has_codepoint, fg->fonts[idx].face, false, lc)) {
+                if (global_state.debug_font_fallback)
+                    output_cell_fallback_data(lc, bold, italic, emoji_presentation, fg->fonts[idx].face, "user-emoji-font");
+                return idx;
+            }
+        }
+    } else {
+        const size_t style = (bold ? 1u : 0u) | (italic ? 2u : 0u);
+        for (size_t i = 0; i < fg->num_user_fallback_families; i++) {
+            ssize_t idx = fg->first_user_fallback_idx + (ssize_t)(4 * i + style);
+            if (has_cell_text((bool (*)(const void *, char_type))face_has_codepoint, fg->fonts[idx].face, false, lc)) {
+                if (global_state.debug_font_fallback)
+                    output_cell_fallback_data(lc, bold, italic, emoji_presentation, fg->fonts[idx].face, "user-fallback-font");
+                return idx;
+            }
+        }
+    }
     ssize_t f;
 
     if (bold) f = italic ? fg->bi_font_idx : fg->bold_font_idx;
@@ -771,7 +808,7 @@ load_fallback_font(FontGroup *fg, const ListOfChars *lc, bool bold, bool italic,
         Py_DECREF(face);
         return MISSING_FONT;
     }
-    if (global_state.debug_font_fallback) output_cell_fallback_data(lc, bold, italic, emoji_presentation, face);
+    if (global_state.debug_font_fallback) output_cell_fallback_data(lc, bold, italic, emoji_presentation, face, NULL);
     if (PyLong_Check(face)) {
         ssize_t ans = fg->first_fallback_font_idx + PyLong_AsSsize_t(face);
         Py_DECREF(face);
@@ -2285,7 +2322,7 @@ clear_symbol_maps(void) {
 }
 
 typedef struct {
-    unsigned int main, bold, italic, bi, num_symbol_fonts;
+    unsigned int main, bold, italic, bi, num_symbol_fonts, num_user_fallback_families, num_emoji_fallback_families;
 } DescriptorIndices;
 
 DescriptorIndices descriptor_indices = {0};
@@ -2315,12 +2352,14 @@ set_font_data(PyObject UNUSED *m, PyObject *args) {
     Py_CLEAR(descriptor_for_idx);
     if (!PyArg_ParseTuple(
             args,
-            "OIIIIO!dO!",
+            "OIIIIIIO!dO!",
             &descriptor_for_idx,
             &descriptor_indices.bold,
             &descriptor_indices.italic,
             &descriptor_indices.bi,
             &descriptor_indices.num_symbol_fonts,
+            &descriptor_indices.num_user_fallback_families,
+            &descriptor_indices.num_emoji_fallback_families,
             &PyTuple_Type,
             &sm,
             &OPT(font_size),
@@ -2433,7 +2472,8 @@ initialize_font(FontGroup *fg, unsigned int desc_idx, const char *ftype) {
 
 static void
 initialize_font_group(FontGroup *fg) {
-    fg->fonts_capacity = 10 + descriptor_indices.num_symbol_fonts;
+    fg->fonts_capacity = 10 + descriptor_indices.num_symbol_fonts + 4 * descriptor_indices.num_user_fallback_families +
+                         descriptor_indices.num_emoji_fallback_families;
     fg->fonts = calloc(fg->fonts_capacity, sizeof(Font));
     if (fg->fonts == NULL) fatal("Out of memory allocating fonts array");
     fg->fonts_count = 1; // the 0 index font is the box font
@@ -2449,13 +2489,22 @@ initialize_font_group(FontGroup *fg) {
     I(italic);
     I(bi);
 #undef I
+    // The static bands' descriptors follow the styled main fonts contiguously.
+    // get_font_files() always returns all four of medium/bold/italic/bi, so
+    // descriptor_indices.bi is always 3 and the bands start at 4; the single
+    // incrementing `desc` states that invariant once for all three bands.
+    size_t desc = descriptor_indices.bi + 1;
     fg->first_symbol_font_idx = fg->fonts_count;
+    fg->num_symbol_fonts = descriptor_indices.num_symbol_fonts;
+    for (size_t i = 0; i < descriptor_indices.num_symbol_fonts; i++) initialize_font(fg, desc++, "symbol_map");
+    fg->first_user_fallback_idx = fg->fonts_count;
+    fg->num_user_fallback_families = descriptor_indices.num_user_fallback_families;
+    for (size_t i = 0; i < 4 * descriptor_indices.num_user_fallback_families; i++) initialize_font(fg, desc++, "fallback_font");
+    fg->first_emoji_fallback_idx = fg->fonts_count;
+    fg->num_emoji_fallback_families = descriptor_indices.num_emoji_fallback_families;
+    for (size_t i = 0; i < descriptor_indices.num_emoji_fallback_families; i++) initialize_font(fg, desc++, "emoji_font");
     fg->first_fallback_font_idx = fg->fonts_count;
     fg->fallback_fonts_count = 0;
-    for (size_t i = 0; i < descriptor_indices.num_symbol_fonts; i++) {
-        initialize_font(fg, descriptor_indices.bi + 1 + i, "symbol_map");
-        fg->first_fallback_font_idx++;
-    }
 #undef I
     calc_cell_metrics(fg, fg->fonts[fg->medium_font_idx].face);
     ensure_canvas_can_fit(fg, 8, 1);
@@ -2470,10 +2519,14 @@ initialize_font_group(FontGroup *fg) {
     // a failed render and drawn blank. Reserving here (not in send_prerendered_
     // sprites) makes the invariant hold regardless of upload ordering.
     do_increment(&fg->color_sprite_tracker, COLOR_SPRITE_ATLAS_GROWTH_MIN_ROWS);
-    // rescale the symbol_map faces for the desired cell height, this is how fallback fonts are sized as well
-    for (size_t i = 0; i < descriptor_indices.num_symbol_fonts; i++) {
-        Font *font = fg->fonts + i + fg->first_symbol_font_idx;
-        set_size_for_face(font->face, fg->fcm.cell_height, true, (FONTS_DATA_HANDLE)fg);
+    // rescale the symbol_map, fallback_font and emoji_font faces for the
+    // desired cell height, this is how fallback fonts are sized as well. Note
+    // that on macOS set_size_for_face ignores desired_height (core_text.m
+    // marks it UNUSED) so skipping a band here would be invisible on macOS,
+    // while on FreeType desired_height sizes the face to fit the cell
+    // (freetype.c) -- omitting the user bands would be a Linux-only bug.
+    for (ssize_t i = fg->first_symbol_font_idx; i < fg->first_fallback_font_idx; i++) {
+        set_size_for_face(fg->fonts[i].face, fg->fcm.cell_height, true, (FONTS_DATA_HANDLE)fg);
     }
     ScaledFontData sfd = {.fcm = fg->fcm, .font_sz_in_pts = fg->font_sz_in_pts};
     vt_insert(&fg->scaled_font_map, 1.f, sfd);
@@ -2665,14 +2718,38 @@ current_fonts(PyObject *self UNUSED, PyObject *args) {
     if (fg->bold_font_idx > 0) SET(bold, fg->bold_font_idx);
     if (fg->italic_font_idx > 0) SET(italic, fg->italic_font_idx);
     if (fg->bi_font_idx > 0) SET(bi, fg->bi_font_idx);
-    unsigned num_symbol_fonts = fg->first_fallback_font_idx - fg->first_symbol_font_idx;
-    RAII_PyObject(ss, PyTuple_New(num_symbol_fonts));
+    // Use the explicitly stored count: deriving it as first_fallback_font_idx
+    // - first_symbol_font_idx would absorb the user fallback/emoji bands that
+    // now sit between those two boundaries into the symbol tuple.
+    RAII_PyObject(ss, PyTuple_New(fg->num_symbol_fonts));
     if (!ss) return NULL;
-    for (size_t i = 0; i < num_symbol_fonts; i++) {
+    for (size_t i = 0; i < fg->num_symbol_fonts; i++) {
         Py_INCREF(fg->fonts[fg->first_symbol_font_idx + i].face);
         PyTuple_SET_ITEM(ss, i, fg->fonts[fg->first_symbol_font_idx + i].face);
     }
     if (PyDict_SetItemString(ans, "symbol", ss) != 0) return NULL;
+    // One entry per configured fallback_font family: a 4-tuple of the styled
+    // faces in (medium, bold, italic, bi) order, mirroring the band layout.
+    RAII_PyObject(uf, PyTuple_New(fg->num_user_fallback_families));
+    if (!uf) return NULL;
+    for (size_t i = 0; i < fg->num_user_fallback_families; i++) {
+        PyObject *styles = PyTuple_New(4);
+        if (!styles) return NULL;
+        PyTuple_SET_ITEM(uf, i, styles);
+        for (size_t s = 0; s < 4; s++) {
+            PyObject *face = fg->fonts[fg->first_user_fallback_idx + 4 * i + s].face;
+            Py_INCREF(face);
+            PyTuple_SET_ITEM(styles, s, face);
+        }
+    }
+    if (PyDict_SetItemString(ans, "user_fallback", uf) != 0) return NULL;
+    RAII_PyObject(ef, PyTuple_New(fg->num_emoji_fallback_families));
+    if (!ef) return NULL;
+    for (size_t i = 0; i < fg->num_emoji_fallback_families; i++) {
+        Py_INCREF(fg->fonts[fg->first_emoji_fallback_idx + i].face);
+        PyTuple_SET_ITEM(ef, i, fg->fonts[fg->first_emoji_fallback_idx + i].face);
+    }
+    if (PyDict_SetItemString(ans, "emoji_fallback", ef) != 0) return NULL;
     RAII_PyObject(ff, PyTuple_New(fg->fallback_fonts_count));
     if (!ff) return NULL;
     for (size_t i = 0; i < fg->fallback_fonts_count; i++) {
@@ -2706,6 +2783,12 @@ get_fallback_font(PyObject UNUSED *self, PyObject *args) {
     if (!PyArg_ParseTuple(args, "Upp", &text, &bold, &italic)) return NULL;
     GPUCell gpu_cell = {0};
     CPUCell cpu_cell = {0};
+    // Mirror the render path's emoji handling: emoji cells are multicell
+    // there, and has_emoji_presentation() requires is_multicell before it
+    // reports emoji presentation. Without this every probe resolves with
+    // emoji_presentation=false, so the emoji fallback chain is untestable
+    // from Python. Non-emoji text is unaffected (is_emoji gates the rest).
+    cpu_cell.is_multicell = true;
     RAII_ListOfChars(lc);
     lc.count = PyUnicode_GET_LENGTH(text);
     ensure_space_for_chars(&lc, lc.count);
@@ -2722,7 +2805,10 @@ get_fallback_font(PyObject UNUSED *self, PyObject *args) {
         PyErr_SetString(PyExc_ValueError, "Too many fallback fonts");
         return NULL;
     }
-    return fg->fonts[ans].face;
+    // The Font struct owns its face reference; returning it borrowed would
+    // underflow the refcount on every successful call and free a face the
+    // font group still uses.
+    return Py_NewRef(fg->fonts[ans].face);
 }
 
 static PyObject *
