@@ -568,18 +568,33 @@ class FallbackFontChain(BaseTest):
     # emoji_font): style-aware static bands consulted by load_fallback_font()
     # before the OS fallback path.
 
-    def setup_ctx(self, main: str = 'family=Menlo', fallback: tuple = (), emoji: tuple = (), symbol_map_font: str = ''):
+    def setup_ctx(
+        self, main: str = 'family=Menlo', fallback: tuple = (), emoji: tuple = (), symbol_map_font: str = '',
+        bold: tuple = (), italic: tuple = (), bold_italic: tuple = (),
+    ):
         from kitty.options.types import defaults
-        from kitty.options.utils import emoji_font as emoji_font_parser
-        from kitty.options.utils import fallback_font as fallback_font_parser
         from kitty.options.utils import symbol_map
 
         opts = defaults._replace(font_family=parse_font_spec(main))
-        opts.fallback_font = {k: v for x in fallback for k, v in fallback_font_parser(x)}
-        opts.emoji_font = {k: v for x in emoji for k, v in emoji_font_parser(x)}
+        for attr, lines in (
+            ('fallback_font', fallback), ('emoji_font', emoji), ('bold_fallback_font', bold),
+            ('italic_fallback_font', italic), ('bold_italic_fallback_font', bold_italic),
+        ):
+            setattr(opts, attr, self.parse_font_list(attr, lines))
         if symbol_map_font:
             opts.symbol_map = dict(symbol_map(f'U+E0A0-U+E0A3 {symbol_map_font}'))
         return setup_for_testing(opts=opts)
+
+    def parse_font_list(self, option_name: str, lines: Iterable[str]) -> dict:
+        # Drive the real option parser so the tests exercise the same
+        # accumulation keying (position + spec) production config parsing uses.
+        import kitty.options.utils as ou
+        parser = getattr(ou, option_name)
+        ans: dict = {}
+        for line in lines:
+            for k, v in parser(line, ans):
+                ans[k] = v
+        return ans
 
     def has_family(self, family: str) -> bool:
         m = all_fonts_map(False)
@@ -698,23 +713,64 @@ class FallbackFontChain(BaseTest):
             self.ae(len(current_fonts()['fallback']), 0)
 
     def test_fallback_font_spec_parsing(self):
-        from kitty.options.utils import fallback_font as fallback_font_parser
-        d: dict = {}
         entries = ('family="Hiragino Sans"', 'postscript_name=HiraginoSans-W6', 'family="Hiragino Sans" style=W6', 'Hiragino Sans')
-        for v in entries:
-            d.update(fallback_font_parser(v))
-        specs = list(d.values())
+        specs = list(self.parse_font_list('fallback_font', entries).values())
         self.ae(len(specs), 4)
         self.ae([s.created_from_string for s in specs], list(entries))  # config order is preserved
         self.ae(specs[0].family, 'Hiragino Sans')
         self.ae(specs[1].postscript_name, 'HiraginoSans-W6')
         self.ae(specs[2].style, 'W6')
         self.assertTrue(specs[3].is_system)
-        # a duplicate entry collapses instead of growing the chain
-        d.update(fallback_font_parser(entries[0]))
-        self.ae(len(d), 4)
+        # A repeated spec keeps its own position: the per-style lists pair with
+        # fallback_font by index, so collapsing duplicates would desync them
+        dup = self.parse_font_list('bold_fallback_font', ('family=A', 'family=A', 'family=B'))
+        self.ae([s.created_from_string for s in dup.values()], ['family=A', 'family=A', 'family=B'])
         # a hyphenated postscript name survives family_name_to_key
         self.assertIn('-', family_name_to_key('HiraginoSans-W6'))
+
+    @unittest.skipUnless(is_macos, 'Test uses macOS system fonts')
+    def test_fallback_font_per_style_override(self):
+        if not self.has_family('Hiragino Sans') or not self.has_family('Hiragino Mincho ProN'):
+            self.skipTest('Hiragino families are not available')
+        # Baseline: with no override the matcher picks the family's own bold
+        with self.setup_ctx(fallback=('family="Hiragino Sans"',)):
+            auto_bold = current_fonts()['user_fallback'][0][1].postscript_name()
+        self.assertNotEqual(auto_bold, 'HiraginoSans-W6')  # the divergence the override exists to fix
+        with self.setup_ctx(
+            fallback=('family="Hiragino Sans"',),
+            bold=('family="Hiragino Sans" style=W6',),
+            italic=('family="Hiragino Mincho ProN"',),
+        ):
+            regular, bold, italic, bi = (f.postscript_name() for f in current_fonts()['user_fallback'][0])
+            self.ae(bold, 'HiraginoSans-W6')  # explicit override wins
+            self.ae(regular, 'HiraginoSans-W3')  # base entry untouched
+            self.assertIn('HiraMin', italic)  # an override may name a different family
+            self.assertIn('HiraginoSans', bi)  # unspecified slot keeps automatic resolution from the base entry
+            self.ae(get_fallback_font('\u3042', True, False).postscript_name(), 'HiraginoSans-W6')
+
+    @unittest.skipUnless(is_macos, 'Test uses macOS system fonts')
+    def test_fallback_font_per_style_pairs_by_position(self):
+        if not self.has_family('Hiragino Sans') or not self.has_family('Hiragino Mincho ProN'):
+            self.skipTest('Hiragino families are not available')
+        # Two entries, override only on the SECOND: position 0 must keep its
+        # automatic bold and position 1 must take the override
+        with self.setup_ctx(
+            fallback=('family="Hiragino Mincho ProN"', 'family="Hiragino Sans"'),
+            bold=('family="Hiragino Mincho ProN"', 'family="Hiragino Sans" style=W6'),
+        ):
+            uf = current_fonts()['user_fallback']
+            self.ae(len(uf), 2)
+            self.assertIn('HiraMin', uf[0][1].postscript_name())
+            self.ae(uf[1][1].postscript_name(), 'HiraginoSans-W6')
+        # An override list longer than fallback_font ignores the extras rather
+        # than growing the chain
+        with self.setup_ctx(
+            fallback=('family="Hiragino Sans"',),
+            bold=('family="Hiragino Sans" style=W6', 'family="Hiragino Mincho ProN"'),
+        ):
+            uf = current_fonts()['user_fallback']
+            self.ae(len(uf), 1)
+            self.ae(uf[0][1].postscript_name(), 'HiraginoSans-W6')
 
 
 def test_chars(chars: str = '╌', sz: int = 128) -> None:

@@ -66,7 +66,9 @@ option_names = (
     'bell_border_color',
     'bell_on_tab',
     'bell_path',
+    'bold_fallback_font',
     'bold_font',
+    'bold_italic_fallback_font',
     'bold_italic_font',
     'box_drawing_scale',
     'clear_all_mouse_actions',
@@ -382,6 +384,7 @@ option_names = (
     'initial_window_height',
     'initial_window_width',
     'input_delay',
+    'italic_fallback_font',
     'italic_font',
     'kitten_alias',
     'kitty_mod',
@@ -737,12 +740,15 @@ class Options:
     window_title_bar_min_windows: int = 0
     window_title_template: str = '{fmt.fg.red}{bell_symbol}{activity_symbol}{fmt.fg.window}{progress_percent}{title}'
     action_alias: dict[str, str] = {}
+    bold_fallback_font: dict[str, kitty.fonts.FontSpec] = {}
+    bold_italic_fallback_font: dict[str, kitty.fonts.FontSpec] = {}
     emoji_font: dict[str, kitty.fonts.FontSpec] = {}
     env: dict[str, str] = {}
     exe_search_path: dict[str, str] = {}
     fallback_font: dict[str, kitty.fonts.FontSpec] = {}
     filter_notification: dict[str, str] = {}
     font_features: dict[str, tuple[kitty.fast_data_types.ParsedFontFeature, ...]] = {}
+    italic_fallback_font: dict[str, kitty.fonts.FontSpec] = {}
     kitten_alias: dict[str, str] = {}
     menu_map: dict[tuple[str, ...], str] = {}
     modify_font: dict[str, kitty.fonts.FontModification] = {}
@@ -868,12 +874,15 @@ class Options:
 defaults = Options()
 
 defaults.action_alias = {}
+defaults.bold_fallback_font = {}
+defaults.bold_italic_fallback_font = {}
 defaults.emoji_font = {}
 defaults.env = {}
 defaults.exe_search_path = {}
 defaults.fallback_font = {}
 defaults.filter_notification = {}
 defaults.font_features = {}
+defaults.italic_fallback_font = {}
 defaults.kitten_alias = {}
 defaults.menu_map = {}
 defaults.modify_font = {}

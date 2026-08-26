@@ -1243,17 +1243,35 @@ def narrow_symbols(val: str) -> Iterable[tuple[tuple[int, int], int]]:
         yield x, int(y or 1)
 
 
-# Keyed by the spec string so repeated identical entries collapse while config
-# order is preserved (dict insertion order), which is the documented
-# first-listed-wins semantics for the fallback chain.
-def fallback_font(val: str) -> Iterable[tuple[str, FontSpec]]:
+# The fallback chains are ORDERED lists that also pair up by position
+# (the n-th bold_fallback_font entry overrides the n-th fallback_font entry),
+# so the accumulation key encodes the position as well as the spec: a
+# duplicate spec at a different position must keep its own slot, while
+# re-declaring the identical entry at the same position stays idempotent.
+# Config order is dict insertion order.
+def _fallback_font_entry(val: str, current_val: dict[str, FontSpec]) -> Iterable[tuple[str, FontSpec]]:
     spec = FontSpec.from_setting(val)
-    yield spec.created_from_string, spec
+    yield f'{len(current_val)}:{spec.created_from_string}', spec
 
 
-def emoji_font(val: str) -> Iterable[tuple[str, FontSpec]]:
-    spec = FontSpec.from_setting(val)
-    yield spec.created_from_string, spec
+def fallback_font(val: str, current_val: dict[str, FontSpec]) -> Iterable[tuple[str, FontSpec]]:
+    yield from _fallback_font_entry(val, current_val)
+
+
+def bold_fallback_font(val: str, current_val: dict[str, FontSpec]) -> Iterable[tuple[str, FontSpec]]:
+    yield from _fallback_font_entry(val, current_val)
+
+
+def italic_fallback_font(val: str, current_val: dict[str, FontSpec]) -> Iterable[tuple[str, FontSpec]]:
+    yield from _fallback_font_entry(val, current_val)
+
+
+def bold_italic_fallback_font(val: str, current_val: dict[str, FontSpec]) -> Iterable[tuple[str, FontSpec]]:
+    yield from _fallback_font_entry(val, current_val)
+
+
+def emoji_font(val: str, current_val: dict[str, FontSpec]) -> Iterable[tuple[str, FontSpec]]:
+    yield from _fallback_font_entry(val, current_val)
 
 
 def parse_key_action(action: str, action_type: MapType = MapType.MAP) -> KeyAction:

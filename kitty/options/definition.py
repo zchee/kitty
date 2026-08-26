@@ -136,11 +136,22 @@ example, bold Japanese text will use the bold face of the configured family.
 The variants are chosen by kitty's own font matcher -- the same one that
 resolves :opt:`bold_font` -- which can pick a different face than the
 operating system's fallback restyling would (for example, on macOS the bold
-face of Hiragino Sans resolves to W5 where the OS restyle uses W6).
+face of Hiragino Sans resolves to W5 where the OS restyle uses W6); see
+:opt:`bold_fallback_font` below to pick the face for a style yourself.
 For instance::
 
     fallback_font family="Hiragino Sans"
     fallback_font family="Noto Sans CJK JP"
+
+To choose the face for a particular style yourself instead of letting the
+matcher pick it, use :opt:`bold_fallback_font`, :opt:`italic_fallback_font` and
+:opt:`bold_italic_fallback_font`, which pair up with this option **by
+position** -- their n-th entry overrides the n-th entry of this option::
+
+    fallback_font             family="Hiragino Sans"
+    bold_fallback_font        family="Hiragino Sans" style=W6
+    italic_fallback_font      family="Hiragino Mincho ProN"
+    bold_italic_fallback_font family="Hiragino Mincho ProN" style=W6
 
 Unlike :opt:`symbol_map`, an entry is only used if the resolved font actually
 contains glyphs for the text; otherwise the next entry, and finally the
@@ -152,6 +163,51 @@ listed here (for example Noto Sans CJK) will be used for *every* character the
 main font misses -- including Greek, Cyrillic or dingbats -- which may not be
 what you want. Use :option:`kitty --debug-font-fallback` to see exactly which
 configured font, if any, is chosen for a particular character.
+""",
+)
+
+opt(
+    '+bold_fallback_font',
+    'family="Hiragino Sans" style=W6',
+    option_type='bold_fallback_font',
+    add_to_default=False,
+    long_text="""
+The face to use for **bold** text handled by a :opt:`fallback_font` entry.
+Entries pair up with :opt:`fallback_font` by position: the first
+:code:`bold_fallback_font` line overrides the bold face of the first
+:opt:`fallback_font` line, the second overrides the second, and so on. A
+position with no entry keeps the automatically resolved bold face, and entries
+beyond the end of the :opt:`fallback_font` list are ignored with a warning.
+The value uses the same :ref:`font specification syntax <font_spec_syntax>` as
+:opt:`font_family` and need not name the same family as the entry it
+overrides::
+
+    fallback_font      family="Hiragino Sans"
+    bold_fallback_font family="Hiragino Sans" style=W6
+""",
+)
+
+opt(
+    '+italic_fallback_font',
+    'family="Hiragino Mincho ProN"',
+    option_type='italic_fallback_font',
+    add_to_default=False,
+    long_text="""
+The face to use for **italic** text handled by a :opt:`fallback_font` entry.
+Pairs up with :opt:`fallback_font` by position exactly as
+:opt:`bold_fallback_font` does.
+""",
+)
+
+opt(
+    '+bold_italic_fallback_font',
+    'family="Hiragino Mincho ProN" style=W6',
+    option_type='bold_italic_fallback_font',
+    add_to_default=False,
+    long_text="""
+The face to use for **bold italic** text handled by a :opt:`fallback_font`
+entry. Pairs up with :opt:`fallback_font` by position exactly as
+:opt:`bold_fallback_font` does.
 """,
 )
 

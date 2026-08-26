@@ -9,23 +9,24 @@ from kitty.conf.utils import (
 )
 from kitty.options.utils import (
     action_alias, active_tab_title_template, allow_hyperlinks, background_images, bell_on_tab,
-    box_drawing_scale, clear_all_mouse_actions, clear_all_shortcuts, clipboard_control,
-    clone_source_strategies, config_or_absolute_path, confirm_close, copy_on_select,
-    cursor_blink_interval, cursor_text_color, cursor_trail_decay, cursor_trail_start_threshold,
-    custom_shaders, deprecated_adjust_line_height, deprecated_hide_window_decorations_aliases,
-    deprecated_macos_show_window_title_in_menubar_alias, deprecated_scrollback_indicator_opacity,
-    deprecated_send_text, disable_ligatures, edge_width, emoji_font, env, fallback_font,
-    filter_notification, font_features, hide_window_decorations, macos_option_as_alt,
-    macos_titlebar_color, menu_map, modify_font, mouse_hide_wait, narrow_symbols, notify_on_cmd_finish,
-    optional_edge_width, parse_font_spec, parse_map, parse_mouse_map, paste_actions,
-    pointer_shape_when_dragging, remap_modifiers, remote_control_password, resize_debounce_time,
-    scrollback_lines, scrollback_pager_history_size, scrollbar_color, shell_integration,
-    show_hyperlink_targets, store_multiple, symbol_map, tab_activity_symbol, tab_bar_edge,
-    tab_bar_margin_height, tab_bar_min_tabs, tab_fade, tab_font_style, tab_separator,
-    tab_title_template, tab_title_wrap, text_fg_override_threshold, titlebar_color, to_cursor_shape,
-    to_cursor_unfocused_shape, to_font_size, to_layout_names, to_modifiers,
-    transparent_background_colors, underline_exclusion, url_prefixes, url_style, visual_bell_duration,
-    visual_window_select_characters, window_border_width, window_logo_scale, window_size
+    bold_fallback_font, bold_italic_fallback_font, box_drawing_scale, clear_all_mouse_actions,
+    clear_all_shortcuts, clipboard_control, clone_source_strategies, config_or_absolute_path,
+    confirm_close, copy_on_select, cursor_blink_interval, cursor_text_color, cursor_trail_decay,
+    cursor_trail_start_threshold, custom_shaders, deprecated_adjust_line_height,
+    deprecated_hide_window_decorations_aliases, deprecated_macos_show_window_title_in_menubar_alias,
+    deprecated_scrollback_indicator_opacity, deprecated_send_text, disable_ligatures, edge_width,
+    emoji_font, env, fallback_font, filter_notification, font_features, hide_window_decorations,
+    italic_fallback_font, macos_option_as_alt, macos_titlebar_color, menu_map, modify_font,
+    mouse_hide_wait, narrow_symbols, notify_on_cmd_finish, optional_edge_width, parse_font_spec,
+    parse_map, parse_mouse_map, paste_actions, pointer_shape_when_dragging, remap_modifiers,
+    remote_control_password, resize_debounce_time, scrollback_lines, scrollback_pager_history_size,
+    scrollbar_color, shell_integration, show_hyperlink_targets, store_multiple, symbol_map,
+    tab_activity_symbol, tab_bar_edge, tab_bar_margin_height, tab_bar_min_tabs, tab_fade,
+    tab_font_style, tab_separator, tab_title_template, tab_title_wrap, text_fg_override_threshold,
+    titlebar_color, to_cursor_shape, to_cursor_unfocused_shape, to_font_size, to_layout_names,
+    to_modifiers, transparent_background_colors, underline_exclusion, url_prefixes, url_style,
+    visual_bell_duration, visual_window_select_characters, window_border_width, window_logo_scale,
+    window_size
 )
 
 
@@ -113,8 +114,16 @@ class Parser:
     def bell_path(self, val: str, ans: dict[str, typing.Any]) -> None:
         ans['bell_path'] = config_or_absolute_path(val)
 
+    def bold_fallback_font(self, val: str, ans: dict[str, typing.Any]) -> None:
+        for k, v in bold_fallback_font(val, ans["bold_fallback_font"]):
+            ans["bold_fallback_font"][k] = v
+
     def bold_font(self, val: str, ans: dict[str, typing.Any]) -> None:
         ans['bold_font'] = parse_font_spec(val)
+
+    def bold_italic_fallback_font(self, val: str, ans: dict[str, typing.Any]) -> None:
+        for k, v in bold_italic_fallback_font(val, ans["bold_italic_fallback_font"]):
+            ans["bold_italic_fallback_font"][k] = v
 
     def bold_italic_font(self, val: str, ans: dict[str, typing.Any]) -> None:
         ans['bold_italic_font'] = parse_font_spec(val)
@@ -995,7 +1004,7 @@ class Parser:
         ans['editor'] = str(val)
 
     def emoji_font(self, val: str, ans: dict[str, typing.Any]) -> None:
-        for k, v in emoji_font(val):
+        for k, v in emoji_font(val, ans["emoji_font"]):
             ans["emoji_font"][k] = v
 
     def enable_audio_bell(self, val: str, ans: dict[str, typing.Any]) -> None:
@@ -1013,7 +1022,7 @@ class Parser:
             ans["exe_search_path"][k] = v
 
     def fallback_font(self, val: str, ans: dict[str, typing.Any]) -> None:
-        for k, v in fallback_font(val):
+        for k, v in fallback_font(val, ans["fallback_font"]):
             ans["fallback_font"][k] = v
 
     def file_transfer_confirmation_bypass(self, val: str, ans: dict[str, typing.Any]) -> None:
@@ -1076,6 +1085,10 @@ class Parser:
 
     def input_delay(self, val: str, ans: dict[str, typing.Any]) -> None:
         ans['input_delay'] = positive_int(val)
+
+    def italic_fallback_font(self, val: str, ans: dict[str, typing.Any]) -> None:
+        for k, v in italic_fallback_font(val, ans["italic_fallback_font"]):
+            ans["italic_fallback_font"][k] = v
 
     def italic_font(self, val: str, ans: dict[str, typing.Any]) -> None:
         ans['italic_font'] = parse_font_spec(val)
@@ -1635,12 +1648,15 @@ class Parser:
 def create_result_dict() -> dict[str, typing.Any]:
     return {
         'action_alias': {},
+        'bold_fallback_font': {},
+        'bold_italic_fallback_font': {},
         'emoji_font': {},
         'env': {},
         'exe_search_path': {},
         'fallback_font': {},
         'filter_notification': {},
         'font_features': {},
+        'italic_fallback_font': {},
         'kitten_alias': {},
         'menu_map': {},
         'modify_font': {},

@@ -23,6 +23,7 @@ from kitty.fast_data_types import (
     test_render_line,
     test_shape,
 )
+from kitty.fonts import FontSpec
 from kitty.options.types import Options, defaults
 from kitty.options.utils import parse_font_spec
 from kitty.typing_compat import CoreTextFont, FontConfigPattern
@@ -30,6 +31,7 @@ from kitty.utils import log_error
 
 from . import family_name_to_key
 from .common import (
+    Descriptor,
     FamilyAxisValues,
     get_axis_values,
     get_font_files,
@@ -216,38 +218,56 @@ def clear_font_caches() -> None:
     clear_platform_caches()
 
 
+def resolve_fallback_face(spec: FontSpec, bold: bool, italic: bool) -> Descriptor:
+    # monospaced=False: fallback families (CJK being the motivating case) are
+    # usually proportional, so restricting the search to monospaced fonts
+    # would silently resolve them to Menlo/monospace. The spec is anchored on
+    # its OWN resolved regular face: resolved_medium_font is the anchor for
+    # in-family variable-axis derivation (find_bold_italic_variant keys
+    # variable_map by the anchor's family), so anchoring on any other family
+    # crashes (KeyError) or silently resolves the slot to that other family.
+    regular = get_font_from_spec(spec, monospaced=False)
+    if not bold and not italic:
+        return regular
+    family_axis_values = FamilyAxisValues()
+    if is_variable(regular) or is_actually_variable_despite_fontconfigs_lies(regular):
+        family_axis_values.set_regular_values(get_axis_values(regular, get_variable_data_for_descriptor(regular)))
+    return get_font_from_spec(
+        spec, bold, italic, resolved_medium_font=regular, family_axis_values=family_axis_values, monospaced=False)
+
+
 def create_user_fallback_fonts(opts: Options) -> int:
     # Resolve each fallback_font spec into its four styled faces, in config
     # order. The append order per family (regular, bold, italic, bi) must match
     # the style offset computed in load_fallback_font() in kitty/fonts.c.
-    # monospaced=False: fallback families (CJK being the motivating case) are
-    # usually proportional, so restricting the search to monospaced fonts
-    # would silently resolve them to Menlo/monospace. Each family is anchored
-    # on its OWN resolved regular face: resolved_medium_font is the anchor for
-    # in-family variable-axis derivation (find_bold_italic_variant keys
-    # variable_map by the anchor's family), so threading the MAIN font's
-    # medium here would crash on a static main font (KeyError) or silently
-    # resolve a variable fallback family's slots to the main font.
-    count = 0
-    for spec in opts.fallback_font.values():
-        regular = get_font_from_spec(spec, monospaced=False)
-        family_axis_values = FamilyAxisValues()
-        if is_variable(regular) or is_actually_variable_despite_fontconfigs_lies(regular):
-            family_axis_values.set_regular_values(get_axis_values(regular, get_variable_data_for_descriptor(regular)))
-        current_faces.append((regular, False, False))
-        for bold, italic in ((True, False), (False, True), (True, True)):
-            font = get_font_from_spec(
-                spec, bold, italic, resolved_medium_font=regular, family_axis_values=family_axis_values, monospaced=False)
-            current_faces.append((font, bold, italic))
-        count += 1
-    return count
+    # bold_fallback_font/italic_fallback_font/bold_italic_fallback_font pair
+    # with fallback_font BY POSITION: the n-th entry of each overrides that
+    # style's face for the n-th fallback_font entry, and a position with no
+    # entry keeps the automatically resolved face.
+    base = tuple(opts.fallback_font.values())
+    overrides: dict[tuple[bool, bool], tuple[FontSpec, ...]] = {
+        (True, False): tuple(opts.bold_fallback_font.values()),
+        (False, True): tuple(opts.italic_fallback_font.values()),
+        (True, True): tuple(opts.bold_italic_fallback_font.values()),
+    }
+    for (bold, italic), specs in overrides.items():
+        if len(specs) > len(base):
+            name = ('bold' if bold else '') + ('_' if bold and italic else '') + ('italic' if italic else '') + '_fallback_font'
+            for spec in specs[len(base):]:
+                log_error(f'Ignoring {name} {spec.created_from_string}: there is no fallback_font entry at that position')
+    for i, spec in enumerate(base):
+        for bold, italic in ((False, False), (True, False), (False, True), (True, True)):
+            styles = overrides.get((bold, italic), ())
+            resolved_from = styles[i] if i < len(styles) else spec
+            current_faces.append((resolve_fallback_face(resolved_from, bold, italic), bold, italic))
+    return len(base)
 
 
 def create_emoji_fallback_fonts(opts: Options) -> int:
     # One face per family: the emoji-presentation path never restyles for
     # bold/italic, so styled variants would be dead weight.
     for spec in opts.emoji_font.values():
-        current_faces.append((get_font_from_spec(spec, monospaced=False), False, False))
+        current_faces.append((resolve_fallback_face(spec, False, False), False, False))
     return len(opts.emoji_font)
 
 
