@@ -62,6 +62,16 @@ static size_t num_symbol_maps = 0, num_narrow_symbols = 0;
 
 typedef enum { SPACER_STRATEGY_UNKNOWN, SPACERS_BEFORE, SPACERS_AFTER, SPACERS_IOSEVKA } SpacerStrategy;
 
+// modify_font size <font> <val>: the per-font adjustment of the point size at
+// which this face rasterizes glyphs, resolved from OPT(font_size_mods) when the
+// face is created. Kept as (val, unit) rather than a resolved point size so the
+// same entry can be re-resolved against the scaled base of a multicell run.
+typedef struct FontSizeAdjustment {
+    bool enabled;
+    float val;
+    AdjustmentUnit unit;
+} FontSizeAdjustment;
+
 typedef struct {
     PyObject *face;
     // Map glyphs to sprite map co-ords
@@ -71,6 +81,7 @@ typedef struct {
     GLYPH_PROPERTIES_MAP_HANDLE glyph_properties_hash_table;
     bool bold, italic, emoji_presentation;
     SpacerStrategy spacer_strategy;
+    FontSizeAdjustment size_adjustment;
 } Font;
 
 typedef struct Canvas {
@@ -154,6 +165,10 @@ typedef struct {
     fallback_font_map_t fallback_font_map;
     scaled_font_map_t scaled_font_map;
     decorations_index_map_t decorations_index_map;
+    // font_sz_in_pts is mutated to the scaled size for the duration of a
+    // multicell run; this is the size the group was created for and never
+    // changes, so size adjustments can be resolved against a stable base.
+    double unscaled_font_sz_in_pts;
 } FontGroup;
 
 static FontGroup *font_groups = NULL;
@@ -312,6 +327,7 @@ font_group_for(double font_sz_in_pts, double logical_dpi_x, double logical_dpi_y
     FontGroup *fg = font_groups + num_font_groups - 1;
     zero_at_ptr(fg);
     fg->font_sz_in_pts = font_sz_in_pts;
+    fg->unscaled_font_sz_in_pts = font_sz_in_pts;
     fg->logical_dpi_x = logical_dpi_x;
     fg->logical_dpi_y = logical_dpi_y;
     fg->id = ++font_group_id_counter;
@@ -585,10 +601,90 @@ init_hash_tables(Font *f) {
     return true;
 }
 
+// A modify_font size entry names a face by its PostScript name (one face) or by
+// its family name (every style in the family).
+static bool
+face_has_size_mod_name(PyObject *face, const char *name) {
+    if (!face || !name) return false;
+    const char *psname = postscript_name_for_face(face), *family = family_name_for_face(face);
+    return (psname && strcmp(name, psname) == 0) || (family && strcmp(name, family) == 0);
+}
+
+static FontSizeAdjustment
+size_adjustment_for_face(PyObject *face) {
+    FontSizeAdjustment ans = {0};
+    if (!face || !OPT(font_size_mods).num) return ans;
+    // An exact PostScript name identifies a single face where a family name
+    // matches every style in the family, so it wins when both match.
+    const char *names[2] = {postscript_name_for_face(face), family_name_for_face(face)};
+    for (unsigned n = 0; n < arraysz(names); n++) {
+        if (!names[n] || !names[n][0]) continue;
+        for (size_t i = 0; i < OPT(font_size_mods).num; i++) {
+            __typeof__(OPT(font_size_mods).entries) e = OPT(font_size_mods).entries + i;
+            if (strcmp(e->name, names[n]) == 0) {
+                ans.enabled = true;
+                ans.val = e->val;
+                ans.unit = e->unit;
+                return ans;
+            }
+        }
+    }
+    return ans;
+}
+
+// Mirrors adjust_metric()'s unit semantics: pt and px are deltas, percent is a
+// multiplier. px is converted through the mean of the two dpis because that is
+// the number CoreText sizes with (_scaled_point_sz); on FreeType, which sizes
+// with separate x/y dpi, an anisotropic display makes a px adjustment only
+// approximately N pixels.
+static double
+adjusted_font_sz_in_pts(const FontGroup *fg, FontSizeAdjustment a) {
+    if (!a.enabled || a.val == 0.f) return fg->font_sz_in_pts;
+    const double base = fg->unscaled_font_sz_in_pts;
+    if (base <= 0) return fg->font_sz_in_pts;
+    double ans = base;
+    switch (a.unit) {
+        case POINT: ans = base + a.val; break;
+        case PERCENT: ans = base * fabs((double)a.val) / 100.; break;
+        case PIXEL: ans = base + (double)a.val * 72. / ((fg->logical_dpi_x + fg->logical_dpi_y) / 2.); break;
+    }
+    // A multicell run re-sizes the group, so express the adjustment as a ratio
+    // of the base and re-apply it at the run's size. Otherwise a -1pt tuned at
+    // scale 1 would be half as strong at scale 2, where the cell is twice as
+    // big -- cell_width/cell_height deltas do not drift that way, because they
+    // are baked into the base cell that scaled_cell_dimensions() multiplies.
+    if (fg->font_sz_in_pts != base) ans *= fg->font_sz_in_pts / base;
+    return MAX(1., ans);
+}
+
+// Size one face for the group, honouring its modify_font size adjustment. The
+// adjusted size is carried on a stack copy of just the fonts-data header (the
+// only part either backend reads) so the group's own font_sz_in_pts -- which is
+// what the cell metrics are derived from -- is never perturbed. Goes through
+// face_apply_scaling(), the backend's "this face was re-sized" entry point, so
+// FreeType's derived-metrics refresh is not skipped.
+static bool
+apply_face_size(FontGroup *fg, Font *f) {
+    double sz = adjusted_font_sz_in_pts(fg, f->size_adjustment);
+    if (sz == fg->font_sz_in_pts) return face_apply_scaling(f->face, (FONTS_DATA_HANDLE)fg);
+    // fcm is load-bearing, not padding: face_apply_scaling() passes
+    // desired_height 0 and FreeType's set_font_size() then falls back to the
+    // handle's cell_height to pick a bitmap strike for non-scalable faces.
+    struct {
+        FONTS_DATA_HEAD
+    } copy = {.sprite_map = fg->sprite_map,
+              .logical_dpi_x = fg->logical_dpi_x,
+              .logical_dpi_y = fg->logical_dpi_y,
+              .font_sz_in_pts = sz,
+              .fcm = fg->fcm};
+    return face_apply_scaling(f->face, (FONTS_DATA_HANDLE)&copy);
+}
+
 static bool
 init_font(Font *f, PyObject *face, bool bold, bool italic, bool emoji_presentation) {
     f->face = face;
     Py_INCREF(f->face);
+    f->size_adjustment = size_adjustment_for_face(face);
     f->bold = bold;
     f->italic = italic;
     f->emoji_presentation = emoji_presentation;
@@ -829,6 +925,9 @@ load_fallback_font(FontGroup *fg, const ListOfChars *lc, bool bold, bool italic,
     ssize_t ans = fg->first_fallback_font_idx + fg->fallback_fonts_count;
     Font *af = &fg->fonts[ans];
     if (!init_font(af, face, bold, italic, emoji_presentation)) fatal("Out of memory");
+    // The set_size_for_face() above fits the face to the cell; a modify_font
+    // size adjustment for it is only knowable once init_font() has resolved it.
+    if (af->size_adjustment.enabled) apply_face_size(fg, af);
     Py_DECREF(face);
     fg->fallback_fonts_count++;
     fg->fonts_count++;
@@ -965,6 +1064,9 @@ box_glyph_id(char_type ch) {
 }
 
 static PyObject *descriptor_for_idx = NULL;
+// Cleared in set_font_data (the config-load boundary) so the unmatched
+// modify_font size warning is emitted once per config, not once per font group.
+static bool font_size_mods_reported = false;
 
 void
 render_alpha_mask(
@@ -1062,6 +1164,9 @@ apply_scale_to_font_group(FontGroup *fg, RunFont *rf) {
         sfd.fcm.cell_height = scaled_cell_height;
         if (vt_is_end(vt_insert(&fg->scaled_font_map, scale, sfd))) fatal("Out of memory inserting scaled font data into map");
         apply_scaling(fg);
+        // apply_scaling() sizes the medium face from fg->font_sz_in_pts, which
+        // is the unadjusted base -- restore its modify_font size adjustment.
+        if (medium_font->size_adjustment.enabled) apply_face_size(fg, medium_font);
     } else sfd = i.data->val;
     fg->font_sz_in_pts = sfd.font_sz_in_pts;
     fg->fcm = sfd.fcm;
@@ -1957,7 +2062,7 @@ shape_run(
     ListOfChars *lc) {
     float scale = apply_scale_to_font_group(fg, &rf);
     if (scale != 1.f)
-        if (!face_apply_scaling(font->face, (FONTS_DATA_HANDLE)fg) && PyErr_Occurred()) PyErr_Print();
+        if (!apply_face_size(fg, font) && PyErr_Occurred()) PyErr_Print();
     hb_font_t *hbf = harfbuzz_font_for_face(font->face);
     if (font->spacer_strategy == SPACER_STRATEGY_UNKNOWN) detect_spacer_strategy(hbf, font, tc);
     shape(first_cpu_cell, first_gpu_cell, num_cells, hbf, font, disable_ligature, tc);
@@ -1971,7 +2076,7 @@ shape_run(
 #endif
     if (scale != 1.f) {
         apply_scale_to_font_group(fg, NULL);
-        if (!face_apply_scaling(font->face, (FONTS_DATA_HANDLE)fg) && PyErr_Occurred()) PyErr_Print();
+        if (!apply_face_size(fg, font) && PyErr_Occurred()) PyErr_Print();
     }
     return scale;
 }
@@ -2016,7 +2121,7 @@ render_groups(FontGroup *fg, RunFont rf, bool center_glyph, const TextCache *tc)
     const FontCellMetrics unscaled_metrics = fg->fcm;
     float scale = apply_scale_to_font_group(fg, &rf);
     if (scale != 1.f)
-        if (!face_apply_scaling(fg->fonts[rf.font_idx].face, (FONTS_DATA_HANDLE)fg) && PyErr_Occurred()) PyErr_Print();
+        if (!apply_face_size(fg, fg->fonts + rf.font_idx) && PyErr_Occurred()) PyErr_Print();
     while (idx <= G(group_idx)) {
         Group *group = G(groups) + idx;
         if (!group->num_cells) break;
@@ -2045,7 +2150,7 @@ render_groups(FontGroup *fg, RunFont rf, bool center_glyph, const TextCache *tc)
     }
     if (scale != 1.f) {
         apply_scale_to_font_group(fg, NULL);
-        if (!face_apply_scaling(fg->fonts[rf.font_idx].face, (FONTS_DATA_HANDLE)fg) && PyErr_Occurred()) PyErr_Print();
+        if (!apply_face_size(fg, fg->fonts + rf.font_idx) && PyErr_Occurred()) PyErr_Print();
     }
 }
 
@@ -2376,6 +2481,7 @@ set_font_data(PyObject UNUSED *m, PyObject *args) {
             &ns))
         return NULL;
     Py_INCREF(descriptor_for_idx);
+    font_size_mods_reported = false;
     free_font_groups();
     clear_symbol_maps();
     set_symbol_maps(&symbol_maps, &num_symbol_maps, sm);
@@ -2537,6 +2643,31 @@ initialize_font_group(FontGroup *fg) {
     for (ssize_t i = fg->first_symbol_font_idx; i < fg->first_fallback_font_idx; i++) {
         set_size_for_face(fg->fonts[i].face, fg->fcm.cell_height, true, (FONTS_DATA_HANDLE)fg);
     }
+    // modify_font size, applied last: after calc_cell_metrics() so the cell grid
+    // is derived from the unmodified font size, and after the cell-fitting loop
+    // above so an explicit adjustment for a symbol/fallback face wins over it.
+    for (size_t i = 1; i < fg->fonts_count; i++) {
+        if (fg->fonts[i].size_adjustment.enabled) apply_face_size(fg, fg->fonts + i);
+    }
+    // A well-formed line naming a font that is not loaded does nothing at all,
+    // which is otherwise indistinguishable from the option not working. Only
+    // the configured fonts exist at this point, so an entry aimed at a font the
+    // OS supplies as a fallback later is called out as still possible. Said
+    // once per config load, not once per font group: a group is created per
+    // (font size, dpi), so warning per group would re-emit on every
+    // increase_font_size with no way to silence it.
+    for (size_t i = 0; !font_size_mods_reported && i < OPT(font_size_mods).num; i++) {
+        const char *name = OPT(font_size_mods).entries[i].name;
+        bool matched = false;
+        for (size_t f = 1; f < fg->fonts_count && !matched; f++) matched = face_has_size_mod_name(fg->fonts[f].face, name);
+        if (!matched)
+            log_error(
+                "No configured font has the PostScript or family name '%s', so"
+                " modify_font size for it has no effect (unless that font is"
+                " later loaded as a fallback)",
+                name);
+    }
+    font_size_mods_reported = true;
     ScaledFontData sfd = {.fcm = fg->fcm, .font_sz_in_pts = fg->font_sz_in_pts};
     vt_insert(&fg->scaled_font_map, 1.f, sfd);
 }

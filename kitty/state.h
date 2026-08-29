@@ -173,6 +173,17 @@ typedef struct Options {
             hb_feature_t *features;
         } *entries;
     } font_features;
+    // modify_font size <font> <val>: per-font rasterization size adjustments,
+    // keyed by PostScript name or family name. Applied to the glyph render
+    // size only -- cell metrics are derived from the unmodified font_size.
+    struct {
+        size_t num;
+        struct {
+            const char *name;
+            float val;
+            AdjustmentUnit unit;
+        } *entries;
+    } font_size_mods;
     struct {
         Animation *cursor, *visual_bell;
     } animation;

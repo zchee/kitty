@@ -334,6 +334,35 @@ Note that modifying the baseline will automatically adjust the underline and
 strikethrough positions by the same amount. Increasing the baseline raises
 glyphs inside the cell and decreasing it lowers them. Decreasing the cell size
 might cause rendering artifacts, so use with care.
+
+Cell dimensions are a whole number of pixels, so :code:`cell_width` and
+:code:`cell_height` adjustments are rounded to the nearest pixel. On a display
+without HiDPI scaling that makes one pixel the finest available step.
+
+Finally, you can adjust the size at which an individual font rasterizes its
+glyphs, without changing the cell grid::
+
+    modify_font size MonoLisa -0.5
+    modify_font size Symbols Nerd Font Mono 90%
+
+The font is named by its PostScript name, or by its family name to cover every
+style in that family; an exact PostScript name wins when both match, and is the
+portable choice, since family names come from the platform font backend and the
+same font can report a different one on Linux and macOS. The name may contain
+spaces, as the size value is always the last field, and a name that matches
+none of the configured fonts is reported in the log rather than silently
+ignored.
+
+Unlike every other modification, this one does not affect the cell metrics at
+all -- those are always derived from :opt:`font_size`. That makes it the way to
+tune how tightly glyphs fill the cell independently of how wide the cell is, at
+a much finer granularity than :code:`cell_width` allows, and the way to bring an
+oversized symbol or fallback font into line with the main font. A percentage is
+applied as a magnitude, so a negative one behaves like a positive one; the
+resulting size is clamped to a minimum of one point; and increasing the size
+past what the cell can hold clips the glyph. The adjustment is proportional to
+:opt:`font_size`, so text drawn at a larger scale by the text sizing protocol
+keeps the same glyph-to-cell ratio you tuned at normal size.
 """,
 )
 

@@ -376,6 +376,240 @@ class Rendering(FontBaseTest):
         block_test(upper_half_block, scale=1, subscale_n=1, subscale_d=2, text='██')
         block_test(lower_half_block, scale=1, subscale_n=1, subscale_d=2, text='██', vertical_align=1)
 
+    def modify_font_setup(self, *lines):
+        # Drive the real option parser so the tests exercise the same key
+        # shapes ("size:<name>") production config parsing produces.
+        from kitty.options.types import defaults
+        from kitty.options.utils import modify_font
+
+        mf = {}
+        for line in lines:
+            for k, v in modify_font(line):
+                mf[k] = v
+        opts = defaults._replace(font_size=self.font_size, modify_font=mf)
+        return setup_for_testing(size=self.font_size, dpi=self.dpi, main_face_path=self.path_for_font(self.font_name), opts=opts)
+
+    @staticmethod
+    def sprite_ink(data, cell_width, cell_height):
+        # Coverage is the low byte of each pixel -- is_rendered() in fonts.c
+        # tests it as `& 0x000000ff` -- which on a little-endian host is the
+        # first byte of the pixel. Summing it measures how much of the cell the
+        # glyph fills, so it moves with the rasterized glyph size.
+        px = cell_width * cell_height
+        bpp, extra = divmod(len(data), px)
+        # Measured: the sprite is exactly one cell at 4 bytes per pixel, with no
+        # trailing underline-exclusion row. Fail loudly if that ever changes,
+        # rather than silently summing the wrong bytes at the wrong stride.
+        assert extra == 0 and bpp > 0, f'sprite is {len(data)} bytes, not a whole number of {px} pixels'
+        return sum(data[i * bpp] for i in range(px))
+
+    def test_modify_font_size(self):
+        # modify_font size adjusts only the point size at which a font
+        # rasterizes its glyphs. The cell grid is derived from font_size and must
+        # not move, which is what makes it a finer knob than modify_font
+        # cell_width, whose steps are quantized to whole pixels.
+        from kitty.fast_data_types import Screen, current_fonts
+
+        def render(*lines):
+            with self.modify_font_setup(*lines) as (sprites, cw, ch):
+                psname = current_fonts()['medium'].postscript_name()
+                s = Screen(None, 1, 4)
+                line = s.line(0)
+                s.draw('M')
+                test_render_line(line)
+                idx = line.sprite_at(0) & 0x7FFFFFFF
+                glyph = bytes(sprites[sprite_idx_to_pos(idx, setup_for_testing.xnum, setup_for_testing.ynum)])
+            return (cw, ch), psname, glyph, self.sprite_ink(glyph, cw, ch)
+
+        base_cell, psname, base_glyph, base_ink = render()
+        self.assertTrue(psname, 'the test font reported no PostScript name')
+        self.assertGreater(base_ink, 0, 'the unmodified glyph rendered no ink, so the ink assertions below prove nothing')
+
+        # The cell must not move, and the glyph must, for any unit.
+        for spec in (f'size {psname} -2', f'size {psname} 2', f'size {psname} 80%', f'size {psname} -3px'):
+            with self.subTest(spec=spec):
+                cell, _, glyph, _ = render(spec)
+                self.ae(cell, base_cell, f'{spec} moved the cell metrics')
+                self.assertNotEqual(glyph, base_glyph, f'{spec} left the rendered glyph unchanged')
+
+        # Direction and magnitude are asserted in
+        # test_modify_font_size_is_monotonic, which cannot use this harness: it
+        # pins the main face by path, and face_from_path (core_text.m) builds
+        # the face with a size of 0.0, so CoreText gives it its own default
+        # 12pt no matter what font_size says. That makes the unadjusted
+        # baseline a 12pt face while the option computes its delta from 16, so
+        # `size <face> -4` lands back on 12pt and reproduces the unadjusted
+        # render byte for byte -- useless as a sample point -- while every
+        # growing value overflows the 12pt-derived cell and is clamped to one
+        # rendering (measured: +1, +2, +4, +6 and +12 all share a hash).
+
+        # A name matching no loaded face must be inert. The value matters: -4
+        # would land this harness's 12pt face back on 12pt, so a matched name
+        # would produce the base sprite too and the assertion could not fail for
+        # the reason it states. -8 moves a matched face to 8pt, so it can.
+        self.assertNotEqual(render(f'size {psname} -8')[2], base_glyph, 'the control for the check below does not discriminate')
+        cell, _, glyph, _ = render('size ThisFontDoesNotExist -8')
+        self.ae(cell, base_cell)
+        self.ae(glyph, base_glyph)
+
+        # The two knobs are independent: cell_width moves the cell and leaves the
+        # glyph alone, size does the reverse and does not add to the cell.
+        widened = (base_cell[0] + 2, base_cell[1])
+        cell, _, _, ink = render('cell_width 2px')
+        self.ae(cell, widened)
+        self.ae(ink, base_ink, 'cell_width re-rasterized the glyph instead of only widening the cell')
+        cell, _, _, _ = render('cell_width 2px', f'size {psname} -2')
+        self.ae(cell, widened, 'size perturbed the cell when combined with cell_width')
+
+    def test_modify_font_size_is_monotonic(self):
+        # Uses a descriptor-resolved family rather than this class's path-pinned
+        # test font, because only a descriptor-loaded face is created at the
+        # group's own point size -- which is what puts the unadjusted baseline
+        # in the right place in the ordering below. The size is large so a two
+        # point step stays well inside what the cell can hold; a step that
+        # overflowed would be clamped and would flatten the top of the sequence.
+        from kitty.fast_data_types import Screen, current_fonts
+        from kitty.options.types import defaults
+        from kitty.options.utils import modify_font, parse_font_spec
+
+        size = 40.0
+
+        def render(*lines):
+            mf = {}
+            for line in lines:
+                for k, v in modify_font(line):
+                    mf[k] = v
+            opts = defaults._replace(font_family=parse_font_spec('monospace'), font_size=size, modify_font=mf)
+            with setup_for_testing(size=size, dpi=self.dpi, opts=opts) as (sprites, cw, ch):
+                psname = current_fonts()['medium'].postscript_name()
+                s = Screen(None, 1, 4)
+                line = s.line(0)
+                s.draw('M')
+                test_render_line(line)
+                idx = line.sprite_at(0) & 0x7FFFFFFF
+                glyph = bytes(sprites[sprite_idx_to_pos(idx, setup_for_testing.xnum, setup_for_testing.ynum)])
+            return psname, (cw, ch), self.sprite_ink(glyph, cw, ch), glyph
+
+        psname, base_cell, base_ink, base_glyph = render()
+        self.assertTrue(psname, 'the resolved monospace face reported no PostScript name')
+        inks = []
+        for d in (-4, -2, 0, 2):
+            if d == 0:
+                cell, ink, glyph = base_cell, base_ink, base_glyph
+            else:
+                cell, ink, glyph = render(f'size {psname} {d}')[1:]
+                # A sample that stops moving the glyph would silently cost the
+                # ordering below its teeth, so fail on it here instead.
+                self.assertNotEqual(glyph, base_glyph, f'size {d} rendered identically to no adjustment')
+            self.ae(cell, base_cell, f'size {d} moved the cell metrics')
+            inks.append(ink)
+        self.assertEqual(inks, sorted(inks), f'glyph coverage is not monotonic in the size adjustment: {inks}')
+        self.assertEqual(len(set(inks)), len(inks), f'two different adjustments rendered the same coverage: {inks}')
+
+    def test_modify_font_size_scales_with_multicell_runs(self):
+        # A point delta is applied as a ratio of the configured font size, so it
+        # keeps its strength when a multicell run re-sizes the group. Asserted
+        # by equivalence rather than by measuring the scaled sprite: at
+        # font_size 40 a -4pt delta and a 90% multiplier are the same reduction,
+        # so they must render identically at every scale. If the delta were
+        # absolute they would agree at scale 1 and diverge at scale 2, where the
+        # base is doubled (76pt against 72pt).
+        from kitty.fast_data_types import Screen, current_fonts
+        from kitty.options.types import defaults
+        from kitty.options.utils import modify_font, parse_font_spec
+
+        size = 40.0
+
+        def render(*lines, scale=1):
+            mf = {}
+            for line in lines:
+                for k, v in modify_font(line):
+                    mf[k] = v
+            opts = defaults._replace(font_family=parse_font_spec('monospace'), font_size=size, modify_font=mf)
+            with setup_for_testing(size=size, dpi=self.dpi, opts=opts) as (sprites, cw, ch):
+                psname = current_fonts()['medium'].postscript_name()
+                s = Screen(None, 4, 8)
+                if scale == 1:
+                    s.draw('M')
+                else:
+                    draw_multicell(s, 'M', scale=scale)
+                line = s.line(0)
+                test_render_line(line)
+                idx = line.sprite_at(0) & 0x7FFFFFFF
+                glyph = bytes(sprites[sprite_idx_to_pos(idx, setup_for_testing.xnum, setup_for_testing.ynum)])
+            return psname, glyph
+
+        psname, _ = render()
+        for scale in (1, 2):
+            with self.subTest(scale=scale):
+                plain = render(scale=scale)[1]
+                by_pt = render(f'size {psname} -4', scale=scale)[1]
+                by_pct = render(f'size {psname} 90%', scale=scale)[1]
+                self.assertNotEqual(by_pt, plain, f'the adjustment did not reach the scale={scale} render')
+                self.ae(by_pt, by_pct, f'at scale={scale} a -4pt delta and 90% of 40pt did not agree, so the delta is not proportional')
+
+    def test_modify_font_size_survives_scaled_run(self):
+        # The scaled (multicell) render path re-sizes faces and restores them
+        # afterwards. An adjustment has to survive that round trip and also has
+        # to reach the scaled render itself.
+        from kitty.fast_data_types import Screen, current_fonts
+
+        def run(*lines):
+            with self.modify_font_setup(*lines) as (sprites, cw, ch):
+                psname = current_fonts()['medium'].postscript_name()
+
+                def sprite(s, x=0, y=0):
+                    line = s.line(y)
+                    test_render_line(line)
+                    idx = line.sprite_at(x) & 0x7FFFFFFF
+                    return bytes(sprites[sprite_idx_to_pos(idx, setup_for_testing.xnum, setup_for_testing.ynum)])
+
+                unscaled = Screen(None, 4, 8)
+                unscaled.draw('M')
+                before = sprite(unscaled)
+                multicell = Screen(None, 4, 8)
+                draw_multicell(multicell, 'M', scale=2)
+                scaled = sprite(multicell)
+                again = Screen(None, 4, 8)
+                again.draw('M')
+                after = sprite(again)
+            return psname, before, scaled, after
+
+        psname, base_before, base_scaled, base_after = run()
+        self.ae(base_before, base_after, 'the unscaled sprite changed across a scaled run even with no adjustment')
+        _, adj_before, adj_scaled, adj_after = run(f'size {psname} -2')
+        self.ae(adj_before, adj_after, 'the size adjustment was lost across a scaled run')
+        self.assertNotEqual(adj_before, base_before, 'the adjustment did not reach the unscaled render')
+        self.assertNotEqual(adj_scaled, base_scaled, 'the adjustment did not reach the scaled render')
+
+    @unittest.skipUnless(is_macos, 'only CoreText exposes the family name of a face to Python')
+    def test_modify_font_size_matches_family_name(self):
+        # A family name covers every style in the family, where a PostScript
+        # name identifies one face.
+        from kitty.fast_data_types import Screen, current_fonts
+
+        def render(*lines):
+            with self.modify_font_setup(*lines) as (sprites, cw, ch):
+                family = current_fonts()['medium'].family_name
+                s = Screen(None, 1, 4)
+                line = s.line(0)
+                s.draw('M')
+                test_render_line(line)
+                idx = line.sprite_at(0) & 0x7FFFFFFF
+                glyph = bytes(sprites[sprite_idx_to_pos(idx, setup_for_testing.xnum, setup_for_testing.ynum)])
+            return (cw, ch), family, glyph
+
+        base_cell, family, base_glyph = render()
+        self.assertTrue(family, 'the test font reported no family name')
+        # The bundled test font's family name contains a space, which is the
+        # case the unquoted multi-field parse in modify_font() exists for.
+        self.assertIn(' ', family)
+        for spec in (f'size {family} -2', f'size "{family}" -2'):
+            with self.subTest(spec=spec):
+                cell, _, glyph = render(spec)
+                self.ae(cell, base_cell)
+                self.assertNotEqual(glyph, base_glyph)
+
     def test_font_rendering(self):
         render_string('ab\u0347\u0305你好|\U0001f601|\U0001f64f|\U0001f63a|')
         text = 'He\u0347\u0305llo\u0341, w\u0302or\u0306l\u0354d!'

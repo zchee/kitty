@@ -317,6 +317,46 @@ parse_font_mod_size(PyObject *val, float *sz, AdjustmentUnit *unit) {
             case PERCENT:
             case PIXEL: *unit = u; break;
         }
+        Py_DECREF(mv);
+    }
+}
+
+static inline void
+free_font_size_mods(Options *opts) {
+    if (opts->font_size_mods.entries) {
+        for (size_t i = 0; i < opts->font_size_mods.num; i++) free((void *)opts->font_size_mods.entries[i].name);
+        free(opts->font_size_mods.entries);
+    }
+    memset(&opts->font_size_mods, 0, sizeof(opts->font_size_mods));
+}
+
+// The `size` modification type is keyed per font, so its dict keys are
+// "size:<font name>" rather than one of the fixed metric names handled by
+// modify_font() below.
+static inline void
+font_size_mods(PyObject *mf, Options *opts) {
+    free_font_size_mods(opts);
+    Py_ssize_t capacity = PyDict_GET_SIZE(mf);
+    if (capacity < 1) return;
+    opts->font_size_mods.entries = calloc(capacity, sizeof(opts->font_size_mods.entries[0]));
+    if (!opts->font_size_mods.entries) {
+        PyErr_NoMemory();
+        return;
+    }
+    PyObject *key, *value;
+    Py_ssize_t pos = 0;
+    while (PyDict_Next(mf, &pos, &key, &value)) {
+        const char *k = PyUnicode_AsUTF8(key);
+        static const char prefix[] = "size:";
+        if (!k || strncmp(k, prefix, sizeof(prefix) - 1) != 0 || !k[sizeof(prefix) - 1]) continue;
+        __typeof__(opts->font_size_mods.entries) e = opts->font_size_mods.entries + opts->font_size_mods.num;
+        e->name = strdup(k + sizeof(prefix) - 1);
+        if (!e->name) {
+            PyErr_NoMemory();
+            return;
+        }
+        parse_font_mod_size(value, &e->val, &e->unit);
+        opts->font_size_mods.num++;
     }
 }
 
@@ -336,6 +376,7 @@ modify_font(PyObject *mf, Options *opts) {
     S(cell_width);
     S(baseline);
 #undef S
+    font_size_mods(mf, opts);
 }
 
 static inline void
@@ -693,6 +734,7 @@ free_allocs_in_options(Options *opts) {
     free_menu_map(opts);
     free_url_prefixes(opts);
     free_font_features(opts);
+    free_font_size_mods(opts);
     free_background_images(opts);
 #define F(x)       \
     free(opts->x); \

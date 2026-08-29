@@ -1098,11 +1098,22 @@ def modify_font(val: str) -> Iterable[tuple[str, FontModification]]:
     pos += 1
     font_name = ''
     if mtype is ModificationType.size:
-        font_name = parts[pos]
-        pos += 1
-    if plen - pos < 1:
-        log_error(f'Ignoring invalid modify_font: {val}')
-        return
+        # Font names commonly contain spaces (Fira Code, JetBrains Mono), and the
+        # size value is always the last field, so the name is everything between
+        # the two. That keeps `modify_font size Fira Code -1` working without
+        # requiring the user to quote anything.
+        if plen - pos < 2:
+            log_error(f'Ignoring invalid modify_font: {val}')
+            return
+        font_name = ' '.join(parts[pos : plen - 1])
+        # Quoting is unnecessary but people reach for it anyway, and a name that
+        # kept its quotes would match no font while looking perfectly correct.
+        if len(font_name) > 1 and font_name[0] == font_name[-1] and font_name[0] in '"\'':
+            font_name = font_name[1:-1]
+        if not font_name:
+            log_error(f'Ignoring modify_font with empty font name: {val}')
+            return
+        pos = plen - 1
     sz = parts[pos]
     pos += 1
     munit = ModificationUnit.pt

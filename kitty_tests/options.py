@@ -295,6 +295,19 @@ def conf_parsing(self):
             'size:Test': FontModification(ModificationType.size, ModificationValue(-1.0, ModificationUnit.pixel), 'Test'),
         },
     )
+    # A font name is every field between the modification type and the value, so
+    # names with spaces need no quoting -- and quoting them anyway still works.
+    opts = p('modify_font size Fira Code -1', "modify_font size 'JetBrains Mono' 90%")
+    self.ae(
+        opts.modify_font,
+        {
+            'size:Fira Code': FontModification(ModificationType.size, ModificationValue(-1.0, ModificationUnit.pt), 'Fira Code'),
+            'size:JetBrains Mono': FontModification(ModificationType.size, ModificationValue(90.0, ModificationUnit.percent), 'JetBrains Mono'),
+        },
+    )
+    # ...but a line with no name, or nothing left after unquoting, is rejected.
+    opts = p('modify_font size -1', 'modify_font size "" -1', bad_line_num=0)
+    self.ae(opts.modify_font, {})
 
     # test the aliasing options
     opts = p('env A=1', 'env B=x$A', 'env C=', 'env D', 'clear_all_shortcuts y', 'kitten_alias a b --moo', 'map f1 kitten a arg')
