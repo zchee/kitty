@@ -112,7 +112,9 @@ class ModificationValue(NamedTuple):
     unit: ModificationUnit
 
     def __repr__(self) -> str:
-        u = '%' if self.unit is ModificationUnit.percent else ''
+        # Round-trips as written, so `kitty --debug-config` shows the unit that
+        # was actually parsed rather than silently dropping the px suffix.
+        u = {ModificationUnit.percent: '%', ModificationUnit.pixel: 'px'}.get(self.unit, '')
         return f'{self.val:g}{u}'
 
 
