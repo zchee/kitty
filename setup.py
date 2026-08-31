@@ -1268,6 +1268,8 @@ def glfw_init_env(
         ans.cppflags.append('-I/opt/local/include')
         ans.ldflags.append(f'-F{homebrew_prefix()}/Frameworks')
         ans.cppflags.append('-DGL_SILENCE_DEPRECATION')
+        # QuartzCore stays: upstream dropped it with the window-corners revert,
+        # but the Metal backend's CAMetalLayer lives there.
         frameworks = 'Cocoa IOKit CoreFoundation CoreVideo QuartzCore UniformTypeIdentifiers'
         ans.cppflags.append('-DKITTY_USE_METAL')
         # The Metal backend replaces the NSGL context implementation
@@ -1509,6 +1511,9 @@ SHADER_UNIFORMS: Dict[str, Tuple[str, ...]] = {
     'rounded_rect': (
         'rect', 'params', 'color', 'background_color',   # rounded_rect_fragment.glsl
         # rounded_rect_vertex.glsl declares no uniforms
+        # outer_color: upstream 376e72ded (rounded window borders), appended so
+        # the four slots above keep their indices.
+        'outer_color',
     ),
     'screenshot': (
         'image', 'src_size',                       # screenshot_fragment.glsl

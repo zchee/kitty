@@ -730,14 +730,17 @@ pyset_borders_rects(PyObject *self UNUSED, PyObject *args) {
     BorderRects *br = &tab->border_rects;
     br->is_dirty = true;
     br->num_border_rects = PyList_GET_SIZE(rects);
+    br->num_rounded_rects = 0;
     ensure_space_for(br, rect_buf, BorderRect, br->num_border_rects + 1, capacity, 32, false);
     for (unsigned i = 0; i < br->num_border_rects; i++) {
         PyObject *pr = PyList_GET_ITEM(rects, i);
         unsigned long color;
         long long border_type;
         BorderRect *r = br->rect_buf + i;
-        int horizontal;
-        if (!PyArg_ParseTuple(pr, "IIIIkLp", &r->px.left, &r->px.top, &r->px.right, &r->px.bottom, &color, &border_type, &horizontal)) return NULL;
+        int horizontal, render;
+        if (!PyArg_ParseTuple(
+                pr, "IIIIkLppII", &r->px.left, &r->px.top, &r->px.right, &r->px.bottom, &color, &border_type, &horizontal, &render, &r->radius, &r->thickness))
+            return NULL;
         r->left = gl_pos_x(r->px.left, osw->viewport_width);
         r->top = gl_pos_y(r->px.top, osw->viewport_height);
         r->right = r->left + gl_size(r->px.right - r->px.left, osw->viewport_width);
@@ -745,6 +748,8 @@ pyset_borders_rects(PyObject *self UNUSED, PyObject *args) {
         r->color = color;
         r->border_type = border_type;
         r->horizontal = horizontal;
+        if (r->radius && r->thickness) br->num_rounded_rects++;
+        if (!render) r->left = r->top = r->right = r->bottom = -2.f;
     }
     END_WITH_TAB
     Py_RETURN_NONE;

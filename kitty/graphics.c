@@ -11,6 +11,7 @@
 #include "disk-cache.h"
 #include "iqsort.h"
 #include "safe-wrappers.h"
+#include "simd-string.h"
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -42,10 +43,14 @@ cache_key(const ImageAndFrame x, char *key) {
 }
 #define CK(x) key, cache_key(x, key)
 
+// Transfers ownership of *data (a malloc() allocated pointer) to the cache,
+// setting it to NULL, on success. This avoids copying what are often many
+// megabytes of image data. Note that *data must not be used afterwards, the
+// cache write thread can modify it (encryption is done in-place) at any time.
 static bool
-add_to_cache(GraphicsManager *self, const ImageAndFrame x, const void *data, const size_t sz, bool memory_only) {
+add_to_cache(GraphicsManager *self, const ImageAndFrame x, void **data, const size_t sz, bool memory_only) {
     char key[CACHE_KEY_BUFFER_SIZE];
-    return add_to_disk_cache(self->disk_cache, CK(x), data, sz, memory_only);
+    return add_to_disk_cache_move(self->disk_cache, CK(x), data, sz, memory_only);
 }
 
 static bool
@@ -112,10 +117,22 @@ free_load_data(LoadData *ld) {
     ld->buf_used = 0;
     ld->buf_capacity = 0;
     ld->buf = NULL;
-    if (ld->mapped_file) munmap(ld->mapped_file, ld->mapped_file_sz);
-    ld->mapped_file = NULL;
-    ld->mapped_file_sz = 0;
+    ld->data = NULL;
     ld->loading_for = (const ImageAndFrame){0};
+}
+
+// Moves the loaded image data into the cache. ld->data always aliases ld->buf,
+// so the load data is left empty on success.
+static bool
+add_load_data_to_cache(GraphicsManager *self, const ImageAndFrame x, bool memory_only) {
+    LoadData *ld = &self->currently_loading;
+    void *data = ld->data;
+    if (!add_to_cache(self, x, &data, ld->data_sz, memory_only)) return false;
+    ld->buf = NULL;
+    ld->data = NULL;
+    ld->buf_used = 0;
+    ld->buf_capacity = 0;
+    return true;
 }
 
 static void *
@@ -332,20 +349,78 @@ set_command_failed_response(const char *code, const char *fmt, ...) {
         goto err;                                        \
     }
 
+#ifdef __APPLE__
+// On macOS POSIX shared memory objects cannot be read() from, they can only be
+// accessed via mmap(). Unlike with regular files, there is no risk of SIGBUS
+// from a client shrinking the object while we copy from it, since macOS does
+// not allow shared memory objects to be resized once created.
 static bool
-mmap_img_file(GraphicsManager *self, int fd, size_t sz, off_t offset) {
-    if (!sz) {
-        struct stat s;
-        if (fstat(fd, &s) != 0) ABRT(EBADF, "Failed to fstat() the fd: %d file with error: [%d] %s", fd, errno, strerror(errno));
-        sz = s.st_size;
-    }
-    void *addr = mmap(0, sz, PROT_READ, MAP_SHARED, fd, offset);
+copy_from_shm(GraphicsManager *self, int fd, size_t sz, off_t offset) {
+    LoadData *ld = &self->currently_loading;
+    if (!sz) return true; // mmap() of a zero sized region fails
+    const off_t page_start = offset - (offset % sysconf(_SC_PAGESIZE));
+    const size_t delta = (size_t)(offset - page_start), map_sz = sz + delta;
+    void *addr = mmap(0, map_sz, PROT_READ, MAP_SHARED, fd, page_start);
     if (addr == MAP_FAILED)
-        ABRT(EBADF, "Failed to map image file fd: %d at offset: %zd with size: %zu with error: [%d] %s", fd, offset, sz, errno, strerror(errno));
-    self->currently_loading.mapped_file = addr;
-    self->currently_loading.mapped_file_sz = sz;
+        ABRT(EIO, "Failed to map shm object fd: %d at offset: %zd with size: %zu with error: [%d] %s", fd, (ssize_t)page_start, map_sz, errno, strerror(errno));
+    memcpy(ld->buf, (uint8_t *)addr + delta, sz);
+    munmap(addr, map_sz);
+    ld->buf_used = sz;
     return true;
 err:
+    return false;
+}
+#endif
+
+static bool
+read_img_file(GraphicsManager *self, int fd, size_t sz, off_t offset, size_t max_to_read, bool is_shm) {
+    LoadData *ld = &self->currently_loading;
+    struct stat s;
+    if (fstat(fd, &s) != 0) ABRT(EBADF, "Failed to fstat() the fd: %d file with error: [%d] %s", fd, errno, strerror(errno));
+    // The graphics protocol specification mandates that only regular files be
+    // read. Reading from FIFOs/devices/etc. can block forever or have
+    // side-effects. POSIX shared memory fds on macOS do not report as regular
+    // files via fstat(), so skip this check for them.
+    if (!is_shm && !S_ISREG(s.st_mode)) ABRT(EBADF, "The image file with fd: %d is not a regular file", fd);
+    const size_t available = offset < s.st_size ? (size_t)(s.st_size - offset) : 0;
+    if (!sz) sz = available;
+    if (sz > max_to_read) sz = max_to_read;
+    free(ld->buf);
+    // Note that for files the data is copied rather than mmap()ed as the
+    // client is free to truncate the file at any time, which would cause
+    // SIGBUS when reading from a mapping of it. With read() a truncated file
+    // simply results in a short read, which is reported as insufficient data
+    // by the caller.
+    ld->buf = malloc(sz ? sz : 1);
+    if (!ld->buf) ABRT(ENOMEM, "Out of memory allocating %zu bytes to read image file", sz);
+    ld->buf_capacity = sz;
+    ld->buf_used = 0;
+#ifdef __APPLE__
+    // Copying more than the shared memory object contains would read past its
+    // end, a smaller object is reported as insufficient data by the caller.
+    if (is_shm) {
+        if (!copy_from_shm(self, fd, MIN(sz, available), offset)) goto err;
+    } else
+#endif
+    {
+        while (ld->buf_used < sz) {
+            ssize_t n = pread(fd, ld->buf + ld->buf_used, sz - ld->buf_used, offset + (off_t)ld->buf_used);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                ABRT(EIO, "Failed to read from image file fd: %d with error: [%d] %s", fd, errno, strerror(errno));
+            }
+            if (!n) break; // EOF, the file is smaller than expected, reported as insufficient data by the caller
+            ld->buf_used += n;
+        }
+    }
+    return true;
+err:
+    // Discard any partially read data, the caller is not guaranteed to call
+    // free_load_data() on failure.
+    free(ld->buf);
+    ld->buf = NULL;
+    ld->buf_capacity = 0;
+    ld->buf_used = 0;
     return false;
 }
 
@@ -661,8 +736,10 @@ load_image_data(
         case 's': // POSIX shared memory
             if (g->payload_sz > 2048) ABRT("EINVAL", "Filename too long");
             snprintf(fname, sizeof(fname) / sizeof(fname[0]), "%.*s", (int)g->payload_sz, payload);
-            if (transmission_type == 's') fd = safe_shm_open(fname, O_RDONLY, 0);
-            else fd = safe_open(fname, O_CLOEXEC | O_RDONLY | O_NONBLOCK, 0); // O_NONBLOCK so that opening a FIFO pipe does not block
+            if (transmission_type == 's') {
+                if (fname[0] != '/') ABRT("EBADF", "Failed to open file for graphics transmission with error: %s", "POSIX SHM names must start with /");
+                fd = safe_shm_open(fname, O_RDONLY, 0);
+            } else fd = safe_open(fname, O_CLOEXEC | O_RDONLY | O_NONBLOCK, 0); // O_NONBLOCK so that opening a FIFO pipe does not block
             if (fd == -1) ABRT("EBADF", "Failed to open file for graphics transmission with error: [%d] %s", errno, strerror(errno));
             if (global_state.boss && transmission_type != 's') {
                 RAII_PyObject(cret_, PyObject_CallMethod(global_state.boss, "is_ok_to_read_image_file", "si", fname, fd));
@@ -675,7 +752,11 @@ load_image_data(
                     ABRT("EPERM", "Permission denied to read image file");
                 }
             }
-            load_data->loading_completed_successfully = mmap_img_file(self, fd, g->data_sz, g->data_offset);
+            // When the data needs further processing the entire (possibly
+            // compressed) payload is needed, otherwise reading more than the
+            // expected number of bytes is pointless.
+            const size_t max_to_read = (g->compressed || data_fmt == PNG) ? MAX_DATA_SZ : load_data->data_sz;
+            load_data->loading_completed_successfully = read_img_file(self, fd, g->data_sz, g->data_offset, max_to_read, transmission_type == 's');
             safe_close(fd, __FILE__, __LINE__);
             if (transmission_type == 't' && strstr(fname, "tty-graphics-protocol") != NULL) {
                 if (global_state.boss) {
@@ -690,20 +771,15 @@ load_image_data(
 }
 
 static Image *
-process_image_data(GraphicsManager *self, Image *img, const GraphicsCommand *g, const unsigned char transmission_type, const uint32_t data_fmt) {
+process_image_data(GraphicsManager *self, Image *img, const GraphicsCommand *g, const uint32_t data_fmt) {
     bool needs_processing = g->compressed || data_fmt == PNG;
     if (needs_processing) {
         uint8_t *buf;
         size_t bufsz;
-#define IB                                                  \
-    {                                                       \
-        if (self->currently_loading.buf) {                  \
-            buf = self->currently_loading.buf;              \
-            bufsz = self->currently_loading.buf_used;       \
-        } else {                                            \
-            buf = self->currently_loading.mapped_file;      \
-            bufsz = self->currently_loading.mapped_file_sz; \
-        }                                                   \
+#define IB                                        \
+    {                                             \
+        buf = self->currently_loading.buf;        \
+        bufsz = self->currently_loading.buf_used; \
     }
         switch (g->compressed) {
             case 'z':
@@ -731,21 +807,10 @@ process_image_data(GraphicsManager *self, Image *img, const GraphicsCommand *g, 
         if (self->currently_loading.buf_used < self->currently_loading.data_sz) {
             ABRT("ENODATA", "Insufficient image data: %zu < %zu", self->currently_loading.buf_used, self->currently_loading.data_sz);
         }
-        if (self->currently_loading.mapped_file) {
-            munmap(self->currently_loading.mapped_file, self->currently_loading.mapped_file_sz);
-            self->currently_loading.mapped_file = NULL;
-            self->currently_loading.mapped_file_sz = 0;
-        }
     } else {
-        if (transmission_type == 'd') {
-            if (self->currently_loading.buf_used < self->currently_loading.data_sz) {
-                ABRT("ENODATA", "Insufficient image data: %zu < %zu", self->currently_loading.buf_used, self->currently_loading.data_sz);
-            } else self->currently_loading.data = self->currently_loading.buf;
-        } else {
-            if (self->currently_loading.mapped_file_sz < self->currently_loading.data_sz) {
-                ABRT("ENODATA", "Insufficient image data: %zu < %zu", self->currently_loading.mapped_file_sz, self->currently_loading.data_sz);
-            } else self->currently_loading.data = self->currently_loading.mapped_file;
-        }
+        if (self->currently_loading.buf_used < self->currently_loading.data_sz) {
+            ABRT("ENODATA", "Insufficient image data: %zu < %zu", self->currently_loading.buf_used, self->currently_loading.data_sz);
+        } else self->currently_loading.data = self->currently_loading.buf;
         self->currently_loading.loading_completed_successfully = true;
     }
     return img;
@@ -956,7 +1021,7 @@ handle_add_command(GraphicsManager *self, const GraphicsCommand *g, const uint8_
     img = load_image_data(self, img, g, tt, fmt, payload);
     if (!img || !self->currently_loading.loading_completed_successfully) return NULL;
     self->currently_loading.loading_for = (const ImageAndFrame){0};
-    img = process_image_data(self, img, g, tt, fmt);
+    img = process_image_data(self, img, g, fmt);
     if (!img) return NULL;
     size_t required_sz = transmitted_bytes_per_pixel(self->currently_loading.is_hdr, self->currently_loading.is_opaque) * self->currently_loading.width * self->currently_loading.height;
     if (self->currently_loading.data_sz != required_sz) ABRT("EINVAL", "Image dimensions: %ux%u do not match data size: %zu, expected size: %zu", self->currently_loading.width, self->currently_loading.height, self->currently_loading.data_sz, required_sz);
@@ -980,17 +1045,13 @@ handle_add_command(GraphicsManager *self, const GraphicsCommand *g, const uint8_
             .transient = (g->usage_hints & GRAPHICS_USAGE_HINT_TRANSIENT) != 0,
         };
         if (!is_query) {
-            if (!add_to_cache(
-                    self,
-                    (const ImageAndFrame){.image_id = img->internal_id, .frame_id = img->root_frame.id},
-                    self->currently_loading.data,
-                    self->currently_loading.data_sz,
-                    img->root_frame.transient)) {
+            // Upload before caching, the cache takes ownership of the data
+            upload_to_gpu(self, img, img->root_frame.is_opaque, img->root_frame.is_4byte_aligned, self->currently_loading.data);
+            img->last_uploaded_frame_id = img->root_frame.id;  // G3-lite: GPU now holds the root frame; a delta on it can SubImage
+            if (!add_load_data_to_cache(self, (const ImageAndFrame){.image_id = img->internal_id, .frame_id = img->root_frame.id}, img->root_frame.transient)) {
                 if (PyErr_Occurred()) PyErr_Print();
                 ABRT("ENOSPC", "Failed to store image data in cache");
             }
-            upload_to_gpu(self, img, img->root_frame.is_opaque, img->root_frame.is_4byte_aligned, self->currently_loading.data);
-            img->last_uploaded_frame_id = img->root_frame.id;  // G3-lite: GPU now holds the root frame; a delta on it can SubImage
             self->used_storage += required_sz;
             img->used_storage = required_sz;
         }
@@ -1631,29 +1692,6 @@ typedef struct {
     bool is_4byte_aligned, is_opaque, transient;
 } CoalescedFrameData;
 
-static void
-blend_on_opaque(uint8_t *under_px, const uint8_t *over_px) {
-    const float alpha = (float)over_px[3] / 255.f;
-    const float alpha_op = 1.f - alpha;
-    for (unsigned i = 0; i < 3; i++) under_px[i] = (uint8_t)(over_px[i] * alpha + under_px[i] * alpha_op);
-}
-
-static void
-alpha_blend(uint8_t *dest_px, const uint8_t *src_px) {
-    if (src_px[3]) {
-        const float dest_a = (float)dest_px[3] / 255.f, src_a = (float)src_px[3] / 255.f;
-        const float alpha = src_a + dest_a * (1.f - src_a);
-        dest_px[3] = (uint8_t)(255 * alpha);
-        if (!dest_px[3]) {
-            dest_px[0] = 0;
-            dest_px[1] = 0;
-            dest_px[2] = 0;
-            return;
-        }
-        for (unsigned i = 0; i < 3; i++) dest_px[i] = (uint8_t)((src_px[i] * src_a + dest_px[i] * dest_a * (1.f - src_a)) / alpha);
-    }
-}
-
 typedef struct {
     bool needs_blending;
     uint32_t over_px_sz, under_px_sz;
@@ -1661,84 +1699,67 @@ typedef struct {
     uint32_t stride;
 } ComposeData;
 
-#define COPY_RGB              \
-    under_px[0] = over_px[0]; \
-    under_px[1] = over_px[1]; \
-    under_px[2] = over_px[2];
-#define COPY_PIXELS                                                                         \
-    if (d.needs_blending) {                                                                 \
-        if (d.under_px_sz == 3) { ROW_ITER PIX_ITER blend_on_opaque(under_px, over_px); }   \
-    }                                                                                       \
-    }                                                                                       \
-    else { ROW_ITER PIX_ITER alpha_blend(under_px, over_px); }                              \
-    }                                                                                       \
-    }                                                                                       \
-    }                                                                                       \
-    else {                                                                                  \
-        if (d.under_px_sz == 4) {                                                           \
-            if (d.over_px_sz == 4) { ROW_ITER PIX_ITER COPY_RGB under_px[3] = over_px[3]; } \
-        }                                                                                   \
-    }                                                                                       \
-    else { ROW_ITER PIX_ITER COPY_RGB under_px[3] = 255; }                                  \
-    }                                                                                       \
-    }                                                                                       \
-    }                                                                                       \
-    else { ROW_ITER PIX_ITER COPY_RGB }                                                     \
-    }                                                                                       \
-    }                                                                                       \
+static void
+copy_or_blend_row(
+    uint8_t *under_row, const uint8_t *over_row, const unsigned num_px, const uint32_t under_px_sz, const uint32_t over_px_sz, const bool needs_blending) {
+    if (needs_blending && over_px_sz == 4) {
+        // over is straight alpha RGBA
+        if (under_px_sz == 4) blend_over_straight(under_row, over_row, num_px);
+        else blend_over_opaque(under_row, 3, over_row, num_px);
+    } else {
+        for (unsigned x = 0; x < num_px; x++) {
+            uint8_t *under_px = under_row + (size_t)under_px_sz * x;
+            const uint8_t *over_px = over_row + (size_t)over_px_sz * x;
+            under_px[0] = over_px[0];
+            under_px[1] = over_px[1];
+            under_px[2] = over_px[2];
+            if (under_px_sz == 4) under_px[3] = over_px_sz == 4 ? over_px[3] : 255;
+        }
     }
-
+}
 
 static void
-compose_rectangles(const ComposeData d, uint8_t *under_data, const uint8_t *over_data) {
-    // compose two equal sized, non-overlapping rectangles at different offsets
-    // does not do bounds checking on the data arrays
+compose_rectangles(const ComposeData d, uint8_t *under_data, const size_t under_data_sz, const uint8_t *over_data, const size_t over_data_sz) {
+    // compose two equal sized, non-overlapping rectangles at different offsets.
+    // The per-row guard ensures that inconsistent geometry (offsets or
+    // dimensions larger than the actual buffers) can never cause an out of
+    // bounds read or write. All offset arithmetic is done in size_t to avoid
+    // 32-bit overflow.
     const bool can_copy_rows = !d.needs_blending && d.over_px_sz == d.under_px_sz;
     const unsigned min_width = MIN(d.under_width, d.over_width);
-#define ROW_ITER                                                                                                                  \
-    for (unsigned y = 0; y < d.under_height && y < d.over_height; y++) {                                                          \
-        uint8_t *under_row = under_data + (y + d.under_offset_y) * d.under_px_sz * d.stride + (d.under_offset_x * d.under_px_sz); \
-        const uint8_t *over_row = over_data + (y + d.over_offset_y) * d.over_px_sz * d.stride + (d.over_offset_x * d.over_px_sz);
-    if (can_copy_rows) { ROW_ITER memcpy(under_row, over_row, (size_t)d.over_px_sz * min_width); }
-    return;
-}
-#define PIX_ITER                                             \
-    for (unsigned x = 0; x < min_width; x++) {               \
-        uint8_t *under_px = under_row + (d.under_px_sz * x); \
-        const uint8_t *over_px = over_row + (d.over_px_sz * x);
-COPY_PIXELS
-#undef PIX_ITER
-#undef ROW_ITER
+    for (unsigned y = 0; y < d.under_height && y < d.over_height; y++) {
+        const size_t under_off = (size_t)(y + d.under_offset_y) * d.under_px_sz * d.stride + (size_t)d.under_offset_x * d.under_px_sz;
+        const size_t over_off = (size_t)(y + d.over_offset_y) * d.over_px_sz * d.stride + (size_t)d.over_offset_x * d.over_px_sz;
+        if (under_off + (size_t)d.under_px_sz * min_width > under_data_sz || over_off + (size_t)d.over_px_sz * min_width > over_data_sz) break;
+        uint8_t *under_row = under_data + under_off;
+        const uint8_t *over_row = over_data + over_off;
+        if (can_copy_rows) memcpy(under_row, over_row, (size_t)d.over_px_sz * min_width);
+        else copy_or_blend_row(under_row, over_row, min_width, d.under_px_sz, d.over_px_sz, d.needs_blending);
+    }
 }
 
 static void
-compose(const ComposeData d, uint8_t *under_data, const uint8_t *over_data) {
+compose(const ComposeData d, uint8_t *under_data, const size_t under_data_sz, const uint8_t *over_data, const size_t over_data_sz) {
+    // The per-row guard ensures that inconsistent geometry (an overlay
+    // declaring more data than it actually has, or an oversized base) can
+    // never cause an out of bounds read or write. All offset arithmetic is
+    // done in size_t to avoid 32-bit overflow.
     const bool can_copy_rows = !d.needs_blending && d.over_px_sz == d.under_px_sz;
     unsigned min_row_sz = d.over_offset_x < d.under_width ? d.under_width - d.over_offset_x : 0;
     min_row_sz = MIN(min_row_sz, d.over_width);
-#define ROW_ITER                                                                                                                   \
-    for (unsigned y = 0; y + d.over_offset_y < d.under_height && y < d.over_height; y++) {                                         \
-        uint8_t *under_row = under_data + (y + d.over_offset_y) * d.under_px_sz * d.under_width + d.under_px_sz * d.over_offset_x; \
-        const uint8_t *over_row = over_data + y * d.over_px_sz * d.over_width;
-#define END_ITER }
-    if (can_copy_rows) {
-        ROW_ITER memcpy(under_row, over_row, (size_t)d.over_px_sz * min_row_sz);
-        END_ITER
-        return;
+    for (unsigned y = 0; y + d.over_offset_y < d.under_height && y < d.over_height; y++) {
+        const size_t under_off = (size_t)(y + d.over_offset_y) * d.under_px_sz * d.under_width + (size_t)d.under_px_sz * d.over_offset_x;
+        const size_t over_off = (size_t)y * d.over_px_sz * d.over_width;
+        if (under_off + (size_t)d.under_px_sz * min_row_sz > under_data_sz || over_off + (size_t)d.over_px_sz * min_row_sz > over_data_sz) break;
+        uint8_t *under_row = under_data + under_off;
+        const uint8_t *over_row = over_data + over_off;
+        if (can_copy_rows) memcpy(under_row, over_row, (size_t)d.over_px_sz * min_row_sz);
+        else copy_or_blend_row(under_row, over_row, min_row_sz, d.under_px_sz, d.over_px_sz, d.needs_blending);
     }
-#define PIX_ITER                                             \
-    for (unsigned x = 0; x < min_row_sz; x++) {              \
-        uint8_t *under_px = under_row + (d.under_px_sz * x); \
-        const uint8_t *over_px = over_row + (d.over_px_sz * x);
-    COPY_PIXELS
-#undef COPY_RGB
-#undef PIX_ITER
-#undef ROW_ITER
-#undef END_ITER
 }
 
 static CoalescedFrameData
-get_coalesced_frame_data_standalone(const Image *img, const Frame *f, uint8_t *frame_data) {
+get_coalesced_frame_data_standalone(const Image *img, const Frame *f, uint8_t *frame_data, const size_t frame_data_sz) {
     CoalescedFrameData ans = {0};
     ans.transient = f->transient;
     bool is_full_frame = f->width == img->width && f->height == img->height && !f->x && !f->y;
@@ -1785,7 +1806,7 @@ get_coalesced_frame_data_standalone(const Image *img, const Frame *f, uint8_t *f
         .under_width = img->width,
         .under_height = img->height,
         .needs_blending = f->alpha_blend && !f->is_opaque};
-    compose(d, base, frame_data);
+    compose(d, base, (size_t)img->width * img->height * bytes_per_pixel, frame_data, frame_data_sz);
     ans.buf = base;
     ans.is_4byte_aligned = bytes_per_pixel == 4 || (img->width % 4) == 0;
     ans.is_opaque = f->is_opaque;
@@ -1802,7 +1823,7 @@ get_coalesced_frame_data_impl(GraphicsManager *self, Image *img, const Frame *f,
     void *frame_data;
     ImageAndFrame key = {.image_id = img->internal_id, .frame_id = f->id};
     if (!read_from_cache(self, key, &frame_data, &frame_data_sz)) return ans;
-    if (!f->base_frame_id) return get_coalesced_frame_data_standalone(img, f, frame_data);
+    if (!f->base_frame_id) return get_coalesced_frame_data_standalone(img, f, frame_data, frame_data_sz);
     Frame *base = frame_for_id(img, f->base_frame_id);
     if (!base) {
         free(frame_data);
@@ -1823,7 +1844,7 @@ get_coalesced_frame_data_impl(GraphicsManager *self, Image *img, const Frame *f,
         .under_width = img->width,
         .under_height = img->height,
         .needs_blending = f->alpha_blend && !f->is_opaque};
-    compose(d, base_data.buf, frame_data);
+    compose(d, base_data.buf, (size_t)img->width * img->height * d.under_px_sz, frame_data, frame_data_sz);
     free(frame_data);
     base_data.transient = base_data.transient || f->transient;
     return base_data;
@@ -1892,21 +1913,25 @@ frame_chain_is_transient(Image *img, const Frame *frame) {
 
 static Image *
 handle_animation_frame_load_command(GraphicsManager *self, GraphicsCommand *g, Image *img, const uint8_t *payload, bool *is_dirty) {
-    uint32_t frame_number = g->frame_number, fmt = g->format ? g->format : RGBA;
+    uint32_t fmt = g->format ? g->format : RGBA;
+    unsigned char tt = g->transmission_type ? g->transmission_type : 'd';
+    const bool is_chunked_continuation = tt == 'd' && self->currently_loading.loading_for.image_id == img->internal_id;
+    if (is_chunked_continuation) {
+        INIT_CHUNKED_LOAD; // g now points to the command that started the chunked load
+    }
     // W27 P4.2: animation frames are composited, cached and delta-uploaded as
     // 3/4-byte pixels throughout (get_coalesced_frame_data, update_image_sub_
     // region, the compose paths). Rather than widen all of that for a case with
     // no demand, an f=3232 frame is refused outright -- an explicit error beats
     // a silent 4x size mismatch. The same refusal covers an SDR frame arriving
-    // for an HDR root image, whose texture is RGBA32Float.
+    // for an HDR root image, whose texture is RGBA32Float. Checked after the
+    // chunked-load rewrite above so fmt is the start command's format.
     if (fmt == RGBA_F32 || img->is_hdr) ABRT("EINVAL", "Animation frames are not supported for f=%u (HDR) images", RGBA_F32);
+    uint32_t frame_number = g->frame_number;
     if (!frame_number || frame_number > img->extra_framecnt + 2) frame_number = img->extra_framecnt + 2;
     bool is_new_frame = frame_number == img->extra_framecnt + 2;
     g->frame_number = frame_number;
-    unsigned char tt = g->transmission_type ? g->transmission_type : 'd';
-    if (tt == 'd' && self->currently_loading.loading_for.image_id == img->internal_id) {
-        INIT_CHUNKED_LOAD;
-    } else {
+    if (!is_chunked_continuation) {
         self->currently_loading.loading_for = (const ImageAndFrame){0};
         if (g->data_width > MAX_IMAGE_DIMENSION || g->data_height > MAX_IMAGE_DIMENSION)
             ABRT("EINVAL", "Image too large, width or height greater than %u", MAX_IMAGE_DIMENSION);
@@ -1916,7 +1941,7 @@ handle_animation_frame_load_command(GraphicsManager *self, GraphicsCommand *g, I
     img = load_image_data(self, img, g, tt, fmt, payload);
     if (!img || !load_data->loading_completed_successfully) return NULL;
     self->currently_loading.loading_for = (const ImageAndFrame){0};
-    img = process_image_data(self, img, g, tt, fmt);
+    img = process_image_data(self, img, g, fmt);
     if (!img || !load_data->loading_completed_successfully) return img;
 
     const unsigned long bytes_per_pixel = load_data->is_opaque ? 3 : 4;
@@ -1936,7 +1961,7 @@ handle_animation_frame_load_command(GraphicsManager *self, GraphicsCommand *g, I
         .y = g->y_offset,
         .is_4byte_aligned = load_data->is_4byte_aligned,
         .is_opaque = load_data->is_opaque,
-        .alpha_blend = g->compose_mode != 1 && !load_data->is_opaque,
+        .alpha_blend = g->blend_mode != 1 && !load_data->is_opaque,
         .gap = g->gap > 0     ? g->gap
                : (g->gap < 0) ? 0
                               : DEFAULT_GAP,
@@ -1973,10 +1998,16 @@ handle_animation_frame_load_command(GraphicsManager *self, GraphicsCommand *g, I
                     .under_width = img->width,
                     .under_height = img->height,
                     .needs_blending = transmitted_frame.alpha_blend && !transmitted_frame.is_opaque};
-                compose(d, cfd.buf, load_data->data);
+                compose(d, cfd.buf, (size_t)img->width * img->height * d.under_px_sz, load_data->data, load_data->data_sz);
                 free_load_data(load_data);
-                load_data->data = cfd.buf;
+                // Transfer ownership of the coalesced frame to the load data,
+                // keeping data aliased to buf so it is freed/moved as usual
                 load_data->data_sz = (size_t)img->width * img->height * d.under_px_sz;
+                load_data->buf = cfd.buf;
+                cfd.buf = NULL;
+                load_data->buf_capacity = load_data->data_sz;
+                load_data->buf_used = load_data->data_sz;
+                load_data->data = load_data->buf;
                 transmitted_frame.width = img->width;
                 transmitted_frame.height = img->height;
                 transmitted_frame.x = 0;
@@ -1990,7 +2021,7 @@ handle_animation_frame_load_command(GraphicsManager *self, GraphicsCommand *g, I
             }
         }
         *frame = transmitted_frame;
-        if (!add_to_cache(self, key, load_data->data, load_data->data_sz, frame->transient)) {
+        if (!add_load_data_to_cache(self, key, frame->transient)) {
             img->extra_framecnt--;
             if (PyErr_Occurred()) PyErr_Print();
             ABRT("ENOSPC", "Failed to cache data for image frame");
@@ -2027,14 +2058,17 @@ handle_animation_frame_load_command(GraphicsManager *self, GraphicsCommand *g, I
             .under_width = frame->width,
             .under_height = frame->height,
             .needs_blending = transmitted_frame.alpha_blend && !transmitted_frame.is_opaque};
-        compose(d, cfd.buf, load_data->data);
+        compose(d, cfd.buf, (size_t)frame->width * frame->height * d.under_px_sz, load_data->data, load_data->data_sz);
         const ImageAndFrame key = {.image_id = img->internal_id, .frame_id = frame->id};
-        bool added = add_to_cache(self, key, cfd.buf, (size_t)bytes_per_pixel * frame->width * frame->height, frame->transient);
-        if (added && frame == current_frame(img)) {
+        // Upload before caching, the cache takes ownership of the data
+        if (frame == current_frame(img)) {
             update_current_frame(self, img, &cfd);
             *is_dirty = true;
         }
-        free(cfd.buf);
+        void *frame_data = cfd.buf;
+        cfd.buf = NULL;
+        bool added = add_to_cache(self, key, &frame_data, (size_t)bytes_per_pixel * frame->width * frame->height, frame->transient);
+        free(frame_data); // NULL if ownership was transferred to the cache
         if (!added) {
             if (PyErr_Occurred()) PyErr_Print();
             ABRT("ENOSPC", "Failed to cache data for image frame");
@@ -2240,24 +2274,34 @@ handle_compose_command(GraphicsManager *self, bool *is_dirty, const GraphicsComm
         .under_width = width,
         .under_height = height,
         .stride = img->width};
-    compose_rectangles(d, dest_data.buf, src_data.buf);
+    compose_rectangles(d, dest_data.buf, (size_t)img->width * img->height * d.under_px_sz, src_data.buf, (size_t)img->width * img->height * d.over_px_sz);
     bool transient = src_data.transient || dest_data.transient;
     const ImageAndFrame key = {.image_id = img->internal_id, .frame_id = dest_frame->id};
-    if (!add_to_cache(self, key, dest_data.buf, ((size_t)(dest_data.is_opaque ? 3 : 4)) * img->width * img->height, transient)) {
+    // Upload before caching, the cache takes ownership of the data
+    const bool is_current_frame = (g->other_frame_number - 1) == img->current_frame_index;
+    *is_dirty = is_current_frame;
+    if (is_current_frame) update_current_frame(self, img, &dest_data);
+    const size_t dest_sz = ((size_t)(dest_data.is_opaque ? 3 : 4)) * img->width * img->height;
+    void *dest_buf = dest_data.buf;
+    dest_data.buf = NULL;
+    if (!add_to_cache(self, key, &dest_buf, dest_sz, transient)) {
+        free(dest_buf);
         if (PyErr_Occurred()) PyErr_Print();
         set_command_failed_response("ENOSPC", "Failed to store image data in cache");
     } else {
+        // The frame is now a fully coalesced frame. Commit its descriptor only
+        // after the matching data has been accepted by the cache.
+        dest_frame->x = 0;
+        dest_frame->y = 0;
+        dest_frame->width = img->width;
+        dest_frame->height = img->height;
+        dest_frame->base_frame_id = 0;
+        dest_frame->bgcolor = 0;
+        dest_frame->is_opaque = dest_data.is_opaque;
+        dest_frame->is_4byte_aligned = dest_data.is_4byte_aligned;
+        dest_frame->alpha_blend = false;
         dest_frame->transient = transient;
     }
-    // frame is now a fully coalesced frame
-    dest_frame->x = 0;
-    dest_frame->y = 0;
-    dest_frame->width = img->width;
-    dest_frame->height = img->height;
-    dest_frame->base_frame_id = 0;
-    dest_frame->bgcolor = 0;
-    *is_dirty = (g->other_frame_number - 1) == img->current_frame_index;
-    if (*is_dirty) update_current_frame(self, img, &dest_data);
 }
 // }}}
 
@@ -2340,6 +2384,20 @@ ref_outside_region(const ImageRef *ref, index_type margin_top, index_type margin
     return ref->start_row + (int32_t)ref->effective_num_rows <= (int32_t)margin_top || ref->start_row > (int32_t)margin_bottom;
 }
 
+static float
+src_pixels_per_screen_pixel(const ImageRef *ref, CellPixelSize cell) {
+    // The vertical scale factor mapping pixels in the destination rectangle on
+    // the screen to pixels in the source rectangle. Must match the dest rect
+    // calculation used for rendering in grman_update_layers().
+    float dest_height_px;
+    if (ref->num_rows) dest_height_px = (float)(ref->num_rows * cell.height) - (float)ref->cell_y_offset;
+    else if (ref->num_cols && ref->src_width > 0) {
+        float dest_width_px = (float)(ref->num_cols * cell.width) - (float)ref->cell_x_offset;
+        dest_height_px = dest_width_px * ref->src_height / ref->src_width;
+    } else return 1.f; // rendered at native size
+    return dest_height_px > 0 ? ref->src_height / dest_height_px : 1.f;
+}
+
 static bool
 scroll_filter_margins_func(ImageRef *ref, Image *img, const void *data, CellPixelSize cell) {
     if (ref->is_virtual_ref) return false;
@@ -2348,24 +2406,33 @@ scroll_filter_margins_func(ImageRef *ref, Image *img, const void *data, CellPixe
         ref->start_row += d->amt;
         if (ref_outside_region(ref, d->margin_top, d->margin_bottom)) return true;
         // Clip the image if scrolling has resulted in part of it being outside the page area
-        uint32_t clip_amt, clipped_rows;
+        uint32_t clipped_rows;
+        float clip_amt;
+        const float scale = src_pixels_per_screen_pixel(ref, cell);
         if (ref->start_row < (int32_t)d->margin_top) {
             // image moved up
             clipped_rows = d->margin_top - ref->start_row;
-            clip_amt = cell.height * clipped_rows;
+            clip_amt = scale * (float)(cell.height * clipped_rows - ref->cell_y_offset);
             if (ref->src_height <= clip_amt) return true;
             ref->src_y += clip_amt;
             ref->src_height -= clip_amt;
             ref->effective_num_rows -= clipped_rows;
+            if (ref->num_rows) ref->num_rows -= clipped_rows;
+            ref->cell_y_offset = 0;
             update_src_rect(ref, img);
             ref->start_row += clipped_rows;
         } else if (ref->start_row + (int32_t)ref->effective_num_rows - 1 > (int32_t)d->margin_bottom) {
             // image moved down
             clipped_rows = ref->start_row + ref->effective_num_rows - 1 - d->margin_bottom;
-            clip_amt = cell.height * clipped_rows;
-            if (ref->src_height <= clip_amt) return true;
-            ref->src_height -= clip_amt;
+            // the last row may be only partially covered by the image,
+            // so calculate the clip amount from the height that remains visible
+            float visible_height_px = (float)(cell.height * (ref->effective_num_rows - clipped_rows)) - (float)ref->cell_y_offset;
+            float new_src_height = scale * visible_height_px;
+            if (new_src_height <= 0) return true;
+            clip_amt = ref->src_height - new_src_height;
+            if (clip_amt > 0) ref->src_height -= clip_amt;
             ref->effective_num_rows -= clipped_rows;
+            if (ref->num_rows) ref->num_rows -= clipped_rows;
             update_src_rect(ref, img);
         }
         return ref_outside_region(ref, d->margin_top, d->margin_bottom);
@@ -2622,7 +2689,14 @@ grman_handle_command(GraphicsManager *self, const GraphicsCommand *g, const uint
         return finish_command_response(g, false);
     }
 
-    switch (g->action) {
+    unsigned char action = g->action;
+    if (!action && self->currently_loading.loading_for.image_id && self->currently_loading.start_command.action == 'f') {
+        // A continuation chunk carries no action key, so when the chunked
+        // load was started by an a=f command, route it to the frame load
+        // handler rather than the add handler
+        action = 'f';
+    }
+    switch (action) {
         case 0:
         case 't':
         case 'T':
@@ -2662,9 +2736,16 @@ grman_handle_command(GraphicsManager *self, const GraphicsCommand *g, const uint
                 ret = finish_command_response(g, false);
             } else {
                 GraphicsCommand ag = *g;
-                if (ag.action == 'f') {
+                if (action == 'f') {
+                    if (!ag.action) {
+                        // continuation chunk, the response must identify the image from the start command
+                        ag.action = action;
+                        ag.id = self->currently_loading.start_command.id;
+                        ag.image_number = self->currently_loading.start_command.image_number;
+                    }
                     img = handle_animation_frame_load_command(self, &ag, img, payload, is_dirty);
                     if (!self->currently_loading.loading_for.image_id) free_load_data(&self->currently_loading);
+                    if (!ag.frame_number) ag.frame_number = self->currently_loading.start_command.frame_number;
                     if (g->quiet) ag.quiet = g->quiet;
                     else ag.quiet = self->currently_loading.start_command.quiet;
                     ret = finish_command_response(&ag, img != NULL);
@@ -2900,6 +2981,14 @@ pycreate_canvas(PyObject *self UNUSED, PyObject *args) {
     Py_ssize_t over_sz;
     const uint8_t *over_data;
     if (!PyArg_ParseTuple(args, "y#IIIIII", &over_data, &over_sz, &over_width, &x, &y, &width, &height, &bytes_per_pixel)) return NULL;
+    if (bytes_per_pixel != 3 && bytes_per_pixel != 4) {
+        PyErr_SetString(PyExc_ValueError, "bytes_per_pixel must be 3 or 4");
+        return NULL;
+    }
+    if (!over_width) {
+        PyErr_SetString(PyExc_ValueError, "over_width must be non-zero");
+        return NULL;
+    }
     size_t canvas_sz = (size_t)width * height * bytes_per_pixel;
     PyObject *ans = PyBytes_FromStringAndSize(NULL, canvas_sz);
     if (!ans) return NULL;
@@ -2909,14 +2998,14 @@ pycreate_canvas(PyObject *self UNUSED, PyObject *args) {
     ComposeData cd = {
         .needs_blending = bytes_per_pixel == 4,
         .over_width = over_width,
-        .over_height = over_sz / (bytes_per_pixel * over_width),
+        .over_height = (size_t)over_sz / ((size_t)bytes_per_pixel * over_width),
         .under_width = width,
         .under_height = height,
         .over_px_sz = bytes_per_pixel,
         .under_px_sz = bytes_per_pixel,
         .over_offset_x = x,
         .over_offset_y = y};
-    compose(cd, canvas, over_data);
+    compose(cd, canvas, canvas_sz, over_data, (size_t)over_sz);
 
     return ans;
 }

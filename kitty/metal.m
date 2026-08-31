@@ -1426,6 +1426,7 @@ fill_rounded_rect_uniforms(int program, MetalRoundedRectUniforms *u) {
     slot_fv(program, ROUNDED_RECT_U_params, u->params, 2);
     slot_fv(program, ROUNDED_RECT_U_color, u->color, 4);
     slot_fv(program, ROUNDED_RECT_U_background_color, u->background_color, 4);
+    slot_fv(program, ROUNDED_RECT_U_outer_color, u->outer_color, 4);
 }
 
 static void

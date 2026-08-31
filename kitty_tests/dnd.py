@@ -4,6 +4,7 @@
 import errno
 import os
 import re
+import tempfile
 from base64 import standard_b64encode
 from contextlib import contextmanager
 from functools import partial
@@ -15,6 +16,7 @@ from kitty.fast_data_types import (
     dnd_set_test_write_func,
     dnd_test_cleanup_fake_window,
     dnd_test_create_fake_window,
+    dnd_test_drag_get_data,
     dnd_test_drag_notify,
     dnd_test_drop_update_mimes,
     dnd_test_fake_drop_data,
@@ -360,15 +362,22 @@ class WriteCapture:
 
 
 @contextmanager
-def dnd_test_window(mime_list_cap=0, present_data_cap=0, remote_drag_limit=0):
+def dnd_test_window(mime_list_cap=0, present_data_cap=0, remote_drag_limit=0, case_insensitive_tempdir=-1):
     """Context manager that creates a fake window + write-capture harness.
 
     Yields (window_id, screen, capture) where:
     * ``screen``       – Screen object whose window_id matches the fake window
     * ``capture``      – WriteCapture accumulating bytes sent to the child
+
+    ``case_insensitive_tempdir`` forces kitty to treat the directory used for
+    remote drag data as being on a case-insensitive (1) or case-sensitive (0)
+    filesystem. The default of -1 auto-detects, as in normal operation. Tests
+    that depend on how identically named directory entries are handled must
+    force it, since otherwise their behavior varies by platform (macOS
+    filesystems are typically case-insensitive, Linux ones are not).
     """
     capture = WriteCapture()
-    dnd_set_test_write_func(capture, mime_list_cap, present_data_cap, remote_drag_limit)
+    dnd_set_test_write_func(capture, mime_list_cap, present_data_cap, remote_drag_limit, case_insensitive_tempdir)
     os_window_id, window_id = dnd_test_create_fake_window()
     capture.window_id = window_id
     try:
@@ -695,6 +704,70 @@ class TestDnDProtocol(BaseTest):
             # Only the end signal should be present.
             self.assertEqual(len(r_events), 1, raw)
             self.ae(r_events[0]['payload'], b'')
+
+    def test_data_request_before_drop_denied(self) -> None:
+        """Data requests sent while the drag is merely hovering are rejected with EPERM."""
+        with dnd_test_window() as (screen, cap):
+            self._register_for_drops(screen, cap, 'text/plain text/uri-list')
+            dnd_test_set_mouse_pos(cap.window_id, 0, 0, 0, 0)
+            # Only a move event so far, no drop.
+            dnd_test_fake_drop_event(cap.window_id, False, ['text/plain', 'text/uri-list'])
+            cap.consume()
+
+            # All three request forms must be denied before the drop.
+            for req in (client_request_data(1), client_request_uri_data(2, 1), client_dir_read(2, 1)):
+                parse_bytes(screen, req)
+                events = self._get_events(cap)
+                self.assertEqual(len(events), 1, events)
+                self.ae(events[0]['type'], 'R')
+                self.ae(events[0]['payload'].strip().partition(b':')[0], b'EPERM')
+
+            # The denial must not have terminated the drag session: after an
+            # actual drop, requests work as usual.
+            dnd_test_fake_drop_event(cap.window_id, True, ['text/plain', 'text/uri-list'])
+            cap.consume()
+            parse_bytes(screen, client_request_data(1))
+            dnd_test_fake_drop_data(cap.window_id, 'text/plain', b'hello')
+            combined = b''.join(e['payload'] for e in parse_escape_codes_b64(cap.consume()) if e['type'] == 'r')
+            self.ae(combined, b'hello')
+
+    def test_drag_leave_discards_drag_session_data(self) -> None:
+        """When the drag leaves the window all data obtained from it is discarded."""
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, 'secret.txt'), 'wb') as f:
+                f.write(b'secret data')
+            uri_list = f'file://{root}\r\n'.encode()
+            with dnd_test_window() as (screen, cap):
+                self._setup_uri_drop(screen, cap, uri_list)
+                # Get a directory handle for root.
+                parse_bytes(screen, client_request_uri_data(2, 1))
+                events = parse_escape_codes_b64(cap.consume())
+                d_events = [e for e in events if e['type'] == 'r' and is_dir_event(e)]
+                self.assertTrue(d_events, 'expected directory listing for root')
+                handle_id = dir_handle(d_events[0])
+                self.assertGreater(dnd_test_probe_state(cap.window_id, 'drop_num_dir_handles'), 0)
+                self.assertGreater(dnd_test_probe_state(cap.window_id, 'drop_uri_list_sz'), 0)
+
+                # Drag leaves the window.
+                dnd_test_fake_drop_event(cap.window_id, False, None)
+                cap.consume()  # discard the leave event
+
+                # The URI list, directory handles and any in-flight file
+                # transfer must be gone.
+                self.ae(dnd_test_probe_state(cap.window_id, 'drop_num_dir_handles'), 0)
+                self.ae(dnd_test_probe_state(cap.window_id, 'drop_uri_list_sz'), 0)
+                self.ae(dnd_test_probe_state(cap.window_id, 'drop_file_fd_plus_one'), 0)
+                self.assertFalse(dnd_test_probe_state(cap.window_id, 'drop_dropped'))
+
+                # Requests using the stale handle must fail.
+                parse_bytes(screen, client_dir_read(handle_id, 1))
+                events = self._get_events(cap)
+                self.assertEqual(len(events), 1, events)
+                self.ae(events[0]['type'], 'R')
+                self.ae(events[0]['payload'].strip().partition(b':')[0], b'EPERM')
 
     # ---- remote file/directory transfer tests ----------------
 
@@ -2786,24 +2859,26 @@ class TestDnDProtocol(BaseTest):
             self.assert_drag_data_complete(cap)
 
     def test_remote_drag_process_item_data_basic(self) -> None:
-        """Basic drag_process_item_data: send data for a MIME type after DROPPED state."""
-        with dnd_test_window() as (screen, cap):
-            # Set up a non-remote drag with text/plain
-            parse_bytes(screen, _osc(f'{DND_CODE};t=o:x=1;{machine_id()}'))
-            parse_bytes(screen, client_drag_offer_mimes(1, 'text/plain'))
-            cap.consume()
-            dnd_test_force_drag_dropped(cap.window_id)
-            dnd_test_request_drag_data(cap.window_id, 0)
-            # Send data for text/plain (index 0)
-            b64 = standard_b64encode(b'test data').decode()
-            parse_bytes(screen, client_drag_send_data(0, b64))
-            self._assert_no_output(cap)
-            # End of data
-            parse_bytes(screen, client_drag_send_data(0, ''))
-            # Should get a notification (but no error)
-            events = self._get_events(cap)
-            for ev in events:
-                self.assertNotEqual(ev['type'], 'E', f'unexpected error: {ev}')
+        """MIME data reads finish at EOF, even when no data was sent."""
+        for data in (b'', b'test data'):
+            with self.subTest(data=data), dnd_test_window() as (screen, cap):
+                parse_bytes(screen, _osc(f'{DND_CODE};t=o:x=1;{machine_id()}'))
+                parse_bytes(screen, client_drag_offer_mimes(1, 'text/plain'))
+                cap.consume()
+                dnd_test_force_drag_dropped(cap.window_id)
+                with self.assertRaises(OSError) as pending:
+                    dnd_test_drag_get_data(cap.window_id, 'text/plain')
+                self.assertEqual(pending.exception.errno, errno.EAGAIN)
+                cap.consume()
+                if data:
+                    parse_bytes(screen, client_drag_send_data(0, standard_b64encode(data).decode(), more=True))
+                    self.assertEqual(dnd_test_drag_get_data(cap.window_id, 'text/plain'), data)
+                    with self.assertRaises(OSError) as pending:
+                        dnd_test_drag_get_data(cap.window_id, 'text/plain')
+                    self.assertEqual(pending.exception.errno, errno.EAGAIN)
+                parse_bytes(screen, client_drag_send_data(0, ''))
+                self.assertEqual(dnd_test_drag_get_data(cap.window_id, 'text/plain'), b'')
+                self._assert_no_output(cap)
 
     def test_remote_drag_process_item_data_error(self) -> None:
         """Client can report an error via t=E for a MIME data delivery."""
@@ -2817,6 +2892,9 @@ class TestDnDProtocol(BaseTest):
             parse_bytes(screen, client_drag_send_error(0, 'EPERM'))
             # The error should propagate but not crash
             cap.consume()
+            with self.assertRaises(OSError) as failed:
+                dnd_test_drag_get_data(cap.window_id, 'text/plain')
+            self.assertEqual(failed.exception.errno, errno.EPERM)
 
     def test_remote_drag_process_item_data_invalid_index(self) -> None:
         """Sending data for a non-existent MIME index is rejected."""
@@ -2905,6 +2983,142 @@ class TestDnDProtocol(BaseTest):
             child_path = os.path.join(dir_path, 'empty_child.txt')
             self.assertTrue(os.path.isfile(child_path), f'empty child file must exist on disk: {child_path}')
             self.assertEqual(os.path.getsize(child_path), 0, f'child file must be empty: {child_path}')
+
+    def assert_symlink_traversal_refused(self, cap) -> None:
+        """The drag must have been aborted because a directory entry was a symlink.
+
+        O_NOFOLLOW combined with O_DIRECTORY reports ENOTDIR on Linux and ELOOP on
+        some other platforms, so accept either.
+        """
+        events = self._get_events(cap)
+        self.assertEqual(len(events), 1, events)
+        self.ae(events[0]['type'], 'E')
+        self.assertIn(events[0]['payload'].partition(b':')[0], (b'ENOTDIR', b'ELOOP'), events)
+
+    def test_remote_drag_symlinked_subdir_cannot_escape_tempdir(self) -> None:
+        """A directory entry that resolves through a symlink must not be written to.
+
+        A malicious client can send a directory listing containing two entries with
+        the same name, registering the first as a symlink pointing outside the
+        temporary directory and the second as a directory. The symlink creation
+        succeeds and the mkdirat for the directory fails with EEXIST (which is
+        ignored), so a subsequent request to write into that "directory" used to
+        follow the symlink and write attacker controlled files at an arbitrary
+        location.
+
+        The temporary directory is forced to be case-sensitive as on a
+        case-insensitive filesystem the duplicate name is renamed before it can
+        collide, see test_remote_drag_case_insensitive_duplicate_entries.
+        """
+        uri_list = b'file:///home/user/root\r\n'
+        with tempfile.TemporaryDirectory() as escape_target, dnd_test_window(case_insensitive_tempdir=0) as (screen, cap):
+            self._setup_remote_drag(screen, cap, uri_list)
+            # Top-level directory (handle 2) with two identically named entries
+            b64 = standard_b64encode(b'evil\x00evil').decode()
+            parse_bytes(screen, client_remote_file(1, b64, item_type=2))
+            parse_bytes(screen, client_remote_file(1, '', item_type=2))
+            self._assert_no_output(cap)
+
+            # Entry 1: symlink named "evil" pointing outside the temporary directory
+            b64 = standard_b64encode(escape_target.encode()).decode()
+            parse_bytes(screen, client_remote_file(1, b64, item_type=1, parent_handle=2, entry_num=1))
+            parse_bytes(screen, client_remote_file(1, '', item_type=1, parent_handle=2, entry_num=1))
+            self._assert_no_output(cap)
+
+            # Entry 2: directory named "evil" (handle 3), mkdirat fails with EEXIST
+            b64 = standard_b64encode(b'pwned.txt').decode()
+            parse_bytes(screen, client_remote_file(1, b64, item_type=3, parent_handle=2, entry_num=2))
+            parse_bytes(screen, client_remote_file(1, '', item_type=3, parent_handle=2, entry_num=2))
+            self._assert_no_output(cap)
+
+            # Now write a child of the "directory" -- must not traverse the symlink
+            b64 = standard_b64encode(b'owned').decode()
+            parse_bytes(screen, client_remote_file(1, b64, item_type=0, parent_handle=3, entry_num=1))
+            # kitty must refuse to open the symlinked directory and abort the drag
+            self.assert_symlink_traversal_refused(cap)
+
+            escaped = os.path.join(escape_target, 'pwned.txt')
+            self.assertFalse(os.path.exists(escaped), f'drag source data escaped the temporary directory to: {escaped}')
+            self.assertEqual(os.listdir(escape_target), [], 'drag source wrote data outside its temporary directory')
+
+    def test_remote_drag_symlinked_intermediate_component_cannot_escape(self) -> None:
+        """A symlink at an intermediate component of a sub-directory path must not be traversed.
+
+        As above, the temporary directory is forced to be case-sensitive so that
+        the two identically named entries actually collide on all platforms.
+        """
+        uri_list = b'file:///home/user/root\r\n'
+        with tempfile.TemporaryDirectory() as escape_target, dnd_test_window(case_insensitive_tempdir=0) as (screen, cap):
+            os.mkdir(os.path.join(escape_target, 'sub'))
+            self._setup_remote_drag(screen, cap, uri_list)
+            # root/ (handle 2) with two entries both named "evil"
+            b64 = standard_b64encode(b'evil\x00evil').decode()
+            parse_bytes(screen, client_remote_file(1, b64, item_type=2))
+            parse_bytes(screen, client_remote_file(1, '', item_type=2))
+
+            # Entry 1: symlink "evil" -> outside
+            b64 = standard_b64encode(escape_target.encode()).decode()
+            parse_bytes(screen, client_remote_file(1, b64, item_type=1, parent_handle=2, entry_num=1))
+            parse_bytes(screen, client_remote_file(1, '', item_type=1, parent_handle=2, entry_num=1))
+
+            # Entry 2: directory "evil" (handle 3) containing a sub directory "sub"
+            b64 = standard_b64encode(b'sub').decode()
+            parse_bytes(screen, client_remote_file(1, b64, item_type=3, parent_handle=2, entry_num=2))
+            parse_bytes(screen, client_remote_file(1, '', item_type=3, parent_handle=2, entry_num=2))
+            self._assert_no_output(cap)
+
+            # "sub" is a directory (handle 4) that would be reached via root/evil/sub
+            b64 = standard_b64encode(b'pwned.txt').decode()
+            parse_bytes(screen, client_remote_file(1, b64, item_type=4, parent_handle=3, entry_num=1))
+            self.assert_symlink_traversal_refused(cap)
+
+            b64 = standard_b64encode(b'owned').decode()
+            parse_bytes(screen, client_remote_file(1, b64, item_type=0, parent_handle=4, entry_num=1))
+            cap.consume()
+
+            escaped = os.path.join(escape_target, 'sub', 'pwned.txt')
+            self.assertFalse(os.path.exists(escaped), f'drag source data escaped the temporary directory to: {escaped}')
+            self.assertEqual(os.listdir(os.path.join(escape_target, 'sub')), [], 'drag source wrote data outside its temporary directory')
+
+    def test_remote_drag_case_insensitive_duplicate_entries(self) -> None:
+        """On a case-insensitive filesystem identically named entries are renamed apart.
+
+        This is the code path taken on macOS, where the temporary directory is
+        normally on a case-insensitive filesystem. The symlink and the directory
+        no longer collide, so the drag succeeds, but the data must still be
+        written inside the temporary directory, not through the symlink.
+        """
+        uri_list = b'file:///home/user/root\r\n'
+        with tempfile.TemporaryDirectory() as escape_target, dnd_test_window(case_insensitive_tempdir=1) as (screen, cap):
+            self._setup_remote_drag(screen, cap, uri_list)
+            # root/ (handle 2) with two entries both named "evil"
+            b64 = standard_b64encode(b'evil\x00evil').decode()
+            parse_bytes(screen, client_remote_file(1, b64, item_type=2))
+            parse_bytes(screen, client_remote_file(1, '', item_type=2))
+
+            # Entry 1: symlink "evil" -> outside
+            b64 = standard_b64encode(escape_target.encode()).decode()
+            parse_bytes(screen, client_remote_file(1, b64, item_type=1, parent_handle=2, entry_num=1))
+            parse_bytes(screen, client_remote_file(1, '', item_type=1, parent_handle=2, entry_num=1))
+
+            # Entry 2: directory "evil" (handle 3), renamed to avoid the collision
+            b64 = standard_b64encode(b'file.txt').decode()
+            parse_bytes(screen, client_remote_file(1, b64, item_type=3, parent_handle=2, entry_num=2))
+            parse_bytes(screen, client_remote_file(1, '', item_type=3, parent_handle=2, entry_num=2))
+            self._assert_no_output(cap)
+
+            b64 = standard_b64encode(b'data').decode()
+            parse_bytes(screen, client_remote_file(1, b64, item_type=0, parent_handle=3, entry_num=1))
+            parse_bytes(screen, client_remote_file(1, '', item_type=0, parent_handle=3, entry_num=1))
+            self.assert_drag_data_complete(cap)
+
+            root_path = dnd_test_probe_state(cap.window_id, 'drag_remote_item_path:0')
+            self.assertIsNotNone(root_path, 'root path should be known')
+            written = os.path.join(root_path, 'case-conflict-1-evil', 'file.txt')
+            self.assertTrue(os.path.isfile(written), f'renamed directory entry must exist at: {written}')
+            with open(written, 'rb') as f:
+                self.ae(f.read(), b'data')
+            self.assertEqual(os.listdir(escape_target), [], 'drag source wrote data outside its temporary directory')
 
     def test_remote_drag_uri_list_with_comments(self) -> None:
         """URI list with comment lines (starting with #) should filter them out."""

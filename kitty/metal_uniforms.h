@@ -158,6 +158,7 @@ typedef struct MetalRoundedRectUniforms {
     float _pad0[2];
     float color[4];
     float background_color[4];
+    float outer_color[4];
 } MetalRoundedRectUniforms;
 
 // Laid out to mirror padding_fork.slang's vertex entryPointParams block (the
@@ -220,8 +221,8 @@ _Static_assert(sizeof(MetalBlitUniforms) == 32, "MetalBlitUniforms layout drifte
 _Static_assert(sizeof(MetalScreenshotUniforms) == 48, "MetalScreenshotUniforms layout drifted");
 _Static_assert(offsetof(MetalScreenshotUniforms, src_size) == 32, "screenshot src_size must start at 32");
 
-_Static_assert(sizeof(MetalRoundedRectUniforms) == 64, "MetalRoundedRectUniforms layout drifted");
+_Static_assert(sizeof(MetalRoundedRectUniforms) == 80, "MetalRoundedRectUniforms layout drifted");
 _Static_assert(offsetof(MetalRoundedRectUniforms, params) == 16 && offsetof(MetalRoundedRectUniforms, color) == 32 &&
-               offsetof(MetalRoundedRectUniforms, background_color) == 48,
+               offsetof(MetalRoundedRectUniforms, background_color) == 48 && offsetof(MetalRoundedRectUniforms, outer_color) == 64,
     "MetalRoundedRectUniforms no longer mirrors rounded_rect.slang's fragment block");
 #endif

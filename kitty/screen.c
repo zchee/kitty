@@ -1815,8 +1815,10 @@ screen_handle_multicell_command(Screen *self, const MultiCellCommand *cmd, const
             char_type ch = self->lc->chars[i];
             CharProps cp = char_props_for(ch);
             if (cp.is_invalid) continue;
-            if ((s = grapheme_segmentation_step(s, cp)).add_to_current_cell || (wcwidth_std(cp) == 0 && lc.count)) lc.chars[lc.count++] = ch;
-            else {
+            if ((s = grapheme_segmentation_step(s, cp)).add_to_current_cell || (wcwidth_std(cp) == 0 && lc.count)) {
+                ensure_space_for_chars(&lc, lc.count + 1);
+                lc.chars[lc.count++] = ch;
+            } else {
                 if (lc.count) handle_variable_width_multicell_command(self, mcd, &lc);
                 switch (wcwidth_std(cp)) {
                     case 0:
@@ -5270,7 +5272,26 @@ screen_draw_overlay_line(Screen *self) {
     self->modes.mIRM = false;
     Cursor *orig_cursor = self->cursor;
     self->cursor = &(self->overlay_line.original_line.cursor);
-    self->cursor->sgr.reverse ^= true;
+    // Mark the pre-edit text as distinct from committed text: italic, with a
+    // dashed underline in the highlight color. Underline rather than reverse
+    // video matches what other terminals do (VTE and foot both underline), and
+    // dashed avoids colliding with the styles applications already use: curly
+    // for spell checking and straight for hyperlinks. Saved and restored around
+    // the draw, like the modes above.
+    const bool orig_italic = self->cursor->sgr.italic;
+    const uint8_t orig_decoration = self->cursor->sgr.decoration;
+    const color_type orig_decoration_fg = self->cursor->sgr.decoration_fg;
+    self->cursor->sgr.italic = true;
+    self->cursor->sgr.decoration = 5; // dashed
+    self->cursor->sgr.decoration_fg = ((colorprofile_to_color_with_fallback(
+                                            self->color_profile,
+                                            self->color_profile->overridden.highlight_bg,
+                                            self->color_profile->configured.highlight_bg,
+                                            self->color_profile->overridden.default_fg,
+                                            self->color_profile->configured.default_fg) &
+                                        COL_MASK)
+                                       << 8) |
+                                      2;
     self->cursor->x = xstart;
     self->cursor->y = self->overlay_line.ynum;
     self->overlay_line.xnum = 0;
@@ -5322,7 +5343,9 @@ screen_draw_overlay_line(Screen *self) {
         self->overlay_line.xnum += len;
     }
     self->overlay_line.cursor_x = self->cursor->x;
-    self->cursor->sgr.reverse ^= true;
+    self->cursor->sgr.italic = orig_italic;
+    self->cursor->sgr.decoration = orig_decoration;
+    self->cursor->sgr.decoration_fg = orig_decoration_fg;
     self->cursor = orig_cursor;
     self->modes.mDECAWM = orig_line_wrap_mode;
     self->modes.mDECTCEM = orig_cursor_enable_mode;

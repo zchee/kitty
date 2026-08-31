@@ -424,11 +424,13 @@ typedef struct BorderRect {
     uint32_t color;
     long long border_type;
     bool horizontal;
+    unsigned radius, thickness;
 } BorderRect;
 
 typedef struct BorderRects {
     BorderRect *rect_buf;
     unsigned int num_border_rects, capacity;
+    unsigned int num_rounded_rects;
     bool is_dirty;
     ssize_t vao_idx;
 } BorderRects;
@@ -777,6 +779,7 @@ OSWindow *current_os_window(void);
 void os_window_regions(const OSWindow *, Region *main, Region *tab_bar);
 bool drag_scroll(Window *, OSWindow *);
 void draw_borders(ssize_t vao_idx, unsigned int num_border_rects, BorderRect *rect_buf, bool rect_data_is_dirty, color_type, unsigned int, bool, OSWindow *w);
+void draw_rounded_borders(BorderRects *, color_type, unsigned int, bool, OSWindow *);
 ssize_t create_cell_vao(void);
 ssize_t create_border_vao(void);
 void bind_shader_globals_to_current_context(void);

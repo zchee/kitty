@@ -65,6 +65,8 @@ get_errno_name(int err) {
         case ENOMEM: return "ENOMEM";
         case EFBIG: return "EFBIG";
         case EISDIR: return "EISDIR";
+        case ELOOP: return "ELOOP";
+        case ENOTDIR: return "ENOTDIR";
         case ENOSPC: return "ENOSPC";
         case 0: return "OK";
         default: return "EUNKNOWN";
@@ -207,13 +209,17 @@ sanitized_filename_from_url(const char *url) {
 
 
 static void
-dnd_set_test_write_func(PyObject *func, size_t mime_list_size_cap, size_t present_data_cap, size_t remote_drag_limit) {
+dnd_set_test_write_func(PyObject *func, size_t mime_list_size_cap, size_t present_data_cap, size_t remote_drag_limit, int case_insensitive_tempdir) {
     (void)machine_id;
     Py_CLEAR(g_dnd_test_write_func);
     g_dnd_test_write_func = Py_XNewRef(func);
     MIME_LIST_SIZE_CAP = mime_list_size_cap ? mime_list_size_cap : DEFAULT_MIME_LIST_SIZE_CAP;
     PRESENT_DATA_CAP = present_data_cap ? present_data_cap : DEFAULT_PRESENT_DATA_CAP;
     REMOTE_DRAG_LIMIT = remote_drag_limit ? remote_drag_limit : DEFAULT_REMOTE_DRAG_LIMIT;
+    // Allows tests to exercise both the case-sensitive and the case-insensitive
+    // filesystem code paths regardless of the filesystem the tests run on. A
+    // negative value means auto-detect, as in normal operation.
+    tempdir_case_insensitive = case_insensitive_tempdir < 0 ? -1 : (case_insensitive_tempdir ? 1 : 0);
 }
 
 static int
@@ -946,7 +952,7 @@ drop_send_file_chunks(Window *w) {
 static bool
 drop_send_file_data(Window *w, const char *path) {
     drop_close_file_fd(w);
-    int fd = safe_open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK, 0);
+    int fd = safe_open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW, 0);
     if (fd < 0) {
         switch (errno) {
             case ENOENT:
@@ -1367,6 +1373,23 @@ drop_enqueue_request(Window *w, int32_t cell_x, int32_t cell_y, int32_t pixel_y,
         return;
     }
 
+    if (!w->drop.dropped) {
+        /* The user has not actually dropped anything on this window, so the
+         * client is not allowed to read any drag data. Movement events are
+         * informational only; consent to transfer data is given by the drop. */
+        int32_t saved_x = w->drop.current_request_x;
+        int32_t saved_y = w->drop.current_request_y;
+        int32_t saved_Y = w->drop.current_request_Y;
+        w->drop.current_request_x = cell_x;
+        w->drop.current_request_y = cell_y;
+        w->drop.current_request_Y = pixel_y;
+        drop_send_error(w, EPERM, "drop data can only be requested after a drop");
+        w->drop.current_request_x = saved_x;
+        w->drop.current_request_y = saved_y;
+        w->drop.current_request_Y = saved_Y;
+        return;
+    }
+
     if (w->drop.num_data_requests >= arraysz(w->drop.data_requests)) {
         /* Queue full: deny with EMFILE and end the drop */
         int32_t saved_x = w->drop.current_request_x;
@@ -1397,6 +1420,18 @@ drop_left_child(Window *w) {
     w->drop.hovered = false;
     w->drop.dropped = false;
     drop_free_offered_mimes(w);
+    /* The drag session no longer involves this window, so discard everything
+     * obtained from it: otherwise a previously fetched URI list, open
+     * directory handles and an in-flight file transfer would let the client
+     * keep reading files with no drag in progress. */
+    drop_close_file_fd(w);
+    drop_free_request_queue(w);
+    drop_free_dir_handles(w);
+    free(w->drop.uri_list);
+    w->drop.uri_list = NULL;
+    w->drop.uri_list_sz = 0;
+    free(w->drop.getting_data_for_mime);
+    w->drop.getting_data_for_mime = NULL;
     if (w->drop.wanted) {
         char buf[128];
         int header_size = snprintf(buf, sizeof(buf), "\x1b]%d;t=m:x=-1:y=-1", DND_CODE);
@@ -2086,6 +2121,20 @@ drag_process_item_data(Window *w, size_t idx, int has_more, const uint8_t *paylo
         return;
     }
 
+    // Open temp file if not yet open, including for an empty transfer.
+    if (!ds.items[idx].fd_plus_one) {
+        int fd = open_item_tmpfile();
+        if (fd < 0) {
+            cancel_drag(w, EIO, "failed to open temporary file to store drag source item data");
+            return;
+        }
+        ds.items[idx].fd_plus_one = fd + 1;
+        ds.items[idx].data_decode_initialized = true;
+        ds.items[idx].data_size = 0;     // read position for pread
+        ds.items[idx].data_capacity = 0; // bytes written to file
+        base64_init_stream_decoder(&ds.items[idx].base64_state);
+    }
+
     // End of data: has_more == 0 and empty payload
     if (has_more == 0 && payload_sz == 0) {
         ds.items[idx].data_decode_initialized = false;
@@ -2098,20 +2147,6 @@ drag_process_item_data(Window *w, size_t idx, int has_more, const uint8_t *paylo
             }
         }
         return;
-    }
-
-    // Open temp file if not yet open
-    if (!ds.items[idx].fd_plus_one) {
-        int fd = open_item_tmpfile();
-        if (fd < 0) {
-            cancel_drag(w, EIO, "failed to open temporary file to store drag source item data");
-            return;
-        }
-        ds.items[idx].fd_plus_one = fd + 1;
-        ds.items[idx].data_decode_initialized = true;
-        ds.items[idx].data_size = 0;     // read position for pread
-        ds.items[idx].data_capacity = 0; // bytes written to file
-        base64_init_stream_decoder(&ds.items[idx].base64_state);
     }
 
     // Decode and write payload data
@@ -2407,7 +2442,7 @@ toplevel_data_for_drag(
             log_error("Failed to create directory for drag source item at: %s/%u with error: %s", ds.base_dir_for_remote_items, uri_item_idx, strerror(err));
             abrt(err, "failed to create directory for drag source item");
         }
-        int fd = safe_openat(ds.base_dir_fd_plus_one - 1, path, O_RDONLY | O_DIRECTORY, 0);
+        int fd = safe_openat(ds.base_dir_fd_plus_one - 1, path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW, 0);
         if (fd < 0) abrt(errno, "failed to open directory for drag source item");
         ri->top_level_parent_dir_fd_plus_one = fd + 1;
         if (!ds.file_promises) {
@@ -2419,26 +2454,69 @@ toplevel_data_for_drag(
 }
 
 static DragRemoteItem *
-find_by_handle(DragRemoteItem *parent, int handle, char *path_to_parent, size_t *path_len) {
+find_by_handle(DragRemoteItem *parent, int handle) {
     if (parent->type == handle) return parent;
     DragRemoteItem *x;
     for (size_t i = 0; i < parent->children_sz; i++) {
-        DragRemoteItem *child = parent->children + i;
-        size_t before = *path_len;
-        size_t n = snprintf(path_to_parent + before, PATH_MAX - before, "/%s", child->dir_entry_name);
-        if (n + before + 1 >= PATH_MAX) return NULL;
-        *path_len += n;
-        if ((x = find_by_handle(parent->children + i, handle, path_to_parent, path_len))) return x;
-        *path_len = before;
+        if ((x = find_by_handle(parent->children + i, handle))) return x;
     }
     return NULL;
+}
+
+// Maximum nesting depth of a remote drag source directory tree. Prevents
+// unbounded recursion in open_subdir_of_drag() for a maliciously deep tree.
+#define MAX_DRAG_DIR_DEPTH 128u
+
+// Open the directory for item by walking down from the top-level directory of
+// the drag source item, one component at a time, with O_NOFOLLOW. Constructing
+// a path and opening it is unsafe: a malicious client can send a directory
+// listing with two identically named entries, registering the first as a
+// symlink pointing outside the temporary directory and the second as a
+// directory. Creating the directory then fails with EEXIST (which is ignored)
+// and opening the path would follow the symlink, allowing the client to write
+// arbitrary files anywhere the kitty process can write. Starting at a directory
+// we created ourselves and refusing to traverse symlinks keeps every write
+// contained within the temporary directory.
+static int
+open_subdir_of_drag(DragRemoteItem *root, DragRemoteItem *item, unsigned depth) {
+    if (depth > MAX_DRAG_DIR_DEPTH) {
+        errno = ELOOP;
+        return -1;
+    }
+    if (!item->dir_entry_name) {
+        errno = EINVAL;
+        return -1;
+    }
+    int parent_fd, ans;
+    bool close_parent_fd = false;
+    if (item == root) {
+        if (!root->top_level_parent_dir_fd_plus_one) {
+            errno = EINVAL;
+            return -1;
+        }
+        parent_fd = root->top_level_parent_dir_fd_plus_one - 1;
+    } else {
+        if (!item->parent) {
+            errno = EINVAL;
+            return -1;
+        }
+        parent_fd = open_subdir_of_drag(root, item->parent, depth + 1);
+        if (parent_fd < 0) return -1;
+        close_parent_fd = true;
+    }
+    ans = safe_openat(parent_fd, item->dir_entry_name, O_DIRECTORY | O_RDONLY | O_NOFOLLOW, 0);
+    if (close_parent_fd) {
+        int saved_errno = errno;
+        safe_close(parent_fd, __FILE__, __LINE__);
+        errno = saved_errno;
+    }
+    return ans;
 }
 
 static void
 subdir_data_for_drag(
     Window *w,
     unsigned mime_item_idx,
-    unsigned uri_item_idx,
     int handle,
     unsigned entry_num,
     unsigned item_type,
@@ -2460,16 +2538,13 @@ subdir_data_for_drag(
         }
     }
     if (parent == NULL || !parent->fd_plus_one) {
-        char path[PATH_MAX + 1];
-        path[PATH_MAX] = 0;
         if (!root->dir_entry_name) abrt(EINVAL, "drag source sub directory parent dir does not exist");
-        size_t pos = snprintf(path, PATH_MAX, "%s/%u/%s", ds.base_dir_for_remote_items, uri_item_idx, root->dir_entry_name);
-        parent = find_by_handle(root, handle, path, &pos);
+        parent = find_by_handle(root, handle);
         if (!parent) abrt(EINVAL, "drag source sub directory parent dir handle does not exist");
         mi.currently_open_subdir = parent;
         if (!parent->fd_plus_one) {
-            int fd = safe_open(path, O_DIRECTORY | O_RDONLY, 0);
-            if (fd < 0) abrt(errno, "drag source failed to create sub directory");
+            int fd = open_subdir_of_drag(root, parent, 0);
+            if (fd < 0) abrt(errno, "drag source failed to open sub directory");
             parent->fd_plus_one = fd + 1;
         }
     }
@@ -2552,7 +2627,7 @@ drag_remote_file_data(Window *w, int32_t x, int32_t y, int32_t X, int32_t Y, boo
         }
     } else {
         if (y < 1) abrt(EINVAL, "drag source remote item y index cannot be less than 1");
-        subdir_data_for_drag(w, mime_item_idx, uri_item_idx, Y, y - 1, X, has_more, payload, payload_sz, &ri);
+        subdir_data_for_drag(w, mime_item_idx, Y, y - 1, X, has_more, payload, payload_sz, &ri);
         if (all_data_received && ri && all_children_complete(ri)) {
             ri->completed = true;
             while (1) {
@@ -2581,9 +2656,10 @@ static PyObject *
 py_dnd_set_test_write_func(PyObject *self UNUSED, PyObject *args) {
     PyObject *func = Py_None;
     unsigned mime_list_size_cap = 0, present_data_cap = 0, remote_drag_limit = 0;
-    if (!PyArg_ParseTuple(args, "|OIII", &func, &mime_list_size_cap, &present_data_cap, &remote_drag_limit)) return NULL;
+    int case_insensitive_tempdir = -1;
+    if (!PyArg_ParseTuple(args, "|OIIIi", &func, &mime_list_size_cap, &present_data_cap, &remote_drag_limit, &case_insensitive_tempdir)) return NULL;
     // Pass None to clear the interceptor and restore normal operation.
-    dnd_set_test_write_func(func == Py_None ? NULL : func, mime_list_size_cap, present_data_cap, remote_drag_limit);
+    dnd_set_test_write_func(func == Py_None ? NULL : func, mime_list_size_cap, present_data_cap, remote_drag_limit, case_insensitive_tempdir);
     Py_RETURN_NONE;
 }
 
@@ -2893,6 +2969,10 @@ dnd_test_probe_state(PyObject *self UNUSED, PyObject *args) {
         return ans;
     }
     if (strcmp(q, "drop_getting_data_for_mime") == 0) { return PyUnicode_FromString(w->drop.getting_data_for_mime ? w->drop.getting_data_for_mime : ""); }
+    if (strcmp(q, "drop_dropped") == 0) { return Py_NewRef(w->drop.dropped ? Py_True : Py_False); }
+    if (strcmp(q, "drop_num_dir_handles") == 0) { return PyLong_FromSize_t(w->drop.num_dir_handles); }
+    if (strcmp(q, "drop_uri_list_sz") == 0) { return PyLong_FromSize_t(w->drop.uri_list_sz); }
+    if (strcmp(q, "drop_file_fd_plus_one") == 0) { return PyLong_FromLong((long)w->drop.file_fd_plus_one); }
     if (strcmp(q, "can_offer") == 0) { return Py_NewRef(w->drag_source.can_offer ? Py_True : Py_False); }
     if (strcmp(q, "drag_operations") == 0) { return PyLong_FromLong((long)w->drag_source.allowed_operations); }
     if (strcmp(q, "drag_mimes") == 0) {

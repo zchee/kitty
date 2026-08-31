@@ -1238,7 +1238,7 @@
 #define PADDING_FORK_VERTEX_BUFSZ_wct 4224u
 
 #define ROUNDED_RECT_FRAGMENT_BUF_entryPointParams 0
-#define ROUNDED_RECT_FRAGMENT_BUFSZ_entryPointParams 64u
+#define ROUNDED_RECT_FRAGMENT_BUFSZ_entryPointParams 80u
 
 
 #define SCREENSHOT_FRAGMENT_BUF_entryPointParams 0

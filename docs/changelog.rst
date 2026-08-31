@@ -53,6 +53,7 @@ should see a 15-35% improvement depending on workload. Some details:
 
 #. Improve throughput when processing large amounts of plain text by another ~10% by finding runs of printable ASCII chars with :term:`SIMD`, filling cells using wide stores and skipping unnecessary work in the scrolling hot path when there are no images
 
+#. Speed up pixel compositing with :term:`SIMD` vectorization: alpha blending of graphics protocol images and animation frames is 2-3.5x faster and glyph alpha masks are composited onto canvases using the same vectorized primitives.
 
 
 Vertical tabs [0.48]
@@ -219,6 +220,8 @@ Detailed list of changes
 
 - Various throughput performance improvements for a 15-35% real world improvement depending on workload
 
+- Add :opt:`window_border_radius` for rounded window borders (:pull:`10421`)
+
 - A new option :opt:`remap_modifiers` to allow having modifier keys behave as different modifier keys (:pull:`10307`)
 
 - A new option, :opt:`padding_fill_strategy` to control how the thin padding strips that appear when the window size is not an exact multiple of the cell size are colored. You can choose to have the padding colored to match the background of each neighboring cell, effectively extending the size of the cell or you can continue to use the existing behavior of using the background.
@@ -242,7 +245,7 @@ Detailed list of changes
 
 - Sessions: Also save/restore layouts other than the currently active layout (:pull:`10324`)
 
-- Wayland: Fix clipboard sharing between kitty instances in containers with isolated PID namespaces (:iss:`10352`)
+- Wayland: Fix clipboard sharing between kitty instances in containers with isolated PID namespaces and stale paste data when used with clipboard managers that restore application private MIME types (:iss:`10352`, :iss:`10376`)
 
 - When expanding a window in alternate screen mode use the most common
   background color as the color for the newly created lines leading to less
@@ -251,6 +254,61 @@ Detailed list of changes
 - macOS: Allow kitty OS Windows to participate in Split View tiling (:pull:`103701`)
 
 - Port remaining built in kittens from Python to Go (:pull:`10371`)
+
+- Graphics protocol: Fix scaled images (created with the ``r`` or ``c`` keys)
+  being distorted instead of clipped when scrolled against a margin
+  (:iss:`10377`)
+
+- IME preedit text: use underline rather than reverse video (:pull:`10386`)
+
+- Map mouse button presses in the :opt:`padding <window_padding_width>`
+  around a window to the nearest cell, so that, for example, selections can be
+  started by pressing in the padding. Presses in the :opt:`margins
+  <window_margin_width>` and in the region around window borders used for
+  :opt:`dragging borders <window_drag_tolerance>` no longer start selections
+  (:iss:`10393`)
+
+- dnd kitten: Add an option to use file copies instead of hard links for copy drops (:pull:`10412`)
+
+- Graphics protocol: Fix a regression in 0.45.0 that caused the overwrite
+  composition mode for animation frames (``a=f``) to be controlled by the
+  undocumented ``C`` key instead of the documented ``X`` key (:iss:`10379`)
+
+- Graphics protocol: Fix chunked transmission of animation frame data
+  (``a=f``) replacing the image's root frame instead of creating or editing
+  the animation frame, when the continuation chunks contain only the ``m``
+  key, as prescribed by the spec
+
+- Graphics protocol: Reduce memory usage and speed up image transmission by
+  moving image data into the disk cache instead of copying it. Images transmitted
+  with the transient usage hint no longer keep a redundant second copy of their
+  data in memory for their entire lifetime
+
+- Graphics protocol: Fix a memory leak when transmitting an animation frame
+  based on a frame with a long chain of references to other frames
+
+- Graphics protocol: Fix image data being lost or read back incorrectly in the
+  rare case that an image was overwritten or deleted while its previous data
+  was being written to the disk cache by the cache's background thread
+
+- Drag and drop protocol: deny requests for drag data made before the user has actually dropped something onto the window (:cve:`2026-80432`)
+
+- Drag and drop protocol: Deny drag sources that send identically named symlink/dir entries with an appropriate error (:cve:`2026-80430`)
+
+- Text sizing protocol: Fix a buffer overflow when a natural width text sizing escape code contains a grapheme cluster longer than four codepoints (:cve:`2026-80431`)
+
+- Graphics protocol: Fix a crash when transmitting image data via a file or
+  shared memory object (``t=f``, ``t=t`` or ``t=s``) and the client truncates
+  it while kitty is reading from it.
+
+- Graphics protocol: Fix reading image data from a file or shared memory
+  object at an offset (the ``O`` key) failing unless the offset happened to be
+  a multiple of the system page size
+
+- Clipboard protocol: Report an ``EFBIG`` error to programs that try to write
+  more data to the clipboard than allowed by :opt:`clipboard_max_size`, instead
+  of silently truncating their data. Also fix :opt:`clipboard_max_size` being
+  interpreted in units of TB rather than MB (:iss:`10399`)
 
 
 0.48.2 [2026-07-30]

@@ -11,6 +11,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from io import BytesIO
 
+from kitty.constants import is_macos
 from kitty.fast_data_types import base64_decode, base64_encode, load_png_data, shm_unlink, shm_write
 
 from .base import BaseTest, parse_bytes
@@ -345,6 +346,47 @@ class TestGraphics(BaseTest):
         remove(3)
         self.assertEqual(dc.holes(), {(1, 9)})
 
+    def test_disk_cache_entry_changed_while_being_written(self):
+        # The disk cache write thread releases the lock while writing an entry
+        # to disk, so the entry can be replaced or removed in the meantime. The
+        # data written for it is then stale and must neither be associated with
+        # the entry nor be allowed to leak space in the cache file.
+        s = self.create_screen()
+        dc = s.grman.disk_cache
+        dc.small_hole_threshold = 0
+
+        # Replaced while being written
+        dc.pause_writes()
+        dc.add(b'k1', b'a' * 100)
+        self.assertTrue(dc.wait_until_writes_paused())
+        dc.add(b'k1', b'b' * 200)
+        self.assertTrue(dc.resume_writes())
+        self.assertTrue(dc.wait_for_write())
+        # The new data must have been written to disk rather than the entry
+        # being marked as written at the position of the old data
+        self.assertEqual(dc.num_cached_in_ram(), 0)
+        self.assertEqual(dc.get(b'k1'), b'b' * 200)
+        self.assertEqual(dc.total_size, 200)
+        # The space used by the stale data must have been reclaimed
+        self.assertEqual(dc.holes(), {(0, 100)})
+        self.assertEqual(dc.end_of_data_offset(), 300)
+
+        # Removed while being written
+        dc.pause_writes()
+        dc.add(b'k2', b'c' * 50)
+        self.assertTrue(dc.wait_until_writes_paused())
+        self.assertTrue(dc.remove(b'k2'))
+        self.assertTrue(dc.resume_writes())
+        self.assertTrue(dc.wait_for_write())
+        self.assertRaises(KeyError, dc.get, b'k2')
+        self.assertEqual(dc.total_size, 200)
+        # k2 was written into the existing 100 byte hole, both the 50 bytes it
+        # used and the 50 byte remainder must be reclaimed and coalesced
+        self.assertEqual(dc.holes(), {(0, 100)})
+        self.assertEqual(dc.end_of_data_offset(), 300)
+        # The untouched entry must be unaffected throughout
+        self.assertEqual(dc.get(b'k1'), b'b' * 200)
+
     def test_suppressing_gr_command_responses(self):
         s, g, pl, sl = load_helpers(self)
         self.ae(pl('abcd', s=10, v=10, q=1), 'ENODATA:Insufficient image data: 4 < 400')
@@ -463,6 +505,54 @@ class TestGraphics(BaseTest):
         s.reset()
         self.assertEqual(g.disk_cache.total_size, 0)
 
+    def test_load_images_from_file_edge_cases(self):
+        s, g, pl, sl = load_helpers(self)
+        random_data = byte_block(32 * 1024)
+
+        with tempfile.NamedTemporaryFile(prefix='tty-graphics-protocol-') as f:
+            # A window of the file specified with a non page aligned offset
+            f.write(b'x' * 3 + random_data + b'y' * 5), f.flush()
+            sl(f.name, s=1024, v=8, t='f', S=len(random_data), O=3, expecting_data=random_data)
+
+            # A file that is truncated after the size declared in the command
+            # must be reported as insufficient data rather than crashing
+            f.seek(0), f.truncate(), f.write(random_data[:128]), f.flush()
+            self.ae(pl(f.name, s=1024, v=8, t='f', S=len(random_data)), f'ENODATA:Insufficient image data: 128 < {len(random_data)}')
+
+            # Ditto when the size is not declared and is read from the file itself
+            self.ae(pl(f.name, s=1024, v=8, t='f'), f'ENODATA:Insufficient image data: 128 < {len(random_data)}')
+
+            # An offset past the end of the file
+            self.ae(pl(f.name, s=1024, v=8, t='f', O=4096), f'ENODATA:Insufficient image data: 0 < {len(random_data)}')
+
+        # Only regular files may be read
+        with tempfile.TemporaryDirectory(prefix='tty-graphics-protocol-') as tdir:
+            fifo = os.path.join(tdir, 'fifo')
+            os.mkfifo(fifo)
+            self.assertTrue(pl(fifo, s=1024, v=8, t='f').startswith('EBADF:'), 'Reading from a FIFO was not refused')
+
+        # A window of a shared memory object with a non page aligned offset
+        name = '/kitty-test-shm-offset'
+        shm_write(name, b'x' * 3 + random_data + b'y' * 5)
+        sl(name, s=1024, v=8, t='s', S=len(random_data), O=3, expecting_data=random_data)
+        self.assertRaises(FileNotFoundError, shm_unlink, name)  # check that the object was deleted
+
+        # A shared memory object truncated to less than the declared size
+        name = '/kitty-test-shm-truncated'
+        shm_write(name, random_data[:64])
+        # macOS rounds the size of a shared memory object up to a multiple of
+        # the page size, zero filling the padding, and reports the rounded up
+        # size via fstat(), so more data than was written is available there.
+        available = 64
+        if is_macos:
+            page_size = os.sysconf('SC_PAGESIZE')
+            available = min(len(random_data), (64 + page_size - 1) // page_size * page_size)
+        self.ae(pl(name, s=1024, v=8, t='s', S=len(random_data)), f'ENODATA:Insufficient image data: {available} < {len(random_data)}')
+        self.assertRaises(FileNotFoundError, shm_unlink, name)  # check that the object was deleted
+
+        s.reset()
+        self.assertEqual(g.disk_cache.total_size, 0)
+
     @unittest.skipIf(Image is None, 'PIL not available, skipping PNG tests')
     def test_load_png(self):
         s, g, pl, sl = load_helpers(self)
@@ -511,6 +601,20 @@ class TestGraphics(BaseTest):
         # a 25-byte chunk previously caused a crash.
         res = pl(b'x' * 25, f=100)
         self.ae(res.partition(':')[0], 'EBADPNG')
+        if Image is None:
+            return
+        # Test that a truncated PNG (valid header + IHDR declaring more rows
+        # than the IDAT data can produce, with no trailing chunks) is rejected
+        # cleanly instead of causing libpng to parse uninitialized memory. The
+        # read callback must abort via png_error() when it runs out of bytes.
+        w, h = 3, 3
+        buf = BytesIO()
+        Image.frombytes('RGBA', (w, h), byte_block(w * h * 4)).save(buf, 'PNG')
+        full = buf.getvalue()
+        # Drop the trailing bytes (IDAT tail + IEND) so the stream runs out
+        # while libpng still expects more compressed data.
+        truncated = full[:-16]
+        self.assertRaisesRegex(ValueError, '[EBADPNG]', load_png_data, truncated)
 
     def test_gr_operations_with_numbers(self):
         s = self.create_screen()
@@ -750,7 +854,7 @@ class TestGraphics(BaseTest):
         self.ae(positions(), {(1, 5): {'x': 2, 'y': 2}, (1, 2): {'x': 3, 'y': 4}})
 
     def test_unicode_placeholders(self):
-        # This test tests basic image placement using using unicode placeholders
+        # This test tests basic image placement using unicode placeholders
         cw, ch = 10, 20
         s, dx, dy, put_image, put_ref, layers, rect_eq = put_helpers(self, cw, ch)
         # Upload two images.
@@ -1029,6 +1133,50 @@ class TestGraphics(BaseTest):
         self.ae(layers(s)[0]['src_rect'], {'left': 0.0, 'top': 0.0, 'right': 1.0, 'bottom': 0.5})
         s.reverse_index()
         self.ae(s.grman.image_count, 2)
+        # Test that scaled images (r=/c=) are clipped rather than distorted
+        # when scrolled against a margin (#10377)
+        s.reset()
+        s.set_margins(1, 3)  # 1-based indexing
+        put_image(s, cw, 4 * ch, num_cols=1, num_lines=2, no_id=True)  # 10x80 px image scaled into 1x2 cells at (0, 0)
+        self.ae(s.grman.image_count, 1)
+        self.ae(layers(s)[0]['src_rect'], {'left': 0.0, 'top': 0.0, 'right': 1.0, 'bottom': 1.0})
+        rect_eq(layers(s)[0]['dest_rect'], -1, 1, -1 + dx, 1 - 2 * dy)
+        while s.cursor.y != 2:
+            s.index()
+        s.index()  # scroll up, the top row of the image is clipped
+        l0 = layers(s)
+        self.ae(len(l0), 1)
+        self.ae(l0[0]['src_rect'], {'left': 0.0, 'top': 0.5, 'right': 1.0, 'bottom': 1.0})
+        rect_eq(l0[0]['dest_rect'], -1, 1, -1 + dx, 1 - dy)
+        s.index()
+        self.ae(s.grman.image_count, 0)
+        # Now check clipping of a scaled image at the bottom margin
+        s.reset()
+        s.set_margins(1, 3)
+        s.index()
+        put_image(s, cw, 4 * ch, num_cols=1, num_lines=2, no_id=True)  # 1x2 cells at (0, 1)
+        while s.cursor.y != 0:
+            s.reverse_index()
+        s.reverse_index()  # scroll down, the bottom row of the image is clipped
+        l0 = layers(s)
+        self.ae(len(l0), 1)
+        self.ae(l0[0]['src_rect'], {'left': 0.0, 'top': 0.0, 'right': 1.0, 'bottom': 0.5})
+        rect_eq(l0[0]['dest_rect'], -1, 1 - 2 * dy, -1 + dx, 1 - 3 * dy)
+        s.reverse_index()
+        self.ae(s.grman.image_count, 0)
+        # Scaling specified via c= only, with the height derived from the aspect ratio
+        s.reset()
+        s.set_margins(1, 3)
+        put_image(s, 2 * cw, 4 * ch, num_cols=1, no_id=True)  # 20x80 px image scaled into 1 col => 10x40 px => 1x2 cells
+        rect_eq(layers(s)[0]['dest_rect'], -1, 1, -1 + dx, 1 - 2 * dy)
+        while s.cursor.y != 2:
+            s.index()
+        s.index()  # scroll up, the top row of the image is clipped
+        l0 = layers(s)
+        self.ae(l0[0]['src_rect'], {'left': 0.0, 'top': 0.5, 'right': 1.0, 'bottom': 1.0})
+        rect_eq(l0[0]['dest_rect'], -1, 1, -1 + dx, 1 - dy)
+        s.index()
+        self.ae(s.grman.image_count, 0)
         s.reset()
         self.assertEqual(s.grman.disk_cache.total_size, 0)
 
@@ -1186,6 +1334,21 @@ class TestGraphics(BaseTest):
         t(payload='3' * 36, r=2)
         img = g.image_for_client_id(1)
         self.assertEqual(img['extra_frames'], ({'gap': 77, 'id': 2, 'data': b'3' * 36},))
+        # the composition mode for frame edits must be controlled by the X key,
+        # with fully transparent pixels being a no-op unless X=1 (issue #10379)
+        transparent = b'\x00' * 48
+        t(payload=transparent, r=2, f=32)
+        img = g.image_for_client_id(1)
+        self.assertEqual(img['extra_frames'], ({'gap': 77, 'id': 2, 'data': b'3' * 36},))
+        t(payload=transparent, r=2, f=32, C=1)
+        img = g.image_for_client_id(1)
+        self.assertEqual(img['extra_frames'], ({'gap': 77, 'id': 2, 'data': b'3' * 36},))
+        t(payload=transparent, r=2, f=32, X=1)
+        img = g.image_for_client_id(1)
+        self.assertEqual(img['extra_frames'], ({'gap': 77, 'id': 2, 'data': b'\x00' * 36},))
+        t(payload='3' * 36, r=2)
+        img = g.image_for_client_id(1)
+        self.assertEqual(img['extra_frames'], ({'gap': 77, 'id': 2, 'data': b'3' * 36},))
         # test loading from previous frame
         t(payload='4' * 12, c=2, s=2, v=2, z=101, frame_number=3)
         img = g.image_for_client_id(1)
@@ -1288,6 +1451,20 @@ class TestGraphics(BaseTest):
                 {'gap': 40, 'id': 3, 'data': b'3' * 12 + (b'333abc' + b'3' * 6) * 2},
             ),
         )
+
+        # Composing into a frame materializes it as a full frame. Its pixel
+        # format metadata must be updated to match the coalesced frame data.
+        rgba_screen = self.create_screen()
+        rgba_grman = rgba_screen.grman
+        rgba_li = make_send_command(rgba_screen)
+        self.assertEqual(rgba_li(payload=b'\0' * 48, a='t', f=32).code, 'OK')
+        self.assertEqual(rgba_li(payload=b'R' * 12, c=1, s=2, v=2, f=24).code, 'OK')
+        frame_before_composition = rgba_grman.image_for_client_id(1)['extra_frames'][0]['data']
+        self.assertEqual(len(frame_before_composition), 48)
+        self.assertEqual(rgba_li(payload=b'', a='c', f=0, s=0, v=0, r=1, c=2, w=1, h=1, x=3, y=2).code, 'OK')
+        frame_after_composition = rgba_grman.image_for_client_id(1)['extra_frames'][0]['data']
+        self.assertEqual(frame_after_composition, frame_before_composition)
+
         # Test that compose commands with offset values that would overflow a 32-bit
         # unsigned integer are correctly rejected with EINVAL instead of crashing.
         # In the old code, UINT32_MAX + img->width wrapped around as uint32_t to a
@@ -1298,6 +1475,89 @@ class TestGraphics(BaseTest):
                 'EINVAL',
                 f'Expected EINVAL for overflow in compose offset parameter {offset_param!r}',
             )
+
+    def test_graphics_compose_canvas_bounds(self):
+        from kitty.fast_data_types import create_canvas
+
+        # Sanity: a well formed overlay is copied correctly onto the canvas.
+        overlay = bytes(range(1, 13))  # 2x2 RGB overlay
+        canvas = create_canvas(overlay, 2, 0, 0, 2, 2, 3)
+        self.assertEqual(canvas, overlay)
+        # out of bounds overlay
+        big_overlay = bytes((i % 251) + 1 for i in range(4 * 4 * 3))
+        canvas = create_canvas(big_overlay, 4, 0, 0, 2, 2, 3)
+        self.assertEqual(len(canvas), 2 * 2 * 3)
+        expected = big_overlay[0:6] + big_overlay[12:18]  # first two rows, first two pixels
+        self.assertEqual(canvas, expected)
+        # out of bounds offset overlay
+        canvas = create_canvas(overlay, 2, 1000, 1000, 2, 2, 3)
+        self.assertEqual(canvas, b'\x00' * (2 * 2 * 3))
+        # A huge offset (near UINT32_MAX) must not overflow the address math.
+        canvas = create_canvas(overlay, 2, 0xFFFFFFFF, 0xFFFFFFFF, 2, 2, 3)
+        self.assertEqual(canvas, b'\x00' * (2 * 2 * 3))
+        # A partially overlapping overlay: place a 2x2 overlay at x=1,y=1 of a
+        # 2x2 canvas so only its top-left pixel lands inside the canvas.
+        canvas = create_canvas(overlay, 2, 1, 1, 2, 2, 3)
+        expected = bytearray(2 * 2 * 3)
+        expected[9:12] = overlay[0:3]  # bottom-right pixel of canvas
+        self.assertEqual(canvas, bytes(expected))
+        # Degenerate/invalid parameters must raise instead of crashing.
+        self.assertRaises(ValueError, create_canvas, overlay, 0, 0, 0, 2, 2, 3)
+        self.assertRaises(ValueError, create_canvas, overlay, 2, 0, 0, 2, 2, 0)
+        self.assertRaises(ValueError, create_canvas, overlay, 2, 0, 0, 2, 2, 5)
+
+    def test_animation_frame_long_reference_chain(self):
+        # A new frame based on another frame with a long/large reference chain is
+        # stored as a fully coalesced key frame rather than as a delta
+        s = self.create_screen()
+        g = s.grman
+        li = make_send_command(s)
+        self.assertEqual(li(a='t').code, 'OK')
+        self.assertEqual(g.disk_cache.total_size, 36)
+
+        # frame 2 is a delta on top of the root frame
+        self.assertEqual(li(payload='2' * 36, c=1).frame_number, 2)
+        self.assertEqual(g.disk_cache.total_size, 72)
+
+        # frame 3 is based on frame 2, whose reference chain is now large enough
+        # that frame 3 must be coalesced into a full key frame
+        self.assertEqual(li(payload='4' * 12, c=2, s=2, v=2).frame_number, 3)
+        img = g.image_for_client_id(1)
+        self.assertEqual(
+            img['extra_frames'],
+            (
+                {'gap': 40, 'id': 2, 'data': b'2' * 36},
+                {'gap': 40, 'id': 3, 'data': b'444444222222' * 2 + b'2' * 12},
+            ),
+        )
+        # a full 36 byte key frame, not a 12 byte delta
+        self.assertEqual(g.disk_cache.total_size, 108)
+
+    def test_animation_frame_chunked_loading(self):
+        # continuation chunks of a chunked a=f transmission carry only the m key,
+        # they must be routed to the frame load handler, not the add handler
+        s = self.create_screen()
+        g = s.grman
+        li = make_send_command(s)
+        self.assertEqual(li(a='t').code, 'OK')
+
+        def chunked(payload, last_payload, **kw):
+            self.assertIsNone(li(payload=payload, m=1, **kw))
+            self.assertFalse(send_command(s, 'm=1', payload))
+            return parse_full_response(send_command(s, 'm=0', last_payload))
+
+        # create a new frame with continuation chunks
+        res = chunked('2' * 12, '2' * 12, z=77)
+        self.assertEqual((res.code, res.image_id, res.frame_number), ('OK', 1, 2))
+        img = g.image_for_client_id(1)
+        self.assertEqual(img['data'], b'abcdefghijkl' * 3)  # root frame must be untouched
+        self.assertEqual(img['extra_frames'], ({'gap': 77, 'id': 2, 'data': b'2' * 36},))
+        # edit an existing frame with continuation chunks, r= is only present
+        # in the start command
+        res = chunked('3' * 12, '3' * 12, r=2)
+        self.assertEqual((res.code, res.image_id, res.frame_number), ('OK', 1, 2))
+        img = g.image_for_client_id(1)
+        self.assertEqual(img['extra_frames'], ({'gap': 77, 'id': 2, 'data': b'3' * 36},))
 
     def test_graphics_quota_enforcement(self):
         s = self.create_screen()

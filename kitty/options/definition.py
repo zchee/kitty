@@ -1803,6 +1803,20 @@ drawn.
 )
 
 opt(
+    'window_border_radius',
+    '0',
+    option_type='window_border_width',
+    long_text="""
+The corner radius of window borders. Can be either in pixels (px) or pts (pt).
+Values in pts will be rounded to the nearest number of pixels based on screen
+resolution. If not specified, the unit is assumed to be pts. A value of zero
+disables rounded borders. This option applies only when full window borders are
+drawn; it has no effect with minimal borders. Rounded borders are drawn over
+corner cells, so use :opt:`window_padding_width` to keep text clear of them.
+""",
+)
+
+opt(
     'draw_window_borders_for_single_window',
     'no',
     option_type='to_bool',
@@ -3194,7 +3208,9 @@ opt(
     long_text="""
 The maximum size (in MB) of data from programs running in kitty that will be
 stored for writing to the system clipboard. A value of zero means no size limit
-is applied. See also :opt:`clipboard_control`.
+is applied. Programs using the :doc:`clipboard protocol <clipboard>` that try to
+write more data than this are sent an ``EFBIG`` error and their data is
+discarded. See also :opt:`clipboard_control`.
 """,
 )
 
@@ -3585,7 +3601,8 @@ window. A value of :code:`menubar` will show the title of the currently active
 window in the macOS global menu bar, making use of otherwise wasted space. A
 value of :code:`all` will show the title in both places, and :code:`none` hides
 the title. See :opt:`macos_menubar_title_max_length` for how to control the
-length of the title in the menu bar.
+length of the title in the menu bar. Note that when displaying the title in the
+menubar it is prefixed by :code:`::` as a separator which cannot be changed.
 """,
 )
 
