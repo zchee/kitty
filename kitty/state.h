@@ -188,6 +188,7 @@ typedef struct Options {
         Animation *cursor, *visual_bell;
     } animation;
     unsigned undercurl_style;
+    IMEPreeditStyle ime_preedit_style;
     struct {
         float thickness;
         int unit;

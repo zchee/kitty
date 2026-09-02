@@ -5272,14 +5272,30 @@ screen_draw_overlay_line(Screen *self) {
     self->modes.mIRM = false;
     Cursor *orig_cursor = self->cursor;
     self->cursor = &(self->overlay_line.original_line.cursor);
-    // Fork divergence from upstream dbabd12ba, which draws the pre-edit run as
-    // italic with a dashed underline in highlight_bg. That underline is only as
-    // visible as the user's selection_background, which it shares: against a
-    // near-black background a dark selection colour leaves a 1px dash at ~2:1
-    // contrast, so the composing run reads as unmarked. Reverse video carries
-    // the fg/bg contrast of the theme itself and cannot degrade this way, so
-    // this fork keeps it. XOR restores itself, hence no save/restore pair here.
-    self->cursor->sgr.reverse ^= true;
+    // Mark the pre-edit run as distinct from committed text. Upstream dbabd12ba
+    // made italic + dashed underline the only style; that underline is drawn in
+    // highlight_bg, so its visibility is a function of the user's selection
+    // colour and it can wash out on a theme where that colour sits close to the
+    // background. Reverse video derives from the colours the text is already
+    // drawn in and cannot degrade that way, so ime_preedit_style selects
+    // between them and defaults to reverse here.
+    const bool underline_preedit = OPT(ime_preedit_style) == IME_PREEDIT_UNDERLINE;
+    const bool orig_italic = self->cursor->sgr.italic;
+    const uint8_t orig_decoration = self->cursor->sgr.decoration;
+    const color_type orig_decoration_fg = self->cursor->sgr.decoration_fg;
+    if (underline_preedit) {
+        self->cursor->sgr.italic = true;
+        self->cursor->sgr.decoration = 5; // dashed
+        self->cursor->sgr.decoration_fg = ((colorprofile_to_color_with_fallback(
+                                                self->color_profile,
+                                                self->color_profile->overridden.highlight_bg,
+                                                self->color_profile->configured.highlight_bg,
+                                                self->color_profile->overridden.default_fg,
+                                                self->color_profile->configured.default_fg) &
+                                            COL_MASK)
+                                           << 8) |
+                                          2;
+    } else self->cursor->sgr.reverse ^= true;
     self->cursor->x = xstart;
     self->cursor->y = self->overlay_line.ynum;
     self->overlay_line.xnum = 0;
@@ -5331,7 +5347,11 @@ screen_draw_overlay_line(Screen *self) {
         self->overlay_line.xnum += len;
     }
     self->overlay_line.cursor_x = self->cursor->x;
-    self->cursor->sgr.reverse ^= true;
+    if (underline_preedit) {
+        self->cursor->sgr.italic = orig_italic;
+        self->cursor->sgr.decoration = orig_decoration;
+        self->cursor->sgr.decoration_fg = orig_decoration_fg;
+    } else self->cursor->sgr.reverse ^= true;
     self->cursor = orig_cursor;
     self->modes.mDECAWM = orig_line_wrap_mode;
     self->modes.mDECTCEM = orig_cursor_enable_mode;

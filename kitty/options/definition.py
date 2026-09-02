@@ -646,6 +646,23 @@ of the cursor trail independently of the cursor color.
 """,
 )
 
+opt(
+    'ime_preedit_style',
+    'reverse',
+    ctype='ime_preedit_style',
+    choices=('reverse', 'underline'),
+    long_text="""
+How text being composed by an Input Method Editor (the pre-edit run, shown
+before you commit a conversion) is distinguished from committed text.
+:code:`reverse` draws it in reverse video, swapping the foreground and
+background colors the text already uses. :code:`underline` draws it in italics
+with a dashed underline in :opt:`selection_background`, which is what VTE and
+foot do; note that this ties the mark's visibility to your selection color, so
+on a theme where that color is close to the background the pre-edit run can be
+hard to pick out.
+""",
+)
+
 egr()  # }}}
 
 # scrollback {{{

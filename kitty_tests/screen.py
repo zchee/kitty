@@ -2133,14 +2133,9 @@ class TestScreen(BaseTest):
         self.assertTrue(s.is_main_linebuf())
 
     def test_ime_preedit_styling(self):
-        self.skipTest(
-            'this fork draws the IME pre-edit run in reverse video, not upstream dbabd12ba\'s'
-            ' italic + dashed underline: that underline inherits selection_background, which on a'
-            ' dark theme leaves the composing run effectively unmarked'
-        )
-        # Pre-edit text is marked with italics and a dashed underline in the
-        # highlight color, rather than reverse video.
-        s = self.create_screen(cols=10, lines=3)
+        # ime_preedit_style=underline: italics and a dashed underline in the
+        # highlight color. This is upstream's only style; here it is opt-in.
+        s = self.create_screen(cols=10, lines=3, options={'ime_preedit_style': 'underline'})
         s.draw('xy')
         before = s.line(0).cursor_from(0)
         s.test_draw_overlay_line('ab', 0, 0)
@@ -2159,6 +2154,23 @@ class TestScreen(BaseTest):
         self.assertFalse(s.cursor.italic)
         self.ae(s.cursor.decoration, before.decoration)
         self.ae(s.cursor.decoration_fg, before.decoration_fg)
+
+        # ime_preedit_style=reverse (the default here): reverse video, and none
+        # of the underline attributes are touched.
+        s = self.create_screen(cols=10, lines=3)
+        s.draw('xy')
+        before = s.line(0).cursor_from(0)
+        s.test_draw_overlay_line('ab', 0, 0)
+        line = s.line(0)
+        for x in (0, 1):
+            c = line.cursor_from(x)
+            self.assertTrue(c.reverse, f'pre-edit cell {x} is not in reverse video')
+            self.assertFalse(c.italic, f'pre-edit cell {x} is italic')
+            self.ae(c.decoration, before.decoration, f'pre-edit cell {x} gained a decoration')
+            self.ae(c.decoration_fg, before.decoration_fg, f'pre-edit cell {x} gained a decoration color')
+
+        # reverse is toggled with XOR, so it must come back off the overlay cursor
+        self.assertFalse(s.cursor.reverse)
 
 
 def detect_url(self, scale=1):

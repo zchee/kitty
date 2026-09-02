@@ -72,6 +72,13 @@ window_title_in(PyObject *title_in) {
     return ALL;
 }
 
+static inline IMEPreeditStyle
+ime_preedit_style(PyObject *src) {
+    const char *q = PyUnicode_AsUTF8(src);
+    if (!q) return IME_PREEDIT_REVERSE;
+    return q[0] == 'u' ? IME_PREEDIT_UNDERLINE : IME_PREEDIT_REVERSE;
+}
+
 static inline ScrollbarVisibilityPolicy
 scrollbar(PyObject *src) {
     const char *q = PyUnicode_AsUTF8(src);

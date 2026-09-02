@@ -1062,6 +1062,14 @@ class Parser:
     def hide_window_decorations(self, val: str, ans: dict[str, typing.Any]) -> None:
         ans['hide_window_decorations'] = hide_window_decorations(val)
 
+    def ime_preedit_style(self, val: str, ans: dict[str, typing.Any]) -> None:
+        val = val.lower()
+        if val not in self.choices_for_ime_preedit_style:
+            raise ValueError(f"The value {val} is not a valid choice for ime_preedit_style")
+        ans["ime_preedit_style"] = val
+
+    choices_for_ime_preedit_style = frozenset(('reverse', 'underline'))
+
     def inactive_border_color(self, val: str, ans: dict[str, typing.Any]) -> None:
         ans['inactive_border_color'] = to_color(val)
 
