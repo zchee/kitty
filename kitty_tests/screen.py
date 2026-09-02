@@ -2133,6 +2133,11 @@ class TestScreen(BaseTest):
         self.assertTrue(s.is_main_linebuf())
 
     def test_ime_preedit_styling(self):
+        self.skipTest(
+            'this fork draws the IME pre-edit run in reverse video, not upstream dbabd12ba\'s'
+            ' italic + dashed underline: that underline inherits selection_background, which on a'
+            ' dark theme leaves the composing run effectively unmarked'
+        )
         # Pre-edit text is marked with italics and a dashed underline in the
         # highlight color, rather than reverse video.
         s = self.create_screen(cols=10, lines=3)
