@@ -60,6 +60,7 @@ from .fast_data_types import (
     add_timer,
     add_window,
     base64_decode,
+    base64_encode,
     buffer_keys_in_window,
     cell_size_for_window,
     click_mouse_cmd_output,
@@ -543,19 +544,17 @@ def process_remote_print(msg: memoryview) -> str:
     return replace_c0_codes_except_nl_space_tab(base64_decode(msg)).decode('utf-8', 'replace')
 
 
-def transparent_background_color_control(cp: ColorProfile, responses: dict[str, str], index: int, key: str, sep: str, val: str) -> None:
+def transparent_background_color_control(cp: ColorProfile, responses: list[tuple[str, str]], index: int, key: str, sep: str, val: str) -> None:
+    # index is guaranteed to be a valid transparent background color index by the caller
     if sep == '=':
         if val == '?':
-            if index > 8:
-                responses[key] = '?'
+            c = cp.get_transparent_background_color(index - 1)
+            if c is None:
+                responses.append((key, ''))
             else:
-                c = cp.get_transparent_background_color(index - 1)
-                if c is None:
-                    responses[key] = ''
-                else:
-                    opacity = max(0, min(c.alpha / 255.0, 1))
-                    responses[key] = f'rgb:{c.red:02x}/{c.green:02x}/{c.blue:02x}@{opacity:.4f}'
-        elif index <= 8:
+                opacity = max(0, min(c.alpha / 255.0, 1))
+                responses.append((key, f'rgb:{c.red:02x}/{c.green:02x}/{c.blue:02x}@{opacity:.4f}'))
+        else:
             col, _, o = val.partition('@')
             try:
                 opacity = float(o)
@@ -564,21 +563,34 @@ def transparent_background_color_control(cp: ColorProfile, responses: dict[str, 
             c = to_color(col)
             if c is not None:
                 cp.set_transparent_background_color(index - 1, c, opacity)
-    elif index <= 8:
+    else:
         cp.set_transparent_background_color(index - 1)
 
 
 def color_control(cp: ColorProfile, code: int, value: str | bytes | memoryview = '') -> str:
     if isinstance(value, (bytes, memoryview)):
         value = str(value, 'utf-8', 'replace')
-    responses: dict[str, str] = {}
+    responses: list[tuple[str, str]] = []
     # Only printable ASCII payload allowed as it is echoed back
     value = re.sub(r'[^ -~]', '', value)
+
+    def mark_unknown(key: str) -> None:
+        # The field name is base64 encoded rather than echoed verbatim, otherwise
+        # this escape code could be abused to make the terminal emit arbitrary text
+        responses.append(('unknown', base64_encode(key).decode('ascii')))
+
     for rec in value.split(';'):
         key, sep, val = rec.partition('=')
+        if not key:  # ignore empty fields, e.g. from a stray or trailing semicolon
+            continue
         if key.startswith('transparent_background_color'):
-            index = int(key[len('transparent_background_color') :])
-            transparent_background_color_control(cp, responses, index, key, sep, val)
+            # Only respond to canonically specified, in-range indices, any other index
+            # is an unknown field
+            suffix = key[len('transparent_background_color') :]
+            if suffix.isdigit() and 1 <= (index := int(suffix)) <= 8:
+                transparent_background_color_control(cp, responses, index, key, sep, val)
+            else:
+                mark_unknown(key)
             continue
         attr = {
             'foreground': 'default_fg',
@@ -589,9 +601,10 @@ def color_control(cp: ColorProfile, code: int, value: str | bytes | memoryview =
             'cursor_text': 'cursor_text_color',
             'visual_bell': 'visual_bell_color',
         }.get(key, '')
-        colnum = -1
-        with suppress(Exception):
-            colnum = int(key)
+        colnum = int(key) if key.isdigit() else -1
+        if not attr and not 0 <= colnum <= 255:
+            mark_unknown(key)
+            continue
 
         def serialize_color(c: Color | None) -> str:
             return '' if c is None else f'rgb:{c.red:02x}/{c.green:02x}/{c.blue:02x}'
@@ -600,13 +613,10 @@ def color_control(cp: ColorProfile, code: int, value: str | bytes | memoryview =
             if val == '?':
                 if attr:
                     c = getattr(cp, attr)
-                    responses[key] = serialize_color(c)
+                    responses.append((key, serialize_color(c)))
                 else:
-                    if 0 <= colnum <= 255:
-                        c = cp.as_color((colnum << 8) | 1)
-                        responses[key] = serialize_color(c)
-                    else:
-                        responses[key] = '?'
+                    c = cp.as_color((colnum << 8) | 1)
+                    responses.append((key, serialize_color(c)))
             else:
                 if attr:
                     if val:
@@ -634,7 +644,7 @@ def color_control(cp: ColorProfile, code: int, value: str | bytes | memoryview =
                 if 0 <= colnum <= 255:
                     cp.set_color(colnum, get_options().color_table[colnum])
     if responses:
-        payload = ';'.join(f'{k}={v}' for k, v in responses.items())
+        payload = ';'.join(f'{k}={v}' for k, v in responses)
         return f'{code};{payload}'
     return ''
 
@@ -1730,10 +1740,10 @@ class Window:
     def handle_remote_echo(self, msg: memoryview) -> None:
         # This is used by the ssh kitten to flush garbage from the tty on exit
         data = base64_decode(msg)
-        if re.match(rb'\d+$', data) is None:
-            log_error(f'Invalid echo message received from client: {data!r}')
-        else:
+        if data.isdigit():
             self.write_to_child(data)
+        else:
+            log_error(f'Invalid echo message received from client: {data!r}')
 
     def handle_remote_ssh(self, msg: memoryview) -> None:
         from kittens.ssh.utils import get_ssh_data
@@ -1812,23 +1822,40 @@ class Window:
     def handle_remote_askpass(self, msgb: memoryview) -> None:
         from .shm import SharedMemory
 
-        msg = str(msgb, 'utf-8')
-        with SharedMemory(name=msg, readonly=True) as shm:
+        name = str(msgb, 'utf-8')
+        try:
+            shm = SharedMemory(name=name)
+        except OSError as err:
+            log_error(f'Ignoring ask request as opening its shared memory object failed with error: {err}')
+            return
+        try:
+            # The askpass client polls its own mapping for the answer, so
+            # unlinking the name here does not affect it and prevents anyone
+            # else from opening this object while we are using it.
+            shm.unlink()
+            shm.verify_owner_and_mode()
             shm.seek(1)
             data = json.loads(shm.read_data_with_size())
+            q = str(data['type'])
+            message: str = sanitize_control_codes(data['message'])
+            choices = tuple(map(sanitize_control_codes, data['choices'])) if q == 'choose' else ()
+        except Exception as err:
+            shm.close()
+            log_error(f'Ignoring invalid ask request with error: {err}')
+            return
 
         def callback(ans: Any) -> None:
-            data = json.dumps(ans)
-            with SharedMemory(name=msg) as shm:
+            try:
                 shm.seek(1)
-                shm.write_data_with_size(data)
+                shm.write_data_with_size(json.dumps(ans))
                 shm.flush()
                 shm.seek(0)
                 shm.write(b'\x01')
+            finally:
+                shm.close()
 
-        message: str = data['message']
         window_title = 'A program wants your input'
-        if data['type'] == 'confirm':
+        if q == 'confirm':
             get_boss().confirm(
                 message,
                 callback,
@@ -1837,16 +1864,22 @@ class Window:
                 confirm_on_accept=bool(data.get('confirm_on_accept', True)),
                 title=window_title,
             )
-        elif data['type'] == 'choose':
-            get_boss().choose(message, callback, *data['choices'], window=self, default=data.get('default', ''), title=window_title)
-        elif data['type'] == 'get_line':
+        elif q == 'choose':
+            get_boss().choose(message, callback, *choices, window=self, default=data.get('default', ''), title=window_title)
+        elif q == 'get_line':
             which = 'password' if data.get('is_password') else 'input'
             message = f'\x1b[33mA program running in this window is asking for your {which}\x1b[m\n\n{message}'
             get_boss().get_line(
-                message, callback, window=self, is_password=bool(data.get('is_password')), prompt=data.get('prompt', '> '), window_title=window_title
+                message,
+                callback,
+                window=self,
+                is_password=bool(data.get('is_password')),
+                prompt=sanitize_control_codes(data.get('prompt', '> ')),
+                window_title=window_title,
             )
         else:
-            log_error(f'Ignoring ask request with unknown type: {data["type"]}')
+            shm.close()
+            log_error(f'Ignoring ask request with unknown type: {q}')
 
     def handle_remote_print(self, msg: memoryview) -> None:
         text = process_remote_print(msg)
