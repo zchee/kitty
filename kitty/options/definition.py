@@ -451,6 +451,7 @@ opt(
     'text_fg_override_threshold',
     '0',
     option_type='text_fg_override_threshold',
+    ctype='text_fg_override_threshold',
     long_text="""
 A setting to prevent low contrast between foreground and background colors.
 Useful when working with applications that use colors that do not contrast

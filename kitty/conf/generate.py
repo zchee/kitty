@@ -56,8 +56,7 @@ def generate_class(defn: Definition, loc: str) -> tuple[str, str]:
     def option_type_data(option: Option | MultiOption) -> tuple[Callable[[Any], Any], str]:
         func = option.parser_func
         if func.__module__ == 'builtins':
-            assert isinstance(func, types.FunctionType)
-            return func, func.__name__
+            return func, getattr(func, '__name__')
         th = get_type_hints(func)
         rettype = th['return']
         typ = option_type_as_str(rettype)

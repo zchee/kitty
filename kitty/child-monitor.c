@@ -2717,7 +2717,13 @@ close_os_window(ChildMonitor *self, OSWindow *os_window) {
     if (os_window->handle && !global_state.is_wayland) glfwGetWindowPos(os_window->handle, &x, &y);
     bool is_layer_shell = os_window->is_layer_shell;
     bool was_maximized = false;
-    if (os_window->handle && !is_layer_shell) { was_maximized = glfwGetWindowAttrib(os_window->handle, GLFW_MAXIMIZED) != 0; }
+    if (os_window->handle && !is_layer_shell) {
+        if (os_window->before_fullscreen.is_set && is_os_window_fullscreen(os_window)) {
+            was_maximized = os_window->before_fullscreen.was_maximized;
+        } else {
+            was_maximized = glfwGetWindowAttrib(os_window->handle, GLFW_MAXIMIZED) != 0;
+        }
+    }
     destroy_os_window(os_window);
     call_boss(on_os_window_closed, "KiiiiOO", os_window->id, x, y, w, h, was_maximized ? Py_True : Py_False, is_layer_shell ? Py_True : Py_False);
     for (size_t t = 0; t < os_window->num_tabs; t++) {
@@ -3916,10 +3922,12 @@ io_loop(void *data) {
         }
 #undef TIMED_POLL
         if (ret > 0) {
-            // W23 F-B: the old logical `revents && POLLIN` was true on ANY
-            // event; the explicit mask keeps that drain-on-any-event intent
-            // (POLLERR/POLLHUP on these process-lifetime self-pipe fds is
-            // unreachable by construction — both ends process-owned).
+            // W23 F-B: the original logical `revents && POLLIN` was true on
+            // ANY event; the explicit mask keeps that drain-on-any-event
+            // intent. Upstream (f3fdc2185) narrowed the same bug to a bare
+            // POLLIN; the wider mask is kept deliberately so an unreadable
+            // self-pipe cannot spin poll(2) forever on an undrained
+            // POLLERR/POLLHUP (unreachable today — both ends process-owned).
             if (children_fds[0].revents & (POLLIN | POLLHUP | POLLERR)) drain_fd(children_fds[0].fd); // wakeup
             if (children_fds[1].revents & (POLLIN | POLLHUP | POLLERR)) {
                 SignalSet ss = {0};

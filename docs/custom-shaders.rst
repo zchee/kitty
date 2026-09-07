@@ -284,11 +284,15 @@ the pipeline via the ``KittyTextures`` struct (``t.a``, ``t.b``, ``t.persist``).
     frame *N+1*. This allows effects that accumulate state over time (e.g.
     simulation steps, trails, fluid simulations).
 
-All three named textures have the same pixel dimensions as the OS window
-viewport. They must be declared in the top-level ``textures`` directive before
-they can be referenced. A named texture that is the output target for the
-current group cannot simultaneously be sampled as input; kitty automatically
-substitutes the backbuffer in that case.
+All three named textures cover the same area as the OS Window viewport and are
+sampled in the same UV co-ordinate space as ``t.pos``, via the ``Sample()``
+method on ``KittyTexture``. Note that the underlying GPU textures can be larger
+than the viewport, since kitty grows them to fit the largest OS Window and
+never shrinks them again, so always sample via ``Sample()`` rather than using
+the raw ``tex`` sampler. They must be declared in the top-level ``textures``
+directive before they can be referenced. A named texture that is the output
+target for the current group cannot simultaneously be sampled as input; kitty
+automatically substitutes the backbuffer in that case.
 
 **How groups chain together**
 

@@ -72,17 +72,43 @@ public struct KittyCustomShaderData {
     public float cursor_trail_change_time;
 }
 
+// A texture kitty renders into, addressed in the same UV co-ordinate space as
+// KittyTextures.pos. kitty renders into textures that are at least as large as
+// the largest OS Window viewport, so the pixels for the current OS Window
+// occupy only the lower-left corner of the texture after the window is made
+// smaller. Sampling via the Sample() method below hides that detail, so
+// shaders never need to know the size of the underlying texture.
+public struct KittyTexture {
+    // The underlying texture. Use this only if you need raw texture UV,
+    // remember to multiply your co-ordinates by scale below when you do.
+    public Sampler2D tex;
+    // The fraction of tex occupied by the OS Window viewport. Always in (0, 1].
+    public float2 scale;
+    // The largest usable co-ordinate for Sample() below. Half a texel less than
+    // one, so that sampling the top/right edge does not blend in texels from
+    // outside the viewport.
+    public float2 max_pos;
+
+    // Sample this texture at pos, which is in the same UV co-ordinate space as
+    // KittyTextures.pos, that is, [0, 1] with the origin at the bottom-left.
+    // Co-ordinates outside that range are clamped to the edge of the viewport.
+    public float4
+    Sample(float2 pos) {
+        return tex.Sample(clamp(pos, float2(0.f), max_pos) * scale);
+    }
+}
+
 public struct KittyTextures {
     // the buffer containing the original rendered pixels from kitty's own rendering. This will
     // be updated with the output color only after all custom shaders in this group have run
-    public Sampler2D backbuffer;
+    public KittyTexture backbuffer;
     // The following are named textures that can be sampled from in custom
     // shaders. The persist texture will persist across frames, anything
     // written to it in render number N can be read from it in subsequent
     // renders.
-    public Sampler2D a;
-    public Sampler2D b;
-    public Sampler2D persist;
+    public KittyTexture a;
+    public KittyTexture b;
+    public KittyTexture persist;
 
     public float2 pos; // the position of this pixel in the viewport (UV coordinates, [0,1] range, origin at bottom-left)
 

@@ -34,16 +34,15 @@ hsluv_lengthOfRayUntilIntersect(float theta, float3 x, float3 y) {
 
 float
 hsluv_maxSafeChromaForL(float L) {
-    // Transposed from GLSL column-major constructor to Slang row-major layout
     float3x3 m2 = float3x3(
         3.2409699419045214,
-        -1.5373831775700935,
-        -0.49861076029300328,
         -0.96924363628087983,
-        1.8759675015077207,
-        0.041555057407175613,
         0.055630079696993609,
+        -1.5373831775700935,
+        1.8759675015077207,
         -0.20397695888897657,
+        -0.49861076029300328,
+        0.041555057407175613,
         1.0569715142428786);
 
     float sub0 = L + 16.0;
@@ -73,16 +72,15 @@ float
 hsluv_maxChromaForLH(float L, float H) {
     float hrad = radians(H);
 
-    // Transposed from GLSL column-major constructor to Slang row-major layout
     float3x3 m2 = float3x3(
         3.2409699419045214,
-        -1.5373831775700935,
-        -0.49861076029300328,
         -0.96924363628087983,
-        1.8759675015077207,
-        0.041555057407175613,
         0.055630079696993609,
+        -1.5373831775700935,
+        1.8759675015077207,
         -0.20397695888897657,
+        -0.49861076029300328,
+        0.041555057407175613,
         1.0569715142428786);
 
     float sub1 = pow(L + 16.0, 3.0) / 1560896.0;
@@ -126,35 +124,33 @@ hsluv_lToY(float L) {
 
 float3
 xyzToRgb(float3 tuple) {
-    // Transposed layout from GLSL column-major matrix construction
+    // GLSL `mat3(args)` and Slang `float3x3(args)` agree: `v * m` in GLSL is
+    // `mul(m, v)` in Slang with the arguments in the same order.
     const float3x3 m = float3x3(
         3.2409699419045214,
-        -0.96924363628087983,
-        0.055630079696993609,
         -1.5373831775700935,
-        1.8759675015077207,
-        -0.20397695888897657,
         -0.49861076029300328,
+        -0.96924363628087983,
+        1.8759675015077207,
         0.041555057407175613,
+        0.055630079696993609,
+        -0.20397695888897657,
         1.0569715142428786);
-    // GLSL `tuple * m` is transformed to Slang/HLSL `mul(m, tuple)`
     return hsluv_fromLinear(mul(m, tuple));
 }
 
 float3
 rgbToXyz(float3 tuple) {
-    // Transposed layout from GLSL column-major matrix construction
     const float3x3 m = float3x3(
         0.41239079926595948,
-        0.21263900587151036,
-        0.019330818715591851,
         0.35758433938387796,
-        0.71516867876775593,
-        0.11919477979462599,
         0.18048078840183429,
+        0.21263900587151036,
+        0.71516867876775593,
         0.072192315360733715,
+        0.019330818715591851,
+        0.11919477979462599,
         0.95053215224966058);
-    // GLSL `tuple * m` is transformed to Slang/HLSL `mul(m, tuple)`
     return mul(m, hsluv_toLinear(tuple));
 }
 

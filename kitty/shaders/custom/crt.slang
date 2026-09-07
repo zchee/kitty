@@ -31,14 +31,13 @@ fragment_main(float4 color, KittyTextures t, KittyCustomShaderData d) {
     uv.y += 0.5f;
 
     // Original Y pixel coordinate within the viewport (for scanline phase)
-    float fragCoordY = (t.pos.y - t.viewport.y) * float(d.viewport_size_pixels.y);
+    float fragCoordY = t.pos.y * float(d.viewport_size_pixels.y) * t.viewport.w;
 
     // Scanline darkness at this pixel row
     float apply = abs(sin(fragCoordY) * 0.25f * SCAN);
 
     // Sample the backbuffer at the warped viewport UV
-    float2 sample_uv = t.viewport.xy + uv * t.viewport.zw;
-    float3 col = t.backbuffer.Sample(sample_uv).rgb;
+    float3 col = t.backbuffer.Sample(uv).rgb;
     // apply the tint
     col = lerp(col, col * TINT.rgb, TINT.a);
 
