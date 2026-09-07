@@ -179,13 +179,11 @@ def _snapshot(screen):
     # part of as_ansi output), wrap-continuation flags, and the final
     # cursor position.
     #
-    # NOTE: Line.width(x) is deliberately NOT compared here: kitty/line.c's
-    # width() returns a bare C `0` (i.e. NULL) instead of PyLong_FromLong(0)
-    # for any cell with no text, which CPython surfaces as `SystemError:
-    # error return without exception set` instead of the intended `0`. That
-    # is a pre-existing bug unrelated to ascii_runfill, out of scope to fix
-    # here; as_ansi() already reflects wide-character layout since it emits
-    # each logical character's glyph exactly once.
+    # NOTE: Line.width(x) is deliberately NOT compared here -- as_ansi()
+    # already reflects wide-character layout, since it emits each logical
+    # character's glyph exactly once. (width() used to raise SystemError on a
+    # cell with no text, which is what originally kept it out of this
+    # comparator; that bug is fixed, the redundancy is why it stays out.)
     lines, hyperlink_ids, continued = [], [], []
     for y in range(screen.lines):
         line = screen.line(y)

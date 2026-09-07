@@ -717,7 +717,10 @@ width(Line *self, PyObject *val) {
         return NULL;
     }
     const CPUCell *c = self->cpu_cells + x;
-    if (!cell_has_text(c)) return 0;
+    // A bare `return 0` here is a NULL return with no exception set, which the
+    // interpreter turns into SystemError for every caller that hits a cell
+    // holding no text.
+    if (!cell_has_text(c)) return PyLong_FromUnsignedLong(0);
     unsigned long ans = 1;
     if (c->is_multicell) ans = c->x || c->y ? 0 : c->width;
     return PyLong_FromUnsignedLong(ans);
