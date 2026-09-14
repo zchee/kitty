@@ -289,21 +289,21 @@
     },
 
     {
-        "name": "wayland 1.24.0",
+        "name": "wayland 1.26.0",
         "os": "linux",
         "unix": {
             "file_extension": "tar.xz",
-            "hash": "sha256:82892487a01ad67b334eca83b54317a7c86a03a89cfadacfef5211f11a5d0536",
+            "hash": "sha256:64176eaa46e4969903e286f8e5ef8331affc17fdf03ac9b58381d2b23162b7a3",
             "urls": ["https://gitlab.freedesktop.org/wayland/wayland/-/releases/{version}/downloads/{filename}"]
         }
     },
 
     {
-        "name": "wayland-protocols 1.45",
+        "name": "wayland-protocols 1.49",
         "os": "linux",
         "unix": {
             "file_extension": "tar.xz",
-            "hash": "sha256:4d2b2a9e3e099d017dc8107bf1c334d27bb87d9e4aff19a0c8d856d17cd41ef0",
+            "hash": "sha256:ec4c8f74942d6dff7ace8b4ce4764f0ef9ff618a935d974ea77edee2ad240b14",
             "urls": ["https://gitlab.freedesktop.org/wayland/wayland-protocols/-/releases/{version}/downloads/{filename}"]
         }
     }

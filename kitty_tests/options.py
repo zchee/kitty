@@ -35,6 +35,9 @@ class TestConfParsing(BaseTest):
     def test_cli_parsing(self):
         cli_parsing(self)
 
+    def test_font_size_clamping(self):
+        font_size_clamping(self)
+
     def test_session_discovery(self):
         from unittest.mock import patch
 
@@ -174,6 +177,32 @@ version
     t('-1 -v0', fails=True, version_called=True)
     t('-1 --version', fails=True, version_called=True)
     t('-f=3.142 --int 17', float=3.142, int=17)
+
+
+def font_size_clamping(self: 'BaseTest') -> None:
+    from kitty.options.utils import MAXIMUM_FONT_SIZE, MINIMUM_FONT_SIZE, clamp_font_size
+
+    # the floor applies whatever the configured size
+    self.ae(clamp_font_size(0, 11), MINIMUM_FONT_SIZE)
+    self.ae(clamp_font_size(-100, 11), MINIMUM_FONT_SIZE)
+
+    # sizes inside the range come back untouched
+    self.ae(clamp_font_size(11, 11), 11)
+    self.ae(clamp_font_size(64, 11), 64)
+
+    # the ceiling is the larger of the multiple and the absolute maximum, so a
+    # small configured size no longer implies a small maximum zoom
+    self.ae(clamp_font_size(1e6, 4), MAXIMUM_FONT_SIZE)
+    self.ae(clamp_font_size(1e6, 11), MAXIMUM_FONT_SIZE)
+    self.ae(clamp_font_size(200, 4), 200)
+
+    # a large configured size keeps its proportional ceiling
+    self.ae(clamp_font_size(1e6, 40), 400)
+    self.ae(clamp_font_size(1e6, 100), 1000)
+
+    # and the ceiling is never below the absolute maximum
+    for configured in (1, 4, 11, 25.6, 40, 100):
+        self.assertGreaterEqual(clamp_font_size(1e6, configured), MAXIMUM_FONT_SIZE)
 
 
 def launcher(self):

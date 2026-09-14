@@ -372,8 +372,8 @@ typedef struct Window {
         bool can_offer, is_remote_client;
         struct {
             index_type x, y;
-            bool active;
-        } potential_url_drag;
+            enum { POTENTIAL_DRAG_NONE, POTENTIAL_DRAG_URL, POTENTIAL_DRAG_SELECTION } type;
+        } potential_drag;
         struct {
             double x, y;
             monotonic_t at;

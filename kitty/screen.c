@@ -2023,18 +2023,6 @@ screen_dirty_line_graphics(Screen *self, const unsigned int top, const unsigned 
     if (need_to_remove) grman_remove_cell_images(main_buf ? self->main_grman : self->alt_grman, top, bottom);
 }
 
-static bool
-screen_mark_potential_url_drag(Screen *self) {
-    Window *w;
-    if ((!self->current_hyperlink_under_mouse.id && !self->current_hyperlink_under_mouse.has_detected_url) || !self->window_id ||
-        !(w = window_for_window_id(self->window_id)))
-        return false;
-    w->drag_source.potential_url_drag.active = true;
-    w->drag_source.potential_url_drag.x = w->mouse_pos.cell_x;
-    w->drag_source.potential_url_drag.y = w->mouse_pos.cell_y;
-    return true;
-}
-
 void
 screen_handle_dnd_command(Screen *self, const DnDCommand *cmd_, const uint8_t *payload) {
     Window *w;
@@ -4822,6 +4810,33 @@ screen_has_selection(Screen *self) {
     return false;
 }
 
+bool
+screen_is_cell_selected(Screen *self, index_type x, index_type y) {
+    if (x >= self->columns || y >= self->lines || !self->selections.count) return false;
+    const int row = (int)y - self->scrolled_by;
+    const Line *queried_line = checked_range_line(self, row);
+    if (!queried_line) return false;
+    const CPUCell cell = queried_line->cpu_cells[x];
+    // Every cell of a multi-cell character has the same selection highlight.
+    const int first_row = cell.is_multicell ? row - cell.y : row;
+    const int last_row = cell.is_multicell ? first_row + cell.scale : row + 1;
+    const int visible_start = -(int)self->scrolled_by - pixel_scroll_enabled(self);
+    const int visible_end = (int)self->lines - self->scrolled_by;
+    for (size_t i = 0; i < self->selections.count; i++) {
+        IterationData idata;
+        iteration_data(self->selections.items + i, &idata, self->columns, -self->historybuf->count, 0);
+        const int start = MAX(visible_start, MAX(first_row, idata.y)), end = MIN(visible_end, MIN(last_row, idata.y_limit));
+        for (int r = start; r < end; r++) {
+            const Line *line = checked_range_line(self, r);
+            if (line) {
+                const XRange xr = xrange_for_iteration_with_multicells(&idata, r, line);
+                if (x >= xr.x && x < xr.x_limit) return true;
+            }
+        }
+    }
+    return false;
+}
+
 void
 screen_apply_selection(Screen *self, void *address_, size_t size) {
     uint8_t *address = address_;
@@ -7326,12 +7341,6 @@ current_selections(Screen *self, PyObject *a UNUSED) {
 WRAP0(update_only_line_graphics_data)
 WRAP0(bell)
 
-static PyObject *
-mark_potential_url_drag(Screen *self, PyObject *a UNUSED) {
-    if (screen_mark_potential_url_drag(self)) Py_RETURN_TRUE;
-    Py_RETURN_FALSE;
-}
-
 #define MND(name, args) {#name, (PyCFunction)name, args, #name},
 #define MODEFUNC(name) MND(name, METH_NOARGS) MND(set_##name, METH_O)
 
@@ -7547,7 +7556,6 @@ static PyMethodDef methods[] = {
     MND(scroll_to_next_mark, METH_VARARGS)
     MND(update_only_line_graphics_data, METH_NOARGS)
     MND(bell, METH_NOARGS)
-    MND(mark_potential_url_drag, METH_NOARGS)
     MND(current_selections, METH_NOARGS)
     {"select_graphic_rendition", (PyCFunction)_select_graphic_rendition, METH_VARARGS, ""},
 

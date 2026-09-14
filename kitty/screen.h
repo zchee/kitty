@@ -346,6 +346,7 @@ void report_mode_status(Screen *self, unsigned int which, bool);
 void screen_apply_selection(Screen *self, void *address, size_t size);
 bool screen_is_selection_dirty(Screen *self);
 bool screen_has_selection(Screen *);
+bool screen_is_cell_selected(Screen *, index_type x, index_type y);
 bool screen_invert_colors(Screen *self);
 // D2: force_full=true rewrites every render row (GL backend, resize/fresh ring slot,
 // paused rendering); force_full=false uploads only rows whose gpu_cells differ from

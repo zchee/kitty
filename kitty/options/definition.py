@@ -1432,10 +1432,39 @@ mma(
     'Start selecting text',
     'start_simple_selection left press ungrabbed mouse_selection normal',
     long_text="""
-If you would like to drag and drop hyperlinks or detected URLs, instead of
-:code:`normal` use :code:`drag_or_normal_select`, then if a hyperlink is under
-the mouse it will be dragged based on :opt:`drag_threshold` otherwise a normal
-selection will be performed.
+By default, pressing the left mouse button starts a new selection. To enable
+dragging selected text, hyperlinks or detected URLs, add this to :file:`kitty.conf`::
+
+    mouse_map left press ungrabbed mouse_selection drag_or_normal_select
+
+After saving, use :sc:`reload_config_file` if :opt:`auto_reload_config` is disabled.
+Select some text and release the mouse button. Then press inside the selection
+and drag it to another kitty window (including a split) or an application that
+accepts text drops. The text is copied without changing the clipboard.
+
+For programs that capture mouse events, such as editors with mouse support,
+also add the following mapping and hold :kbd:`Shift` when selecting and dragging::
+
+    mouse_map shift+left press grabbed mouse_selection drag_or_normal_select
+
+To require :kbd:`Ctrl` for dragging, use these mappings instead of the first
+example, keeping ordinary left-button selection unchanged::
+
+    mouse_map left press ungrabbed mouse_selection normal
+    mouse_map ctrl+left press ungrabbed mouse_selection drag_or_normal_select
+
+To disable text and link dragging, replace :code:`drag_or_normal_select` with
+:code:`normal` in the mappings you added. Setting :opt:`drag_threshold` to zero
+also disables dragging, but affects tab and window dragging as well.
+
+Dragging starts after the mouse has moved farther than :opt:`drag_threshold`.
+The selection takes precedence over links under the mouse. Outside a selection,
+links can be dragged as before, and other text can be selected normally. A click
+inside the selection clears it, while double and triple clicks still select
+words and lines.
+
+Drops into kitty follow the receiving window's :opt:`paste_actions` settings.
+Multiline text or text containing control codes can therefore require confirmation.
 """,
 )
 

@@ -218,7 +218,7 @@ class ArgsHandling:
         c = self.args_count
         if c is not None:
             yield f'{go_name}.StopCompletingAtArg = {c}'
-        if self.completion:
+        if self.completion:  # ty: ignore[redundant-condition]
             yield from self.completion.as_go_code(go_name + '.ArgCompleter', ' = ')
 
     def as_go_code(self, cmd_name: str, field_types: dict[str, str], handled_fields: set[str]) -> Iterator[str]:

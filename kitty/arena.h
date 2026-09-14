@@ -33,6 +33,11 @@ typedef struct MA_BLOCK_TYPE_NAME {
 typedef struct MA_TYPE_NAME {
     MA_BLOCK_TYPE_NAME *blocks;
     size_t count, capacity;
+    // total number of bytes malloced by this arena, for callers that need to
+    // bound their memory use. Note that this is larger than the sum of the
+    // sizes passed to _get() since blocks are allocated in fixed size chunks
+    // and the tail of a block is wasted when the next allocation does not fit.
+    size_t allocated;
 } MA_TYPE_NAME;
 
 static inline void
@@ -52,7 +57,7 @@ MA_CAT(MA_NAME, _get)(MA_TYPE_NAME *self, size_t sz) {
         void *chunk = NULL;
         if (MA_BLOCK_SIZE >= sizeof(void *) && MA_BLOCK_SIZE % sizeof(void *) == 0) {
             if (posix_memalign(&chunk, MA_BLOCK_SIZE, block_sz) != 0) chunk = NULL;
-            memset(chunk, 0, block_sz);
+            else memset(chunk, 0, block_sz);
         } else chunk = calloc(1, block_sz);
         if (!chunk) { return NULL; }
         if (count > self->capacity) {
@@ -62,11 +67,13 @@ MA_CAT(MA_NAME, _get)(MA_TYPE_NAME *self, size_t sz) {
                 free(chunk);
                 return NULL;
             }
+            self->allocated += (capacity - self->capacity) * sizeof(MA_BLOCK_TYPE_NAME);
             self->capacity = capacity;
             self->blocks = blocks;
         }
         self->blocks[count - 1] = (MA_BLOCK_TYPE_NAME){.capacity = block_sz, .buf = chunk};
         self->count = count;
+        self->allocated += block_sz;
     }
     char *ans = (char *)self->blocks[self->count - 1].buf + self->blocks[self->count - 1].used;
     self->blocks[self->count - 1].used += required_size;

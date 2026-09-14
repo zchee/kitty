@@ -251,7 +251,7 @@ pointer_handle_frame(void *data UNUSED, struct wl_pointer *pointer UNUSED) {
     ev.x_offset = scale * ev.unscaled.x;
     ev.y_offset = scale * ev.unscaled.y;
     glfw_handle_scroll_event_for_momentum(window, &ev, stopped, info.source_type == WL_POINTER_AXIS_SOURCE_FINGER);
-    window->wl.prev_frame_offset_type = ev.offset_type;
+    if (found) window->wl.prev_frame_offset_type = ev.offset_type;
     /* clear pointer_curr_axis_info for next frame */
     memset(&info, 0, sizeof(info));
 }

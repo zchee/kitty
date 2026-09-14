@@ -539,6 +539,12 @@ end_drag(Window *w) {
     global_state.active_drag_button = -1;
     w->last_drag_scroll_at = 0;
     w->scrollbar.is_dragging = false;
+    if (w->drag_source.potential_drag.type == POTENTIAL_DRAG_SELECTION) {
+        // A press on selected text that never became a drag is an ordinary click.
+        screen_start_selection(screen, w->mouse_pos.cell_x, w->mouse_pos.cell_y, w->mouse_pos.in_left_half_of_cell, false, EXTEND_CELL);
+    }
+    zero_at_ptr(&w->drag_source.potential_drag);
+    zero_at_ptr(&w->drag_source.initial_left_press);
 
     if (global_state.callback_os_window &&
         get_scrollbar_hit_type(w, global_state.callback_os_window->mouse_x, global_state.callback_os_window->mouse_y) == SCROLLBAR_HIT_NONE) {
@@ -650,6 +656,47 @@ distance(double x1, double y1, double x2, double y2) {
     return sqrt((x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2));
 }
 
+static void
+clear_click_queue(Window *w, int button) {
+    if (0 <= button && button < (ssize_t)arraysz(w->click_queues)) w->click_queues[button].length = 0;
+}
+
+// NB: This can call into Python, which can re-alloc the windows array, so w
+// must not be used after it returns. Keep it last in its callers.
+static void
+handle_potential_drag(Window *w, int button) {
+    if (button != GLFW_MOUSE_BUTTON_LEFT || !w->drag_source.initial_left_press.at || OPT(drag_threshold) <= 0) return;
+    if (distance(w->mouse_pos.global_x, w->mouse_pos.global_y, w->drag_source.initial_left_press.x, w->drag_source.initial_left_press.y) <= OPT(drag_threshold))
+        return;
+    zero_at_ptr(&w->drag_source.initial_left_press);
+    Screen *screen = w->render_data.screen;
+    // A native drag consumes the release event, including when canceled. Stop
+    // tracking the local gesture before handing it to the window system,
+    // otherwise the press lingers and the next one counts as a double click.
+    clear_click_queue(w, button);
+    if (w->drag_source.potential_drag.type == POTENTIAL_DRAG_SELECTION) {
+        zero_at_ptr(&w->drag_source.potential_drag);
+        global_state.active_drag_in_window = 0;
+        global_state.active_drag_button = -1;
+        set_mouse_cursor_for_screen(screen);
+        if (screen->callbacks != Py_None) {
+            PyObject *ret = PyObject_CallMethod(screen->callbacks, "drag_selection", NULL);
+            if (ret) Py_DECREF(ret);
+            else PyErr_Print();
+        }
+    } else if (w->drag_source.can_offer) {
+        drag_offer_start_to_child(w, w->mouse_pos.cell_x, w->mouse_pos.cell_y, (int)w->mouse_pos.global_x, (int)w->mouse_pos.global_y);
+        debug("Sent drag start event to child\n");
+    } else if (w->drag_source.potential_drag.type == POTENTIAL_DRAG_URL) {
+        w->drag_source.potential_drag.type = POTENTIAL_DRAG_NONE;
+        screen_detect_url(screen, w->drag_source.potential_drag.x, w->drag_source.potential_drag.y);
+        if (screen->current_hyperlink_under_mouse.id || screen->current_hyperlink_under_mouse.has_detected_url) {
+            screen_open_url(screen, "drag_url");
+            debug("Started URL drag\n");
+        }
+    }
+}
+
 HANDLER(handle_move_event) {
     modifiers &= ~GLFW_LOCK_MASK;
 
@@ -674,27 +721,7 @@ HANDLER(handle_move_event) {
             }
         }
     }
-    if (w->drag_source.initial_left_press.at &&
-        distance(w->mouse_pos.global_x, w->mouse_pos.global_y, w->drag_source.initial_left_press.x, w->drag_source.initial_left_press.y) >
-            OPT(drag_threshold)) {
-        zero_at_ptr(&w->drag_source.initial_left_press);
-        if (w->drag_source.can_offer) {
-            drag_offer_start_to_child(w, w->mouse_pos.cell_x, w->mouse_pos.cell_y, (int)w->mouse_pos.global_x, (int)w->mouse_pos.global_y);
-            debug("Sent drag start event to child\n");
-        } else if (w->drag_source.potential_url_drag.active) {
-            w->drag_source.potential_url_drag.active = false;
-            screen_detect_url(screen, w->drag_source.potential_url_drag.x, w->drag_source.potential_url_drag.y);
-            if (screen->current_hyperlink_under_mouse.id || screen->current_hyperlink_under_mouse.has_detected_url) {
-                screen_open_url(screen, "drag_url");
-                debug("Started URL drag\n");
-            }
-        }
-    }
-}
-
-static void
-clear_click_queue(Window *w, int button) {
-    if (0 <= button && button <= (ssize_t)arraysz(w->click_queues)) w->click_queues[button].length = 0;
+    handle_potential_drag(w, button);
 }
 
 #define N(n) (q->clicks[q->length - n])
@@ -853,14 +880,31 @@ dispatch_possible_click(Window *w, int button, int modifiers) {
     }
 }
 
+// Must be called for every button event before any early return, otherwise a
+// pending drag lingers and fires on a later mouse move with no button held.
+static void
+clear_potential_drag(Window *w, int button, bool is_release) {
+    zero_at_ptr(&w->drag_source.potential_drag);
+    if (is_release && button == GLFW_MOUSE_BUTTON_LEFT) zero_at_ptr(&w->drag_source.initial_left_press);
+}
+
+// Needs an up-to-date w->mouse_pos, as the drag threshold is measured from it.
+static void
+arm_potential_drag(Window *w, int button) {
+    if (button != GLFW_MOUSE_BUTTON_LEFT) return;
+    w->drag_source.initial_left_press.x = w->mouse_pos.global_x;
+    w->drag_source.initial_left_press.y = w->mouse_pos.global_y;
+    w->drag_source.initial_left_press.at = monotonic();
+}
+
 HANDLER(handle_button_event) {
     modifiers &= ~GLFW_LOCK_MASK;
     OSWindow *osw = global_state.callback_os_window;
     if (!osw) return;
-    w->drag_source.potential_url_drag.active = false;
 
     Tab *t = osw->tabs + osw->active_tab;
     bool is_release = !osw->mouse_button_pressed[button];
+    clear_potential_drag(w, button, is_release);
 
     if (handle_scrollbar_mouse(w, button, is_release ? RELEASE : PRESS, modifiers)) return;
 
@@ -871,16 +915,8 @@ HANDLER(handle_button_event) {
 
     bool a, b;
     if (!set_mouse_position(w, &a, &b)) return;
-    if (button == GLFW_MOUSE_BUTTON_LEFT) {
-        if (is_release) {
-            zero_at_ptr(&w->drag_source.initial_left_press);
-        } else {
-            osw->shader_anim_event_registry |= (1u << SHADER_ANIM_EVENT_POINTER_LEFT_BUTTON_PRESS);
-            w->drag_source.initial_left_press.x = w->mouse_pos.global_x;
-            w->drag_source.initial_left_press.y = w->mouse_pos.global_y;
-            w->drag_source.initial_left_press.at = monotonic();
-        }
-    }
+    if (!is_release) arm_potential_drag(w, button);
+    if (button == GLFW_MOUSE_BUTTON_LEFT && !is_release) osw->shader_anim_event_registry |= (1u << SHADER_ANIM_EVENT_POINTER_LEFT_BUTTON_PRESS);
     id_type wid = w->id;
     if (!dispatch_mouse_event(w, button, is_release ? -1 : 1, modifiers, screen->modes.mouse_tracking_mode != 0)) {
         if (screen->modes.mouse_tracking_mode != 0) {
@@ -1181,6 +1217,7 @@ enter_event(int modifiers, bool cursor_moved) {
 
 
 typedef enum MouseSelectionType {
+    MOUSE_SELECTION_DRAG_OR_NORMAL_SELECT = -1,
     MOUSE_SELECTION_NORMAL,
     MOUSE_SELECTION_EXTEND,
     MOUSE_SELECTION_RECTANGLE,
@@ -1196,6 +1233,7 @@ typedef enum MouseSelectionType {
 
 void
 mouse_selection(Window *w, int code, int button) {
+    zero_at_ptr(&w->drag_source.potential_drag);
     global_state.active_drag_in_window = w->id;
     global_state.active_drag_button = button;
     Screen *screen = w->render_data.screen;
@@ -1209,6 +1247,25 @@ mouse_selection(Window *w, int code, int button) {
     }
 
     switch ((MouseSelectionType)code) {
+        case MOUSE_SELECTION_DRAG_OR_NORMAL_SELECT:
+            screen_pause_rendering(screen, false, 0);
+            if (button == GLFW_MOUSE_BUTTON_LEFT && OPT(drag_threshold) > 0) {
+                if (!screen->selections.in_progress && screen_is_cell_selected(screen, w->mouse_pos.cell_x, w->mouse_pos.cell_y)) {
+                    // Like iTerm2's mouseDownOnSelection: defer changing the
+                    // selection until we can distinguish a click from a drag.
+                    w->drag_source.potential_drag.type = POTENTIAL_DRAG_SELECTION;
+                    return;
+                }
+                if (screen->current_hyperlink_under_mouse.id || screen->current_hyperlink_under_mouse.has_detected_url) {
+                    w->drag_source.potential_drag.type = POTENTIAL_DRAG_URL;
+                    w->drag_source.potential_drag.x = w->mouse_pos.cell_x;
+                    w->drag_source.potential_drag.y = w->mouse_pos.cell_y;
+                    global_state.active_drag_in_window = 0;
+                    global_state.active_drag_button = -1;
+                    return;
+                }
+            }
+            /* fallthrough */
         case MOUSE_SELECTION_NORMAL:
             screen_start_selection(screen, w->mouse_pos.cell_x, w->mouse_pos.cell_y, w->mouse_pos.in_left_half_of_cell, false, EXTEND_CELL);
             break;
@@ -1680,14 +1737,33 @@ send_mock_mouse_event_to_window(PyObject *self UNUSED, PyObject *args) {
     PyObject *capsule;
     int button, modifiers, is_release, clear_clicks, in_left_half_of_cell;
     unsigned int x, y;
-    if (!PyArg_ParseTuple(args, "O!iipIIpp", &PyCapsule_Type, &capsule, &button, &modifiers, &is_release, &x, &y, &clear_clicks, &in_left_half_of_cell))
+    PyObject *pixel_x = Py_None, *pixel_y = Py_None;
+    if (!PyArg_ParseTuple(
+            args,
+            "O!iipIIpp|OO",
+            &PyCapsule_Type,
+            &capsule,
+            &button,
+            &modifiers,
+            &is_release,
+            &x,
+            &y,
+            &clear_clicks,
+            &in_left_half_of_cell,
+            &pixel_x,
+            &pixel_y))
         return NULL;
     Window *w = PyCapsule_GetPointer(capsule, "Window");
     if (!w) return NULL;
     if (clear_clicks) clear_click_queue(w, button);
     bool mouse_cell_changed = x != w->mouse_pos.cell_x || y != w->mouse_pos.cell_y || w->mouse_pos.in_left_half_of_cell != in_left_half_of_cell;
-    w->mouse_pos.global_x = 10 * x;
-    w->mouse_pos.global_y = 20 * y;
+    // None means derive the pixel position from the cell, so that tests that do
+    // not care about sub-cell positions stay terse. Negative values are legal.
+    const double px = pixel_x == Py_None ? 10 * x : PyFloat_AsDouble(pixel_x);
+    const double py = pixel_y == Py_None ? 20 * y : PyFloat_AsDouble(pixel_y);
+    if (PyErr_Occurred()) return NULL;
+    w->mouse_pos.global_x = px;
+    w->mouse_pos.global_y = py;
     w->mouse_pos.cell_x = x;
     w->mouse_pos.cell_y = y;
     w->mouse_pos.in_left_half_of_cell = in_left_half_of_cell;
@@ -1695,12 +1771,18 @@ send_mock_mouse_event_to_window(PyObject *self UNUSED, PyObject *args) {
     if (button < 0) {
         if (button == -2) do_drag_scroll(w, true);
         else if (button == -3) do_drag_scroll(w, false);
-        else handle_mouse_movement_in_kitty(w, last_button_pressed, mouse_cell_changed);
+        else {
+            if (OPT(detect_urls)) detect_url(w->render_data.screen, x, y);
+            handle_mouse_movement_in_kitty(w, last_button_pressed, mouse_cell_changed);
+            handle_potential_drag(w, last_button_pressed);
+        }
     } else {
         if (global_state.active_drag_in_window && is_release && button == global_state.active_drag_button) {
             end_drag(w);
         } else {
-            dispatch_mouse_event(w, button, is_release ? -1 : 1, modifiers, false);
+            clear_potential_drag(w, button, is_release);
+            if (!is_release) arm_potential_drag(w, button);
+            dispatch_mouse_event(w, button, is_release ? -1 : 1, modifiers, w->render_data.screen->modes.mouse_tracking_mode != NO_TRACKING);
             if (!is_release) {
                 last_button_pressed = button;
                 add_press(w, button, modifiers);
@@ -1753,6 +1835,7 @@ init_mouse(PyObject *module) {
     PyModule_AddIntMacro(module, RELEASE);
     PyModule_AddIntMacro(module, DRAG);
     PyModule_AddIntMacro(module, MOVE);
+    PyModule_AddIntMacro(module, MOUSE_SELECTION_DRAG_OR_NORMAL_SELECT);
     PyModule_AddIntMacro(module, MOUSE_SELECTION_NORMAL);
     PyModule_AddIntMacro(module, MOUSE_SELECTION_EXTEND);
     PyModule_AddIntMacro(module, MOUSE_SELECTION_RECTANGLE);

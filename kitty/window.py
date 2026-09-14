@@ -32,6 +32,7 @@ from .constants import (
     appname,
     clear_handled_signals,
     config_dir,
+    is_macos,
     kitten_exe,
     unserialize_launch_flag,
     wakeup_io_loop,
@@ -43,11 +44,11 @@ from .fast_data_types import (
     ESC_CSI,
     ESC_DCS,
     ESC_OSC,
+    GLFW_DRAG_OPERATION_COPY,
     GLFW_MOD_CONTROL,
     GLFW_PRESS,
     GLFW_RELEASE,
     GLFW_REPEAT,
-    MOUSE_SELECTION_NORMAL,
     NO_CURSOR_SHAPE,
     NULL_COLOR_VALUE,
     SCROLL_FULL,
@@ -325,6 +326,8 @@ DYNAMIC_COLOR_CODES = {
     19: DynamicColor.highlight_fg,
 }
 DYNAMIC_COLOR_CODES.update({k + 100: v for k, v in DYNAMIC_COLOR_CODES.items()})
+# Maximum number of characters of dragged text shown in the drag thumbnail
+MAX_DRAG_PREVIEW_LENGTH = 256
 
 
 class Watcher:
@@ -1416,6 +1419,17 @@ class Window:
             return False
         return get_boss().combine(action, window_for_dispatch=self, dispatch_type='MouseEvent')
 
+    def drag_thumbnails(self, label: str) -> tuple[tuple[bytes, int, int], ...]:
+        # Render label as a single line of text, clipped to the width of this window
+        fg = color_as_int(self.screen.color_profile.default_fg)
+        bg = color_as_int(self.screen.color_profile.default_bg)
+        pixels, width = draw_single_line_of_text(
+            self.os_window_id, f' {label} ', 0xFF000000 | fg, 0xFF000000 | bg, self.geometry.right - self.geometry.left, max_width=True
+        )
+        if width < 1:
+            return ()
+        return ((pixels, width, len(pixels) // (width * 4)),)
+
     def drag_url(self, url: str, hyperlink_id: int) -> None:
         if not url:
             return
@@ -1423,17 +1437,29 @@ class Window:
             from urllib.parse import quote
 
             url = 'file://' + quote(os.path.abspath(url))
-        fg = color_as_int(self.screen.color_profile.default_fg)
-        bg = color_as_int(self.screen.color_profile.default_bg)
-        width = self.geometry.right - self.geometry.left
-        pixels, width = draw_single_line_of_text(self.os_window_id, f' {url} ', 0xFF000000 | fg, 0xFF000000 | bg, width, max_width=True)
-        height = len(pixels) // (width * 4)
-        thumbnails = ((pixels, width, height),)
         drag_data = {'text/uri-list': (url + '\r\n').encode()}
         try:
-            start_drag_with_data(self.os_window_id, drag_data, thumbnails)
+            start_drag_with_data(self.os_window_id, drag_data, self.drag_thumbnails(url))
         except OSError as e:
             log_error(f'Failed to start URL drag: {e}')
+
+    def drag_selection(self) -> None:
+        text = self.text_for_selection()
+        if not text:
+            return
+        # Bound the preview, but always offer the complete selection as plain text.
+        preview = ' '.join(text[:MAX_DRAG_PREVIEW_LENGTH].split()) + ('…' if len(text) > MAX_DRAG_PREVIEW_LENGTH else '')
+        thumbnails = self.drag_thumbnails(preview)
+        data = text.encode('utf-8')
+        drag_data = {'text/plain': data}
+        if not is_macos:
+            # Some receivers interpret bare text/plain as a legacy encoding.
+            # Cocoa maps text/plain to a native string and makes each MIME type a separate drag item.
+            drag_data['text/plain;charset=utf-8'] = data
+        try:
+            start_drag_with_data(self.os_window_id, drag_data, thumbnails, GLFW_DRAG_OPERATION_COPY)
+        except OSError as e:
+            log_error(f'Failed to drag selected text: {e}')
 
     def open_url(self, url: str, hyperlink_id: int, cwd: str | None = None) -> None:
         boss = get_boss()
@@ -2030,10 +2056,6 @@ class Window:
         """,
     )
     def mouse_selection(self, code: int) -> None:
-        if code == MOUSE_SELECTION_NORMAL - 1:
-            code = MOUSE_SELECTION_NORMAL
-            if self.screen.mark_potential_url_drag():
-                return
         mouse_selection(self.os_window_id, self.tab_id, self.id, code, self.current_mouse_event_button)
 
     @ac('mouse', 'Paste the current primary selection')

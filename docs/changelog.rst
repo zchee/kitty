@@ -55,6 +55,8 @@ should see a 15-35% improvement depending on workload. Some details:
 
 #. Speed up pixel compositing with :term:`SIMD` vectorization: alpha blending of graphics protocol images and animation frames is 2-3.5x faster and glyph alpha masks are composited onto canvases using the same vectorized primitives.
 
+#. Cache HarfBuzz results for repeated short runs (≤32 cells) so redraws of the same on-screen text are not reshaped
+
 
 Vertical tabs [0.48]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -235,6 +237,11 @@ Detailed list of changes
 - Wayland: Fix the first movement of the scroll wheel after reversing direction
   often not scrolling, with high resolution wheels such as the Logitech MX
   Master 3 (:pull:`10306`)
+
+- Allow dragging selected text to other windows or applications with the
+  :code:`mouse_selection drag_or_normal_select` mouse action, in addition to
+  its existing support for dragging links. See the
+  :sc:`configuration examples <start_simple_selection>` to enable it.
 
 - Vertical tabs: Improve handling of multi-line tab titles. Controlled via two new options:
   :opt:`tab_title_max_lines` and :opt:`tab_title_template` (:pull:`10303`)

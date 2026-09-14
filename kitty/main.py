@@ -361,7 +361,7 @@ def _run_app(opts: Options, args: CLIOptions, bad_lines: Sequence[BadLine] = (),
             startup_sessions = tuple(create_sessions(opts, args))
         wincls = (startup_sessions[0].os_window_class if startup_sessions else '') or args.cls or appname
         winname = (startup_sessions[0].os_window_name if startup_sessions else '') or args.name or wincls or appname
-        window_state = (args.start_as if args.start_as and args.start_as != 'normal' else None) or (
+        window_state = (args.start_as if args.start_as and args.start_as != 'normal' else None) or (  # ty: ignore[redundant-condition]
             getattr(startup_sessions[0], 'os_window_state', None) if startup_sessions else None
         )
         # Remember the maximized state from the previous session, if enabled.

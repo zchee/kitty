@@ -25,10 +25,12 @@ def send_mouse_event(
     x=0.0,
     y=0,
     clear_click_queue=False,
+    pixel_x=None,
+    pixel_y=None,
 ):
     ix = int(x)
     in_left_half_of_cell = x - ix < 0.5
-    send_mock_mouse_event_to_window(window, button, modifiers, is_release, ix, y, clear_click_queue, in_left_half_of_cell)
+    send_mock_mouse_event_to_window(window, button, modifiers, is_release, ix, y, clear_click_queue, in_left_half_of_cell, pixel_x, pixel_y)
 
 
 class TestMouse(BaseTest):

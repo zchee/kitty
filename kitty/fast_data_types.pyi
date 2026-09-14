@@ -52,6 +52,7 @@ MAX_CUSTOM_SHADER_GROUPS: int
 MOUSE_SELECTION_LINE: int
 MOUSE_SELECTION_EXTEND: int
 MOUSE_SELECTION_NORMAL: int
+MOUSE_SELECTION_DRAG_OR_NORMAL_SELECT: int
 MOUSE_SELECTION_WORD: int
 MOUSE_SELECTION_RECTANGLE: int
 MOUSE_SELECTION_LINE_FROM_BEGIN: int
@@ -1151,7 +1152,6 @@ class Screen:
     def hyperlink_for_id(self, hyperlink_id: int) -> str: ...
     def erase_last_command(self) -> bool: ...
     def set_progress(self, state: int, percent: int) -> None: ...
-    def mark_potential_url_drag(self) -> bool: ...
     def cursor_at_prompt(self) -> bool:
         pass
 

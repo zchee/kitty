@@ -143,7 +143,7 @@ from .keys import Mappings
 from .layout.base import set_layout_options
 from .notifications import NotificationManager
 from .options.types import Options, nullable_colors
-from .options.utils import MINIMUM_FONT_SIZE, KeyboardMode, KeyDefinition
+from .options.utils import KeyboardMode, KeyDefinition, clamp_font_size
 from .os_window_size import initial_window_size_func
 from .session import (
     Session,
@@ -516,7 +516,7 @@ class Boss:
         with Window.set_ignore_focus_changes_for_new_windows():
             for startup_session in si:
                 # The window state from the CLI options will override and apply to every single OS window in startup session
-                wstate = self.args.start_as if self.args.start_as and self.args.start_as != 'normal' else None
+                wstate = self.args.start_as if self.args.start_as and self.args.start_as != 'normal' else None  # ty: ignore[redundant-condition]
                 wid = self.add_os_window(startup_session, window_state=wstate, os_window_id=os_window_id)
                 if startup_session.focus_os_window:
                     focused_os_window = wid
@@ -1116,7 +1116,7 @@ class Boss:
                                 assert isinstance(window.launch_spec, LaunchSpec)
                                 launch(get_boss(), window.launch_spec.opts, window.launch_spec.args)
                     continue
-                wstate = args.start_as if args.start_as and args.start_as != 'normal' else None
+                wstate = args.start_as if args.start_as and args.start_as != 'normal' else None  # ty: ignore[redundant-condition]
                 os_window_id = self.add_os_window(
                     session,
                     wclass=args.cls,
@@ -1716,12 +1716,10 @@ class Boss:
             self.show_error(_('Unknown clear type'), _('The clear type: {} is unknown').format(action))
 
     def increase_font_size(self) -> None:  # legacy
-        cfs = global_font_size()
-        self.set_font_size(min(get_options().font_size * 5, cfs + 2.0))
+        self.set_font_size(global_font_size() + 2.0)
 
     def decrease_font_size(self) -> None:  # legacy
-        cfs = global_font_size()
-        self.set_font_size(max(MINIMUM_FONT_SIZE, cfs - 2.0))
+        self.set_font_size(global_font_size() - 2.0)
 
     def restore_font_size(self) -> None:  # legacy
         self.set_font_size(get_options().font_size)
@@ -1757,7 +1755,7 @@ class Boss:
                             pass  # no-op
                 else:
                     new_size = amt
-                new_size = max(MINIMUM_FONT_SIZE, min(new_size, get_options().font_size * 10))
+                new_size = clamp_font_size(new_size, get_options().font_size)
             return new_size
 
         if all_windows:

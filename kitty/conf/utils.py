@@ -557,7 +557,7 @@ def parse_kittens_key(val: str, funcs_with_args: dict[str, KeyFunc[tuple[str, An
 def uniq(vals: Iterable[T]) -> list[T]:
     seen: set[T] = set()
     seen_add = seen.add
-    return [x for x in vals if x not in seen and not seen_add(x)]
+    return [x for x in vals if x not in seen and not seen_add(x)]  # ty: ignore[redundant-condition]
 
 
 def save_type_stub(text: str, fpath: str) -> None:
