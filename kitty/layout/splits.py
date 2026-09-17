@@ -127,6 +127,69 @@ class Pair:
                 return q
         return None
 
+    def window_weights(self) -> dict[int, float]:
+        "Map every window in this sub-tree to its fraction of this pair, obtained by multiplying the biases along the path to it"
+        weights: dict[int, float] = {}
+
+        def walk(child: Pair | int | None, weight: float) -> None:
+            if isinstance(child, Pair):
+                if child.is_redundant:
+                    walk(child.one or child.two, weight)
+                else:
+                    walk(child.one, weight * child.bias)
+                    walk(child.two, weight * (1 - child.bias))
+            elif child is not None:
+                weights[child] = weight
+
+        walk(self, 1.0)
+        return weights
+
+    def set_window_weights(self, weights: dict[int, float]) -> None:
+        "The inverse of :meth:`window_weights`: set the biases in this sub-tree so the windows end up with the specified relative sizes"
+
+        def tune(child: Pair | int | None) -> float:
+            if isinstance(child, Pair):
+                one, two = tune(child.one), tune(child.two)
+                if one > 0 and two > 0:
+                    child.bias = one / (one + two)
+                return one + two
+            return weights.get(child, 0.0) if child is not None else 0.0
+
+        tune(self)
+
+    def preserve_weights_on_removal(self, removed: Collection[int]) -> bool:
+        """
+        Adjust the biases in this sub-tree so that the windows surviving the removal of
+        ``removed`` keep their current sizes relative to each other. Returns True if this
+        sub-tree still contains at least one surviving window.
+        """
+
+        # Each perpendicular subtree is one unit along this split axis. If
+        # some of its windows survive, retain its full share on this axis.
+        def tune(child: Pair | int | None, weight: float) -> tuple[float, bool]:
+            if isinstance(child, Pair):
+                if child.horizontal != self.horizontal:
+                    alive = child.preserve_weights_on_removal(removed)
+                    return (weight, True) if alive else (0.0, False)
+                if child.is_redundant:
+                    return tune(child.one or child.two, weight)
+                one, one_alive = tune(child.one, weight * child.bias)
+                two, two_alive = tune(child.two, weight * (1 - child.bias))
+                if not one_alive and not two_alive:
+                    return 0.0, False
+                total = one + two
+                if one_alive and two_alive and total > 0:
+                    child.bias = one / total
+                # A window squeezed to zero size (by maximize or an extreme bias) has zero
+                # weight. Falling back to the incoming share keeps such survivors from
+                # having their space handed to unrelated windows.
+                return (total if total > 0 else weight), True
+            if child is None or child in removed:
+                return 0.0, False
+            return weight, True
+
+        return tune(self, 1.0)[1]
+
     def remove_windows(self, window_ids: Collection[int]) -> None:
         if isinstance(self.one, int) and self.one in window_ids:
             self.one = None
@@ -140,14 +203,19 @@ class Pair:
         return self.one is None or self.two is None
 
     def collapse_redundant_pairs(self) -> None:
-        while isinstance(self.one, Pair) and self.one.is_redundant:
-            self.one = self.one.one or self.one.two
-        while isinstance(self.two, Pair) and self.two.is_redundant:
-            self.two = self.two.one or self.two.two
+        # Collapse depth first, otherwise a child that only becomes redundant
+        # because all of its own descendants were removed is never re-examined
+        # and is left in the tree, consuming its share of the available space.
         if isinstance(self.one, Pair):
             self.one.collapse_redundant_pairs()
         if isinstance(self.two, Pair):
             self.two.collapse_redundant_pairs()
+        while isinstance(self.one, Pair) and self.one.is_redundant:
+            self.one = self.one.one or self.one.two
+        while isinstance(self.two, Pair) and self.two.is_redundant:
+            self.two = self.two.one or self.two.two
+        if self.one is None and self.two is not None:
+            self.one, self.two = self.two, None
 
     def balanced_add(self, window_id: int) -> 'Pair':
         if self.one is None or self.two is None:
@@ -545,6 +613,7 @@ class Pair:
 class SplitsLayoutOpts(LayoutOpts):
     default_axis_is_horizontal: bool | None = True
     equalize_on_close: bool = False
+    proportional: bool = False
 
     def __init__(self, data: dict[str, str]):
         q = data.get('split_axis', 'horizontal')
@@ -553,11 +622,13 @@ class SplitsLayoutOpts(LayoutOpts):
         else:
             self.default_axis_is_horizontal = q == 'horizontal'
         self.equalize_on_close = to_bool(data.get('equalize_on_window_close', 'n'))
+        self.proportional = to_bool(data.get('proportional', 'n'))
 
     def serialized(self) -> dict[str, str]:
         return {
             'split_axis': 'auto' if self.default_axis_is_horizontal is None else ('horizontal' if self.default_axis_is_horizontal else 'vertical'),
             'equalize_on_window_close': 'y' if self.equalize_on_close else 'n',
+            'proportional': 'y' if self.proportional else 'n',
         }
 
 
@@ -587,7 +658,19 @@ class Splits(Layout):
         self._pairs_root = root
 
     def remove_windows(self, *windows_to_remove: int) -> None:
+        if self.layout_opts.proportional and len(windows_to_remove) > 1:
+            # Apply the sizing policy one window at a time, so that pruning a
+            # batch of windows (which happens when they are closed while a
+            # different layout is active) gives the same result as closing them
+            # one by one. The policy is not idempotent over a batch because a
+            # perpendicular sub-tree stops being perpendicular once removals
+            # collapse it down to a single child.
+            for window_id in windows_to_remove:
+                self.remove_windows(window_id)
+            return
         root = self.pairs_root
+        if self.layout_opts.proportional:
+            root.preserve_weights_on_removal(frozenset(windows_to_remove))
         for pair in root.self_and_descendants():
             pair.remove_windows(windows_to_remove)
         root.collapse_redundant_pairs()
@@ -596,6 +679,47 @@ class Splits(Layout):
             if isinstance(q, Pair):
                 self.pairs_root = q
 
+    def proportional_container(self, group_id: int, horizontal: bool) -> Pair | None:
+        "The outermost pair that splits along ``horizontal`` and has the window as one of its leaves"
+        path = self.pairs_root.find_window_in_tree(group_id)
+        if not path or path[-1][0].horizontal != horizontal:
+            return None
+        container = path[-1][0]
+        for pair, _ in reversed(path[:-1]):
+            if pair.horizontal != horizontal:
+                break
+            container = pair
+        return container
+
+    def split_and_add_window(self, pair: Pair, group_id: int, new_id: int, horizontal: bool, after: bool, bias: float | None = None) -> None:
+        container = self.proportional_container(group_id, horizontal) if self.layout_opts.proportional and bias is None else None
+        weights = container.window_weights() if container is not None else {}
+        parent = pair.split_and_add(group_id, new_id, horizontal, after)
+        if bias is not None:
+            parent.bias = bias if parent.one == new_id else (1 - bias)
+        elif container is not None and (weight := weights.get(group_id, 0.0)) > 0:
+            weights[new_id] = weight
+            container.set_window_weights(weights)
+
+    def balanced_add_window(self, new_id: int) -> Pair:
+        "Add a window at a balanced position, applying the proportional sizing policy, if enabled"
+        root = self.pairs_root
+        if not self.layout_opts.proportional:
+            return root.balanced_add(new_id)
+        weights = root.window_weights()
+        pair = root.balanced_add(new_id)
+        # There is no window being split here, so the new window takes the share
+        # of whatever it ended up being paired with.
+        sibling = pair.two if pair.one == new_id else pair.one
+        if isinstance(sibling, Pair):
+            weight = sum(weights.get(wid, 0.0) for wid in sibling.all_window_ids())
+        else:
+            weight = 0.0 if sibling is None else weights.get(sibling, 0.0)
+        if weight > 0 and (container := self.proportional_container(new_id, pair.horizontal)) is not None:
+            weights[new_id] = weight
+            container.set_window_weights(weights)
+        return pair
+
     def do_layout(self, windows: WindowList) -> None:
         groups = tuple(windows.iter_all_layoutable_groups())
         root = self.pairs_root
@@ -603,10 +727,12 @@ class Splits(Layout):
         already_placed_group_ids = frozenset(root.all_window_ids())
         if groups_to_remove := already_placed_group_ids - all_present_group_ids:
             self.remove_windows(*groups_to_remove)
+            # removing windows can collapse the tree, replacing the root
+            root = self.pairs_root
         if groups_to_add := all_present_group_ids - already_placed_group_ids:
             id_idx_map = {g.id: i for i, g in enumerate(groups)}
             for gid in sorted(groups_to_add, key=id_idx_map.__getitem__):
-                root.balanced_add(gid)
+                self.balanced_add_window(gid)
 
         if len(groups) == 1:
             self.layout_single_window_group(groups[0])
@@ -642,14 +768,12 @@ class Splits(Layout):
                     wheight = aw.geometry.bottom - aw.geometry.top
                     horizontal = wwidth >= wheight
                 target_group = all_windows.add_window(window, next_to=aw, before=not after)
-                parent_pair = pair.split_and_add(group_id, target_group.id, horizontal, after)
-                if bias is not None:
-                    parent_pair.bias = bias if parent_pair.one == target_group.id else (1 - bias)
+                self.split_and_add_window(pair, group_id, target_group.id, horizontal, after, bias)
                 return
         all_windows.add_window(window)
         g = all_windows.group_for_window(window)
         assert g is not None
-        p = self.pairs_root.balanced_add(g.id)
+        p = self.pairs_root.balanced_add(g.id) if bias is not None else self.balanced_add_window(g.id)
         if bias is not None:
             p.bias = bias
 
@@ -747,9 +871,9 @@ class Splits(Layout):
         # Re-insert next to dest
         pair = self.pairs_root.pair_for_window(dest_wg.id)
         if pair is not None:
-            pair.split_and_add(dest_wg.id, src_wg.id, horizontal, after)
+            self.split_and_add_window(pair, dest_wg.id, src_wg.id, horizontal, after)
         else:
-            self.pairs_root.balanced_add(src_wg.id)
+            self.balanced_add_window(src_wg.id)
 
     def layout_action(self, action_name: str, args: Sequence[str], all_windows: WindowList) -> bool | None:
         if action_name == 'rotate':
@@ -879,62 +1003,36 @@ class Splits(Layout):
         edges: int,
         all_windows: WindowList,
     ) -> WindowResizeDragData:
-        is_right, is_bottom = bool(edges & RIGHT_EDGE), bool(edges & BOTTOM_EDGE)
-        is_leading_edge = not (is_right or is_bottom)
-        ans = WindowResizeDragData(None, is_right, None, is_bottom)
-        if (wg := all_windows.group_for_window(click_window)) is None or (pair := self.pairs_root.pair_for_window(wg.id)) is None:
+        right, bottom = bool(edges & RIGHT_EDGE), bool(edges & BOTTOM_EDGE)
+        ans = WindowResizeDragData(None, right, None, bottom)
+        group = all_windows.group_for_window(click_window)
+        if group is None:
             return ans
-        pair_parent_map = {}
-        for p in self.pairs_root.self_and_descendants():
-            if isinstance(p.one, Pair):
-                pair_parent_map[p.one] = p
-            if isinstance(p.two, Pair):
-                pair_parent_map[p.two] = p
-        p = pair
+        path = self.pairs_root.find_window_in_tree(group.id)
+        if path is None:
+            return ans
 
-        def size_increases_forwards(p: Pair) -> bool:
-            in_leading_half = not p.is_group_on_second(wg.id)
-            return is_leading_edge != in_leading_half
+        def target(horizontal: bool, trailing: bool) -> tuple[int | None, bool]:
+            fallback = None
+            for pair, in_one in reversed(path):
+                if pair.is_redundant or pair.horizontal != horizontal:
+                    continue
+                if fallback is None:
+                    fallback = id(pair)
+                # The right/bottom edge of the first child, or left/top edge
+                # of the second child, belongs to this divider. Otherwise keep
+                # climbing, even across ancestors with the same split axis.
+                if in_one == trailing:
+                    return id(pair), True
+            # Preserve native resizing from the outside edge of a layout.
+            return fallback, False
 
-        def ancestor_with_neighboring_border_of_same_orientation(p: Pair) -> Pair | None:
-            horizontal = bool(edges & (LEFT_EDGE | RIGHT_EDGE))
-            while q := pair_parent_map.get(p):
-                if q.horizontal == horizontal:
-                    if q.between_borders:
-                        return q
-                    break
-                p = q
-            return None
-
-        def pair_or_parent(p: Pair) -> tuple[Pair, bool]:
-            in_leading_half = not p.is_group_on_second(wg.id)
-            if is_leading_edge == in_leading_half and p is pair and (parent := ancestor_with_neighboring_border_of_same_orientation(p)):
-                # special case for leading edge of one or trailing edge of two with parent being same orientation
-                return parent, True
-            return p, size_increases_forwards(p)
-
-        while ans.horizontal_id is None or ans.vertical_id is None:
-            if p.is_redundant:
-                continue
-            if ans.horizontal_id is None and p.horizontal:
-                new_p, fwd = pair_or_parent(p)
-                p = new_p
-                if not p.horizontal and ans.vertical_id is None:
-                    # pair_or_parent redirected to a vertical pair; use it for vertical resize
-                    ans = ans._replace(vertical_id=id(p), height_increases_downwards=fwd)
-                else:
-                    ans = ans._replace(horizontal_id=id(p), width_increases_rightwards=fwd)
-            if ans.vertical_id is None and not p.horizontal:
-                new_p, fwd = pair_or_parent(p)
-                p = new_p
-                if p.horizontal and ans.horizontal_id is None:
-                    # pair_or_parent redirected to a horizontal pair; use it for horizontal resize
-                    ans = ans._replace(horizontal_id=id(p), width_increases_rightwards=fwd)
-                else:
-                    ans = ans._replace(vertical_id=id(p), height_increases_downwards=fwd)
-            if (parent := pair_parent_map.get(p)) is None:
-                break
-            p = parent
+        if edges & (LEFT_EDGE | RIGHT_EDGE):
+            horizontal_id, forwards = target(True, right)
+            ans = ans._replace(horizontal_id=horizontal_id, width_increases_rightwards=forwards)
+        if edges & (TOP_EDGE | BOTTOM_EDGE):
+            vertical_id, forwards = target(False, bottom)
+            ans = ans._replace(vertical_id=vertical_id, height_increases_downwards=forwards)
         return ans
 
     def layout_state(self) -> dict[str, Any]:

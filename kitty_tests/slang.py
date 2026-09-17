@@ -8,10 +8,12 @@ import os
 import shutil
 import subprocess
 import tempfile
+from unittest.mock import patch
 
 from kitty.constants import is_macos, slangc
 from kitty.shaders.slang import (
     EntryPoint,
+    LoadShaderPrograms,
     SlangFile,
     Stage,
     build_custom_shader_pipeline_glsl,
@@ -35,6 +37,81 @@ _SUPPORT_SHADER_NAMES = frozenset(('types', 'pipeline'))
 
 
 class TestSlang(BaseTest):
+    def test_animation_step_parsing(self):
+        def step(val):
+            return parse_pipeline_definition(['startgroup', f'animation_step {val}', 'shaders focus-highlight', 'endgroup'], 'test')['groups'][0][
+                'animation_step'
+            ]
+
+        # 0 means "static effect, no periodic redraws" and must survive as 0
+        self.ae(step(0), 0)
+        self.ae(step(16), 16_000_000)
+        self.assertRaises(ValueError, step, -1)
+
+    def test_custom_shader_redraw_logic(self):
+        from kitty.fast_data_types import custom_shader_needs_render, simulate_custom_shader_render_ticks
+
+        NEVER = 2**63 - 1  # MONOTONIC_T_MAX, the "nothing scheduled" sentinel
+        STEP = 50_000_000  # an animated group redrawing every 50ms
+        NOW = 1_000_000_000
+
+        def needs_render(before, after, events=0, now=NOW):
+            return custom_shader_needs_render(before, after, events, now)
+
+        idle = (False, NEVER, NEVER)
+        static = (True, NEVER, NEVER)
+        animating = (True, STEP, NEVER)
+
+        # Nothing active and nothing pending: the shader layer must not ask for frames.
+        self.assertFalse(needs_render(idle, idle))
+        self.assertFalse(needs_render(idle, idle, events=1))
+        # A static group only redraws when an event may have changed its output.
+        self.assertFalse(needs_render(static, static))
+        self.assertTrue(needs_render(static, static, events=1))
+        # An animated group redraws every tick...
+        self.assertTrue(needs_render(animating, animating))
+        # ...and gets one final frame after it stops, so the effect is cleared.
+        self.assertTrue(needs_render(animating, static))
+        self.assertTrue(needs_render(animating, idle))
+        # Groups turning on or off is always a visible change.
+        self.assertTrue(needs_render(idle, static))
+        self.assertTrue(needs_render(static, idle))
+        # The tick on which a duration bounded animation expires needs a frame,
+        # earlier ticks do not.
+        self.assertTrue(needs_render((True, NEVER, NOW), static))
+        self.assertTrue(needs_render((True, NEVER, NOW - 1), static))
+        self.assertFalse(needs_render((True, NEVER, NOW + 1), static))
+
+        # A window with no custom shaders configured must settle into asking for
+        # no frames at all, otherwise an idle kitty redraws forever. Test both a
+        # zero initialized window and one initialized the way add_os_window()
+        # does it, since zero is not the MONOTONIC_T_MAX sentinel.
+        self.ae(simulate_custom_shader_render_ticks(8, 0, True), [False] * 8)
+        self.ae(simulate_custom_shader_render_ticks(8)[1:], [False] * 7)
+        # Even a steady stream of shader events must not produce frames when
+        # there are no shaders to draw.
+        self.ae(simulate_custom_shader_render_ticks(8, 0xFF, True), [False] * 8)
+
+    def test_custom_shader_reenable(self):
+        from kitty.fast_data_types import CUSTOM_END_PROGRAM
+        from kitty.options.types import defaults
+
+        loader = LoadShaderPrograms()
+        pipeline = parse_pipeline_definition(['startgroup', 'animation_step 0', 'shaders focus-highlight', 'endgroup'], 'test')
+        self.ae(pipeline['groups'][0]['animation_step'], 0)
+        with (
+            patch('kitty.shaders.slang.parse_pipeline', return_value=pipeline),
+            patch('kitty.shaders.slang.build_custom_shader_pipeline_glsl', return_value=('vertex', 'fragment', {})),
+            # this fork picks the MSL builder on macOS, so both must be stubbed
+            patch('kitty.shaders.slang.build_custom_shader_pipeline_msl', return_value=('vertex', 'fragment', {})),
+            patch('kitty.shaders.slang.compile_program') as compile_program,
+        ):
+            for shaders in (('test',), (), ('test',)):
+                loader.opts = defaults._replace(custom_shaders=shaders)
+                loader.compile_custom_shaders(allow_recompile=True)
+            operations = [c.args[1] for c in compile_program.call_args_list if c.args[0] == CUSTOM_END_PROGRAM]
+            self.ae(operations, [('vertex',), (), ('vertex',)])
+
     def test_slang_parser(self):
         def check(src: str, expected: SlangFile) -> None:
             actual = parse_slang_text(src)

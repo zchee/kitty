@@ -228,6 +228,10 @@ Detailed list of changes
 
 - A new option, :opt:`padding_fill_strategy` to control how the thin padding strips that appear when the window size is not an exact multiple of the cell size are colored. You can choose to have the padding colored to match the background of each neighboring cell, effectively extending the size of the cell or you can continue to use the existing behavior of using the background.
 
+- Splits layout: Add an optional proportional sizing policy that preserves
+  adjusted window weights when adding, closing or repositioning windows.
+  See :doc:`layouts` for configuration (:pull:`10471`)
+
 - The :opt:`scrollbar` option now takes a new value ``scrolled-or-hovered`` to also show the scrollbar when the mouse moves over the scrollbar region (:pull:`10345`)
 
 - A new :code:`kitten @ screenshot` remote control command to take a pixel perfect PNG screenshot of an OS Window, tab or window
@@ -260,7 +264,13 @@ Detailed list of changes
 
 - macOS: Allow kitty OS Windows to participate in Split View tiling (:pull:`103701`)
 
+- Allow dropping a tab containing a single window into another tab's layout,
+  using the existing window drop preview and preserving running programs.
+  See :doc:`overview` for details.
+
 - Port remaining built in kittens from Python to Go (:pull:`10371`)
+
+- Splits layout: Fix dragging a border resizing the wrong split in nested layouts.
 
 - Graphics protocol: Fix scaled images (created with the ``r`` or ``c`` keys)
   being distorted instead of clipped when scrolled against a margin
@@ -278,6 +288,9 @@ Detailed list of changes
 - dnd kitten: Add an option to use file copies instead of hard links for copy drops (:pull:`10412`)
 
 - Fix a malformed CSI escape sequence such as ``\e[?:`` corrupting the parser state so that subsequent SGR color codes are ignored (:iss:`10434`)
+
+- Fix dropping files or URLs onto a window being delivered to the wrong window,
+  or ignored entirely, when the tab bar is at the top or on either side
 
 - Graphics protocol: Fix a regression in 0.45.0 that caused the overwrite
   composition mode for animation frames (``a=f``) to be controlled by the
@@ -318,6 +331,12 @@ Detailed list of changes
   object at an offset (the ``O`` key) failing unless the offset happened to be
   a multiple of the system page size
 
+- Graphics protocol: Fix file descriptor leak that can be triggered by malicious clients
+
+- Graphics protocol: Make fileopen failure responses generic to avoid leaking any information about failed files
+
+- edit-in-kitty: harden the code used to parse messages from clients
+
 - Clipboard protocol: Report an ``EFBIG`` error to programs that try to write
   more data to the clipboard than allowed by :opt:`clipboard_max_size`, instead
   of silently truncating their data. Also fix :opt:`clipboard_max_size` being
@@ -336,6 +355,16 @@ Detailed list of changes
   shells to accumulate as zombie processes and also broke reloading the config
   with ``SIGUSR1`` and quitting on ``SIGINT``/``SIGTERM``/``SIGHUP``
   (:iss:`10436`)
+
+- macOS: Fix long text from input methods being discarded when committed
+  outside a key event (:pull:`10468`)
+
+- :doc:`Multiple cursors protocol </multiple-cursors-protocol>`: Fix hiding the
+  main cursor with DECTCEM also hiding the extra cursors (:iss:`10489`)
+
+- Add a new ``passthrough_and_end`` value for the ``--on-unknown`` option of
+  ``map``, that passes the unknown key through to the program and also exits
+  the custom keyboard mode (:iss:`10490`)
 
 
 0.48.2 [2026-07-30]

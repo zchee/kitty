@@ -314,6 +314,7 @@ add_os_window(void) {
     ans->tab_bar_render_data.vao_idx = create_cell_vao();
     ans->background_opacity.alpha = OPT(background_opacity);
     ans->created_at = monotonic();
+    init_shader_animation_state(ans);
     END_WITH_OS_WINDOW_REFS
     return ans;
 }
@@ -1556,8 +1557,12 @@ PYWRAP1(set_os_window_pos) {
 
 PYWRAP1(set_boss) {
     Py_CLEAR(global_state.boss);
-    global_state.boss = args;
-    Py_INCREF(global_state.boss);
+    if (args == Py_None) {
+        global_state.boss = NULL;
+    } else {
+        global_state.boss = args;
+        Py_INCREF(global_state.boss);
+    }
     Py_RETURN_NONE;
 }
 

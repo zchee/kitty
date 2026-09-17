@@ -32,6 +32,7 @@ from kitty.fast_data_types import Cursor as C
 from kitty.rgb import to_color
 from kitty.utils import (
     is_ok_to_read_image_file,
+    is_ok_to_read_image_path,
     is_path_in_temp_dir,
     lock_with_file,
     sanitize_title,
@@ -40,7 +41,17 @@ from kitty.utils import (
     shlex_split_with_positions,
 )
 
+from . import in_isolated_test_env
 from .base import BaseTest, filled_cursor, filled_history_buf, filled_line_buf
+
+
+def rmtree_in_test_home(path):
+    # Guard against destroying the invoking user's data if the test suite is ever
+    # run without the isolated $HOME set up by env_for_python_tests()
+    if not in_isolated_test_env():
+        raise AssertionError(f'Refusing to delete {path} as the test suite is not running with an isolated HOME')
+    if os.path.exists(path):
+        shutil.rmtree(path)
 
 
 def create_lbuf(*lines):
@@ -625,6 +636,12 @@ class TestDataTypes(BaseTest):
             if os.path.exists(path):
                 with open(path) as pf:
                     self.assertFalse(is_ok_to_read_image_file(path, pf.fileno()), path)
+        # The path based check must reject protected locations without needing
+        # the file to be opened first, since opening it leaks its existence
+        for path in ('', '/proc/self/cmdline', '/proc/does-not-exist', '/sys/kernel', '/dev/null', '/dev/does-not-exist'):
+            self.assertFalse(is_ok_to_read_image_path(path), path)
+        for path in ('/tmp/a.png', '/dev/shm/a.png', os.path.join(tempfile.gettempdir(), 'a.png')):
+            self.assertTrue(is_ok_to_read_image_path(path), path)
         fifo = os.path.join(tempfile.gettempdir(), 'test-kitty-fifo')
         os.mkfifo(fifo)
         fifo_fd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
@@ -685,8 +702,7 @@ class TestDataTypes(BaseTest):
         saved = {x: os.environ.get(x) for x in 'KITTY_CONFIG_DIRECTORY XDG_CONFIG_DIRS XDG_CONFIG_HOME'.split()}
         try:
             dot_config = os.path.expanduser('~/.config')
-            if os.path.exists(dot_config):
-                shutil.rmtree(dot_config)
+            rmtree_in_test_home(dot_config)
             with tempfile.TemporaryDirectory() as tdir:
                 with open(tdir + '/macos-launch-services-cmdline', 'w') as f:
                     print('kitty --title from-file', file=f)
@@ -729,8 +745,7 @@ class TestDataTypes(BaseTest):
                         os.environ[k] = v
                     self.assertEqual(x[-1], get_config_dir(), str(x))
         finally:
-            if os.path.exists(dot_config):
-                shutil.rmtree(dot_config)
+            rmtree_in_test_home(dot_config)
             for k in saved:
                 os.environ.pop(k, None)
                 if saved[k] is not None:

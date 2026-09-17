@@ -705,6 +705,24 @@ init_cell_program(void) {
     bind_shader_globals_to_current_context();
 }
 
+// Non-animated, non-attached groups are active from the moment the pipeline
+// loads; animated groups start inactive and attached groups inherit the state
+// of their predecessor.
+static bool
+group_is_initially_active(const CustomShaderGroup *cg, bool predecessor_is_active) {
+    return cg->attached ? predecessor_is_active : (cg->animation_start_events == 0);
+}
+
+static bool
+pipeline_has_initially_active_group(void) {
+    bool prev = false;
+    for (size_t i = 0; i < custom_shaders.end.num_groups; i++) {
+        prev = group_is_initially_active(custom_shaders.end.groups + i, prev);
+        if (prev) return true;
+    }
+    return false;
+}
+
 static void
 init_custom_programs(void) {
     custom_shaders.count = 0;
@@ -745,33 +763,9 @@ init_custom_programs(void) {
         if (global_state.layers_render_texture.texture_b_fbo_id) free_framebuffer(&global_state.layers_render_texture.texture_b_fbo_id);
     }
     // persist is per-window and freed lazily in start_os_window_rendering
-    // Non-animated, non-attached groups are always active; animated groups start inactive.
-    // Attached groups inherit their initial active state from their predecessor.
-    bool any_initially_active = false;
-    {
-        bool prev_init = false;
-        for (size_t i = 0; i < custom_shaders.end.num_groups; i++) {
-            const CustomShaderGroup *cg = &custom_shaders.end.groups[i];
-            bool this_init = cg->attached ? prev_init : (cg->animation_start_events == 0);
-            if (this_init) any_initially_active = true;
-            prev_init = this_init;
-        }
-    }
-    bool initially_active = custom_shaders.count > 0 && any_initially_active;
     for (size_t w = 0; w < global_state.num_os_windows; w++) {
         OSWindow *osw = global_state.os_windows + w;
-        zero_at_ptr_count(osw->shader_group_anim, custom_shaders.end.num_groups);
-        // Initialize active=true for attached groups that follow always-active predecessors
-        bool prev_init = false;
-        for (size_t i = 0; i < custom_shaders.end.num_groups; i++) {
-            const CustomShaderGroup *cg = &custom_shaders.end.groups[i];
-            bool this_init = cg->attached ? prev_init : (cg->animation_start_events == 0);
-            if (cg->attached && this_init) osw->shader_group_anim[i].active = true;
-            prev_init = this_init;
-        }
-        osw->has_active_custom_shaders = initially_active;
-        osw->shader_anim_min_step = MONOTONIC_T_MAX;
-        osw->shader_anim_next_end_at = MONOTONIC_T_MAX;
+        init_shader_animation_state(osw);
         // Synthesize focus events for windows that already have focus so that
         // animations triggered by os-window-focus-in start on the first render
         // after shader compilation (the focus-in event fired before shaders were
@@ -783,7 +777,31 @@ init_custom_programs(void) {
         custom_shaders.count,
         custom_shaders.end.num_groups,
         custom_shaders.end.textures,
-        initially_active);
+        custom_shaders.count > 0 && pipeline_has_initially_active_group());
+}
+
+// Reset the per-OS-window animation state to what it should be immediately
+// after the current pipeline was loaded. Called both when the pipeline changes
+// and when an OS window is created, so that the MONOTONIC_T_MAX sentinels in
+// ShaderAnimState are never left at their zero initialized values -- a zero
+// min_step/next_end_at reads as "an animation is running and its deadline has
+// already passed", which would make the renderer redraw on every single tick.
+void
+init_shader_animation_state(OSWindow *osw) {
+    zero_at_ptr_count(osw->shader_group_anim, custom_shaders.end.num_groups);
+    bool prev_init = false, any_initially_active = false;
+    for (size_t i = 0; i < custom_shaders.end.num_groups; i++) {
+        const CustomShaderGroup *cg = &custom_shaders.end.groups[i];
+        const bool this_init = group_is_initially_active(cg, prev_init);
+        // Only attached groups are tracked by the state machine when initially
+        // active; always-active non-attached groups never enter it at all.
+        if (cg->attached && this_init) osw->shader_group_anim[i].active = true;
+        if (this_init) any_initially_active = true;
+        prev_init = this_init;
+    }
+    osw->shader_anim.has_active_shaders = custom_shaders.count > 0 && any_initially_active;
+    osw->shader_anim.min_step = MONOTONIC_T_MAX;
+    osw->shader_anim.next_end_at = MONOTONIC_T_MAX;
 }
 
 static const char *
@@ -828,12 +846,12 @@ shader_anim_event_mask_str(unsigned mask) {
 monotonic_t
 update_custom_shader_animations(unsigned event_mask, monotonic_t now, OSWindow *os_window) {
     if (!custom_shaders.count) {
-        os_window->has_active_custom_shaders = false;
+        os_window->shader_anim = (ShaderAnimState){.min_step = MONOTONIC_T_MAX, .next_end_at = MONOTONIC_T_MAX};
         return MONOTONIC_T_MAX;
     }
     // Fast path: no events and no duration-bounded animation expiring this frame.
     // Cached state is still valid — skip group iteration entirely.
-    if (!event_mask && now < os_window->shader_anim_next_end_at) return os_window->shader_anim_min_step;
+    if (!event_mask && now < os_window->shader_anim.next_end_at) return os_window->shader_anim.min_step;
 
     // Slow path: update per-group state and recompute cached values in one pass.
     CustomShaderPipeline *p = &custom_shaders.end;
@@ -898,12 +916,33 @@ update_custom_shader_animations(unsigned event_mask, monotonic_t now, OSWindow *
         }
         prev_active = this_active;
     }
-    bool prev_has_active = os_window->has_active_custom_shaders;
-    os_window->has_active_custom_shaders = any_active;
-    if (prev_has_active != any_active) debug_rendering("has_active_custom_shaders: %d -> %d\n", prev_has_active, any_active);
-    os_window->shader_anim_min_step = min_step;
-    os_window->shader_anim_next_end_at = next_end;
+    bool prev_has_active = os_window->shader_anim.has_active_shaders;
+    if (prev_has_active != any_active) debug_rendering("has_active_shaders: %d -> %d\n", prev_has_active, any_active);
+    os_window->shader_anim.has_active_shaders = any_active;
+    os_window->shader_anim.min_step = min_step;
+    os_window->shader_anim.next_end_at = next_end;
     return min_step;
+}
+
+// Decide whether the custom shader layer needs a frame drawn this tick, given
+// the cached state from the previous tick and the state just recomputed by
+// update_custom_shader_animations(). Kept separate from the renderer so it can
+// be unit tested -- see test_custom_shader_redraw_logic.
+bool
+custom_shader_needs_render(const ShaderAnimState *before, const ShaderAnimState *after, unsigned event_mask, monotonic_t now) {
+    // Groups turned on or off: draw once so the change becomes visible. This is
+    // what produces the final frame that clears a finished effect.
+    if (before->has_active_shaders != after->has_active_shaders) return true;
+    // A duration bounded animation expires on this tick.
+    if (now >= before->next_end_at) return true;
+    // Something was animating last tick, so it either wants its next frame or
+    // has just stopped and wants one last one.
+    if (before->min_step < MONOTONIC_T_MAX) return true;
+    if (!after->has_active_shaders) return false;
+    // Animated groups need periodic frames. Static groups (animation_step 0)
+    // only need one when an event may have changed what they draw; everything
+    // else that changes the screen requests a redraw through other paths.
+    return event_mask != 0 || after->min_step < MONOTONIC_T_MAX;
 }
 
 void
@@ -1100,7 +1139,10 @@ cell_update_uniform_block(ssize_t vao_idx, Screen *screen, int uniform_buffer, i
     Line *line_for_cursor = NULL;
     rd->cursor_opacity = MAX(0, MIN(cursor->cursor_opacity, 1));
     rd->blink_opacity = MAX(0, MIN(cursor->text_blink_opacity, 1));
-    if (rd->cursor_opacity != 0 && cursor->is_visible) {
+    // The extra cursors inherit the colors of the main cursor and, optionally,
+    // its shape, so the main cursor render data must be computed even when the
+    // main cursor itself is hidden by DECTCEM.
+    if (rd->cursor_opacity != 0 && (cursor->is_visible || cursor->multicursor_count)) {
         rd->cursor_x1 = cursor->x, rd->cursor_y1 = cursor->y;
         rd->cursor_x2 = cursor->x, rd->cursor_y2 = cursor->y;
         if (pixel_scroll_enabled(screen)) {
@@ -1164,6 +1206,14 @@ cell_update_uniform_block(ssize_t vao_idx, Screen *screen, int uniform_buffer, i
         }
         // store last rendered cursor color for trail rendering
         screen->last_rendered.cursor_bg = rd->main_cursor_bg;
+        if (!cursor->is_visible) {
+            // Move the main cursor off screen so that only it is hidden, the
+            // extra cursors keep their shape and colors.
+            rd->cursor_x1 = screen->columns + 1;
+            rd->cursor_x2 = screen->columns;
+            rd->cursor_y1 = screen->lines + 1;
+            rd->cursor_y2 = screen->lines;
+        }
     } else {
         rd->cursor_shape = 0;
         rd->cursor_x1 = screen->columns + 1;
@@ -2859,7 +2909,7 @@ start_os_window_rendering(OSWindow *os_window, Tab *tab) {
         // Custom-end frames render att0 into a STORED sampleable surface and
         // need the indirect targets the chain draws through (allocated via
         // the GL shims); plain frames keep the memoryless tile-only surface.
-        const bool custom_end_frame = custom_shaders.end.active && os_window->has_active_custom_shaders;
+        const bool custom_end_frame = custom_shaders.end.active && os_window->shader_anim.has_active_shaders;
         if (custom_end_frame) ensure_layered_render_targets(os_window);
         metal_set_layered_frame_stored(custom_end_frame);
         metal_begin_layered_frame();
@@ -2889,6 +2939,7 @@ struct GPUCustomEndData {
     float mouse_pos[4];
     float mouse_button_pressed[4];
     float active_window_geometry[4];
+    float active_window_padding[4];
     float bell_window_geometry[4];
     float central_area[4];
     float cursor_trail_corners_x[4];
@@ -2940,6 +2991,13 @@ run_custom_end_shader(OSWindow *os_window, float sx, float sy, monotonic_t now) 
         if (t->num_windows) {
             Window *w = t->windows + t->active_window;
             active_win_geom = w->render_data.geometry;
+            if (os_window->viewport_width && os_window->viewport_height) {
+                const float width = (float)os_window->viewport_width, height = (float)os_window->viewport_height;
+                d->active_window_padding[0] = (float)(w->padding.left + w->size_mismatch_padding.left) / width;
+                d->active_window_padding[1] = (float)(w->padding.bottom + w->size_mismatch_padding.bottom) / height;
+                d->active_window_padding[2] = (float)(w->padding.right + w->size_mismatch_padding.right) / width;
+                d->active_window_padding[3] = (float)(w->padding.top + w->size_mismatch_padding.top) / height;
+            }
             Screen *s = w->render_data.screen;
             if (s) {
                 active_bg = colorprofile_to_color(s->color_profile, s->color_profile->overridden.default_bg, s->color_profile->configured.default_bg).rgb;
@@ -3247,7 +3305,7 @@ stop_os_window_rendering(OSWindow *os_window, Tab *tab, Window *active_window, m
         // broken framebuffer table; the fallback then no-ops the resolve (the
         // pass already ended) and the next frame recovers.
         bool ran_custom_end = false;
-        if (custom_shaders.end.active && os_window->has_active_custom_shaders) {
+        if (custom_shaders.end.active && os_window->shader_anim.has_active_shaders) {
             metal_end_layered_frame_stored();
             float sx = global_state.layers_render_texture.width > 0 ? (float)os_window->viewport_width / (float)global_state.layers_render_texture.width : 1.f;
             float sy = global_state.layers_render_texture.height > 0 ? (float)os_window->viewport_height / (float)global_state.layers_render_texture.height : 1.f;
@@ -3272,7 +3330,8 @@ stop_os_window_rendering(OSWindow *os_window, Tab *tab, Window *active_window, m
 #else
         float sx = global_state.layers_render_texture.width > 0 ? (float)os_window->viewport_width / (float)global_state.layers_render_texture.width : 1.f;
         float sy = global_state.layers_render_texture.height > 0 ? (float)os_window->viewport_height / (float)global_state.layers_render_texture.height : 1.f;
-        if (custom_shaders.end.active && os_window->has_active_custom_shaders) {
+        if (custom_shaders.end.active && os_window->shader_anim.has_active_shaders) {
+            // debug_rendering("Custom end shader running (groups=%zu)\n", custom_shaders.end.num_groups);
             restore_viewport();
             if (os_window->live_resize.in_progress)
                 save_viewport_using_top_left_origin(0, 0, os_window->viewport_width, os_window->viewport_height, os_window->live_resize.height);
@@ -3522,7 +3581,7 @@ transfer_pipeline_to_struct(PyObject *pg, CustomShaderPipeline *p) {
 
         PyObject *astep = PyDict_GetItemString(g, "animation_step");
         cg->animation_step = (astep && PyLong_Check(astep)) ? (monotonic_t)PyLong_AsLong(astep) : ANIMATION_SAMPLE_WAIT;
-        cg->animation_step = MAX(cg->animation_step, OPT(repaint_delay));
+        cg->animation_step = cg->animation_step == 0 ? MONOTONIC_T_MAX : MAX(cg->animation_step, OPT(repaint_delay));
 
         PyObject *ae_events = PyDict_GetItemString(g, "animation_end_events");
         if (is_seq(ae_events)) cg->animation_end_events = parse_anim_event_sequence(ae_events);
@@ -3794,6 +3853,55 @@ sprite_map_set_limits(PyObject UNUSED *self, PyObject *args) {
     Py_RETURN_NONE;
 }
 
+// Test only. Wraps custom_shader_needs_render() so the redraw decision can be
+// exercised from the Python test suite without a GPU context. Each state is a
+// (has_active_shaders, min_step, next_end_at) tuple.
+static bool
+parse_shader_anim_state(PyObject *obj, ShaderAnimState *ans) {
+    int has_active;
+    long long min_step, next_end_at;
+    if (!PyArg_ParseTuple(obj, "pLL", &has_active, &min_step, &next_end_at)) return false;
+    *ans = (ShaderAnimState){.has_active_shaders = has_active, .min_step = min_step, .next_end_at = next_end_at};
+    return true;
+}
+
+static PyObject *
+pycustom_shader_needs_render(PyObject *self UNUSED, PyObject *args) {
+    PyObject *b, *a;
+    unsigned int event_mask;
+    long long now;
+    ShaderAnimState before, after;
+    if (!PyArg_ParseTuple(args, "O!O!IL", &PyTuple_Type, &b, &PyTuple_Type, &a, &event_mask, &now)) return NULL;
+    if (!parse_shader_anim_state(b, &before) || !parse_shader_anim_state(a, &after)) return NULL;
+    if (custom_shader_needs_render(&before, &after, event_mask, now)) Py_RETURN_TRUE;
+    Py_RETURN_FALSE;
+}
+
+// Test only. Runs the renderer's per-frame custom shader bookkeeping (the same
+// sequence as prepare_to_render_os_window) against a freshly allocated, zero
+// initialized OSWindow and returns whether each tick asked for a redraw. Used
+// to assert that an idle OS window with no shader work pending stays idle.
+static PyObject *
+pysimulate_custom_shader_render_ticks(PyObject *self UNUSED, PyObject *args) {
+    unsigned long num_ticks;
+    unsigned int event_mask = 0;
+    int initialize = 0;
+    if (!PyArg_ParseTuple(args, "k|Ip", &num_ticks, &event_mask, &initialize)) return NULL;
+    RAII_ALLOC(OSWindow, osw, calloc(1, sizeof(OSWindow)));
+    if (!osw) return PyErr_NoMemory();
+    if (initialize) init_shader_animation_state(osw);
+    RAII_PyObject(ans, PyList_New(0));
+    if (!ans) return NULL;
+    monotonic_t now = monotonic();
+    for (unsigned long i = 0; i < num_ticks; i++, now += ms_to_monotonic_t(10ll)) {
+        const ShaderAnimState before = osw->shader_anim;
+        update_custom_shader_animations(event_mask, now, osw);
+        PyObject *v = custom_shader_needs_render(&before, &osw->shader_anim, event_mask, now) ? Py_True : Py_False;
+        if (PyList_Append(ans, v) != 0) return NULL;
+    }
+    return Py_NewRef(ans);
+}
+
 #define M(name, arg_type) {#name, (PyCFunction)name, arg_type, NULL}
 #define MW(name, arg_type) {#name, (PyCFunction)py##name, arg_type, NULL}
 static PyMethodDef module_methods[] = {
@@ -3808,6 +3916,8 @@ static PyMethodDef module_methods[] = {
     MW(unmap_vao_buffer, METH_VARARGS),
     MW(bind_program, METH_O),
     MW(unbind_program, METH_NOARGS),
+    MW(custom_shader_needs_render, METH_VARARGS),
+    MW(simulate_custom_shader_render_ticks, METH_VARARGS),
 
     {NULL, NULL, 0, NULL} /* Sentinel */
 };

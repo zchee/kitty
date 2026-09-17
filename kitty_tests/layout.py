@@ -587,6 +587,32 @@ class TestLayout(BaseTest):
         self.assertAlmostEqual(root.bias, 0.5, places=5)  # w1 vs right column: 1:1
         self.assertAlmostEqual(inner1.bias, 0.5, places=5)  # w2 vs w3 top/bottom: 1:1
 
+    def test_splits_collapse_nested_empty_pairs(self):
+        # Removing every window of a nested sub-tree in a single pass must not
+        # leave an empty pair behind, still consuming its share of the space.
+        q = create_layout(Splits)
+        all_windows = create_windows(q, num=0)
+        for i in range(1, 6):
+            q.add_window(all_windows, Window(i))
+        q.pairs_root.unserialize({'one': {'one': {'one': 1, 'two': 2}, 'two': {'one': 3, 'two': 4}}, 'two': 5}, lambda x: x)
+        q.remove_windows(3, 2, 1, 4)
+        self.ae(list(q.pairs_root.all_window_ids()), [5])
+        for pair in q.pairs_root.self_and_descendants():
+            self.assertFalse(pair.one is None and pair.two is None, f'empty pair left in tree: {q.pairs_root}')
+        self.ae(q.pairs_root.window_weights(), {5: 1.0})
+
+    def test_splits_relayout_after_root_collapse(self):
+        # Windows added in the same relayout that collapses the root must go into
+        # the new root, not the discarded one.
+        q = create_layout(Splits)
+        all_windows = create_windows(q, num=0)
+        for i in (1, 2, 3):
+            q.add_window(all_windows, Window(i), location='vsplit')
+        all_windows.remove_window(all_windows.id_map[1])
+        all_windows.add_window(Window(4))
+        q(all_windows)
+        self.ae(sorted(q.pairs_root.all_window_ids()), [2, 3, 4])
+
     def test_layout_opts_serialization(self):
         opts = SplitsLayoutOpts({})
         s = opts.serialized()
@@ -855,3 +881,290 @@ class TestLayout(BaseTest):
         d = drtw(q, all_windows, wD, TOP_EDGE)
         self.ae(d.vertical_id, right_pair_id)
         self.ae(d.height_increases_downwards, True)
+
+
+class TestSplitBorderResize(BaseTest):
+    def setUp(self):
+        super().setUp()
+        self.set_options({'tab_bar_style': 'hidden'})
+
+    def make_layout(self, shape):
+        layout = create_layout(Splits)
+        windows = create_windows(layout, num=0)
+        for i in range(1, 5):
+            layout.add_window(windows, Window(i))
+        layout.pairs_root.unserialize(shape, lambda x: x)
+        layout(windows)
+        return layout, windows
+
+    def test_left_center_stack_right_after_resize(self):
+        layout, windows = self.make_layout(
+            {
+                'bias': 1 / 3,
+                'one': 1,
+                'two': {'one': {'horizontal': False, 'one': 2, 'two': 3}, 'two': 4},
+            }
+        )
+        root = layout.pairs_root
+        right_pair = root.two
+        center = right_pair.one
+        ws = {w.id: w for w in windows}
+        # Resize right first, then alternate both sides of the left and right
+        # dividers and both halves of the central horizontal divider.
+        for _ in range(3):
+            for wid, edge, expected in (
+                (4, LEFT_EDGE, right_pair),
+                (2, LEFT_EDGE, root),
+                (3, LEFT_EDGE, root),
+                (1, RIGHT_EDGE, root),
+                (2, RIGHT_EDGE, right_pair),
+                (3, RIGHT_EDGE, right_pair),
+                (2, BOTTOM_EDGE, center),
+                (3, TOP_EDGE, center),
+            ):
+                for increment in (0.04, -0.03):
+                    with self.subTest(wid=wid, edge=edge, increment=increment):
+                        data = layout.drag_resize_target_windows(ws[wid], 0, 0, edge, windows)
+                        horizontal = bool(edge & (LEFT_EDGE | RIGHT_EDGE))
+                        target = data.horizontal_id if horizontal else data.vertical_id
+                        forwards = data.width_increases_rightwards if horizontal else data.height_increases_downwards
+                        self.assertEqual(target, id(expected))
+                        self.assertTrue(forwards)
+                        before = {id(p): p.bias for p in root.self_and_descendants()}
+                        self.assertTrue(layout.drag_resize_window(windows, target, increment, horizontal))
+                        layout(windows)
+                        for p in root.self_and_descendants():
+                            self.assertAlmostEqual(
+                                p.bias,
+                                before[id(p)] + (increment if p is expected else 0),
+                            )
+
+    def test_all_rendered_internal_borders(self):
+        # All 5 binary tree shapes with 4 leaves, with every combination of
+        # horizontal/vertical ancestors: 40 distinct arrangements.
+        def shapes(ids):
+            if len(ids) == 1:
+                yield ids[0]
+                return
+            for n in range(1, len(ids)):
+                for one in shapes(ids[:n]):
+                    for two in shapes(ids[n:]):
+                        for horizontal in (True, False):
+                            yield {
+                                'horizontal': horizontal,
+                                'bias': 0.39,
+                                'one': one,
+                                'two': two,
+                            }
+
+        count = 0
+        for shape in shapes((1, 2, 3, 4)):
+            layout, windows = self.make_layout(shape)
+            ws = {w.id: w for w in windows}
+            for pair in layout.pairs_root.self_and_descendants():
+                if pair.is_redundant:
+                    continue
+                for half in pair.between_borders:
+                    for border in half:
+                        trailing = border.window_id > 0
+                        edge = (RIGHT_EDGE if trailing else LEFT_EDGE) if pair.horizontal else (BOTTOM_EDGE if trailing else TOP_EDGE)
+                        with self.subTest(shape=shape, wid=border.window_id, edge=edge):
+                            data = layout.drag_resize_target_windows(ws[abs(border.window_id)], 0, 0, edge, windows)
+                            target = data.horizontal_id if pair.horizontal else data.vertical_id
+                            forwards = data.width_increases_rightwards if pair.horizontal else data.height_increases_downwards
+                            self.assertEqual(target, id(pair))
+                            self.assertTrue(forwards)
+                count += 1
+        self.assertEqual(count, 120)
+
+    def test_corner_axes_independent_and_single_pane(self):
+        layout, windows = self.make_layout(
+            {
+                'one': 1,
+                'two': {'one': {'horizontal': False, 'one': 2, 'two': 3}, 'two': 4},
+            }
+        )
+        ws = {w.id: w for w in windows}
+        data = layout.drag_resize_target_windows(ws[2], 0, 0, LEFT_EDGE | BOTTOM_EDGE, windows)
+        self.assertEqual(data.horizontal_id, id(layout.pairs_root))
+        self.assertEqual(data.vertical_id, id(layout.pairs_root.two.one))
+        self.assertTrue(data.width_increases_rightwards)
+        self.assertTrue(data.height_increases_downwards)
+        layout.pairs_root = Pair()
+        layout.pairs_root.one = 1
+        data = layout.drag_resize_target_windows(ws[1], 0, 0, LEFT_EDGE | TOP_EDGE, windows)
+        self.assertIsNone(data.horizontal_id)
+        self.assertIsNone(data.vertical_id)
+
+
+class TestProportionalSplits(BaseTest):
+    def make_layout(self, shape=None, num=3, **options):
+        q = create_layout(Splits)
+        q.layout_opts = SplitsLayoutOpts({'proportional': 'yes', **options})
+        windows = create_windows(q, num=0)
+        for i in range(1, (num + 1) if shape else 2):
+            q.add_window(windows, Window(i), location='vsplit')
+        if shape:
+            q.pairs_root.unserialize(shape, lambda x: x)
+        return q, windows
+
+    def check_weights(self, q, expected):
+        # Observe the serialized layout, independently of the sizing helpers.
+        actual = {}
+
+        def walk(node, size):
+            if isinstance(node, int):
+                actual[node] = size
+            elif 'two' not in node:
+                walk(node['one'], size)
+            else:
+                bias = node.get('bias', 0.5)
+                walk(node['one'], size * bias)
+                walk(node['two'], size * (1 - bias))
+
+        walk(q.pairs_root.serialize(), 1.0)
+        self.ae(actual.keys(), expected.keys())
+        for wid, size in expected.items():
+            self.assertAlmostEqual(actual[wid], size)
+
+    def test_proportional_add_equal_siblings(self):
+        for location in ('vsplit', 'hsplit', None):
+            for target in (1, 2):
+                with self.subTest(location=location, target=target):
+                    q, windows = self.make_layout()
+                    q.add_window(windows, Window(2), location=location)
+                    windows.set_active_window_group_for(windows.id_map[target])
+                    q.add_window(windows, Window(3), location=location)
+                    self.check_weights(q, {1: 1 / 3, 2: 1 / 3, 3: 1 / 3})
+                    q.add_window(windows, Window(4), location=location)
+                    self.check_weights(q, dict.fromkeys((1, 2, 3, 4), 0.25))
+
+    def test_proportional_default_unchanged(self):
+        q, windows = self.make_layout(proportional='no')
+        q.add_window(windows, Window(2), location='vsplit')
+        q.add_window(windows, Window(3), location='vsplit')
+        self.check_weights(q, {1: 0.5, 2: 0.25, 3: 0.25})
+
+    def test_proportional_add_preserves_adjusted_weights(self):
+        q, windows = self.make_layout({'bias': 0.2, 'one': 1, 'two': {'bias': 0.375, 'one': 2, 'two': 3}})
+        q.add_window(windows, Window(4), location='vsplit', next_to=windows.id_map[2])
+        self.check_weights(q, {1: 2 / 13, 2: 3 / 13, 3: 5 / 13, 4: 3 / 13})
+
+    def test_proportional_explicit_bias_wins(self):
+        q, windows = self.make_layout()
+        q.add_window(windows, Window(2), location='vsplit')
+        q.add_window(windows, Window(3), location='vsplit', bias=80)
+        self.check_weights(q, {1: 0.5, 2: 0.1, 3: 0.4})
+
+    def test_proportional_close_preserves_survivors(self):
+        for removed in (1, 2, 3):
+            q, windows = self.make_layout({'bias': 0.2, 'one': 1, 'two': {'bias': 0.375, 'one': 2, 'two': 3}})
+            sizes = {1: 0.2, 2: 0.3, 3: 0.5}
+            sizes.pop(removed)
+            total = sum(sizes.values())
+            windows.remove_window(windows.id_map[removed])
+            q.remove_windows(removed)
+            self.check_weights(q, {k: v / total for k, v in sizes.items()})
+
+    def test_proportional_close_multiple(self):
+        q, windows = self.make_layout()
+        for i in range(2, 6):
+            q.add_window(windows, Window(i), location='vsplit')
+        q.remove_windows(1, 3, 5)
+        self.check_weights(q, {2: 0.5, 4: 0.5})
+
+    def test_proportional_batch_close_mixed_axes(self):
+        for horizontal in (True, False):
+            shape = {
+                'horizontal': horizontal,
+                'one': 1,
+                'two': {'horizontal': horizontal, 'one': {'horizontal': not horizontal, 'one': 2, 'two': 3}, 'two': 4},
+            }
+            q, windows = self.make_layout(shape, num=4)
+            q.remove_windows(1, 2)
+            # The surviving center pane keeps its column's width, even though
+            # the other pane in that column was removed at the same time.
+            self.check_weights(q, {3: 0.5, 4: 0.5})
+
+    def test_proportional_mixed_axes(self):
+        q, windows = self.make_layout({'bias': 0.4, 'one': 1, 'two': {'horizontal': False, 'bias': 0.25, 'one': 2, 'two': 3}})
+        q.add_window(windows, Window(4), location='hsplit', next_to=windows.id_map[2])
+        self.check_weights(q, {1: 0.4, 2: 0.12, 3: 0.36, 4: 0.12})
+        q.remove_windows(2)
+        self.check_weights(q, {1: 0.4, 3: 0.45, 4: 0.15})
+        q.remove_windows(4)
+        self.check_weights(q, {1: 0.4, 3: 0.6})
+
+    def test_proportional_perpendicular_subtree_unchanged(self):
+        q, windows = self.make_layout({'bias': 0.4, 'one': 1, 'two': {'horizontal': False, 'bias': 0.25, 'one': 2, 'two': 3}})
+        q.add_window(windows, Window(4), location='vsplit', next_to=windows.id_map[1])
+        self.check_weights(q, {1: 2 / 7, 4: 2 / 7, 2: 3 / 28, 3: 9 / 28})
+
+    def test_proportional_reposition(self):
+        q, windows = self.make_layout({'bias': 0.2, 'one': 1, 'two': {'bias': 0.375, 'one': 2, 'two': 3}})
+        q.insert_window_next_to(windows, windows.id_map[3], windows.id_map[1], True, False)
+        self.check_weights(q, {1: 2 / 7, 2: 3 / 7, 3: 2 / 7})
+        self.ae(list(q.pairs_root.all_window_ids()), [3, 1, 2])
+        before = q.layout_state()
+        q.insert_window_next_to(windows, windows.id_map[1], windows.id_map[1], True, False)
+        self.ae(q.layout_state(), before)
+
+    def test_proportional_overlay_does_not_change_weights(self):
+        q, windows = self.make_layout()
+        q.add_window(windows, Window(2), location='vsplit')
+        before = q.layout_state()
+        q.add_window(windows, Window(10), overlay_for=2)
+        self.ae(q.layout_state(), before)
+        q.add_window(windows, Window(3), location='vsplit')
+        self.check_weights(q, {1: 1 / 3, 2: 1 / 3, 3: 1 / 3})
+        self.assertIs(windows.group_for_window(windows.id_map[10]), windows.group_for_window(windows.id_map[2]))
+
+    def test_proportional_option_roundtrip_and_equalize(self):
+        q, windows = self.make_layout({'bias': 0.2, 'one': 1, 'two': {'bias': 0.375, 'one': 2, 'two': 3}}, equalize_on_window_close='yes')
+        options = SplitsLayoutOpts(q.layout_opts.serialized())
+        self.assertTrue(options.proportional)
+        self.assertTrue(options.equalize_on_close)
+        windows.remove_window(windows.id_map[1])
+        q.remove_windows(1)
+        self.assertTrue(q.on_window_removed(windows))
+        self.check_weights(q, {2: 0.5, 3: 0.5})
+
+    def test_proportional_close_with_zero_sized_survivor(self):
+        # Window 3 has been squeezed to nothing by maximize/bias, so it has zero
+        # weight. Closing window 2 must not hand its column's space to windows 1
+        # and 4, which are not in any sub-tree that lost a window.
+        shape = {'one': 1, 'two': {'one': {'bias': 1.0, 'one': 2, 'two': 3}, 'two': 4}}
+        q, windows = self.make_layout(shape, num=4)
+        self.check_weights(q, {1: 0.5, 2: 0.25, 3: 0.0, 4: 0.25})
+        q.remove_windows(2)
+        self.check_weights(q, {1: 0.5, 3: 0.25, 4: 0.25})
+
+    def test_proportional_batch_close_matches_sequential(self):
+        # Pruning several windows in one pass (which happens when they are closed
+        # while a different layout is active) must match closing them one by one.
+        shape = {
+            'bias': 0.4,
+            'one': {'horizontal': False, 'one': 1, 'two': {'one': 2, 'two': 3}},
+            'two': {'horizontal': False, 'one': 4, 'two': {'horizontal': False, 'one': 5, 'two': 6}},
+        }
+        removed = (6, 1, 3)
+        q, windows = self.make_layout(shape, num=6)
+        q.remove_windows(*removed)
+        batch = q.pairs_root.window_weights()
+        q, windows = self.make_layout(shape, num=6)
+        for wid in removed:
+            q.remove_windows(wid)
+        sequential = q.pairs_root.window_weights()
+        self.ae(batch.keys(), sequential.keys())
+        for wid, weight in sequential.items():
+            self.assertAlmostEqual(batch[wid], weight)
+
+    def test_proportional_balanced_add(self):
+        # A window that appears without being split off an existing one (it was
+        # created while another layout was active) still gets a proportional share.
+        q, windows = self.make_layout()
+        q.add_window(windows, Window(2), location='vsplit')
+        q.add_window(windows, Window(3), location='vsplit')
+        self.check_weights(q, dict.fromkeys((1, 2, 3), 1 / 3))
+        self.ae(q.balanced_add_window(4).horizontal, q.pairs_root.horizontal)
+        self.check_weights(q, dict.fromkeys((1, 2, 3, 4), 0.25))
