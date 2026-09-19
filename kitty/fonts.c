@@ -3068,9 +3068,6 @@ get_fallback_font(PyObject UNUSED *self, PyObject *args) {
         PyErr_SetString(PyExc_ValueError, "Too many fallback fonts");
         return NULL;
     }
-    // The Font struct owns its face reference; returning it borrowed would
-    // underflow the refcount on every successful call and free a face the
-    // font group still uses.
     return Py_NewRef(fg->fonts[ans].face);
 }
 

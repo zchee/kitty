@@ -1067,6 +1067,77 @@ class TestScreen(BaseTest):
         s.reset()
         s.draw('\N{HEAVY EXCLAMATION MARK SYMBOL}' + 4500 * '\N{VARIATION SELECTOR-16}')
 
+    def test_explicit_width_is_not_changed_by_combining_chars(self):
+        # A width set explicitly via the text sizing protocol wins over the implicit
+        # re-sizing done by the variation selectors and Thai/Lao SARA AM
+        def mcd(text, width, follow):
+            s = self.create_screen(cols=8)
+            draw_multicell(s, text, width=width)
+            before = s.cpu_cells(0, 0)['mcd']
+            self.ae(before['width'], width)
+            self.assertFalse(before['natural_width'])
+            s.draw(follow)
+            return s, s.cpu_cells(0, 0)['mcd']
+
+        # VS15 must not narrow an explicitly widened cell
+        s, c = mcd('\u25b6', 2, '\ufe0e')
+        self.ae(c['width'], 2)
+        self.ae(s.cursor.x, 2)
+        # VS16 must not widen an explicitly narrowed cell
+        s, c = mcd('\u26d4', 1, '\ufe0f')
+        self.ae(c['width'], 1)
+        self.ae(s.cursor.x, 1)
+        # SARA AM must not widen an explicitly narrowed cell
+        s, c = mcd('\u0e08', 1, '\u0e33')
+        self.ae(c['width'], 1)
+        self.ae(s.cursor.x, 1)
+
+        # and the natural width cases still re-size, so the tests above are meaningful
+        s = self.create_screen(cols=8)
+        s.draw('\U0001f610')
+        self.ae(s.cursor.x, 2)
+        self.assertTrue(s.cpu_cells(0, 0)['mcd']['natural_width'])
+        s.draw('\ufe0e')
+        self.ae(s.cursor.x, 1)
+        self.ae(s.cpu_cells(0, 0)['mcd']['width'], 1)
+        s = self.create_screen(cols=8)
+        s.draw('\u26d4')
+        self.ae(s.cursor.x, 2)
+        s.draw('\u0e08\u0e33')
+        self.ae(s.cursor.x, 4)
+
+    def test_spacing_mark_widens_narrow_cell(self):
+        # Thai SARA AM and Lao AM are SpacingMarks with width 1 that widen the cell they combine into
+        s = self.create_screen(cols=5)
+        s.draw('จำ')
+        self.ae(s.cursor.x, 2)
+        self.assertTrue(str(s.line(0)).startswith('จำ'))
+        c = s.cpu_cells(0, 0)
+        self.assertTrue(c['mcd'])
+        self.ae(c['mcd']['width'], 2)
+        self.ae(c['x'], 0)
+        self.ae(s.cpu_cells(0, 1)['x'], 1)
+        s.reset()
+        s.draw('จ')
+        self.ae(s.cursor.x, 1)
+        s.draw('ำ')
+        self.ae(s.cursor.x, 2)
+        s.reset()
+        s.draw('จำำ')
+        self.ae(s.cursor.x, 2)
+        s.reset()
+        s.draw('ກຳ')
+        self.ae(s.cursor.x, 2)
+        s.reset()
+        s.draw('กิ')
+        self.ae(s.cursor.x, 1)
+        # widened char on the last column wraps onto the next line
+        s = self.create_screen(cols=2)
+        s.draw('aจำ')
+        self.ae((s.cursor.x, s.cursor.y), (2, 1))
+        self.ae(str(s.line(0)), 'a')
+        self.ae(str(s.line(1)), 'จำ')
+
     def test_writing_with_cursor_on_trailer_of_wide_character(self):
         s = self.create_screen()
 
@@ -2177,6 +2248,58 @@ class TestScreen(BaseTest):
 
         # reverse is toggled with XOR, so it must come back off the overlay cursor
         self.assertFalse(s.cursor.reverse)
+
+    def test_ime_text_around_cursor(self):
+        # The text macOS input methods read to decide things like whether a
+        # space is needed between Latin and CJK text. See :iss:`10492`.
+        s = self.create_screen(cols=8, lines=3)
+        self.ae(s.ime_text_around_cursor(), ('', ''))
+
+        s.draw('abcd')
+        self.ae(s.ime_text_around_cursor(), ('abcd', ''))
+        s.cursor.x = 2
+        self.ae(s.ime_text_around_cursor(), ('ab', 'cd'))
+        s.cursor.x = 0
+        self.ae(s.ime_text_around_cursor(), ('', 'abcd'))
+        # trailing unwritten cells are trimmed, but written blanks are not
+        s.cursor.x = 4
+        s.draw('  ')
+        s.cursor.x = 4
+        self.ae(s.ime_text_around_cursor(), ('abcd', '  '))
+
+        # a cursor sitting past the last cell, with the wrap still deferred
+        s = self.create_screen(cols=4, lines=3)
+        s.draw('abcd')
+        self.ae(s.cursor.x, 4)
+        self.ae(s.ime_text_around_cursor(), ('abcd', ''))
+
+        # wide characters occupy two cells but contribute one character
+        s = self.create_screen(cols=8, lines=3)
+        s.draw('你好ab')
+        self.ae(s.ime_text_around_cursor(), ('你好ab', ''))
+        s.cursor.x = 4
+        self.ae(s.ime_text_around_cursor(), ('你好', 'ab'))
+        s.cursor.x = 2
+        self.ae(s.ime_text_around_cursor(), ('你', '好ab'))
+
+        # the unit is the logical line, not the row: without this an input
+        # method sees nothing before a cursor at the start of a wrapped row
+        s = self.create_screen(cols=4, lines=3)
+        s.draw('abcdefg')
+        self.ae((s.cursor.x, s.cursor.y), (3, 1))
+        self.ae(s.ime_text_around_cursor(), ('abcdefg', ''))
+        s.cursor.x, s.cursor.y = 0, 1
+        self.ae(s.ime_text_around_cursor(), ('abcd', 'efg'))
+        s.cursor.x, s.cursor.y = 2, 0
+        self.ae(s.ime_text_around_cursor(), ('ab', 'cdefg'))
+
+        # a hard line break ends the logical line
+        s = self.create_screen(cols=4, lines=3)
+        s.draw('ab')
+        s.carriage_return(), s.linefeed()
+        s.draw('cd')
+        s.cursor.x = 1
+        self.ae(s.ime_text_around_cursor(), ('c', 'd'))
 
 
 def detect_url(self, scale=1):
