@@ -1165,17 +1165,16 @@ cell_update_uniform_block(ssize_t vao_idx, Screen *screen, int uniform_buffer, i
     }
     UniformBlockShadow *shadow = uniform_block_shadow_for_vao(vao_idx);
     struct GPUCellRenderData computed;
-    // Seed from the shadow (last value actually written to the GPU buffer) so
-    // a field left unassigned on some path below carries forward its previous
-    // value exactly as the mapped GPU buffer used to preserve it across an
-    // orphan (Metal) or invalidate-range remap (GL). A never-written slot
-    // starts zeroed.
+    // Every color and flag is assigned on every path below. Seeding from the
+    // shadow (or zeroing a never-written slot) only keeps the tail padding and
+    // the cursor shape/rect fields a path skips deterministic, so the memcmp
+    // below compares defined bytes.
     if (shadow && shadow->valid) computed = shadow->data; else memset(&computed, 0, sizeof(computed));
     struct GPUCellRenderData *rd = &computed;
 #define COLOR(name) colorprofile_to_color(cp, cp->overridden.name, cp->configured.name).rgb
     // The shaders need these only in linear space, they are converted and
-    // written into rd just before the buffer is unmapped. The cursor colors
-    // are left as is when there is no cursor to render.
+    // written into rd just before the buffer is published. The cursor colors
+    // are zero when there is no cursor to render.
     const color_type highlight_fg = COLOR(highlight_fg), highlight_bg = COLOR(highlight_bg);
     color_type main_cursor_fg = 0, main_cursor_bg = 0;
     rd->default_fg = COLOR(default_fg);
@@ -1334,8 +1333,12 @@ cell_update_uniform_block(ssize_t vao_idx, Screen *screen, int uniform_buffer, i
     if (!shadow || !shadow->valid || screen->reload_all_gpu_data || memcmp(&shadow->data, &computed, sizeof(computed)) != 0) {
         void *gpu = map_vao_buffer_for_write_only(vao_idx, uniform_buffer, 0, crd_block.size);
         if (gpu) {
-            // The GL arm's block has no F1 tail, so it is smaller than the struct.
-            memcpy(gpu, &computed, MIN((size_t)crd_block.size, sizeof(computed)));
+#ifdef KITTY_BACKEND_METAL
+            memcpy(gpu, &computed, sizeof(computed));
+#else
+            // The upstream block the GL arm compiles ends where the F1 tail begins.
+            memcpy(gpu, &computed, MIN((size_t)crd_block.size, offsetof(struct GPUCellRenderData, color_sprites_xnum)));
+#endif
             unmap_vao_buffer(vao_idx, uniform_buffer);
             D2_NOTE_BYTES(crd_block.size);
         }
