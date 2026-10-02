@@ -1687,6 +1687,7 @@ prepare_to_render_os_window(
             }
             if (send_cell_data_to_gpu(WD.vao_idx, WD.screen, os_window)) needs_render = true;
             if (WD.screen->start_visual_bell_at | WD.screen->start_drag_overlay_at) needs_render = true;
+            if (OPT(progress_bar) != PROGRESS_BAR_HIDDEN && WD.screen->progress_state == PROGRESS_STATE_INDETERMINATE) needs_render = true;
             if (WD.screen->start_visual_bell_at && WD.screen->start_visual_bell_at > os_window->last_rendered_at) {
                 os_window->shader_anim_event_registry |= (1u << SHADER_ANIM_EVENT_BELL_IN_WINDOW);
                 os_window->last_bell_window_id = w->id;
@@ -1829,7 +1830,7 @@ render_prepared_os_window(
     BorderRects *br = &tab->border_rects;
     draw_borders(br->vao_idx, br->num_border_rects, br->rect_buf, br->is_dirty, active_window_bg, num_visible_windows, all_windows_have_same_bg, os_window);
     br->is_dirty = false;
-    if (TD.screen && os_window->num_tabs && !os_window->has_too_few_tabs) draw_cells(&TD, os_window, true, true, false, NULL, now);
+    if (TD.screen && os_window->num_tabs && !os_window->has_too_few_tabs) draw_cells(&TD, os_window, true, true, false, NULL, NULL, now);
     unsigned int num_of_visible_windows = 0;
     Window *active_window = NULL;
     for (unsigned int i = 0; i < tab->num_windows; i++) {
@@ -1840,11 +1841,12 @@ render_prepared_os_window(
         if (w->visible && WD.screen) {
             bool is_active_window = i == tab->active_window;
             if (is_active_window) active_window = w;
-            draw_cells(&WD, os_window, is_active_window, false, num_of_visible_windows == 1, w, now);
+            draw_cells(&WD, os_window, is_active_window, false, num_of_visible_windows == 1, w, NULL, now);
             if (WD.screen->start_visual_bell_at | WD.screen->start_drag_overlay_at) set_maximum_wait(ANIMATION_SAMPLE_WAIT);
+            if (OPT(progress_bar) != PROGRESS_BAR_HIDDEN && WD.screen->progress_state == PROGRESS_STATE_INDETERMINATE) set_maximum_wait(ANIMATION_SAMPLE_WAIT);
             WindowRenderData *trd = &w->window_title_render_data;
             if (trd->screen && trd->geometry.right > trd->geometry.left && trd->geometry.bottom > trd->geometry.top)
-                draw_cells(trd, os_window, i == tab->active_window, true, false, NULL, now);
+                draw_cells(trd, os_window, i == tab->active_window, true, false, NULL, w, now);
         }
     }
     draw_rounded_borders(br, active_window_bg, num_visible_windows, all_windows_have_same_bg, os_window);
@@ -4021,7 +4023,9 @@ io_loop(void *data) {
         has_pending_wakeups = false;                                                         \
     }
         // we only wakeup the main loop after input_delay as wakeup is an expensive operation
-        // on some platforms, such as cocoa
+        // on some platforms, such as cocoa. Upstream b0d3d1b4c also wakes early for any
+        // pending input under 1 KiB; this fork keeps its measured key-echo bypass (L5 here,
+        // L-A in run_worker) instead, so that rule is deliberately not carried over.
         if (data_received) {
             now = monotonic();
             // Phase 4 (L5): a SMALL read arriving within L5_KEY_RECENCY_WINDOW of a

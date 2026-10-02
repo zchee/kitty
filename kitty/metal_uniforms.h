@@ -8,12 +8,15 @@
 #pragma once
 
 // Struct definitions shared between the C shim (metal.m) and the Metal
-// shaders (cell_fork.slang's crd block since Phase C). Every member is a 4-byte scalar, so the C
-// natural layout, the MSL layout and the GLSL std140 layout (which packs
-// consecutive scalars without padding) are all identical. Do NOT add vector
-// types or manual padding here: the authoritative layout is the C writer
-// struct GPUCellRenderData in kitty/shaders.c — keep field-for-field parity
-// with it and with the CellRenderData UBO block in kitty/cell_vertex.glsl.
+// shaders (cell_fork.slang's crd block since Phase C). The block opens with
+// nine float4 colors (upstream 929db0c07's CPU-linearized colors), spelled
+// float[4] here; every member after them is a 4-byte scalar. The float4s come
+// first and are 16 bytes each, so the C natural layout matches the MSL layout
+// and the GLSL std140 layout up to the end of the last member; the float4s
+// give the MSL struct 16 byte alignment, hence the explicit tail padding. The
+// authoritative layout is the C writer struct GPUCellRenderData in
+// kitty/shaders.c — keep field-for-field parity with it and with the
+// CellRenderData block in kitty/shaders/background_fork.slang.
 
 #ifdef __METAL_VERSION__
 #include <metal_stdlib>
@@ -25,9 +28,13 @@ typedef uint32_t uint32;
 #endif
 
 typedef struct MetalCellRenderData {
+    float default_fg_lin[4], default_bg_lin[4], highlight_fg_lin[4], highlight_bg_lin[4];
+    float main_cursor_fg_lin[4], main_cursor_bg_lin[4], url_color_lin[4];
+    float extra_cursor_fg_lin[4], extra_cursor_bg_lin[4];
+
     float use_cell_bg_for_selection_fg, use_cell_fg_for_selection_fg, use_cell_for_selection_bg;
 
-    uint32 default_fg, highlight_fg, highlight_bg, main_cursor_fg, main_cursor_bg, url_color, url_style, inverted, extra_cursor_fg, extra_cursor_bg;
+    uint32 default_fg, url_style, inverted, main_cursor_is_special, extra_cursor_fg, extra_cursor_bg;
 
     uint32 columns, lines, sprites_xnum, sprites_ynum, cursor_shape, cell_width, cell_height;
     uint32 cursor_x1, cursor_x2, cursor_y1, cursor_y2;
@@ -47,6 +54,8 @@ typedef struct MetalCellRenderData {
     // KITTY_NO_R8_SPRITE_ATLAS kill switch. Appended at the end so all existing
     // std140/MSL offsets are unchanged.
     uint32 color_sprites_xnum, color_sprites_ynum, color_atlas_active;
+    // MSL rounds the struct's size up to its 16 byte alignment (324 -> 336).
+    uint32 tail_padding[3];
 } MetalCellRenderData;
 
 // Per-draw uniforms for the cell programs, marshalled by draw_quad() in
@@ -180,14 +189,15 @@ typedef struct MetalPaddingUniforms {
 } MetalPaddingUniforms;
 
 #ifndef __METAL_VERSION__
-_Static_assert(sizeof(MetalCellRenderData) == 196, "MetalCellRenderData must match the GPUCellRenderData layout in shaders.c");
-_Static_assert(offsetof(MetalCellRenderData, default_fg) == 12, "selection flags must occupy bytes 0-11");
-_Static_assert(offsetof(MetalCellRenderData, columns) == 52, "color block must occupy bytes 12-51");
-_Static_assert(offsetof(MetalCellRenderData, cursor_x1) == 80, "geometry block must occupy bytes 52-79");
-_Static_assert(offsetof(MetalCellRenderData, cursor_opacity) == 96, "cursor rect must occupy bytes 80-95");
-_Static_assert(offsetof(MetalCellRenderData, bg_colors0) == 120, "opacity block must occupy bytes 96-119");
-_Static_assert(offsetof(MetalCellRenderData, bg_opacities0) == 152, "bg colors must occupy bytes 120-151");
-_Static_assert(offsetof(MetalCellRenderData, color_sprites_xnum) == 184, "R8-atlas block must occupy bytes 184-195");
+_Static_assert(sizeof(MetalCellRenderData) == 336, "MetalCellRenderData must match the GPUCellRenderData layout in shaders.c");
+_Static_assert(offsetof(MetalCellRenderData, use_cell_bg_for_selection_fg) == 144, "the nine linear colors must occupy bytes 0-143");
+_Static_assert(offsetof(MetalCellRenderData, default_fg) == 156, "selection flags must occupy bytes 144-155");
+_Static_assert(offsetof(MetalCellRenderData, columns) == 180, "color block must occupy bytes 156-179");
+_Static_assert(offsetof(MetalCellRenderData, cursor_x1) == 208, "geometry block must occupy bytes 180-207");
+_Static_assert(offsetof(MetalCellRenderData, cursor_opacity) == 224, "cursor rect must occupy bytes 208-223");
+_Static_assert(offsetof(MetalCellRenderData, bg_colors0) == 248, "opacity block must occupy bytes 224-247");
+_Static_assert(offsetof(MetalCellRenderData, bg_opacities0) == 280, "bg colors must occupy bytes 248-279");
+_Static_assert(offsetof(MetalCellRenderData, color_sprites_xnum) == 312, "R8-atlas block must occupy bytes 312-323");
 _Static_assert(sizeof(MetalCellDrawUniforms) == 16, "MetalCellDrawUniforms layout drifted");
 _Static_assert(offsetof(MetalCellDrawUniforms, text_contrast) == 4,
     "the fragment slice must start right after the vertex block's draw_bg_bitfield");

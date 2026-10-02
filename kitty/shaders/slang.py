@@ -192,6 +192,10 @@ class LoadShaderPrograms:
         # Per-instance because it is mutable: the sources most recently compiled
         # into each program, used to skip redundant recompiles.
         self.last_built_custom_shaders: dict[int, tuple[str, str, dict[str, Any]]] = {}
+        # Errors from the most recent attempt to build the shaders named by the
+        # custom_shaders option. A failure here disables the shader silently as
+        # far as rendering is concerned, so the Boss displays these to the user.
+        self.custom_shader_errors: list[str] = []
 
     def get_options(self) -> Options:
         try:
@@ -248,7 +252,7 @@ class LoadShaderPrograms:
             self(allow_recompile=True)
         else:
             opts = self.get_options()
-            if opts.custom_shaders != self.custom_shaders or self.force_recompile_of_custom_shaders:
+            if tuple(opts.custom_shaders) != self.custom_shaders or self.force_recompile_of_custom_shaders:
                 self.compile_custom_shaders(allow_recompile=True)
 
     def __call__(self, allow_recompile: bool = False) -> None:
@@ -307,6 +311,15 @@ class LoadShaderPrograms:
         self.force_recompile_of_custom_shaders = False
         opts = self.get_options()
         self.custom_shaders = tuple(opts.custom_shaders)
+        self.custom_shader_errors = []
+
+        def err(msg: str) -> None:
+            # Record as well as log: a failure here leaves the shader disabled
+            # with no visible difference from not setting custom_shaders at all,
+            # so the Boss shows these to the user.
+            log_error(msg)
+            self.custom_shader_errors.append(msg)
+
         pmap: dict[str, list[Pipeline]] = {}
         for k in self.custom_shaders:
             try:
@@ -315,15 +328,15 @@ class LoadShaderPrograms:
                 try:
                     custom_shader(k)
                 except Exception as e:
-                    log_error(f'Failed to read custom shader pipeline definition from {k} with error: {e}')
+                    err(f'Failed to read custom shader pipeline definition from {k} with error: {e}')
                     continue
                 try:
                     d = parse_pipeline_definition(['startgroup', f'    shaders {k}', 'endgroup'], k)
                 except Exception as e:
-                    log_error(f'Failed to build minimal shader pipeline for {k} with error: {e}')
+                    err(f'Failed to build minimal shader pipeline for {k} with error: {e}')
                     continue
             except Exception as e:
-                log_error(f'Failed to read custom shader pipeline definition from {k} with error: {e}')
+                err(f'Failed to read custom shader pipeline definition from {k} with error: {e}')
                 continue
             pmap.setdefault(d['slot'], []).append(d)
 
@@ -345,8 +358,19 @@ class LoadShaderPrograms:
                     vert, frag, metadata = build(pipeline)
                     # print(vert, file=open('/tmp/sample.vert', 'w'))
                     # print(frag, file=open('/tmp/sample.frag', 'w'))
+                except FileNotFoundError as e:
+                    if e.filename == slangc()[0]:
+                        # Without slangc no custom shader can be built at all, and
+                        # a bare "No such file or directory" gives no hint as to why.
+                        err(
+                            f'Failed to build custom shader for slot {slot} because the slang shader compiler'
+                            f' ({slangc()[0]}) was not found. Install shader-slang to use custom shaders.'
+                        )
+                    else:
+                        err(f'Failed to build custom shader for slot {slot} with error: {e}')
+                    disable(prog)
                 except Exception as e:
-                    log_error(f'Failed to build custom shader for slot {slot} with error: {e}')
+                    err(f'Failed to build custom shader for slot {slot} with error: {e}')
                     disable(prog)
                 else:
                     try:
@@ -354,7 +378,7 @@ class LoadShaderPrograms:
                             compile_program(prog, (vert,), (frag,), metadata, allow_recompile)
                             self.last_built_custom_shaders[prog] = vert, frag, metadata
                     except Exception as e:
-                        log_error(f'Failed to load custom shader for slot {slot} with error: {e}')
+                        err(f'Failed to load custom shader for slot {slot} with error: {e}')
                         disable(prog)
 
         do(CUSTOM_END_PROGRAM, 'end')
@@ -829,6 +853,18 @@ class GLSLMetadata:
         return ans
 
 
+# Uniform blocks that must be emitted as loose uniforms in the default uniform
+# block instead of as a UBO. Uniform values are part of program object state,
+# which the GL implementation is responsible for maintaining, whereas the data
+# store of a buffer object belongs to us and some drivers, notably the macOS
+# OpenGL on Metal layer waking from sleep, silently discard it. Anything we
+# upload to a buffer once and never again then stays corrupt forever. Only
+# suitable for blocks whose contents are compile time constants, since setting
+# a loose uniform costs a GL call per program rather than one buffer write.
+# See https://github.com/kovidgoyal/kitty/issues/10571
+GLSL_LOOSE_UNIFORM_BLOCKS = frozenset({'GammaLUT'})
+
+
 def fixup_opengl_code(glsl_code: str, shader_name: str, existing_metadata: GLSLMetadata | None) -> tuple[str, GLSLMetadata]:
     is_fragment_shader = existing_metadata is None
     shader_name += '.frag.glsl' if is_fragment_shader else '.vert.glsl'
@@ -925,13 +961,14 @@ def fixup_opengl_code(glsl_code: str, shader_name: str, existing_metadata: GLSLM
                 if 'uniform' in words and line.startswith('layout('):  # )
                     in_uniform_block = True
                     in_uniform_block_contents = False
-                    uniform_block_is_struct = line.startswith('layout(std140')  # )
+                    block_name = words[-1]
+                    slang_block_name = block_name[len('block_') :].rpartition('_')[0] if block_name.startswith('block_') else ''
+                    uniform_block_is_struct = line.startswith('layout(std140') and slang_block_name not in GLSL_LOOSE_UNIFORM_BLOCKS  # )
                     if uniform_block_is_struct:
-                        current_uniform_struct_name = words[-1]
-                        assert current_uniform_struct_name.startswith('block_')
-                        current_uniform_struct_name = current_uniform_struct_name[len('block_') :].rpartition('_')[0]
+                        current_uniform_struct_name = slang_block_name
+                        assert block_name.startswith('block_')
                         current_uniform_struct_members = {}
-                        uniform_struct_names[current_uniform_struct_name] = words[-1]
+                        uniform_struct_names[current_uniform_struct_name] = block_name
                     else:
                         line = '// ' + line
                 elif words[0] == 'uniform' and len(words) > 2 and words[1].removeprefix('u').removeprefix('i').startswith('sampler'):
@@ -1644,7 +1681,7 @@ ParallelRun = Callable[[Iterable[tuple[bool, str, list[str]]]], None]
 
 def create_specialisations(sources: dict[str, SlangFile], build_dir: str) -> Iterator[Command]:
     for _, base_build, _, _, sfile in iter_entry_point_shaders(sources, build_dir, build_dir):
-        if sfile.entry_points and sfile.specializations:
+        if sfile.entry_points:
             for sp in sfile.specializations:
                 if not sp.variables:
                     continue

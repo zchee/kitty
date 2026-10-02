@@ -88,7 +88,7 @@ def sanitize_source_folder(path: str) -> None:
     # kitty/shaders/legacy.py. On darwin the Metal backend loads pre-compiled
     # MSL from default.metallib and never opens a .glsl, so they are not
     # shipped there (W27 GLSL freeze-out, stage 3). Linux still needs them.
-    allowed = ('.py', '.slang', '.ttf', '.otf', '.json') if ismacos else ('.py', '.glsl', '.slang', '.ttf', '.otf', '.json')
+    allowed = ('.py', '.slang', '.pipeline', '.ttf', '.otf', '.json') if ismacos else ('.py', '.glsl', '.slang', '.pipeline', '.ttf', '.otf', '.json')
     for q in walk(path):
         if os.path.splitext(q)[1] not in allowed:
             os.unlink(q)

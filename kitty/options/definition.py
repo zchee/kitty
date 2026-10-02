@@ -495,10 +495,11 @@ opt(
 Default text cursor color. If set to the special value :code:`none` the cursor will
 be rendered with a "reverse video" effect. Its color will be the color of the
 text in the cell it is over and the text will be rendered with the background
-color of the cell. Note that if the program running in the terminal sets a
-cursor color, this takes precedence. Also, the cursor colors are modified if
-the cell background and foreground colors have very low contrast. Note that some
-themes set this value, so if you want to override it, place your value after
+color of the cell, including its effective DIM/FAINT foreground color. Note
+that if the program running in the terminal sets a cursor color, this takes
+precedence. Also, the cursor colors are modified if the cell background and
+foreground colors have very low contrast. Note that some themes set this value, so if you want to
+override it, place your value after
 the lines where the theme file is included.
 """,
 )
@@ -597,6 +598,10 @@ for cursors that rapidly change their positions during UI updates in complex app
 See :opt:`cursor_trail_decay` to control the animation speed and :opt:`cursor_trail_start_threshold`
 to control when a cursor trail is started. You can also have different styles of trail by
 using the :opt:`custom_shaders` option, for example: :code:`custom_shaders cursor-trail-blaze`.
+To make fast cursor movements look smoother, use :code:`custom_shaders cursor-trail-motion-blur`,
+which blurs the trail slightly along the direction it is moving. For particles
+that fly off the cursor as it moves, use :code:`cursor-trail-railgun`,
+:code:`cursor-trail-torpedo` or :code:`cursor-trail-pixiedust`.
 """,
 )
 
@@ -1091,7 +1096,40 @@ opt(
 Detect URLs under the mouse. Detected URLs are highlighted with an underline and
 the mouse cursor becomes a hand over them. Even if this option is disabled, URLs
 are still clickable. See also the :opt:`underline_hyperlinks` option to control
-how hyperlinks (as opposed to plain text URLs) are displayed.
+how hyperlinks (as opposed to plain text URLs) are displayed. Use
+:opt:`detect_url_regex` to detect arbitrary text, such as file references, as URLs.
+""",
+)
+
+opt(
+    '+detect_url_regex',
+    '',
+    option_type='store_multiple',
+    add_to_default=False,
+    ctype='!detect_url_regex',
+    long_text="""
+A regular expression to detect as a URL under the mouse, in addition to the
+URLs detected via :opt:`url_prefixes`. Can be specified multiple times, text
+under the mouse is detected as a URL if any of the expressions match it. The
+expressions are tried in the order specified, and only if no normal URL is
+found under the mouse. Matches are highlighted and clickable exactly like
+normal detected URLs, see :opt:`detect_urls`. The expressions use the POSIX
+extended regular expression syntax, so use :code:`[0-9]` rather than
+:code:`\\\\d` and :code:`[[:alnum:]]` rather than :code:`\\\\w`. Text that has
+been soft wrapped onto multiple lines is matched as a single line, looking at
+most three lines above and below the mouse. For example, to detect file
+references of the form :file:`path/to/file.py:42`::
+
+    detect_url_regex [[:alnum:]_./-]+\\.[[:alnum:]]+:[0-9]+
+
+The matched text is used as the URL when clicked. Use :doc:`open_actions` with
+the :code:`url` criterion to specify what to do with it. Note that the
+:code:`url` criterion uses Python regular expression syntax. For example, to
+pass file references to a script of your own that opens them in an editor, add
+to :file:`open-actions.conf`::
+
+    url ^[\\w./-]+\\.\\w+:\\d+$
+    action launch --type=background open-file-ref ${URL}
 """,
 )
 
@@ -1601,7 +1639,10 @@ Delay before input from the program running in the terminal is processed (in
 milliseconds). Note that decreasing it will increase responsiveness, but also
 increase CPU usage and might cause flicker in full screen programs that redraw
 the entire screen on each loop, because kitty is so fast that partial screen
-updates will be drawn. This setting is ignored when the input buffer is almost full.
+updates will be drawn. This setting is ignored when the input buffer is almost
+full. It is also ignored for the echo of typed characters: a read of at most
+128 bytes that arrives within 50 milliseconds of a key press is processed
+immediately.
 """,
 )
 
@@ -1905,6 +1946,20 @@ bottom and left.
 )
 
 opt(
+    'collapse_window_margins',
+    'no',
+    option_type='to_bool',
+    long_text="""
+Normally, the gap between two neighboring windows is the sum of their margins,
+so it is twice as large as the gap between a window and the edge of the
+layout area. When enabled, the margins of neighboring windows collapse into
+each other, so that the gap between two windows is the same size as the gap
+at the edges, as set by :opt:`window_margin_width`. Note that when neighboring
+windows have different margins, the gap is the average of the two.
+""",
+)
+
+opt(
     'window_padding_width',
     '0',
     option_type='edge_width',
@@ -1935,8 +1990,9 @@ opt(
     choices=('top-left', 'top', 'top-right', 'left', 'center', 'right', 'bottom-left', 'bottom', 'bottom-right'),
     long_text="""
 When the window size is not an exact multiple of the cell size, the cell area of
-the terminal window will have some extra padding on the sides. You can control
-how that padding is distributed with this option. Using a value of
+the terminal window will have some extra padding on the sides. This padding is
+inside the window border, so that the borders of neighboring windows line up.
+You can control how that padding is distributed with this option. Using a value of
 :code:`center` means the cell area will be placed centrally. A value of
 :code:`top-left` means the padding will be only at the bottom and right edges.
 The value can be one of: :code:`top-left`, :code:`top`, :code:`top-right`,

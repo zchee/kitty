@@ -608,11 +608,17 @@ def draw_tab_with_powerline(
     separator_symbol, soft_separator_symbol = powerline_symbols.get(draw_data.powerline_style, ('', ''))
     min_title_length = 1 + 2
     start_draw = 2
+    is_vertical = draw_data.tab_bar_edge in ('left', 'right')
+    first_row = screen.cursor.y
 
     if screen.cursor.x == 0:
         screen.cursor.bg = tab_bg
         screen.draw(' ')
         start_draw = 1
+
+    if is_vertical and draw_data.wrap_width:
+        # Keep wrapped lines clear of the last column, which holds the separator.
+        draw_data = draw_data._replace(wrap_width=min(draw_data.wrap_width, max(1, screen.columns - 1 - screen.cursor.x)))
 
     screen.cursor.bg = tab_bg
     if min_title_length >= max_tab_length:
@@ -623,6 +629,20 @@ def draw_tab_with_powerline(
         if extra > 0 and extra + 1 < screen.cursor.x:
             screen.cursor.x -= extra + 1
             screen.draw('…')
+
+    if is_vertical:
+        # Clear anything left after a truncation ellipsis.
+        screen.cursor.bg = tab_bg
+        screen.draw(' ' * (screen.columns - 1 - screen.cursor.x))
+        # Draw the separator at the right edge of every row the title occupies,
+        # so that wrapped titles have a straight edge.
+        screen.cursor.fg = tab_bg
+        screen.cursor.bg = default_bg
+        for y in range(first_row, screen.cursor.y + 1):
+            screen.cursor.x = screen.columns - 1
+            screen.cursor.y = y
+            screen.draw(separator_symbol)
+        return screen.cursor.x
 
     if not needs_soft_separator:
         screen.draw(' ')
@@ -726,6 +746,12 @@ class TabExtent(NamedTuple):
         return self.x.start <= x <= self.x.end and self.y.start <= y <= self.y.end
 
 
+class WindowDropTarget(NamedTuple):
+    tab_id: int = 0
+    # None means an existing tab; zero means append, otherwise insert before this tab.
+    before_tab_id: int | None = None
+
+
 class TabBar:
     def __init__(self, os_window_id: int):
         self.os_window_id = os_window_id
@@ -734,6 +760,8 @@ class TabBar:
         self.data_buffer_size = 0
         self.blank_rects: tuple[Border, ...] = ()
         self.tab_extents: Sequence[TabExtent] = ()
+        self.window_drop_insert_before: int | None = None
+        self.tab_drop_insert_before: int | None = None
         self.laid_out_once = False
         self.left_edge_is_default = True
         self.right_edge_is_default = True
@@ -1041,6 +1069,7 @@ class TabBar:
         self.tab_extents = cr
         s.erase_in_line(0, False)  # Ensure no long titles bleed after the last tab
         self.align()
+        self.draw_drop_insert_marker()
         return self._update_edge_defaults(False)
 
     def update_vertical(self, data: Sequence[TabBarData]) -> bool:
@@ -1138,7 +1167,36 @@ class TabBar:
             s.cursor.fg = as_rgb(0xFF0000)
             s.draw('…')
         self.tab_extents = tuple(cr)
+        self.draw_drop_insert_marker()
         return self._update_edge_defaults(True)
+
+    def draw_drop_insert_marker(self) -> None:
+        before = self.tab_drop_insert_before if self.tab_drop_insert_before is not None else self.window_drop_insert_before
+        if before is None:
+            return
+        extents = tuple(te for te in self.tab_extents if te.tab_id > 0)
+        idx = next((i for i, te in enumerate(extents) if te.tab_id == before), len(extents))
+        s = self.screen
+        s.cursor.fg, s.cursor.bg = self.active_fg, self.active_bg
+        s.cursor.bold, s.cursor.italic = False, False
+        if self.is_vertical:
+            prev_end = extents[idx - 1].y.end if idx else -1
+            next_start = extents[idx].y.start if idx < len(extents) else s.lines
+            # Prefer a blank line next to the insertion point, so no tab title is hidden
+            occupied = {y for te in self.tab_extents for y in range(te.y.start, te.y.end + 1)}
+            candidates = range(next_start - 1, prev_end, -1) if idx == 0 else range(prev_end + 1, next_start)
+            if (gap := next((y for y in candidates if y not in occupied and 0 <= y < s.lines), None)) is None:
+                # Crowded tab bar, mark just the first cell of the tab after the insertion point
+                s.cursor.x, s.cursor.y = 0, max(0, min(s.lines - 1, next_start if idx < len(extents) else prev_end + 1))
+                s.draw('▶')
+            else:
+                s.cursor.x, s.cursor.y = 0, gap
+                s.draw('━' * s.columns)
+        else:
+            coordinate = extents[idx].x.start if idx < len(extents) else (extents[-1].x.end + 1 if extents else 0)
+            s.cursor.x, s.cursor.y = min(s.columns - 1, coordinate), 0
+            s.draw('┃')
+        s.cursor.fg = s.cursor.bg = 0
 
     def align_with_factor(self, factor: int = 1) -> None:
         if not self.tab_extents:
@@ -1168,3 +1226,46 @@ class TabBar:
 
     def drag_axis_coordinate(self, x: int, y: int) -> int:
         return y if self.is_vertical else x
+
+    def _drop_spans(self, x: int, y: int) -> tuple[float, list[tuple[int, int, int]]]:
+        "The pointer position and the non-empty (tab_id, start, end) pixel spans of the tabs along the tab bar axis"
+        g = self.window_geometry
+        coordinate = y - g.top if self.is_vertical else x - g.left
+        cell_size = self.cell_height if self.is_vertical else self.cell_width
+        limit = self.screen.lines if self.is_vertical else self.screen.columns
+        extents = tuple(te.y if self.is_vertical else te.x for te in self.tab_extents if te.tab_id > 0)
+        ids = tuple(te.tab_id for te in self.tab_extents if te.tab_id > 0)
+        spans = []
+        for i, cells in enumerate(extents):
+            start, end = cells.start * cell_size, min(limit, cells.end + 1) * cell_size
+            # Some custom renderers include the next tab's first cell in their extent.
+            if i + 1 < len(extents):
+                end = min(end, extents[i + 1].start * cell_size)
+            if end > start:
+                spans.append((ids[i], start, end))
+        return coordinate, spans
+
+    def tab_insertion_target_at(self, x: int, y: int) -> int:
+        "The tab after the nearest insertion boundary, or zero to append."
+        if not self.laid_out_once:
+            return 0
+        coordinate, spans = self._drop_spans(x, y)
+        for tab_id, start, end in spans:
+            if coordinate < (start + end) / 2:
+                return tab_id
+        return 0
+
+    def window_drop_target_at(self, x: int, y: int) -> WindowDropTarget:
+        """The middle 80% of a tab accepts a window. Its outer 10% and gaps insert a new tab.
+        Called only for points inside the tab bar viewport, including its blank margins."""
+        if not self.laid_out_once:
+            return WindowDropTarget(before_tab_id=0)
+        coordinate, spans = self._drop_spans(x, y)
+        for i, (tab_id, start, end) in enumerate(spans):
+            if coordinate < start + (end - start) * 0.1:
+                return WindowDropTarget(before_tab_id=tab_id)
+            if coordinate < end - (end - start) * 0.1:
+                return WindowDropTarget(tab_id=tab_id)
+            if coordinate < end:
+                return WindowDropTarget(before_tab_id=spans[i + 1][0] if i + 1 < len(spans) else 0)
+        return WindowDropTarget(before_tab_id=0)

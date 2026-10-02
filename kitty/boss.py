@@ -16,7 +16,6 @@ from dataclasses import dataclass
 from functools import partial
 from gettext import gettext as _
 from gettext import ngettext
-from math import floor
 from time import sleep
 from typing import (
     TYPE_CHECKING,
@@ -781,6 +780,7 @@ class Boss:
         if isinstance(args, SpecialWindowInstance):
             sw: SpecialWindowInstance | None = args
         else:
+            args = tuple(args)
             sw = self.args_to_special_window(args, cwd_from) if args else None
         startup_session = next(create_sessions(get_options(), special_window=sw, cwd_from=cwd_from))
         startup_session.session_name = ''
@@ -1607,6 +1607,10 @@ class Boss:
             tm.handle_tab_bar_mouse(x, y, button, modifiers, action)
 
     def start_tab_drag(self, os_window_id: int, window_id: int, pixels: bytes, width: int, height: int) -> None:
+        # A previous drag whose drop never reached _reset_drop_previews (failed transfer, dragged
+        # tab closed, etc.) can leave stale pre-hover focus behind, discard it.
+        for q in self.all_tab_managers:
+            q.finish_tab_drag_hover(restore_focus=False)
         if tm := self.os_window_map.get(os_window_id):
             tm.start_tab_drag(pixels, width, height)
 
@@ -2196,12 +2200,13 @@ class Boss:
         if tm is not None:
             tm.update_tab_bar_data()
 
-    def _reset_drop_previews(self) -> None:
-        "Clear all drag and drop UI state, once a drag has ended"
+    def _reset_drop_previews(self, restore_tab_drag_focus_for: TabManager | None = None) -> None:
+        "Clear drag UI state and restore pre-hover focus after a same-window tab reorder"
         self._update_drag_over(None)
         for q in self.all_tab_managers:
             q.on_window_drop_move()
             q.on_tab_drop_move()
+            q.finish_tab_drag_hover(restore_focus=q is restore_tab_drag_focus_for)
             q.layout_tab_bar()  # ensure tab bar is fully updated
 
     def _update_drag_over(self, tm: TabManager | None) -> None:
@@ -2276,14 +2281,17 @@ class Boss:
         if (tidb := drop.get(f'application/net.kovidgoyal.kitty-tab-{os.getpid()}')) and (tab := self.tab_for_id(int(tidb))):
             tab_bar = viewport_for_window(os_window_id)[1]
             in_tab_bar = tab_bar.left <= x < tab_bar.right and tab_bar.top <= y < tab_bar.bottom
+            restore_tab_drag_focus_for = None
             if (merge_window := self._tab_merge_target(tab, tm, x, y)) is not None:
                 tm.on_window_drop(x, y, merge_window.id)
             elif in_tab_bar or tab.os_window_id != tm.os_window_id:
+                if in_tab_bar and tab.os_window_id == tm.os_window_id:
+                    restore_tab_drag_focus_for = tm
                 tm.on_tab_drop(x, y)
             else:
                 self._move_tab_to(tab)
             set_tab_being_dragged()
-            self._reset_drop_previews()
+            self._reset_drop_previews(restore_tab_drag_focus_for)
             return
         central, tab_bar = viewport_for_window(os_window_id)[:2]
         if central.left <= x < central.right and central.top <= y < central.bottom:
@@ -2362,7 +2370,9 @@ class Boss:
                         self._reset_drop_previews()
                         return
                     if tm.tab_being_dropped:
+                        restore_tab_drag_focus_for = tm if tab.os_window_id == tm.os_window_id else None
                         tm.on_tab_drop(0, 0, bypass_move=True)
+                        self._reset_drop_previews(restore_tab_drag_focus_for)
                         return
             set_tab_being_dragged()
             self._update_drag_over(None)
@@ -2371,6 +2381,11 @@ class Boss:
                 tm.on_tab_drop_move()
             if was_dropped and not was_canceled and tab is not None:  # detach tab into new OS Window
                 self._move_tab_to(tab)
+            # Cocoa can finish an internal drag before on_drop receives its data.
+            # Keep the saved focus until that callback classifies the actual drop.
+            if was_canceled or was_dropped or needs_toplevel_on_wayland:
+                for tm in self.all_tab_managers:
+                    tm.finish_tab_drag_hover(restore_focus=False)
 
     @ac(
         'win',
@@ -2836,6 +2851,12 @@ class Boss:
             if w is not None and tab is not None:
                 tab.new_special_window(self.create_special_window_for_show_error(title, msg, w.id), copy_colors_from=w)
 
+    def show_custom_shader_errors(self) -> None:
+        errors = load_shader_programs.custom_shader_errors
+        if errors:
+            load_shader_programs.custom_shader_errors = []
+            self.show_error(_('Failed to load custom shaders'), '\n\n'.join(errors))
+
     @ac('mk', 'Create a new marker')
     def create_marker(self) -> None:
         w = self.window_for_dispatch or self.active_window
@@ -2931,22 +2952,29 @@ class Boss:
         return False
 
     def drag_resize_update(self, x: float, y: float) -> None:
+        # Truncate towards zero rather than flooring, so that the pointer has to
+        # travel a full cell away from where the drag started before anything moves
+        # and coming back to the start always restores the original layout exactly.
+        # last_step_* counts the cells actually applied, which is not necessarily the
+        # number requested, since the layout stops at minimum sizes. Accumulating the
+        # applied amount keeps the divider locked to the pointer when it comes back
+        # out of a minimum, instead of leaving it lagging by however much was refused.
         if not (r := self.drag_resize_of_window) or not (tab := self.tab_for_id(r.tab_id)):
             return
         if (h := r.data.horizontal_id) is not None:
             mult = 1 if r.data.width_increases_rightwards else -1
-            step_x = floor((x - r.initial_x) / r.cell_width) * mult
+            step_x = int((x - r.initial_x) / r.cell_width) * mult
             dx = step_x - r.last_step_x
             if dx != 0:
-                if tab.drag_resize_window(h, float(dx), True):
-                    self.drag_resize_of_window = r._replace(last_step_x=step_x)
+                if applied := tab.drag_resize_window(h, dx, True):
+                    self.drag_resize_of_window = r = r._replace(last_step_x=r.last_step_x + applied)
         if (v := r.data.vertical_id) is not None:
             mult = 1 if r.data.height_increases_downwards else -1
-            step_y = floor((y - r.initial_y) / r.cell_height) * mult
+            step_y = int((y - r.initial_y) / r.cell_height) * mult
             dy = step_y - r.last_step_y
             if dy != 0:
-                if tab.drag_resize_window(v, float(dy), False):
-                    self.drag_resize_of_window = r._replace(last_step_y=step_y)
+                if applied := tab.drag_resize_window(v, dy, False):
+                    self.drag_resize_of_window = r._replace(last_step_y=r.last_step_y + applied)
 
     def drag_resize_end(self) -> None:
         if tab := self.tab_for_id(self.drag_resize_of_window.tab_id):
@@ -3357,10 +3385,11 @@ class Boss:
 
     def _new_tab(self, args: SpecialWindowInstance | Iterable[str], cwd_from: CwdRequest | None = None, as_neighbor: bool = False) -> Tab | None:
         special_window = None
-        if args:
-            if isinstance(args, SpecialWindowInstance):
-                special_window = args
-            else:
+        if isinstance(args, SpecialWindowInstance):
+            special_window = args
+        else:
+            args = tuple(args)
+            if args:
                 special_window = self.args_to_special_window(args, cwd_from=cwd_from)
         if not self.os_window_map:
             self.add_os_window()
@@ -3661,7 +3690,7 @@ class Boss:
             if file:
                 a(f'In file {file}:')
             [a(format_bad_line(x)) for x in groups[file]]
-        if misc_errors:
+        if misc_errors := tuple(misc_errors):
             a('In final effective configuration:')
             for line in misc_errors:
                 a(line)

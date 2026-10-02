@@ -846,6 +846,10 @@ class Window:
         q = getattr(self.margin, edge)
         if q is not None:
             return pt_to_px(q, self.os_window_id)
+        return self.default_margin(edge)
+
+    def default_margin(self, edge: EdgeLiteral) -> int:
+        "The margin from the options, ignoring any margin set for this window specifically"
         opts = get_options()
         tab = self.tabref()
         is_single_window = tab is not None and tab.has_single_window_visible()
@@ -2403,7 +2407,7 @@ class Window:
             cwd = path_from_osc7_url(self.screen.last_reported_cwd) or cwd
         return cwd
 
-    def as_launch_command(self, ser_opts: SaveAsSessionOptions, cwd: str, is_overlay: bool = False) -> list[str]:
+    def as_launch_command(self, ser_opts: SaveAsSessionOptions, cwd: str, is_overlay: bool = False, extra_launch_args: Sequence[str] = ()) -> list[str]:
         "Return a launch command that can be used to serialize this window. Empty list indicates not serializable."
         if self.actions_on_close or self.actions_on_focus_change or self.actions_on_removal:
             # such windows are typically UI kittens. The actions are not
@@ -2454,6 +2458,7 @@ class Window:
         if is_overlay:
             t = 'overlay-main' if self.overlay_type is OverlayType.main else 'overlay'
             ans.append(f'--type={t}')
+        ans.extend(extra_launch_args)
 
         from kittens.ssh.utils import is_kitten_cmdline as is_ssh_kitten_cmdline
         from kittens.ssh.utils import remove_env_var_from_cmdline, set_cwd_in_cmdline, set_single_env_var_in_cmdline

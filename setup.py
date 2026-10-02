@@ -2456,7 +2456,7 @@ def package(args: Options, bundle_type: str, do_build_all: bool = True) -> None:
     # kitty/shaders/legacy.py. On darwin the Metal backend loads pre-compiled
     # MSL from default.metallib and never opens a .glsl, so they are not
     # shipped there (W27 GLSL freeze-out, stage 3). Linux still needs them.
-    allowed_extensions = frozenset(('py', 'slang', 'so') if is_macos else ('py', 'slang', 'glsl', 'so'))
+    allowed_extensions = frozenset(('py', 'slang', 'pipeline', 'so') if is_macos else ('py', 'slang', 'pipeline', 'glsl', 'so'))
 
     def src_ignore(parent: str, entries: Iterable[str]) -> List[str]:
         return [x for x in entries if '.' in x and x.rpartition('.')[2] not in allowed_extensions]

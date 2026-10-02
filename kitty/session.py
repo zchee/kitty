@@ -131,10 +131,7 @@ class Session:
         spec = parse_launch_args(cmd)
         if needs_expandvars:
             assert isinstance(cmd, list)
-            limit = len(cmd)
-            if len(spec.args):
-                with suppress(ValueError):
-                    limit = cmd.index(spec.args[0])
+            limit = len(cmd) - len(spec.args)
             cmd = [(expand(x) if i < limit else x) for i, x in enumerate(cmd)]
             spec = parse_launch_args(cmd)
 
@@ -701,6 +698,9 @@ def save_as_session_part2(boss: BossType, opts: SaveAsSessionOptions, path: str,
         base_dir = os.path.abspath(os.path.expanduser(opts.base_dir))
         path = os.path.join(base_dir, path)
     path = os.path.abspath(os.path.expanduser(path))
+    if os.path.isdir(path):
+        boss.show_error(_('Invalid session path'), _('{} is a directory, specify a file name for the session').format(path))
+        return
     if path_input_by_user and '.' not in os.path.basename(path):
         path += '.kitty-session'
     session = '\n'.join(boss.serialize_state_as_session(path, opts))

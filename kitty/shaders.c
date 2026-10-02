@@ -129,6 +129,17 @@ color_vec4(GLint location, color_type color, GLfloat alpha) {
     glUniform4f(location, srgb_lut[(color >> 16) & 0xFF], srgb_lut[(color >> 8) & 0xFF], srgb_lut[color & 0xFF], alpha);
 }
 
+// Write a color into a std140 float4 whose fourth component is unused. Uses
+// the same table as the shaders so the result is identical to converting the
+// color in the shader.
+static void
+linear_color_vec4(GLfloat *dest, color_type color) {
+    dest[0] = srgb_lut[(color >> 16) & 0xFF];
+    dest[1] = srgb_lut[(color >> 8) & 0xFF];
+    dest[2] = srgb_lut[color & 0xFF];
+    dest[3] = 0.f;
+}
+
 
 
 #ifndef KITTY_BACKEND_METAL
@@ -561,14 +572,8 @@ draw_rounded_rect(
 
 // Cell {{{
 
-enum {
-    CELL_RENDER_DATA_BINDING_POINT = 0,
-    COLOR_TABLE_BINDING_POINT = 1,
-    GAMMA_LUT_BINDING_POINT = 2,
-    BORDER_COLORS_BINDING_POINT = 3,
-    CUSTOM_END_DATA_BINDING_POINT = 4
-};
-enum { GAMMA_LUT_GLOBAL_BUFFER, BORDER_COLORS_GLOBAL_BUFFER };
+enum { CELL_RENDER_DATA_BINDING_POINT = 0, COLOR_TABLE_BINDING_POINT = 1, BORDER_COLORS_BINDING_POINT = 2, CUSTOM_END_DATA_BINDING_POINT = 3 };
+enum { BORDER_COLORS_GLOBAL_BUFFER };
 // VAOs used only to hold buffers for UBOs that are shared amongst programs/windows,
 // their vertex attribute/array facilities are unused.
 static ssize_t shader_globals_vao_idx = -1;
@@ -607,13 +612,6 @@ static struct {
     size_t count;
 } custom_shaders;
 
-static void
-write_float_array_to_ubo(void *dest, const GLfloat *src, size_t count, const ArrayInformation *ai) {
-    GLint stride = MAX((GLint)sizeof(GLfloat), ai->stride);
-    uint8_t *buf = (uint8_t *)dest + ai->offset;
-    for (size_t i = 0; i < count; i++, buf += stride) memcpy(buf, src + i, sizeof(GLfloat));
-}
-
 #ifndef KITTY_BACKEND_METAL
 static void
 write_uint_array_to_ubo(void *dest, const GLuint *src, size_t count, const ArrayInformation *ai) {
@@ -623,17 +621,38 @@ write_uint_array_to_ubo(void *dest, const GLuint *src, size_t count, const Array
 }
 #endif
 
+// The gamma LUT is a compile time constant that lives in the default uniform
+// block of every program that needs it, rather than in a UBO shared between
+// them. Uniform values are part of program object state, which the GL
+// implementation must maintain, while the data store of a buffer object is
+// ours and some drivers silently discard it, notably macOS waking from sleep
+// or reconfiguring its displays. Every color in every affected program then
+// resolves to garbage with nothing to ever restore it. Uploading it costs a
+// single GL call per program, so this can simply be called again whenever we
+// have reason to believe GPU state was lost.
+// See https://github.com/kovidgoyal/kitty/issues/10571
+void
+upload_gamma_lut(void) {
+#define U(program)                                                    \
+    {                                                                 \
+        bind_program(program);                                        \
+        GLint loc = program_uniform_location(program, "gamma_lut");   \
+        if (loc >= 0) glUniform1fv(loc, arraysz(srgb_lut), srgb_lut); \
+    }
+    for (int i = CELL_PROGRAM; i < CELL_PROGRAM_SENTINEL; i++) U(i);
+    U(BORDERS_PROGRAM);
+    U(PADDING_PROGRAM);
+#undef U
+    unbind_program();
+}
+
 static void
 init_cell_program(void) {
-    GLint gamma_lut_buf_size = 0;
     for (int i = CELL_PROGRAM; i < CELL_PROGRAM_SENTINEL; i++) {
         UniformBlock crd = program_uniform_block(i, "CellRenderData");
         glUniformBlockBinding(program_id(i), crd.index, CELL_RENDER_DATA_BINDING_POINT);
         UniformBlock ct = program_uniform_block(i, "ColorTable");
         glUniformBlockBinding(program_id(i), ct.index, COLOR_TABLE_BINDING_POINT);
-        UniformBlock glut = program_uniform_block(i, "GammaLUT");
-        glUniformBlockBinding(program_id(i), glut.index, GAMMA_LUT_BINDING_POINT);
-        gamma_lut_buf_size = MAX(gamma_lut_buf_size, glut.size);
     }
 
 #ifndef KITTY_BACKEND_METAL
@@ -649,8 +668,6 @@ init_cell_program(void) {
 #endif
     UniformBlock border_colors = program_uniform_block(BORDERS_PROGRAM, "Colors");
     glUniformBlockBinding(program_id(BORDERS_PROGRAM), border_colors.index, BORDER_COLORS_BINDING_POINT);
-    UniformBlock border_glut = program_uniform_block(BORDERS_PROGRAM, "GammaLUT");
-    glUniformBlockBinding(program_id(BORDERS_PROGRAM), border_glut.index, GAMMA_LUT_BINDING_POINT);
 
     // The padding program shares the cell background computation and so uses the
     // same uniform blocks bound to the same binding points as the cell programs.
@@ -659,8 +676,6 @@ init_cell_program(void) {
         glUniformBlockBinding(program_id(PADDING_PROGRAM), crd.index, CELL_RENDER_DATA_BINDING_POINT);
         UniformBlock ct = program_uniform_block(PADDING_PROGRAM, "ColorTable");
         glUniformBlockBinding(program_id(PADDING_PROGRAM), ct.index, COLOR_TABLE_BINDING_POINT);
-        UniformBlock glut = program_uniform_block(PADDING_PROGRAM, "GammaLUT");
-        glUniformBlockBinding(program_id(PADDING_PROGRAM), glut.index, GAMMA_LUT_BINDING_POINT);
     }
 #ifndef KITTY_BACKEND_METAL
     // OpenGL only: the Metal attrib_location stub answers 0 for every name
@@ -677,31 +692,13 @@ init_cell_program(void) {
 #undef C
 #endif
 
-    // The gamma LUT is a constant, shared amongst all the programs that use it via a single UBO.
     if (shader_globals_vao_idx == -1) {
         shader_globals_vao_idx = create_vao();
         add_buffer_to_vao(shader_globals_vao_idx, GL_UNIFORM_BUFFER);
-        add_buffer_to_vao(shader_globals_vao_idx, GL_UNIFORM_BUFFER);
-        gamma_lut_buf_size = MAX(gamma_lut_buf_size, border_glut.size);
-        void *gamma_lut_buf = alloc_and_map_vao_buffer(shader_globals_vao_idx, gamma_lut_buf_size, GAMMA_LUT_GLOBAL_BUFFER, false);
-        const ArrayInformation a = program_uniform_array(CELL_PROGRAM, "gamma_lut");
-        write_float_array_to_ubo(gamma_lut_buf, srgb_lut, arraysz(srgb_lut), &a);
-#ifdef KITTY_BACKEND_METAL
-        // The Metal shim builds its resident gamma-LUT buffer (M5c) from a
-        // glUniform1fv capture, not from the GammaLUT UBO written above (that
-        // block never reaches the hand-written MSL). The fork's init fed it
-        // through the per-program layout caches; feed the capture directly.
-        for (int i = CELL_PROGRAM; i < CELL_PROGRAM_SENTINEL; i++) {
-            bind_program(i);
-            glUniform1fv(program_uniform_location(i, "gamma_lut"), arraysz(srgb_lut), srgb_lut);
-        }
-        bind_program(BORDERS_PROGRAM);
-        glUniform1fv(program_uniform_location(BORDERS_PROGRAM, "gamma_lut"), arraysz(srgb_lut), srgb_lut);
-#endif
-        unmap_vao_buffer(shader_globals_vao_idx, GAMMA_LUT_GLOBAL_BUFFER);
         // The border colors change on every draw, but are shared amongst all border VAOs (only one is ever drawn at a time)
         alloc_vao_buffer(shader_globals_vao_idx, border_colors.size, BORDER_COLORS_GLOBAL_BUFFER, GL_STREAM_DRAW);
     }
+    upload_gamma_lut();
     bind_shader_globals_to_current_context();
 }
 
@@ -742,7 +739,17 @@ init_custom_programs(void) {
                 set_optional_sampler("b", CUSTOM_END_TEXTURE_B_UNIT);
                 set_optional_sampler("persist", CUSTOM_END_TEXTURE_PERSIST_UNIT);
 #undef set_optional_sampler
-                glUniform1i(program_uniform_location(i, "group"), 0);
+                GLint group_loc = try_program_uniform_location(i, "group");
+                if (group_loc >= 0) glUniform1i(group_loc, 0);
+                else if (custom_shaders.end.num_groups > 1) {
+                    // Every group is dispatched by setting this uniform, so without it
+                    // all of them render as group zero, which for a multi pass pipeline
+                    // means the intermediate passes are drawn to the screen.
+                    log_error(
+                        "The custom shader pipeline has %zu groups but its group uniform was optimized away by the"
+                        " GPU driver. Every group will render as group zero.",
+                        custom_shaders.end.num_groups);
+                }
                 UniformBlock ubd = program_uniform_block(i, "KittyCustomShaderData");
                 glUniformBlockBinding(program_id(i), ubd.index, CUSTOM_END_DATA_BINDING_POINT);
                 if (custom_end_vao_idx == -1) {
@@ -948,7 +955,6 @@ custom_shader_needs_render(const ShaderAnimState *before, const ShaderAnimState 
 void
 bind_shader_globals_to_current_context(void) {
     if (shader_globals_vao_idx == -1) return;
-    bind_vao_uniform_buffer(shader_globals_vao_idx, GAMMA_LUT_GLOBAL_BUFFER, GAMMA_LUT_BINDING_POINT);
     bind_vao_uniform_buffer(shader_globals_vao_idx, BORDER_COLORS_GLOBAL_BUFFER, BORDER_COLORS_BINDING_POINT);
 }
 
@@ -987,22 +993,45 @@ create_cell_vao(void) {
     (screen->color_profile->overridden.name.type == COLOR_IS_SPECIAL || \
      (screen->color_profile->overridden.name.type == COLOR_NOT_SET && screen->color_profile->configured.name.type == COLOR_IS_SPECIAL))
 
+static float
+cursor_color_luminance(color_type color) {
+    // Match color_to_vec() and contrast_ratio() in background.slang.
+    return 0.2126f * srgb_lut[(color >> 16) & 0xff] + 0.7152f * srgb_lut[(color >> 8) & 0xff] + 0.0722f * srgb_lut[color & 0xff];
+}
+
+static float
+cursor_color_contrast(color_type a, color_type b) {
+    const float la = cursor_color_luminance(a), lb = cursor_color_luminance(b);
+    return (MAX(la, lb) + 0.05f) / (MIN(la, lb) + 0.05f);
+}
+
 static void
 pick_cursor_color(color_type cell_fg, color_type cell_bg, color_type *cursor_fg, color_type *cursor_bg, color_type default_fg, color_type default_bg) {
-    ARGB32 fg, bg, dfg, dbg;
-    fg.rgb = cell_fg;
-    bg.rgb = cell_bg;
     *cursor_fg = cell_bg;
     *cursor_bg = cell_fg;
-    double cell_contrast = rgb_contrast(fg, bg);
+    const float cell_contrast = cursor_color_contrast(cell_fg, cell_bg);
     if (cell_contrast < 2.5) {
-        dfg.rgb = default_fg;
-        dbg.rgb = default_bg;
-        if (rgb_contrast(dfg, dbg) > cell_contrast) {
+        if (cursor_color_contrast(default_fg, default_bg) > cell_contrast) {
             *cursor_fg = default_bg;
             *cursor_bg = default_fg;
         }
     }
+}
+
+static uint8_t
+dimmed_color_component(uint8_t fg, uint8_t bg, float opacity) {
+    // DIM blends text with the cell background in linear color space.
+    const float linear = (1.f - opacity) * srgb_lut[bg] + opacity * srgb_lut[fg];
+    const float srgb = linear <= 0.0031308f ? 12.92f * linear : 1.055f * powf(linear, 1.f / 2.4f) - 0.055f;
+    return (uint8_t)lroundf(255.f * srgb);
+}
+
+static color_type
+dimmed_cursor_color(color_type fg, color_type bg, float opacity) {
+    if (opacity >= 1.f) return fg;
+    return ((color_type)dimmed_color_component((fg >> 16) & 0xff, (bg >> 16) & 0xff, opacity) << 16) |
+           ((color_type)dimmed_color_component((fg >> 8) & 0xff, (bg >> 8) & 0xff, opacity) << 8) |
+           (color_type)dimmed_color_component(fg & 0xff, bg & 0xff, opacity);
 }
 
 static bool
@@ -1010,10 +1039,28 @@ has_bgimage(OSWindow *w) {
     return background_image_for_os_window(w) != NULL;
 }
 
+// The value resolve_dynamic_color() in background.slang needs for the color
+// types that are an actual color. The other two types resolve to colors that
+// are only known per-cell, so the shader ignores this value for them.
+static color_type
+dynamic_color_for_gpu(const ColorProfile *cp, color_type val) {
+    const DynamicColor dc = {.val = val}, zero = {0};
+    if (dc.type != COLOR_IS_RGB && dc.type != COLOR_IS_INDEX) return 0;
+    return colorprofile_to_color(cp, dc, zero).rgb;
+}
+
 struct GPUCellRenderData {
+    // Colors that are constant for the whole draw, pre-converted to linear
+    // space so the vertex shader does not do a gamma LUT lookup for them
+    // once per vertex. These must come first and the fourth component of
+    // each is unused padding, see CellRenderData in background.slang.
+    GLfloat default_fg_lin[4], default_bg_lin[4], highlight_fg_lin[4], highlight_bg_lin[4];
+    GLfloat main_cursor_fg_lin[4], main_cursor_bg_lin[4], url_color_lin[4];
+    GLfloat extra_cursor_fg_lin[4], extra_cursor_bg_lin[4];
+
     GLfloat use_cell_bg_for_selection_fg, use_cell_fg_for_selection_color, use_cell_for_selection_bg;
 
-    GLuint default_fg, highlight_fg, highlight_bg, main_cursor_fg, main_cursor_bg, url_color, url_style, inverted, extra_cursor_fg, extra_cursor_bg;
+    GLuint default_fg, url_style, inverted, main_cursor_is_special, extra_cursor_fg, extra_cursor_bg;
 
     GLuint columns, lines, sprites_xnum, sprites_ynum, cursor_shape, cell_width, cell_height;
     GLuint cursor_x1, cursor_x2, cursor_y1, cursor_y2;
@@ -1022,19 +1069,27 @@ struct GPUCellRenderData {
     GLuint bg_colors0, bg_colors1, bg_colors2, bg_colors3, bg_colors4, bg_colors5, bg_colors6, bg_colors7;
     GLfloat bg_opacities0, bg_opacities1, bg_opacities2, bg_opacities3, bg_opacities4, bg_opacities5, bg_opacities6, bg_opacities7;
 
-    // F1: colored-atlas layout + activation flag. Appended so all prior std140
-    // offsets are unchanged; mirrors MetalCellRenderData / the CellRenderData UBO
-    // block in cell_vertex.glsl.
+    // F1: colored-atlas layout + activation flag. Appended so all prior
+    // offsets match upstream's block; mirrors MetalCellRenderData and the
+    // CellRenderData block in background_fork.slang. The upstream block that
+    // the GL arm compiles (background.slang) ends before this tail.
     GLuint color_sprites_xnum, color_sprites_ynum, color_atlas_active;
+    // The float4 members give the block 16 byte alignment in MSL, so its size
+    // is rounded up to a multiple of 16.
+    GLuint tail_padding[3];
 };
 
 // Drift gate: the Metal backend reads this exact buffer back as
-// MetalCellRenderData (kitty/metal_uniforms.h, included verbatim by
-// cell_shaders.metal). A field inserted HERE shifts every later member on that
-// side only, and the asserts over there -- which pin MetalCellRenderData against
-// hardcoded byte offsets -- cannot see it. Upstream adding fg_override_threshold
-// and row_offset to the block did exactly that, silently. Pin the pair.
+// MetalCellRenderData (kitty/metal_uniforms.h). A field inserted HERE shifts
+// every later member on that side only, and the asserts over there -- which
+// pin MetalCellRenderData against hardcoded byte offsets -- cannot see it.
+// Upstream adding fg_override_threshold and row_offset to the block did
+// exactly that, silently. Pin the pair.
 _Static_assert(sizeof(struct GPUCellRenderData) == sizeof(MetalCellRenderData), "GPUCellRenderData and MetalCellRenderData sizes drifted");
+_Static_assert(offsetof(struct GPUCellRenderData, main_cursor_fg_lin) == offsetof(MetalCellRenderData, main_cursor_fg_lin), "main_cursor_fg_lin offset drifted");
+_Static_assert(offsetof(struct GPUCellRenderData, extra_cursor_bg_lin) == offsetof(MetalCellRenderData, extra_cursor_bg_lin), "extra_cursor_bg_lin offset drifted");
+_Static_assert(offsetof(struct GPUCellRenderData, use_cell_for_selection_bg) == offsetof(MetalCellRenderData, use_cell_for_selection_bg), "selection flags offset drifted");
+_Static_assert(offsetof(struct GPUCellRenderData, main_cursor_is_special) == offsetof(MetalCellRenderData, main_cursor_is_special), "main_cursor_is_special offset drifted");
 _Static_assert(offsetof(struct GPUCellRenderData, fg_override_threshold) == offsetof(MetalCellRenderData, fg_override_threshold), "fg_override_threshold offset drifted");
 _Static_assert(offsetof(struct GPUCellRenderData, row_offset) == offsetof(MetalCellRenderData, row_offset), "row_offset offset drifted");
 _Static_assert(offsetof(struct GPUCellRenderData, dim_opacity) == offsetof(MetalCellRenderData, dim_opacity), "dim_opacity offset drifted");
@@ -1092,21 +1147,41 @@ cell_update_uniform_block(ssize_t vao_idx, Screen *screen, int uniform_buffer, i
         unmap_vao_buffer(vao_idx, color_table_buf);
         D2_NOTE_BYTES(program_uniform_block(CELL_PROGRAM, "ColorTable").size);
     }
+    // GPUCellRenderData is a hand written mirror of the layout of
+    // CellRenderData in background.slang (GL) and background_fork.slang
+    // (Metal), a mismatch silently corrupts every color, so check it once. The
+    // upstream block the GL arm compiles ends where the F1 tail begins.
+    const UniformBlock crd_block = program_uniform_block(CELL_PROGRAM, "CellRenderData");
+    static bool crd_block_size_checked = false;
+    if (!crd_block_size_checked) {
+        crd_block_size_checked = true;
+#ifdef KITTY_BACKEND_METAL
+        const size_t mirrored_size = sizeof(struct GPUCellRenderData);
+#else
+        const size_t mirrored_size = offsetof(struct GPUCellRenderData, color_sprites_xnum);
+#endif
+        if ((size_t)crd_block.size < mirrored_size)
+            fatal("The CellRenderData uniform block is %d bytes but the C struct mirroring it is %zu bytes", crd_block.size, mirrored_size);
+    }
     UniformBlockShadow *shadow = uniform_block_shadow_for_vao(vao_idx);
     struct GPUCellRenderData computed;
     // Seed from the shadow (last value actually written to the GPU buffer) so
-    // fields not assigned on every path below -- main_cursor_fg/main_cursor_bg
-    // when the cursor is not visible -- carry forward their previous value
-    // exactly as the mapped GPU buffer used to preserve them across an orphan
-    // (Metal) or invalidate-range remap (GL). A never-written slot starts zeroed.
+    // a field left unassigned on some path below carries forward its previous
+    // value exactly as the mapped GPU buffer used to preserve it across an
+    // orphan (Metal) or invalidate-range remap (GL). A never-written slot
+    // starts zeroed.
     if (shadow && shadow->valid) computed = shadow->data; else memset(&computed, 0, sizeof(computed));
     struct GPUCellRenderData *rd = &computed;
 #define COLOR(name) colorprofile_to_color(cp, cp->overridden.name, cp->configured.name).rgb
+    // The shaders need these only in linear space, they are converted and
+    // written into rd just before the buffer is unmapped. The cursor colors
+    // are left as is when there is no cursor to render.
+    const color_type highlight_fg = COLOR(highlight_fg), highlight_bg = COLOR(highlight_bg);
+    color_type main_cursor_fg = 0, main_cursor_bg = 0;
     rd->default_fg = COLOR(default_fg);
-    rd->highlight_fg = COLOR(highlight_fg);
-    rd->highlight_bg = COLOR(highlight_bg);
     rd->extra_cursor_fg = screen->extra_cursors.color.text.val;
     rd->extra_cursor_bg = screen->extra_cursors.color.cursor.val;
+    rd->main_cursor_is_special = IS_SPECIAL_COLOR(cursor_color);
     rd->bg_colors0 = COLOR(default_bg);
     rd->bg_opacities0 = bg_alpha;
     rd->fg_override_threshold = OPT(text_fg_override_threshold);
@@ -1186,26 +1261,24 @@ cell_update_uniform_block(ssize_t vao_idx, Screen *screen, int uniform_buffer, i
             }
         }
         // If you change the following algorithm remember to change it in the cell shader for extra cursors too
-        if (IS_SPECIAL_COLOR(cursor_color)) {
-            if (line_for_cursor) pick_cursor_color(cell_fg, cell_bg, &rd->main_cursor_fg, &rd->main_cursor_bg, rd->default_fg, rd->bg_colors0);
-            else {
-                rd->main_cursor_fg = rd->bg_colors0;
-                rd->main_cursor_bg = rd->default_fg;
-            }
-            if (cell_bg == cell_fg) {
-                rd->main_cursor_fg = rd->bg_colors0;
-                rd->main_cursor_bg = rd->default_fg;
+        if (rd->main_cursor_is_special) {
+            if (line_for_cursor && line_for_cursor->gpu_cells[cell_color_x].attrs.dim) {
+                cell_fg = dimmed_cursor_color(cell_fg, cell_bg, OPT(dim_opacity));
+                pick_cursor_color(cell_fg, cell_bg, &main_cursor_fg, &main_cursor_bg, rd->default_fg, rd->bg_colors0);
+            } else if (cell_bg == cell_fg) {
+                main_cursor_fg = rd->bg_colors0;
+                main_cursor_bg = rd->default_fg;
             } else {
-                rd->main_cursor_fg = cell_bg;
-                rd->main_cursor_bg = cell_fg;
+                main_cursor_fg = cell_bg;
+                main_cursor_bg = cell_fg;
             }
         } else {
-            rd->main_cursor_bg = COLOR(cursor_color);
-            if (IS_SPECIAL_COLOR(cursor_text_color)) rd->main_cursor_fg = cell_bg;
-            else rd->main_cursor_fg = COLOR(cursor_text_color);
+            main_cursor_bg = COLOR(cursor_color);
+            if (IS_SPECIAL_COLOR(cursor_text_color)) main_cursor_fg = cell_bg;
+            else main_cursor_fg = COLOR(cursor_text_color);
         }
         // store last rendered cursor color for trail rendering
-        screen->last_rendered.cursor_bg = rd->main_cursor_bg;
+        screen->last_rendered.cursor_bg = main_cursor_bg;
         if (!cursor->is_visible) {
             // Move the main cursor off screen so that only it is hidden, the
             // extra cursors keep their shape and colors.
@@ -1242,8 +1315,16 @@ cell_update_uniform_block(ssize_t vao_idx, Screen *screen, int uniform_buffer, i
     rd->dim_opacity = OPT(dim_opacity);
 
 #undef COLOR
-    rd->url_color = OPT(url_color);
     rd->url_style = OPT(url_style);
+    linear_color_vec4(rd->default_fg_lin, rd->default_fg);
+    linear_color_vec4(rd->default_bg_lin, rd->bg_colors0);
+    linear_color_vec4(rd->highlight_fg_lin, highlight_fg);
+    linear_color_vec4(rd->highlight_bg_lin, highlight_bg);
+    linear_color_vec4(rd->main_cursor_fg_lin, main_cursor_fg);
+    linear_color_vec4(rd->main_cursor_bg_lin, main_cursor_bg);
+    linear_color_vec4(rd->url_color_lin, OPT(url_color));
+    linear_color_vec4(rd->extra_cursor_fg_lin, dynamic_color_for_gpu(cp, rd->extra_cursor_fg));
+    linear_color_vec4(rd->extra_cursor_bg_lin, dynamic_color_for_gpu(cp, rd->extra_cursor_bg));
     color_type default_bg = rd->bg_colors0;
     // D4: only publish to the GPU buffer when the computed data actually
     // differs from what is already resident there. Any doubt writes: a missing
@@ -1251,11 +1332,12 @@ cell_update_uniform_block(ssize_t vao_idx, Screen *screen, int uniform_buffer, i
     // "force everything" signal already used for the color table above) all
     // force the write, matching cp->dirty's precedent.
     if (!shadow || !shadow->valid || screen->reload_all_gpu_data || memcmp(&shadow->data, &computed, sizeof(computed)) != 0) {
-        struct GPUCellRenderData *gpu = (struct GPUCellRenderData*)map_vao_buffer_for_write_only(vao_idx, uniform_buffer, 0, program_uniform_block(CELL_PROGRAM, "CellRenderData").size);
+        void *gpu = map_vao_buffer_for_write_only(vao_idx, uniform_buffer, 0, crd_block.size);
         if (gpu) {
-            *gpu = computed;
+            // The GL arm's block has no F1 tail, so it is smaller than the struct.
+            memcpy(gpu, &computed, MIN((size_t)crd_block.size, sizeof(computed)));
             unmap_vao_buffer(vao_idx, uniform_buffer);
-            D2_NOTE_BYTES(program_uniform_block(CELL_PROGRAM, "CellRenderData").size);
+            D2_NOTE_BYTES(crd_block.size);
         }
         if (shadow) { shadow->data = computed; shadow->valid = true; }
     }
@@ -1487,6 +1569,13 @@ set_cell_uniforms(bool force) {
             bind_program(i);
             glUniform1i(program_uniform_location(i, "image"), GRAPHICS_UNIT);
         }
+        // These are set for every cell program, but the background program draws no
+        // text and so does not have them.
+#define set_optional(setter, name, value)                  \
+    {                                                      \
+        GLint loc = try_program_uniform_location(i, name); \
+        if (loc >= 0) setter(loc, value);                  \
+    }
         for (int i = CELL_PROGRAM; i < CELL_PROGRAM_SENTINEL; i++) {
 #ifdef KITTY_BACKEND_METAL
             // The Metal cell shader is the fork's hand-written MSL and keeps the
@@ -1501,12 +1590,13 @@ set_cell_uniforms(bool force) {
             glUniform1f(program_uniform_location(i, "text_gamma_adjustment"), text_gamma_adjustment);
 #else
             bind_program(i);
-            glUniform1i(program_uniform_location(i, "sprites"), SPRITE_MAP_UNIT);
-            glUniform1i(program_uniform_location(i, "sprite_decorations_map"), SPRITE_DECORATIONS_MAP_UNIT);
-            glUniform1f(program_uniform_location(i, "text_contrast"), text_contrast);
-            glUniform1f(program_uniform_location(i, "text_gamma_adjustment"), text_gamma_adjustment);
+            set_optional(glUniform1i, "sprites", SPRITE_MAP_UNIT);
+            set_optional(glUniform1i, "sprite_decorations_map", SPRITE_DECORATIONS_MAP_UNIT);
+            set_optional(glUniform1f, "text_contrast", text_contrast);
+            set_optional(glUniform1f, "text_gamma_adjustment", text_gamma_adjustment);
 #endif
         }
+#undef set_optional
         bind_program(BLIT_PROGRAM);
         glUniform1i(program_uniform_location(BLIT_PROGRAM, "image"), GRAPHICS_UNIT);
         bind_program(SCREENSHOT_PROGRAM);
@@ -2219,7 +2309,7 @@ configure_padding_vao_attributes(ssize_t vao_idx) {
 #endif
 
 static void
-draw_window_padding(const UIRenderData *ui, Window *window, ssize_t vao_idx, bool for_final_output) {
+draw_window_padding(const UIRenderData *ui, unsigned int cl, unsigned int ct, unsigned int cr, unsigned int cb, ssize_t vao_idx, bool for_final_output) {
     // Color the compensatory padding strips (the innermost slice of the window
     // padding, arising from the window size not being an exact multiple of the
     // cell size) to match their neighboring cell. The strips lie outside the
@@ -2236,10 +2326,7 @@ draw_window_padding(const UIRenderData *ui, Window *window, ssize_t vao_idx, boo
     // rows, a CPU gather for columns), while the Metal arm's padding_fork.slang
     // fetches the live cell/selection streams by grid index in the vertex, so
     // the packing (and the attribute repointing around it) is GL-only.
-    if (!window || OPT(padding_fill_strategy) != PADDING_FILL_NEIGHBORING_CELL) return;
-    const unsigned int cl = window->size_mismatch_padding.left, ct = window->size_mismatch_padding.top, cr = window->size_mismatch_padding.right,
-                       cb = window->size_mismatch_padding.bottom;
-    if (!(cl | ct | cr | cb)) return;
+    if (OPT(padding_fill_strategy) != PADDING_FILL_NEIGHBORING_CELL || !(cl | ct | cr | cb)) return;
     Screen *screen = ui->screen;
     const unsigned int columns = screen->columns, lines = screen->lines;
     if (!columns || !lines) return;
@@ -2465,7 +2552,15 @@ send_cell_data_to_gpu(ssize_t vao_idx, Screen *screen, OSWindow *os_window) {
 }
 
 void
-draw_cells(const WindowRenderData *srd, OSWindow *os_window, bool is_active_window, bool is_tab_bar, bool is_single_window, Window *window, monotonic_t now) {
+draw_cells(
+    const WindowRenderData *srd,
+    OSWindow *os_window,
+    bool is_active_window,
+    bool is_tab_bar,
+    bool is_single_window,
+    Window *window,
+    const Window *title_bar_of,
+    monotonic_t now) {
     Screen *screen = srd->screen;
     CELL_BUFFERS;
     bind_vertex_array(srd->vao_idx);
@@ -2516,7 +2611,22 @@ draw_cells(const WindowRenderData *srd, OSWindow *os_window, bool is_active_wind
     restore_viewport();
     // The compensatory padding lies outside the per-window cell viewport, so it
     // is drawn after restoring the full framebuffer viewport.
-    draw_window_padding(&ui, window, srd->vao_idx, !ui.os_window->needs_layers);
+    if (window) {
+        draw_window_padding(
+            &ui,
+            window->size_mismatch_padding.left,
+            window->size_mismatch_padding.top,
+            window->size_mismatch_padding.right,
+            window->size_mismatch_padding.bottom,
+            srd->vao_idx,
+            !ui.os_window->needs_layers);
+    } else if (title_bar_of) {
+        // The left and right compensatory padding of a window extends alongside
+        // its title bar. The layout ensures there is no compensatory padding
+        // between the title bar and the window border.
+        draw_window_padding(
+            &ui, title_bar_of->size_mismatch_padding.left, 0, title_bar_of->size_mismatch_padding.right, 0, srd->vao_idx, !ui.os_window->needs_layers);
+    }
 }
 // }}}
 
@@ -2944,10 +3054,15 @@ struct GPUCustomEndData {
     float central_area[4];
     float cursor_trail_corners_x[4];
     float cursor_trail_corners_y[4];
+    float cursor_trail_prev_corners_x[4];
+    float cursor_trail_prev_corners_y[4];
     float cursor_trail_edge[4];
     float cursor_trail_prev_edge[4];
     float cursor_color[4];
     float cursor_trail_color[4];
+    float cursor_trail_history_from[CURSOR_TRAIL_HISTORY_SIZE][4];
+    float cursor_trail_history_to[CURSOR_TRAIL_HISTORY_SIZE][4];
+    float cursor_trail_history_time[CURSOR_TRAIL_HISTORY_SIZE / 4][4];
     uint32_t viewport_size_pixels[2];
     float mouse_pointer_hidden;
     float cursor_trail_state;
@@ -2964,8 +3079,19 @@ struct GPUCustomEndData {
 static void
 run_custom_end_shader(OSWindow *os_window, float sx, float sy, monotonic_t now) {
     bind_program(CUSTOM_END_PROGRAM);
-    struct GPUCustomEndData *d = (struct GPUCustomEndData *)map_vao_buffer_for_write_only(
-        custom_end_vao_idx, 0, 0, program_uniform_block(CUSTOM_END_PROGRAM, "KittyCustomShaderData").size);
+    // GPUCustomEndData is a hand written mirror of the std140 layout of
+    // KittyCustomShaderData in types.slang, so check that they match once.
+    const UniformBlock data_block = program_uniform_block(CUSTOM_END_PROGRAM, "KittyCustomShaderData");
+    static bool data_block_size_checked = false;
+    if (!data_block_size_checked) {
+        data_block_size_checked = true;
+        if ((size_t)data_block.size < sizeof(struct GPUCustomEndData))
+            fatal(
+                "The KittyCustomShaderData uniform block is %d bytes but the C struct mirroring it is %zu bytes",
+                data_block.size,
+                sizeof(struct GPUCustomEndData));
+    }
+    struct GPUCustomEndData *d = (struct GPUCustomEndData *)map_vao_buffer_for_write_only(custom_end_vao_idx, 0, 0, data_block.size);
     memset(d, 0, sizeof(struct GPUCustomEndData));
     d->src_rect[1] = sy;
     d->src_rect[2] = sx;
@@ -2993,10 +3119,23 @@ run_custom_end_shader(OSWindow *os_window, float sx, float sy, monotonic_t now) 
             active_win_geom = w->render_data.geometry;
             if (os_window->viewport_width && os_window->viewport_height) {
                 const float width = (float)os_window->viewport_width, height = (float)os_window->viewport_height;
-                d->active_window_padding[0] = (float)(w->padding.left + w->size_mismatch_padding.left) / width;
-                d->active_window_padding[1] = (float)(w->padding.bottom + w->size_mismatch_padding.bottom) / height;
-                d->active_window_padding[2] = (float)(w->padding.right + w->size_mismatch_padding.right) / width;
-                d->active_window_padding[3] = (float)(w->padding.top + w->size_mismatch_padding.top) / height;
+                // spaces is all the space the layout reserved around the window:
+                // margin, border (only if the layout reserves it), padding and
+                // cell-size compensation.
+                const WindowGeometry *sg = &w->render_data.geometry;
+                d->active_window_padding[0] = (float)sg->spaces.left / width;
+                d->active_window_padding[1] = (float)sg->spaces.bottom / height;
+                d->active_window_padding[2] = (float)sg->spaces.right / width;
+                d->active_window_padding[3] = (float)sg->spaces.top / height;
+                // The content geometry excludes the title bar. Include it before
+                // extending to the outer padding, so the effect boundary cannot
+                // cut through a title bar at either edge of the window.
+                const WindowRenderData *trd = &w->window_title_render_data;
+                if (trd->screen && trd->geometry.right > trd->geometry.left && trd->geometry.bottom > trd->geometry.top) {
+                    if (trd->geometry.top < active_win_geom.top) d->active_window_padding[3] += (float)(active_win_geom.top - trd->geometry.top) / height;
+                    if (trd->geometry.bottom > active_win_geom.bottom)
+                        d->active_window_padding[1] += (float)(trd->geometry.bottom - active_win_geom.bottom) / height;
+                }
             }
             Screen *s = w->render_data.screen;
             if (s) {
@@ -3008,17 +3147,31 @@ run_custom_end_shader(OSWindow *os_window, float sx, float sy, monotonic_t now) 
     }
     FILL_COLOR(d->active_window_background, active_bg);
 #undef FILL_COLOR
+#define NDC_TO_UV(v) (((v) + 1.0f) * 0.5f)
     {
         CursorTrail *ct = NULL;
         if (OPT(cursor_trail) && os_window->num_tabs > 0) {
             CursorTrail *candidate = &os_window->tabs[os_window->active_tab].cursor_trail;
             if (candidate->needs_render) ct = candidate;
+            // The history outlives the trail so that effects started by a move can finish
+            for (int i = 0; i < CURSOR_TRAIL_HISTORY_SIZE; i++) {
+                const CursorMove *m = candidate->history + i;
+                if (!m->at) break;
+                for (int k = 0; k < 2; k++) {
+                    d->cursor_trail_history_from[i][k] = NDC_TO_UV(m->from_x[k]);
+                    d->cursor_trail_history_from[i][k + 2] = NDC_TO_UV(m->from_y[k]);
+                    d->cursor_trail_history_to[i][k] = NDC_TO_UV(m->to_x[k]);
+                    d->cursor_trail_history_to[i][k + 2] = NDC_TO_UV(m->to_y[k]);
+                }
+                d->cursor_trail_history_time[i / 4][i % 4] = ((float)monotonic_t_to_ms(m->at)) / 1e3f;
+            }
         }
         if (ct) {
-#define NDC_TO_UV(v) (((v) + 1.0f) * 0.5f)
             for (int i = 0; i < 4; i++) {
                 d->cursor_trail_corners_x[i] = NDC_TO_UV(ct->corner_x[i]);
                 d->cursor_trail_corners_y[i] = NDC_TO_UV(ct->corner_y[i]);
+                d->cursor_trail_prev_corners_x[i] = NDC_TO_UV(ct->previous_corner_x[i]);
+                d->cursor_trail_prev_corners_y[i] = NDC_TO_UV(ct->previous_corner_y[i]);
             }
             d->cursor_trail_edge[0] = NDC_TO_UV(ct->cursor_edge_x[0]); // left
             d->cursor_trail_edge[1] = NDC_TO_UV(ct->cursor_edge_x[1]); // right
@@ -3030,12 +3183,12 @@ run_custom_end_shader(OSWindow *os_window, float sx, float sy, monotonic_t now) 
                 d->cursor_trail_prev_edge[2] = NDC_TO_UV(ct->prev_cursor_edge_y[0]); // top
                 d->cursor_trail_prev_edge[3] = NDC_TO_UV(ct->prev_cursor_edge_y[1]); // bottom
             }
-#undef NDC_TO_UV
             d->cursor_trail_color[3] = ct->opacity;
             d->cursor_trail_state = 1.0f;
             d->cursor_trail_change_time = ((float)monotonic_t_to_ms(ct->cursor_changed_at)) / 1e3f;
         }
     }
+#undef NDC_TO_UV
 #define FILL_COLOR3(dst, c)                        \
     do {                                           \
         (dst)[0] = srgb_color(((c) >> 16) & 0xFF); \
@@ -3108,10 +3261,12 @@ run_custom_end_shader(OSWindow *os_window, float sx, float sy, monotonic_t now) 
     unmap_vao_buffer(custom_end_vao_idx, 0);
     bind_vao_uniform_buffer(custom_end_vao_idx, 0, CUSTOM_END_DATA_BINDING_POINT);
 
-    GLint group_loc = program_uniform_location(CUSTOM_END_PROGRAM, "group");
-    GLint viewport_loc = program_uniform_location(CUSTOM_END_PROGRAM, "viewport");
-    GLint anim_progress_loc = program_uniform_location(CUSTOM_END_PROGRAM, "animation_progress");
-    GLint convert_to_srgb_loc = program_uniform_location(CUSTOM_END_PROGRAM, "convert_to_srgb");
+    // A custom shader need not reference any of these, in which case the driver
+    // drops them and glUniform*() on the resulting -1 location is a no-op.
+    GLint group_loc = try_program_uniform_location(CUSTOM_END_PROGRAM, "group");
+    GLint viewport_loc = try_program_uniform_location(CUSTOM_END_PROGRAM, "viewport");
+    GLint anim_progress_loc = try_program_uniform_location(CUSTOM_END_PROGRAM, "animation_progress");
+    GLint convert_to_srgb_loc = try_program_uniform_location(CUSTOM_END_PROGRAM, "convert_to_srgb");
     const unsigned num_groups = (unsigned)custom_shaders.end.num_groups;
     const unsigned textures_mask = custom_shaders.end.textures;
     const int vw = os_window->viewport_width, vh = os_window->viewport_height;

@@ -3189,6 +3189,13 @@ _glfwPlatformShowWindow(_GLFWwindow *window, bool move_to_active_screen) {
     }
     if (is_background) {
         [nw orderBack:nil];
+    } else if (!window->ns.layer_shell.is_active) {
+        // Normal windows are left on whatever space the window server has
+        // assigned them. In particular, touching the collection behavior or
+        // the space assignment of such a window discards any assignment the
+        // user has made via the Dock icon's Options->Assign To menu.
+        // See https://github.com/kovidgoyal/kitty/issues/10581
+        [nw orderFront:nil];
     } else {
         // Cocoa has a bug where when showing a hidden window after
         // fullscreening an application, the window does not get added
@@ -4406,9 +4413,12 @@ glfwCocoaSetWindowChrome(
 #endif
         NSColor *window_background = [NSColor windowBackgroundColor];
         if (background_opacity < 1.0) {
-            // use a clear color (fully transparent) so that the final color is just the color from the surface.
-            // prevent blurring of shadows at window corners with desktop background by setting a low alpha background
-            window_background = background_blur > 0 ? [NSColor colorWithWhite:0 alpha:0.001f] : [NSColor clearColor];
+            // Use an almost fully transparent color so that the final color is effectively just the color from
+            // the surface. An actual clear color cannot be used because:
+            // 1) macOS special cases a clear window background by not drawing the system titlebar background
+            //    either, making the titlebar fully transparent. See https://github.com/kovidgoyal/kitty/issues/10540
+            // 2) it causes blurring of shadows at window corners with the desktop background
+            window_background = [NSColor colorWithWhite:0 alpha:0.001f];
         }
         NSAppearance *appearance = nil;
 #define tc window->ns.last_applied_titlebar_settings.color
