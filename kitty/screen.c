@@ -2592,10 +2592,6 @@ screen_tab(Screen *self) {
                 }
                 cpu_cell->ch_or_idx = idx;
                 cpu_cell->ch_is_idx = true;
-                self->lc->count = 2;
-                self->lc->chars[0] = '\t';
-                self->lc->chars[1] = diff;
-                cell_set_chars(cpu_cell, self->text_cache, self->lc);
                 // Wave-24 D0: space-fill is a content write (former W21
                 // no-bump exception).
                 linebuf_gen_bump(self->linebuf, lb_phys(self->linebuf, self->cursor->y));

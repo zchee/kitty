@@ -383,17 +383,30 @@ class Rendering(FontBaseTest):
         self.ae(test_sprite_position_increment(), (1, 0, 2))
 
     def test_sprite_map_ynum_growth(self):
-        sprite_map_set_limits(10, 3)
-        sprite_map_set_layout(1, 1)
-        self.ae(test_sprite_tracker_ynum(), 1)
-        seen = [1]
-        for i in range(10 * 5 * 2 + 3):
-            self.ae(test_sprite_position_increment(), (i % 10, (i // 10) % 5, i // 50))
-            ynum = test_sprite_tracker_ynum()
-            self.assertLessEqual(ynum, 5)
-            if ynum != seen[-1]:
-                seen.append(ynum)
-        self.ae(seen, [1, 2, 4, 5])
+        # The atlas starts with room for about INITIAL_SPRITE_ATLAS_CAPACITY
+        # sprites and grows by max(8, ynum / 2) rows, capped at max_y, which is
+        # max_texture_size // (cell_height + 1).
+        def run(limits, layout, count, max_y, expected_rows):
+            sprite_map_set_limits(*limits)
+            sprite_map_set_layout(*layout)
+            xnum = limits[0] // layout[0]
+            seen = [test_sprite_tracker_ynum()]
+            for i in range(count):
+                pos = test_sprite_position_increment()
+                self.ae(pos, (i % xnum, (i // xnum) % max_y, i // (xnum * max_y)))
+                ynum = test_sprite_tracker_ynum()
+                self.assertLessEqual(ynum, max_y)
+                self.assertGreater(ynum, pos[1], f'row {pos[1]} handed out beyond ynum {ynum}')
+                self.assertGreaterEqual(ynum, seen[-1], 'ynum shrank')
+                if ynum != seen[-1]:
+                    seen.append(ynum)
+            self.ae(seen, expected_rows)
+
+        # a tiny texture: the initial allocation is already clamped to max_y
+        run((10, 3), (1, 1), 10 * 5 * 2 + 3, 5, [5])
+        # 10 sprites per row, 4096 initial sprites -> 410 rows, then one chunk
+        # of 205 rows that the 500 row cap cuts short
+        run((1000, 3), (100, 1), 10 * 500 + 3, 500, [410, 500])
 
     def test_box_drawing(self):
         s = self.create_screen(cols=len(box_chars) + 1, lines=1, scrollback=0)
