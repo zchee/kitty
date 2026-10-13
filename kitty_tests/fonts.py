@@ -18,6 +18,7 @@ from kitty.fast_data_types import (
     Screen,
     current_fonts,
     get_fallback_font,
+    render_decoration,
     set_allow_use_of_box_fonts,
     set_ligature_name_cache_enabled,
     sprite_idx_to_pos,
@@ -26,6 +27,7 @@ from kitty.fast_data_types import (
     test_render_line,
     test_shape,
     test_sprite_position_increment,
+    test_sprite_tracker_ynum,
     wcwidth,
 )
 from kitty.fonts import family_name_to_key
@@ -183,6 +185,23 @@ class Selection(BaseTest):
             self.ae(face_from_descriptor(ff['medium']).applied_features(), {'dlig': 'dlig', 'test': 'test=3'})
             self.ae(face_from_descriptor(ff['bold']).applied_features(), {'dlig': 'dlig', 'test': 'test=3'})
 
+    def test_invalid_font_feature(self):
+        with self.assertRaises(ValueError) as cm:
+            ParsedFontFeature('!!bad!!')
+        self.assertIn('!!bad!!', str(cm.exception))
+
+    def test_render_decoration(self):
+        w, h = 10, 20
+        for which in ('curl', 'dashed', 'dotted', 'double', 'straight', 'strikethrough'):
+            data = render_decoration(which, w, h, 15, 2)
+            self.assertIsInstance(data, bytes)
+            self.ae(len(data), w * h)
+            # Strikethrough metrics default to zero
+            if which != 'strikethrough':
+                self.assertTrue(any(data), f'{which} decoration is empty')
+        with self.assertRaises(KeyError):
+            render_decoration('nonexistent', w, h, 15, 2)
+
     def test_synthetic_italic_matrix(self):
         # A roman-only font that find_best_match finds (e.g. Fira Code, which ships
         # no italic face) must get fontconfig's synthetic-italic FC_MATRIX
@@ -332,6 +351,23 @@ class FontBaseTest(BaseTest):
 
 
 class Rendering(FontBaseTest):
+    def test_decorations_map_growth(self):
+        from kitty.fast_data_types import decorations_map_new_size as size
+
+        m = 4096
+        self.ae(size(0, 0, m), (4096, 1))
+        self.ae(size(5000, 4096, m), (4096, 2))
+        cap, reallocs = 0, 0
+        for count in range(100000):
+            if count >= cap:
+                w, h = size(count, cap, m)
+                cap, reallocs = w * h, reallocs + 1
+        self.assertLess(reallocs, 10)
+        full = m * m
+        self.ae(size(m * (m - 1), m * (m - 1), m), (m, m))
+        self.ae(size(full - 1, full // 2, m), (m, m))
+        self.assertIsNone(size(full, full, m))
+
     def test_sprite_map(self):
         sprite_map_set_limits(10, 3)
         sprite_map_set_layout(5, 4)  # 4 because of underline_exclusion row
@@ -345,6 +381,19 @@ class Rendering(FontBaseTest):
         self.ae(test_sprite_position_increment(), (1, 1, 1))
         self.ae(test_sprite_position_increment(), (0, 0, 2))
         self.ae(test_sprite_position_increment(), (1, 0, 2))
+
+    def test_sprite_map_ynum_growth(self):
+        sprite_map_set_limits(10, 3)
+        sprite_map_set_layout(1, 1)
+        self.ae(test_sprite_tracker_ynum(), 1)
+        seen = [1]
+        for i in range(10 * 5 * 2 + 3):
+            self.ae(test_sprite_position_increment(), (i % 10, (i // 10) % 5, i // 50))
+            ynum = test_sprite_tracker_ynum()
+            self.assertLessEqual(ynum, 5)
+            if ynum != seen[-1]:
+                seen.append(ynum)
+        self.ae(seen, [1, 2, 4, 5])
 
     def test_box_drawing(self):
         s = self.create_screen(cols=len(box_chars) + 1, lines=1, scrollback=0)
@@ -820,6 +869,18 @@ class Rendering(FontBaseTest):
             break
         else:
             self.skipTest('No font on this system has a fallback font for any of the tested codepoints')
+
+    def test_private_use_fallback_font_ignores_style(self):
+        # private use codepoints such as Nerd Font icons must use the same
+        # fallback font in every style, rather than whatever unrelated bold or
+        # italic font happens to cover the codepoint
+        for text in '\uf00c\uf071\uf110\ue654':
+            try:
+                regular = get_fallback_font(text, False, False)
+            except ValueError:
+                continue
+            for bold, italic in ((True, False), (False, True), (True, True)):
+                self.ae(get_fallback_font(text, bold, italic).postscript_name(), regular.postscript_name(), f'{text!r} {bold=} {italic=}')
 
     @unittest.skipIf(is_macos, 'fontconfig is not used on macOS')
     def test_fallback_font_matching(self):

@@ -102,6 +102,7 @@ from .fast_data_types import (
     global_font_size,
     grab_keyboard,
     is_layer_shell_supported,
+    is_modifier_key,
     last_focused_os_window_id,
     load_png_data,
     macos_cycle_through_os_windows,
@@ -142,7 +143,7 @@ from .keys import Mappings
 from .layout.base import set_layout_options
 from .notifications import NotificationManager
 from .options.types import Options, nullable_colors
-from .options.utils import KeyboardMode, KeyDefinition, clamp_font_size
+from .options.utils import KeyboardMode, KeyDefinition, MapType, clamp_font_size
 from .os_window_size import initial_window_size_func
 from .session import (
     Session,
@@ -1074,7 +1075,7 @@ class Boss:
             if data['args'][0] == 'panel':
                 from kittens.panel.main import handle_single_instance_command
 
-                handle_single_instance_command(self, data['args'], data['environ'], data.get('notify_on_os_window_death', ''))
+                handle_single_instance_command(self, data['args'], data['environ'], data.get('notify_on_os_window_death', ''), data.get('cwd', ''))
                 return None
             from .cli_stub import CLIOptions
 
@@ -1907,6 +1908,9 @@ class Boss:
         self.mappings.push_keyboard_mode(new_mode)
 
     def dispatch_possible_special_key(self, ev: KeyEvent) -> bool:
+        if (w := self.active_window) is not None and w.program_status and not is_modifier_key(ev.key):
+            # the user pressing a key in the window means they have seen its finished or failed programs
+            w.program_status_seen_by_user()
         return self.mappings.dispatch_possible_special_key(ev)
 
     def on_shortcut_key_release(self, ev: KeyEvent) -> bool:
@@ -2049,14 +2053,14 @@ class Boss:
         if overlay_window is not None:
             overlay_window.allow_remote_control = True
 
-    def resize_layout_window(self, window: Window, increment: float, is_horizontal: bool, reset: bool = False) -> bool | None | str:
+    def resize_layout_window(self, window: Window, increment: float, is_horizontal: bool, reset: bool = False, fraction: float = 0) -> bool | None | str:
         tab = window.tabref()
         if tab is None or not increment:
             return False
         if reset:
             tab.reset_window_sizes()
             return None
-        return tab.resize_window_by(window.id, increment, is_horizontal)
+        return tab.resize_window_by(window.id, increment, is_horizontal, fraction)
 
     def resize_os_window(self, os_window_id: int, width: int, height: int, unit: str, incremental: bool = False, metrics: 'None | OSWindowSize' = None) -> None:
         if not incremental and (width < 0 or height < 0):
@@ -2149,7 +2153,7 @@ class Boss:
         consumed = False
         if action_definition:
             try:
-                actions = get_options().alias_map.resolve_aliases(action_definition, 'map' if dispatch_type == 'KeyPress' else 'mouse_map')
+                actions = get_options().alias_map.resolve_aliases(action_definition, MapType.MAP if dispatch_type == 'KeyPress' else MapType.MOUSE_MAP)
             except Exception as e:
                 self.show_error('Failed to parse action', f'{action_definition}\n{e}')
                 return True
@@ -2635,7 +2639,7 @@ class Boss:
         action_on_removal: Callable[[int, 'Boss'], None] | None = None,
         default_data: dict[str, Any] | None = None,
     ) -> Any:
-        from kittens.runner import CLIOnlyKitten, KittenMetadata, create_kitten_handler
+        from kittens.runner import CLIOnlyKitten, KittenMetadata, create_kitten_handler, resolved_kitten
 
         is_wrapped = kitten in wrapped_kitten_names()
         if window is None:
@@ -2644,6 +2648,21 @@ class Boss:
         else:
             w = window
             tab = w.tabref() if w else None
+        resize_session = None
+        if w is not None and tab is not None and resolved_kitten(kitten) == 'resize_window':
+            group = tab.windows.group_for_window(w)
+            if group is not None:
+                for i, overlay in enumerate(group.windows):
+                    if i and overlay.is_resize_overlay:
+                        # Replace the existing resize UI so that the options for
+                        # this invocation take effect, but keep its snapshot of
+                        # the sizes from when resize mode was first opened.
+                        from .rc.resize_window_edge import resize_window_edge
+
+                        resize_session = resize_window_edge.sessions.pop(overlay, None)
+                        w = group.windows[i - 1]
+                        self.mark_window_for_close(overlay)
+                        break
         args = list(args)
         if w is not None and '@selection' in args and (sel := self.data_for_at(which='@selection', window=w)):
             args = [sel if xa == '@selection' else xa for xa in args]
@@ -2727,6 +2746,14 @@ class Boss:
             wid = w.id
             overlay_window.actions_on_close.append(partial(self.on_kitten_finish, wid, custom_callback or end_kitten.handle_result, default_data=default_data))
             overlay_window.open_url_handler = end_kitten.open_url_handler
+            if resolved_kitten(kitten) == 'resize_window':
+                # The resize kitten sends commands over the overlay's terminal.
+                # Also allow it when launched directly with configurable options.
+                overlay_window.allow_remote_control = True
+                overlay_window.is_resize_overlay = True
+                from .rc.resize_window_edge import resize_window_edge
+
+                resize_window_edge.start_session(overlay_window, tab.current_layout, resize_session)
             if action_on_removal is not None:
 
                 def callback_wrapper(*a: Any) -> None:
@@ -3725,7 +3752,14 @@ class Boss:
         pd = cast(dict[str, Any], payload if isinstance(payload, dict) else {})
         c.response_from_kitty(self, self.window_for_dispatch or self.active_window, PayloadGetter(c, pd))
 
-    def _move_window_to(self, window: Window | None = None, target_tab_id: str | int | None = None, target_os_window_id: str | int | None = None) -> None:
+    def _move_window_to(
+        self,
+        window: Window | None = None,
+        target_tab_id: str | int | None = None,
+        target_os_window_id: str | int | None = None,
+        new_tab_title: str = '',
+        new_tab_location: str = '',
+    ) -> None:
         window = window or self.active_window
         if not window:
             return
@@ -3736,7 +3770,7 @@ class Boss:
             if target_os_window_id == 'new':
                 target_os_window_id = self.add_os_window()
                 tm = self.os_window_map[target_os_window_id]
-                target_tab = tm.new_tab(empty_tab=True)
+                target_tab = tm.new_tab(empty_tab=True, title=new_tab_title)
             else:
                 target_os_window_id = target_os_window_id or current_os_window()
                 if isinstance(target_tab_id, str):
@@ -3748,7 +3782,7 @@ class Boss:
                         tm = self.os_window_map[target_os_window_id]
                     if target_tab_id.startswith('new'):
                         # valid values for target_tab_id are 'new', 'new_after' and 'new_before'
-                        target_tab = tm.new_tab(empty_tab=True, location=(target_tab_id[4:] or 'last'))
+                        target_tab = tm.new_tab(empty_tab=True, location=(new_tab_location or target_tab_id[4:] or 'last'), title=new_tab_title)
                     else:
                         target_tab = tm.tab_at_location(target_tab_id) or tm.new_tab(empty_tab=True)
                 else:
@@ -3926,6 +3960,8 @@ class Boss:
         """,
     )
     def detach_window(self, *args: str) -> None:
+        if args and args[0].startswith('-'):
+            return self.remote_control('detach-window', *args)
         if not args or args[0] == 'new':
             return self._move_window_to(target_os_window_id='new')
         if args[0] in ('new-tab', 'tab-prev', 'tab-left', 'tab-right', 'new-tab-left', 'new-tab-right'):

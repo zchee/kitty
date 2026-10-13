@@ -130,6 +130,10 @@ typedef struct Options {
     // all remapped source bits, used as a fast path.
     int modifier_remap[8];
     int modifier_remap_mask;
+    // Bit i of wheel_mappings[button][grabbed] is set when mouse_map maps the
+    // wheel with the modifiers i, button is 0 for wheel_up, 1 for wheel_down,
+    // 2 for wheel_left and 3 for wheel_right
+    uint64_t wheel_mappings[4][2];
     bool window_alert_on_bell;
     bool macos_dock_badge_on_bell;
     bool debug_keyboard;
@@ -453,6 +457,8 @@ typedef struct CursorTrail {
     bool needs_render;
     bool target_updated;  // set when cursor moves to a new cell; consumed by child-monitor to fire shader events
     bool prev_edge_valid; // true once cursor_edge_* has been set at least once
+    bool window_changed;  // set when the most recent cursor move was into a different window
+    id_type window_id;    // the window whose cursor the trail last followed
     monotonic_t updated_at;
     monotonic_t cursor_changed_at; // time of most recent cursor position change (for custom shaders)
     float opacity;
@@ -513,6 +519,8 @@ typedef struct BackgroundImageRenderSettings {
 } BackgroundImageRenderSettings;
 
 #define MAX_CUSTOM_SHADER_GROUPS 16
+// Passed to the custom shader pipeline as a preprocessor define by slang.py
+#define POINTER_MAP_SIZE 64
 
 // Summary of the custom shader animation state machine, cached once per frame
 // so the renderer can decide whether a new frame is needed without walking the
@@ -649,6 +657,16 @@ typedef struct OSWindow {
     struct {
         double pending_pixels_x, pending_pixels_y;
         int last_v120_dir_x, last_v120_dir_y;
+        // mouse_map wheel state: the partial steps and the window, modifiers
+        // and mouse mode they belong to, and whether the current gesture fired
+        // a mapping, so that its momentum is swallowed. mapped_last_event_at
+        // bounds the gesture in time, as there is no end-of-gesture event for a
+        // classic wheel.
+        double mapped_pending_pixels_x, mapped_pending_pixels_y;
+        id_type mapped_window_id;
+        int mapped_modifiers;
+        monotonic_t mapped_last_event_at;
+        bool mapped_gesture, mapped_grabbed;
     } scroll;
     unsigned shader_anim_event_registry;
     id_type last_bell_window_id; // ID of the most recent window that received a bell event
@@ -657,6 +675,12 @@ typedef struct OSWindow {
         monotonic_t started_at;
     } shader_group_anim[MAX_CUSTOM_SHADER_GROUPS];
     ShaderAnimState shader_anim;
+    struct {
+        // POINTER_MAP_SIZE x POINTER_MAP_SIZE (x, y) pairs, rows from the bottom up, in viewport UV
+        float *data;
+        int viewport_width, viewport_height;
+        unsigned pipeline_generation;
+    } pointer_map;
 } OSWindow;
 
 static inline float
@@ -690,6 +714,8 @@ typedef struct GlobalState {
     int mods_at_last_key_or_button_event;
     CloseRequest quit_request;
     bool redirect_mouse_handling;
+    // Set once an IME composition has been seen, see sync_ime_position_with_cursor()
+    bool ime_used;
     WindowLogoTable *all_window_logos;
     int gl_version;
     bool supports_framebuffer_srgb;
@@ -872,8 +898,10 @@ bool is_os_window_fullscreen(OSWindow *);
 void update_ime_focus(OSWindow *osw, bool focused);
 void update_ime_position(Window *w, Screen *screen);
 bool update_ime_position_for_window(id_type window_id, bool force, int update_focus);
+void update_ime_state_in_os_window(OSWindow *osw, Window *window, int update_focus);
 void set_ignore_os_keyboard_processing(bool enabled);
 void push_modifier_remap_to_glfw(void);
+bool set_wheel_mappings(PyObject *py_opts, Options *opts);
 void update_menu_bar_title(PyObject *title UNUSED);
 void change_live_resize_state(OSWindow*, bool);
 bool render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images, bool input_driven);
@@ -883,11 +911,14 @@ bool promote_thread_qos_if_key_recent(const char *thread_name);  // W28.2 L-C: p
 void update_mouse_pointer_shape(void);
 void adjust_window_size_for_csd(OSWindow *w, int width, int height, int *adjusted_width, int *adjusted_height);
 void dispatch_buffered_keys(Window *w);
+void free_buffered_keys(Window *w);
 bool screen_needs_rendering_in_layers(OSWindow *os_window, Window *w, Screen *screen);
 void setup_os_window_for_rendering(OSWindow *, Tab *, Window *, bool, monotonic_t);
 monotonic_t update_custom_shader_animations(unsigned event_mask, monotonic_t now, OSWindow *os_window);
 void init_shader_animation_state(OSWindow *os_window);
 bool custom_shader_needs_render(const ShaderAnimState *before, const ShaderAnimState *after, unsigned event_mask, monotonic_t now);
+void map_pointer_position(const OSWindow *os_window, double *x, double *y);
+void set_os_window_mouse_position(OSWindow *window, double x, double y);
 void swap_window_buffers(OSWindow *w);
 void take_screenshot_of_rectangular_region(OSWindow *os_window, Region region, unsigned char *dst_buf, unsigned *thumb_w, unsigned *thumb_h, bool no_scaling);
 bool current_framebuffer_is_ok(void);

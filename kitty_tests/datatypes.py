@@ -18,8 +18,10 @@ from kitty.fast_data_types import (
     expand_ansi_c_escapes,
     expanduser,
     get_config_dir,
+    load_png_data,
     makedirs,
     parse_input_from_terminal,
+    png_from_32bit_rgba_data,
     read_file,
     replace_c0_codes_except_nl_space_tab,
     split_into_graphemes,
@@ -65,6 +67,25 @@ def create_lbuf(*lines):
 
 
 class TestDataTypes(BaseTest):
+    def test_cursor_text_blink(self) -> None:
+        cursor = C()
+        buffer = LineBuf(1, 1)
+        line = buffer.line(0)
+        for blink in (True, False):
+            cursor.text_blink = blink
+            line.set_char(0, 'x', 1, cursor)
+            self.ae(cursor.text_blink, blink)
+            self.ae(line.cursor_from(0).text_blink, blink)
+            self.ae(line.as_ansi(), '\x1b[5mx' if blink else 'x')
+
+        class InvalidTruthValue:
+            def __bool__(self) -> bool:
+                raise ValueError('invalid blink setting')
+
+        with self.assertRaisesRegex(ValueError, 'invalid blink setting'):
+            setattr(cursor, 'text_blink', InvalidTruthValue())
+        self.assertFalse(cursor.text_blink)
+
     def test_replace_c0_codes(self):
         def t(x: str, expected: str):
             q = replace_c0_codes_except_nl_space_tab(x)
@@ -76,6 +97,29 @@ class TestDataTypes(BaseTest):
         t('a\0\x01b\x03\x04\t\rc', 'a\u2400\u2401b\u2403\u2404\t\u240dc')
         t('a\0\x01😸\x03\x04\t\rc', 'a\u2400\u2401😸\u2403\u2404\t\u240dc')
         t('a\nb\tc d', 'a\nb\tc d')
+
+    def test_png_from_32bit_rgba_data(self):
+        rgba = bytes(range(16))
+        png = png_from_32bit_rgba_data(rgba, 2, 2)
+        self.assertTrue(png.startswith(b'\x89PNG\r\n\x1a\n'))
+        self.ae(load_png_data(png), (rgba, 2, 2))
+        for args in (
+            (b'', 0, 0),
+            (rgba, 0, 2),
+            (rgba, 2, 0),
+            (rgba[:-1], 2, 2),
+            (rgba + b'\0', 2, 2),
+            (rgba, 4, 4),
+            (rgba, 65537, 65537),
+            (rgba, 2**32 - 1, 2**32 - 1),
+            (rgba, 2**31, 2),
+            (rgba, 2**32 + 2, 2),
+            (rgba, -2, -2),
+        ):
+            with self.assertRaises(ValueError, msg=repr(args[1:])):
+                png_from_32bit_rgba_data(*args)
+        with self.assertRaises(OverflowError):
+            png_from_32bit_rgba_data(rgba, 2, 2**64 + 2)
 
     def test_to_color(self):
         for x in 'xxx #12 #1234 rgb:a/b'.split():
@@ -92,6 +136,11 @@ class TestDataTypes(BaseTest):
         c('rgb:e/e/e # comment', 0xEE, 0xEE, 0xEE)
         c('rgB:23/45/67', 0x23, 0x45, 0x67)
         c('rgb:abc/abc/def', 0xAB, 0xAB, 0xDE)
+        c('rgbi:1/0/0', 255, 0, 0)
+        c('rgbI:0.5/0.5/0.5', 128, 128, 128)
+        c('rgbi:2/-1/0', 255, 0, 0)
+        for x in 'rgbi:1/0 rgbi:x/0/0 rgbi:nan/0/0 rgbii:1/0/0'.split():
+            self.assertIsNone(to_color(x), x)
         c('rEd', 0xFF, 0, 0)
         c('aLice blUe # comment', 240, 248, 255)
         c('oklch(1,0,0)', 255, 255, 255)
@@ -603,8 +652,8 @@ class TestDataTypes(BaseTest):
 
         self.ae(sanitize_title('a\0\01 \t\n\f\rb'), 'a b')
 
-        def tp(*data, leftover='', text='', csi='', apc='', ibp=False):
-            text_r, csi_r, apc_r, rest = [], [], [], []
+        def tp(*data, leftover='', text='', csi='', apc='', osc='', ibp=False):
+            text_r, csi_r, apc_r, osc_r, rest = [], [], [], [], []
             left = ''
             in_bp = ibp
 
@@ -617,14 +666,15 @@ class TestDataTypes(BaseTest):
                 csi_r.append(x)
 
             for d in data:
-                left = parse_input_from_terminal(text_r.append, rest.append, on_csi, rest.append, rest.append, apc_r.append, left + d, in_bp)
+                left = parse_input_from_terminal(text_r.append, rest.append, on_csi, osc_r.append, rest.append, apc_r.append, left + d, in_bp)
             self.ae(left, leftover)
             self.ae(text, ' '.join(text_r))
             self.ae(csi, ' '.join(csi_r))
             self.ae(apc, ' '.join(apc_r))
+            self.ae(osc, ' '.join(osc_r))
             self.assertFalse(rest)
 
-        tp('a\033[200~\033[32mxy\033[201~\033[33ma', text='a \033[32m xy a', csi='200~ 201~ 33m')
+        tp('a\033[200~\033[32mxy\033[201~\033[33ma', text='a \033[32mxy a', csi='200~ 201~ 33m')
         tp('abc', text='abc')
         tp('a\033[38:5:12:32mb', text='a b', csi='38:5:12:32m')
         tp('a\033_x,;(\033\\b', text='a b', apc='x,;(')
@@ -632,6 +682,63 @@ class TestDataTypes(BaseTest):
         tp('a\033[', 'mb', text='a b', csi='m')
         tp('a\033', '_', 'x\033', '\\b', text='a b', apc='x')
         tp('a\033_', 'x', '\033', '\\', 'b', text='a b', apc='x')
+        tp('a\033bc', text='a bc')
+        tp('\033OAx', text='OAx')
+        tp('\033a', text='a')
+        tp('\033\033[Ab', text='b', csi='A')
+        tp('\033', leftover='\033')
+        tp('\033]ab\033xcd\033\\z', text='z', osc='ab\033xcd')
+        tp('\033]ab\033\033\\z', text='z', osc='ab\033')
+        tp('a\033]0;t\007b', text='a b', osc='0;t')
+        tp('a\033]0;t', leftover='\033]0;t', text='a')
+        tp('a\033_x\007y\033\\b', text='a b', apc='x\007y')
+        tp('\033]x\033\007z', text='z', osc='x\033')
+        tp('\033]x\033', '\007z', text='z', osc='x\033')
+        tp('\033]x', '\033', '\007', 'z', text='z', osc='x\033')
+        tp('\033]x\033\007', osc='x\033')
+        tp('\033]0;t\033\\', text='\033]0;t\033\\', ibp=True)
+        tp('\033]0;t\007', text='\033]0;t\007', ibp=True)
+        tp('\033_x\033\\', text='\033_x\033\\', ibp=True)
+        tp('\033[200~a\033]0;t\033[201~b', text='a\033]0;t b', csi='200~ 201~')
+        tp('\033P1\033[201~b', text='\033P1 b', csi='201~', ibp=True)
+        tp('\033^x\033\033[201~', text='\033^x\033', csi='201~', ibp=True)
+        tp('\033_x\033', '[2', '01~b', text='\033_x b', csi='201~', ibp=True)
+        tp('\033]0;t\033[2', '0x\033\\', text='\033]0;t \033[20x\033\\', ibp=True)
+        tp('\033]0;t\033[1m\033\\b', text='\033]0;t\033[1m\033\\b', ibp=True)
+        tp('\033]0;t\033[20', leftover='\033[20', text='\033]0;t', ibp=True)
+        tp('\033]a\033[201~b\033\\', osc='a\033[201~b')
+        tp('\033[200~a\033[1;2\033[201~b', text='a\033[1;2 b', csi='200~ 201~')
+        tp('\033[200~a\033x\033\033[201~b', text='a\033x\033 b', csi='200~ 201~')
+        tp('a\033', leftover='\033', text='a', ibp=True)
+        tp('\033[1', '\033[201~b', text='\033[1 b', csi='201~', ibp=True)
+        import random
+
+        rnd = random.Random(0)
+        whole = 'a\033bc\033OAx\033[1mq\033]0;t\007w\033]1;\033x\033\\e\033_a\033\033\\r\033\033[Ab\033P1\007\033\\z\033]2\033\007y'
+
+        def events(parts):
+            ev, left = [], ''
+            cbs = [lambda x, n=n: ev.append((n, x)) for n in 'tdcopa']
+            for part in parts:
+                left = parse_input_from_terminal(*cbs, left + part, False)
+            ans = []
+            for n, x in ev:
+                if ans and n == 't' and ans[-1][0] == 't':
+                    ans[-1] = ('t', ans[-1][1] + x)
+                else:
+                    ans.append((n, x))
+            return ans, left
+
+        shared = []
+        scb = shared.append
+        self.ae(parse_input_from_terminal(scb, scb, scb, scb, scb, scb, '\033P1\007x\033\\z\033_a\007b\033\\', False), '')
+        self.ae(shared, ['1\007x', 'z', 'a\007b'])
+        expected = events([whole])
+        self.ae(expected[1], '')
+        for _ in range(300):
+            cuts = sorted(rnd.sample(range(1, len(whole)), rnd.randint(1, 6)))
+            parts = [whole[a:b] for a, b in zip([0] + cuts, cuts + [len(whole)])]
+            self.ae(events(parts), expected, parts)
 
         for prefix in ('/tmp', tempfile.gettempdir()):
             for path in ('a.png', 'x/b.jpg', 'y/../c.jpg'):
@@ -801,6 +908,14 @@ class TestDataTypes(BaseTest):
             self.assertEqual(p.wait(timeout=30), 0)
             p.stdout.close()
 
+    def test_historybuf_continued_after_wraparound(self):
+        s = self.create_screen(cols=5, lines=2, scrollback=4)
+        for i in range(7):
+            s.draw(str(i) * 7)
+            s.carriage_return(), s.linefeed()
+        hb = s.historybuf
+        self.ae([hb.is_continued(y) for y in range(hb.count)], [True, False, True, False])
+
     def test_historybuf(self):
         lb = filled_line_buf()
         hb = HistoryBuf(5, 5)
@@ -840,6 +955,7 @@ class TestDataTypes(BaseTest):
 
         hb = filled_history_buf(5, 5)
         hb2 = hb.rewrap(hb.xnum)
+        self.ae((hb.count, hb2.count), (hb.ynum, hb.ynum))
         for i in range(hb.ynum):
             self.ae(hb2.line(i), hb.line(i))
         hb = filled_history_buf(5, 5)

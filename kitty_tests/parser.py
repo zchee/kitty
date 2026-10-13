@@ -1029,6 +1029,15 @@ class TestParser(BaseTest):
         parse_bytes(s, b'\033[?:m\033[31m')
         self.ae(s.cursor.fg, 1 << 8 | 1)  # red (ANSI color 1)
 
+    def test_csi_separator_after_max_params(self):
+        # A ':' or ';' immediately after the last allowed CSI parameter must
+        # not write past the end of is_sub_param
+        s = self.create_screen()
+        pb = partial(self.parse_bytes_dump, s)
+        too_many = ('CSI escape code has too many parameters, ignoring it',)
+        pb('\033[' + '1;' * 255 + '1:2m\033[31m', too_many, ('select_graphic_rendition', '31'))
+        pb('\033[' + '1;' * 256 + 'm\033[31m', ('select_graphic_rendition', ';'.join('1' * 256)), ('select_graphic_rendition', '31'))
+
     def test_csi_code_rep(self):
         s = self.create_screen(8)
         pb = partial(self.parse_bytes_dump, s)
@@ -1123,6 +1132,10 @@ class TestParser(BaseTest):
         pb('\033]52;p;xyz\x07', ('clipboard_control', 52, 'p;xyz'))
         c.clear()
         pb('\033]22;?__current__\x07', ('set_dynamic_color', 22, '?__current__'))
+        c.clear()
+        pb('\033]7501;?\033\\', ('program_status_report', '?'))
+        pb('\033]7501;state=working:progress=40\x07', ('program_status_report', 'state=working:progress=40'))
+        self.ae(c.program_status_reports, ['?', 'state=working:progress=40'])
 
     def test_dcs_codes(self):
         s = self.create_screen()
@@ -1263,3 +1276,16 @@ class TestParser(BaseTest):
             line = s.line(y)
             for x in range(s.columns):
                 self.ae(line.cursor_from(x).fg, (10 << 8 | 1) if x < 1 or x > 2 else (4 << 8) | 1)
+        # out of range or inverted single line regions must not touch anything
+        before = [[s.line(y).cursor_from(x).bold for x in range(s.columns)] for y in range(s.lines)]
+        for seq in ('\033[100;1;100;5;22$r', '\033[99999999;1;99999999;5;22$r', '\033[10;20;10;2;22$r', '\033[3;4;3;2;22$r'):
+            parse_bytes(s, seq.encode())
+            after = [[s.line(y).cursor_from(x).bold for x in range(s.columns)] for y in range(s.lines)]
+            self.ae(before, after, seq)
+
+    def test_cht_large_count(self):
+        s = self.create_screen(cols=80)
+        parse_bytes(s, b'\033[3I')
+        self.ae(s.cursor.x, 24)
+        parse_bytes(s, b'\033[2147483647I')
+        self.ae(s.cursor.x, s.columns - 1)

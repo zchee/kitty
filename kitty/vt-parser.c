@@ -660,6 +660,10 @@ dispatch_osc(PS *self, uint8_t *buf, size_t limit, bool is_extended_osc) {
             START_DISPATCH
             DISPATCH_OSC(osc_context);
             END_DISPATCH
+        case 7501:
+            START_DISPATCH
+            DISPATCH_OSC(program_status_report);
+            END_DISPATCH
         case 7704: REPORT_ERROR("Ignoring OSC 7704, used by mintty for ANSI colors"); break;
         case 7750: REPORT_ERROR("Ignoring OSC 7750, used by mintty for Emoji style"); break;
         case 7770: REPORT_ERROR("Ignoring OSC 7770, used by mintty for font size"); break;
@@ -925,12 +929,12 @@ csi_parse_loop(PS *self, ParsedCSI *csi, const uint8_t *buf, size_t *pos, const 
                         return true;
                     case ':':
                         if (!commit_csi_param(self, csi)) return true;
-                        csi->is_sub_param[csi->num_params] = true;
+                        if (csi->num_params < MAX_CSI_PARAMS) csi->is_sub_param[csi->num_params] = true;
                         break;
                     case ';':
                         if (!csi->num_digits) csi->num_digits++; // Empty means zero
                         if (!commit_csi_param(self, csi)) return true;
-                        csi->is_sub_param[csi->num_params] = false;
+                        if (csi->num_params < MAX_CSI_PARAMS) csi->is_sub_param[csi->num_params] = false;
                         break;
                     case DIGIT:
                         csi_add_digit(csi, ch);
@@ -1132,7 +1136,11 @@ screen_cursor_back1(Screen *s, unsigned int count) {
 }
 static void
 screen_tabn(Screen *s, unsigned int count) {
-    for (index_type i = 0; i < MAX(1u, count); i++) screen_tab(s);
+    for (index_type i = 0; i < MAX(1u, count); i++) {
+        index_type x = s->cursor->x;
+        screen_tab(s);
+        if (s->cursor->x == x) break;
+    }
 }
 
 static const char *

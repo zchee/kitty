@@ -174,6 +174,37 @@ The two structs passed into this function have the definition shown below:
 
 Shaders take their inputs and use them to transform the color as they see fit.
 
+.. _custom_shader_pointer_map:
+
+Shaders that move content
+__________________________
+
+A shader that draws content somewhere other than where kitty put it, such as
+the ``crt`` shader curving the screen, makes the mouse pointer and the text
+under it disagree, so that clicks and selections land on the wrong cells. To
+fix that, the shader can also define a function that tells kitty where the
+content shown at a given position actually is::
+
+    public float2
+    pointer_map(float2 pos, KittyCustomShaderData d) {
+        return warp(pos);  // the same function fragment_main() uses to sample the backbuffer
+    }
+
+``pos`` and the return value are in the same UV co-ordinates as ``t.pos``.
+The function must be ``public`` and return ``float2``. kitty evaluates it on a
+grid only when the pipeline is loaded and when the OS Window is resized, and
+uses it to move all pointer events, so the only field of ``d`` it may use is
+``d.viewport_size_pixels``. Only shaders in groups that draw to the whole
+screen and are always active, that is, without ``animation_start``,
+``attach``, ``output_texture``, ``viewport_pos`` or ``viewport_size``, are
+used, since only they move content permanently. When several shaders define
+it, they are applied starting from the last one to run.
+
+Note that :code:`d.mouse_pos` then contains the mapped position, that is, the
+position of the content under the mouse before it was moved. Effects that draw
+at the mouse position line up with the pointer when they run before the shader
+that moves content, not after it.
+
 .. _custom_shader_pipeline:
 
 The pipeline part

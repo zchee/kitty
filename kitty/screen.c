@@ -97,6 +97,7 @@ init_overlay_line(Screen *self, index_type columns, bool keep_active) {
     self->overlay_line.cursor_x = 0;
     self->overlay_line.last_ime_pos.x = 0;
     self->overlay_line.last_ime_pos.y = 0;
+    self->overlay_line.last_ime_cursor.valid = false;
 
     return true;
 }
@@ -161,6 +162,7 @@ new_screen_object(PyTypeObject *type, PyObject *args, PyObject UNUSED *kwds) {
         reset_vt_parser(self->vt_parser);
         self->callbacks = callbacks;
         Py_INCREF(callbacks);
+        self->track_activity = true;
         self->test_child = test_child;
         Py_INCREF(test_child);
         self->cursor = alloc_cursor();
@@ -301,6 +303,8 @@ typedef struct CursorTrack {
     } temp;
 } CursorTrack;
 
+static bool history_reuse_disabled_for_tests = false;
+
 static bool
 rewrap(
     Screen *screen,
@@ -314,21 +318,8 @@ rewrap(
     bool main_is_active) {
     TrackCursor cursors[3];
     cursors[2].is_sentinel = true;
-    cursors[0] = (TrackCursor){.x = main_saved_cursor->before.x, .y = main_saved_cursor->before.y};
-    if (main_is_active) cursors[1] = (TrackCursor){.x = cursor->before.x, .y = cursor->before.y};
-    else cursors[1].is_sentinel = true;
-    ResizeResult mr = resize_screen_buffers(screen->main_linebuf, screen->historybuf, lines, columns, &screen->as_ansi_buf, cursors);
-    if (!mr.ok) {
-        PyErr_NoMemory();
-        return false;
-    }
-    main_saved_cursor->temp.x = cursors[0].dest_x;
-    main_saved_cursor->temp.y = cursors[0].dest_y;
-    if (main_is_active) {
-        cursor->temp.x = cursors[1].dest_x;
-        cursor->temp.y = cursors[1].dest_y;
-    }
-
+    // alt first as resizing main consumes the history buffer, so it must be
+    // the last step that can fail
     cursors[0] = (TrackCursor){.x = alt_saved_cursor->before.x, .y = alt_saved_cursor->before.y};
     if (!main_is_active) cursors[1] = (TrackCursor){.x = cursor->before.x, .y = cursor->before.y};
     else cursors[1].is_sentinel = true;
@@ -341,6 +332,29 @@ rewrap(
     alt_saved_cursor->temp.x = cursors[0].dest_x;
     alt_saved_cursor->temp.y = cursors[0].dest_y;
     if (!main_is_active) {
+        cursor->temp.x = cursors[1].dest_x;
+        cursor->temp.y = cursors[1].dest_y;
+    }
+
+    cursors[0] = (TrackCursor){.x = main_saved_cursor->before.x, .y = main_saved_cursor->before.y};
+    if (main_is_active) cursors[1] = (TrackCursor){.x = cursor->before.x, .y = cursor->before.y};
+    else cursors[1].is_sentinel = true;
+    ResizeResult mr = resize_screen_buffers(
+        screen->main_linebuf,
+        screen->historybuf,
+        history_reuse_disabled_for_tests ? HISTORY_CONSUME_NO_REUSE : HISTORY_CONSUME,
+        lines,
+        columns,
+        &screen->as_ansi_buf,
+        cursors);
+    if (!mr.ok) {
+        Py_DecRef((PyObject *)ar.lb);
+        PyErr_NoMemory();
+        return false;
+    }
+    main_saved_cursor->temp.x = cursors[0].dest_x;
+    main_saved_cursor->temp.y = cursors[0].dest_y;
+    if (main_is_active) {
         cursor->temp.x = cursors[1].dest_x;
         cursor->temp.y = cursors[1].dest_y;
     }
@@ -432,12 +446,13 @@ index_selection(const Screen *self, Selections *selections, bool up, index_type 
 }
 
 
-#define INDEX_GRAPHICS(amtv)                                                                 \
+#define INDEX_GRAPHICS(amtv, histv)                                                          \
     {                                                                                        \
         if (UNLIKELY(grman_has_any_images(self->grman))) {                                   \
             bool is_main = self->linebuf == self->main_linebuf;                              \
             static ScrollData s;                                                             \
             s.amt = amtv;                                                                    \
+            s.scroll_history = histv;                                                        \
             s.limit = is_main ? -self->historybuf->ynum : 0;                                 \
             s.has_margins = self->margin_top != 0 || self->margin_bottom != self->lines - 1; \
             s.margin_top = top;                                                              \
@@ -447,7 +462,7 @@ index_selection(const Screen *self, Selections *selections, bool up, index_type 
     }
 
 
-#define INDEX_DOWN                                                                                      \
+#define INDEX_DOWN(scroll_history)                                                                      \
     linebuf_reverse_index(self->linebuf, top, bottom);                                                  \
     linebuf_clear_line(self->linebuf, top, true, false);                                                       \
     if (self->linebuf == self->main_linebuf && self->last_visited_prompt.is_set) {                      \
@@ -455,7 +470,7 @@ index_selection(const Screen *self, Selections *selections, bool up, index_type 
         else if (self->last_visited_prompt.y < self->lines - 1) self->last_visited_prompt.y++;          \
         else self->last_visited_prompt.is_set = false;                                                  \
     }                                                                                                   \
-    INDEX_GRAPHICS(1)                                                                                   \
+    INDEX_GRAPHICS(1, scroll_history)                                                                   \
     self->is_dirty = true;                                                                              \
     if (UNLIKELY(self->selections.count)) index_selection(self, &self->selections, false, top, bottom); \
     if (UNLIKELY(self->url_ranges.count || self->url_ranges.in_progress)) clear_selection(&self->url_ranges);
@@ -732,7 +747,7 @@ screen_resize(Screen *self, unsigned int lines, unsigned int columns) {
         Savepoint *sp = is_main ? &self->main_savepoint : &self->alt_savepoint;
         while (self->cursor->y + 1 < self->lines && self->lines - self->cursor->y > lines_after_cursor_before_resize) {
             if (!historybuf_pop_line(self->historybuf, self->alt_linebuf->line)) break;
-            INDEX_DOWN;
+            INDEX_DOWN(true);
             linebuf_copy_line_to(self->main_linebuf, self->alt_linebuf->line, 0);
             self->cursor->y++;
             sp->cursor.y = MIN(sp->cursor.y + 1, self->lines - 1);
@@ -1272,7 +1287,7 @@ draw_combining_char(Screen *self, text_loop_state *s, char_type ch) {
 
 static void
 screen_on_input(Screen *self) {
-    if (!self->has_activity_since_last_focus && !self->has_focus && self->callbacks != Py_None) {
+    if (self->track_activity && !self->has_activity_since_last_focus && !self->has_focus && self->callbacks != Py_None) {
         PyObject *ret = PyObject_CallMethod(self->callbacks, "on_activity_since_last_focus", NULL);
         if (ret == NULL) PyErr_Print();
         else {
@@ -1901,10 +1916,13 @@ select_graphic_rendition(Screen *self, int *params, unsigned int count, bool is_
         } else {
             index_type x, num;
             if (region.top == region.bottom) {
-                linebuf_init_line(self->linebuf, region.top);
-                x = MIN(region.left, self->columns - 1);
-                num = MIN(self->columns - x, region.right - x + 1);
-                apply_sgr_to_cells(self->linebuf->line->gpu_cells + x, num, params, count, is_group);
+                if (region.top < self->lines) {
+                    linebuf_init_line(self->linebuf, region.top);
+                    x = MIN(region.left, self->columns - 1);
+                    num = region.right >= x ? region.right - x + 1 : 0;
+                    num = MIN(self->columns - x, num);
+                    apply_sgr_to_cells(self->linebuf->line->gpu_cells + x, num, params, count, is_group);
+                }
             } else {
                 for (index_type y = region.top; y < MIN(region.bottom + 1, self->lines); y++) {
                     if (y == region.top) {
@@ -2412,12 +2430,15 @@ change_pointer_shape(Screen *self, PyObject *args) {
     if (!PyArg_ParseTuple(args, "ss", &b, &css_name)) return NULL;
     op = b[0];
     uint8_t *count, *stack;
+    size_t stack_sz;
     if (self->main_linebuf == self->linebuf) {
         count = &self->main_pointer_shape_stack.count;
         stack = self->main_pointer_shape_stack.stack;
+        stack_sz = arraysz(self->main_pointer_shape_stack.stack);
     } else {
         count = &self->alternate_pointer_shape_stack.count;
         stack = self->alternate_pointer_shape_stack.stack;
+        stack_sz = arraysz(self->alternate_pointer_shape_stack.stack);
     }
     if (op == '<') {
         if (*count) *count -= 1;
@@ -2510,7 +2531,7 @@ change_pointer_shape(Screen *self, PyObject *args) {
             if (!*count) *count += 1;
             stack[*count - 1] = s;
         } else if (op == '>') {
-            if ((*count + 1u) >= arraysz(self->main_pointer_shape_stack.stack)) { remove_i_from_array(stack, 0, *count); }
+            if (*count >= stack_sz) { remove_i_from_array(stack, 0, *count); }
             *count += 1;
             stack[*count - 1] = s;
         } else {
@@ -2564,7 +2585,8 @@ screen_tab(Screen *self) {
                 else {
                     self->lc->count = 2;
                     self->lc->chars[0] = '\t';
-                    self->lc->chars[1] = diff;
+                    // number of blank cells after the tab cell that the tab covers
+                    self->lc->chars[1] = diff - 1;
                     idx = tc_get_or_insert_chars(self->text_cache, self->lc);
                     if (diff < arraysz(self->tab_cache.idx_plus_1)) self->tab_cache.idx_plus_1[diff] = idx + 1;
                 }
@@ -2703,7 +2725,7 @@ screen_cursor_to_column(Screen *self, unsigned int column) {
 
 #define INDEX_UP(add_to_history) \
     linebuf_index(self->linebuf, top, bottom); \
-    INDEX_GRAPHICS(-1) \
+    INDEX_GRAPHICS(-1, add_to_history) \
     if (add_to_history) { \
         /* Only add to history when no top margin has been set */ \
         historybuf_take_line_from(self->historybuf, self->linebuf, bottom, &self->as_ansi_buf); \
@@ -2767,7 +2789,7 @@ screen_reverse_index(Screen *self) {
     // Move cursor up one line, scrolling screen if needed
     unsigned int top = self->margin_top, bottom = self->margin_bottom;
     if (self->cursor->y == top) {
-        INDEX_DOWN;
+        INDEX_DOWN(false);
     } else screen_cursor_up(self, 1, false, -1);
 }
 
@@ -2783,7 +2805,7 @@ _reverse_scroll(Screen *self, unsigned int count, bool fill_from_scrollback) {
     while (count-- > 0) {
         bool copied = false;
         if (fill_from_scrollback) copied = historybuf_pop_line(self->historybuf, self->alt_linebuf->line);
-        INDEX_DOWN;
+        INDEX_DOWN(copied);
         if (copied) linebuf_copy_line_to(self->main_linebuf, self->alt_linebuf->line, 0);
     }
 }
@@ -3089,7 +3111,7 @@ screen_erase_in_line(Screen *self, unsigned int how, bool private) {
         default: break;
     }
     if (n > 0) {
-        nuke_multicell_char_intersecting_with(self, s, n, self->cursor->y, self->cursor->y + 1, false);
+        nuke_multicell_char_intersecting_with(self, s, s + n, self->cursor->y, self->cursor->y + 1, false);
         screen_dirty_line_graphics(self, self->cursor->y, self->cursor->y, self->linebuf == self->main_linebuf);
         linebuf_init_line(self->linebuf, self->cursor->y);
         if (private) {
@@ -3150,6 +3172,22 @@ screen_move_into_scrollback(Screen *self) {
     }
 }
 
+static void
+nuke_multiline_chars_split_by_erase(Screen *self, unsigned int how, index_type a, index_type b) {
+    // remove chars crossing the erase boundary
+    for (int top = 1; top >= 0; top--) {
+        if (top ? how == 3 : how != 1) continue;
+        CPUCell *cp;
+        GPUCell *gp;
+        index_type y = top ? a : b - 1;
+        linebuf_init_cells(self->linebuf, y, &cp, &gp);
+        for (index_type x = 0; x < self->columns; x++) {
+            if (!cp[x].is_multicell) continue;
+            if (top ? cp[x].y > 0 : cp[x].y + 1 < cp[x].scale) nuke_multicell_char_at(self, x, y, false);
+        }
+    }
+}
+
 void
 screen_erase_in_display(Screen *self, unsigned int how, bool private) {
     /* Erases display in a specific way.
@@ -3168,7 +3206,6 @@ screen_erase_in_display(Screen *self, unsigned int how, bool private) {
         :param bool private: when ``True`` character attributes are left unchanged
     */
     unsigned int a, b;
-    bool nuke_multicell_chars = true;
     switch (how) {
         case 0:
             a = self->cursor->y + 1;
@@ -3180,7 +3217,6 @@ screen_erase_in_display(Screen *self, unsigned int how, bool private) {
             break;
         case 22:
             screen_move_into_scrollback(self);
-            nuke_multicell_chars = false; // they have been moved into scrollback and we would get double deletions
             how = 2;
             /* fallthrough */
         case 2:
@@ -3192,11 +3228,11 @@ screen_erase_in_display(Screen *self, unsigned int how, bool private) {
             grman_clear(self->grman, how == 3, self->cell_size);
             a = 0;
             b = self->lines;
-            nuke_multicell_chars = false;
             break;
         default: return;
     }
     if (b > a) {
+        if (how < 3) nuke_multiline_chars_split_by_erase(self, how, a, b);
         if (how != 3) screen_dirty_line_graphics(self, a, b, self->linebuf == self->main_linebuf);
         if (private) {
             for (unsigned int i = a; i < b; i++) {
@@ -3206,7 +3242,6 @@ screen_erase_in_display(Screen *self, unsigned int how, bool private) {
                 linebuf_clear_attrs_and_dirty(self->linebuf, i);
             }
         } else linebuf_clear_lines(self->linebuf, self->cursor, a, b);
-        if (nuke_multicell_chars) nuke_multicell_char_intersecting_with(self, 0, self->columns, a, b, false);
         self->is_dirty = true;
         if (selection_intersects_screen_lines(&self->selections, a, b)) clear_selection(&self->selections);
         if (selection_intersects_screen_lines(&self->url_ranges, a, b)) clear_selection(&self->url_ranges);
@@ -3742,6 +3777,11 @@ set_title(Screen *self, PyObject *title) {
 void
 osc_context(Screen *self, PyObject *ctx) {
     CALLBACK("osc_context", "O", ctx);
+}
+
+void
+program_status_report(Screen *self, PyObject *data) {
+    CALLBACK("program_status_report", "O", data);
 }
 
 void
@@ -4525,11 +4565,13 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
     if (self->paused_rendering.expires_at) {
         if (!self->paused_rendering.cell_data_updated) {
             LineBuf *linebuf = self->paused_rendering.linebuf;
+            // The GPU buffer was invalidated so every row must be written. Pixel
+            // scrolling is off while paused, so lines == render_lines_for_screen().
             for (index_type y = 0; y < self->lines; y++) {
                 linebuf_init_line(linebuf, y);
                 if (linebuf->line->attrs.has_dirty_text) {
                     render_line(fonts_data, linebuf->line, y, &self->paused_rendering.cursor, self->disable_ligatures, self->lc);
-                    screen_render_line_graphics(self, linebuf->line, y);
+                    // Cell images are not rendered here: this would modify the live grman using snapshot row numbers
                     if (linebuf->line->attrs.has_dirty_text && screen_has_marker(self)) mark_text_in_line(self->marker, linebuf->line, &self->as_ansi_buf);
                     linebuf_mark_line_clean(linebuf, y);
                 }
@@ -5475,6 +5517,14 @@ screen_update_overlay_text(Screen *self, const char *utf8_text) {
     }
 }
 
+index_type
+screen_overlay_line_start(const Screen *self) {
+    // Right-align the overlay to ensure that the pre-edit text just entered is visible when the cursor is near the end of the line.
+    const OverlayLine *ol = &self->overlay_line;
+    index_type xstart = ol->text_len <= self->columns ? self->columns - ol->text_len : 0;
+    return MIN(ol->xstart, xstart);
+}
+
 static void
 screen_draw_overlay_line(Screen *self) {
     if (!self->overlay_line.overlay_text) return;
@@ -5483,9 +5533,7 @@ screen_draw_overlay_line(Screen *self) {
     // Line instead). Without this, line->cpu_cells can be NULL or stale,
     // crashing the cell loops below.
     linebuf_init_line(self->linebuf, self->overlay_line.ynum);
-    // Right-align the overlay to ensure that the pre-edit text just entered is visible when the cursor is near the end of the line.
-    index_type xstart = self->overlay_line.text_len <= self->columns ? self->columns - self->overlay_line.text_len : 0;
-    if (self->overlay_line.xstart < xstart) xstart = self->overlay_line.xstart;
+    const index_type xstart = screen_overlay_line_start(self);
     index_type columns_exceeded = self->overlay_line.text_len <= self->columns ? 0 : self->overlay_line.text_len - self->columns;
     bool orig_line_wrap_mode = self->modes.mDECAWM;
     bool orig_cursor_enable_mode = self->modes.mDECTCEM;
@@ -5612,9 +5660,10 @@ render_overlay_line(Screen *self, Line *line, FONTS_DATA_HANDLE fonts_data) {
     line_save_cells(line, 0, line->xnum, ol.gpu_cells, ol.cpu_cells);
     line_reset_cells(line, 0, line->xnum, ol.original_line.gpu_cells, ol.original_line.cpu_cells);
     ol.is_dirty = false;
-    const index_type y = MIN(ol.ynum + self->scrolled_by, self->lines - 1);
-    if (ol.last_ime_pos.x != ol.cursor_x || ol.last_ime_pos.y != y) {
-        ol.last_ime_pos.x = ol.cursor_x;
+    const index_type x = screen_overlay_line_start(self), y = MIN(ol.ynum + self->scrolled_by, self->lines - 1);
+    // The IME is anchored at the start of the pre-edit text, see prepare_ime_position_update_event()
+    if (ol.last_ime_pos.x != x || ol.last_ime_pos.y != y) {
+        ol.last_ime_pos.x = x;
         ol.last_ime_pos.y = y;
         update_ime_position_for_window(self->window_id, false, 0);
     }
@@ -6475,7 +6524,9 @@ screen_selection_range_for_word(
 
 void
 screen_history_scroll_to_absolute(Screen *self, double target_scrolled_by) {
-    if (self->linebuf != self->main_linebuf) return;
+    if (self->linebuf != self->main_linebuf || isnan(target_scrolled_by)) return;
+    if (target_scrolled_by < 0) target_scrolled_by = 0;
+    if (target_scrolled_by > self->historybuf->count) target_scrolled_by = self->historybuf->count;
     index_type target_scrolled_by_line = (index_type)target_scrolled_by;
     unsigned pixel_scroll_offset_y = (unsigned)((target_scrolled_by - target_scrolled_by_line) * self->cell_size.height);
     if (!OPT(pixel_scroll)) pixel_scroll_offset_y = 0;
@@ -6488,12 +6539,10 @@ screen_history_scroll_to_absolute(Screen *self, double target_scrolled_by) {
     }
 }
 
-bool
-screen_apply_pixel_scroll(Screen *self, double delta_pixels) {
-    if (!pixel_scroll_enabled(self)) return false;
-    if (!self->historybuf->count) return false;
+static bool
+scroll_by_pixels(Screen *self, double delta_pixels) {
     const double cell_height = (double)self->cell_size.height;
-    if (cell_height <= 0.0 || delta_pixels == 0.0) return false;
+    if (cell_height <= 0.0 || delta_pixels == 0.0 || isnan(delta_pixels)) return false;
 
     double total = self->pixel_scroll_offset_y + (double)self->scrolled_by * cell_height + delta_pixels;
     const double max_total = (double)self->historybuf->count * cell_height;
@@ -6513,6 +6562,13 @@ screen_apply_pixel_scroll(Screen *self, double delta_pixels) {
     }
     if (changed) dirty_scroll(self);
     return changed;
+}
+
+bool
+screen_apply_pixel_scroll(Screen *self, double delta_pixels) {
+    if (!pixel_scroll_enabled(self)) return false;
+    if (!self->historybuf->count) return false;
+    return scroll_by_pixels(self, delta_pixels);
 }
 
 bool
@@ -6539,51 +6595,23 @@ screen_history_scroll(Screen *self, int amt, bool upwards) {
 
 static bool
 screen_fractional_scroll(Screen *self, double amt) {
-    if (amt == 0) return false;
-    index_type before_scrolled_by = self->scrolled_by;
-    double before_pixels = self->pixel_scroll_offset_y;
+    if (amt == 0 || isnan(amt)) return false;
     double integral_part, fractional_part = modf(amt, &integral_part);
-    int lines = (int)integral_part;
-    int pixels = (int)(fractional_part * self->cell_size.height);
-    if (amt > 0) { // downwards
-        if (fractional_part != 0) pixels = MAX(1, pixels);
-        if (lines > (int)self->scrolled_by) {
-            self->scrolled_by = 0;
-            self->pixel_scroll_offset_y = 0;
-        } else {
-            self->scrolled_by -= lines;
-            if (pixels <= (int)self->pixel_scroll_offset_y) self->pixel_scroll_offset_y -= pixels;
-            else {
-                self->pixel_scroll_offset_y = 0;
-                if (self->scrolled_by) {
-                    self->scrolled_by--;
-                    self->pixel_scroll_offset_y = self->cell_size.height - pixels;
-                }
-            }
-        }
-    } else {
-        if (fractional_part != 0) pixels = MIN(-1, pixels);
-        self->pixel_scroll_offset_y -= pixels; // pixels is negative
-        if (self->pixel_scroll_offset_y >= self->cell_size.height) {
-            self->pixel_scroll_offset_y = 0;
-            self->scrolled_by++;
-        }
-        self->scrolled_by = MIN(self->scrolled_by - lines, self->historybuf->count);
-        if (self->scrolled_by >= self->historybuf->count) self->pixel_scroll_offset_y = 0;
-    }
-    if (self->scrolled_by != before_scrolled_by || self->pixel_scroll_offset_y != before_pixels) {
-        dirty_scroll(self);
-        return true;
-    }
-    return false;
+    double pixels = trunc(fractional_part * self->cell_size.height);
+    if (fractional_part > 0) pixels = MAX(1, pixels);
+    else if (fractional_part < 0) pixels = MIN(-1, pixels);
+    // positive amt scrolls towards the bottom
+    return scroll_by_pixels(self, -(integral_part * self->cell_size.height + pixels));
 }
 
 static PyObject *
 fractional_scroll(Screen *self, PyObject *amt) {
     double y;
     if (PyFloat_Check(amt)) y = PyFloat_AS_DOUBLE(amt);
-    else if (PyLong_Check(amt)) y = PyLong_AsDouble(amt);
-    else {
+    else if (PyLong_Check(amt)) {
+        y = PyLong_AsDouble(amt);
+        if (y == -1.0 && PyErr_Occurred()) return NULL;
+    } else {
         PyErr_SetString(PyExc_TypeError, "amt must be a float");
         return NULL;
     }
@@ -6594,8 +6622,10 @@ static PyObject *
 scroll_to_absolute(Screen *self, PyObject *amt) {
     double y;
     if (PyFloat_Check(amt)) y = PyFloat_AS_DOUBLE(amt);
-    else if (PyLong_Check(amt)) y = PyLong_AsDouble(amt);
-    else {
+    else if (PyLong_Check(amt)) {
+        y = PyLong_AsDouble(amt);
+        if (y == -1.0 && PyErr_Occurred()) return NULL;
+    } else {
         PyErr_SetString(PyExc_TypeError, "amt must be a number");
         return NULL;
     }
@@ -7478,7 +7508,7 @@ scroll_prompt_to_bottom(Screen *self, PyObject *args UNUSED) {
 static void
 dump_line_with_attrs(Screen *self, int y, PyObject *accum) {
     Line *line = range_line_(self, y);
-    RAII_PyObject(u, PyUnicode_FromFormat("\x1b[31m%d: \x1b[39m", y++));
+    RAII_PyObject(u, PyUnicode_FromFormat("\x1b[31m%d: \x1b[39m", y));
     if (!u) return;
     RAII_PyObject(r1, PyObject_CallOneArg(accum, u));
     if (!r1) return;
@@ -7567,6 +7597,11 @@ test_create_write_buffer(Screen *screen UNUSED, PyObject *args UNUSED) {
     size_t s;
     uint8_t *buf = vt_parser_create_write_buffer(screen->vt_parser, &s);
     return PyMemoryView_FromMemory((char *)buf, s, PyBUF_WRITE);
+}
+
+static PyObject *
+overlay_line_start(Screen *self, PyObject *a UNUSED) {
+    return PyLong_FromUnsignedLong(screen_overlay_line_start(self));
 }
 
 static PyObject *
@@ -7709,8 +7744,9 @@ static PyMethodDef methods[] = {
     METHODB(test_commit_write_buffer, METH_VARARGS),
     METHODB(test_parse_written_data, METH_VARARGS),
     METHODB(test_draw_overlay_line, METH_VARARGS),
-    MND(line_edge_colors, METH_NOARGS) MND(ime_text_around_cursor, METH_NOARGS) MND(line, METH_O) MND(dump_lines_with_attrs, METH_VARARGS)
-        MND(cpu_cells, METH_VARARGS) MND(cursor_at_prompt, METH_NOARGS){"visual_line", (PyCFunction)pyvisual_line, METH_VARARGS, ""},
+    MND(overlay_line_start, METH_NOARGS) MND(line_edge_colors, METH_NOARGS) MND(ime_text_around_cursor, METH_NOARGS) MND(line, METH_O)
+        MND(dump_lines_with_attrs, METH_VARARGS) MND(cpu_cells, METH_VARARGS)
+            MND(cursor_at_prompt, METH_NOARGS){"visual_line", (PyCFunction)pyvisual_line, METH_VARARGS, ""},
     MND(current_url_text, METH_NOARGS) MND(draw, METH_O) MND(apply_sgr, METH_O) MND(cursor_position, METH_VARARGS) MND(erase_last_command, METH_NOARGS)
         MND(set_window_char, METH_VARARGS) MND(set_progress, METH_VARARGS) MND(set_mode, METH_VARARGS) MND(reset_mode, METH_VARARGS) MND(reset, METH_VARARGS)
             MND(reset_dirty, METH_NOARGS) MND(is_using_alternate_linebuf, METH_NOARGS) MND(is_main_linebuf, METH_NOARGS) MND(cursor_move, METH_VARARGS)
@@ -7796,6 +7832,7 @@ static PyGetSetDef getsetters[] = {
 
 static PyMemberDef members[] = {
     {"callbacks", T_OBJECT_EX, offsetof(Screen, callbacks), 0, "callbacks"},
+    {"track_activity", T_BOOL, offsetof(Screen, track_activity), 0, "track_activity"},
     {"cursor", T_OBJECT_EX, offsetof(Screen, cursor), READONLY, "cursor"},
     {"vt_parser", T_OBJECT_EX, offsetof(Screen, vt_parser), READONLY, "vt_parser"},
     {"last_reported_cwd", T_OBJECT, offsetof(Screen, last_reported_cwd), READONLY, "last_reported_cwd"},
@@ -7805,6 +7842,7 @@ static PyMemberDef members[] = {
     {"main_linebuf", T_OBJECT_EX, offsetof(Screen, main_linebuf), READONLY, "main_linebuf"},
     {"historybuf", T_OBJECT_EX, offsetof(Screen, historybuf), READONLY, "historybuf"},
     {"scrolled_by", T_UINT, offsetof(Screen, scrolled_by), READONLY, "scrolled_by"},
+    {"pixel_scroll_offset_y", T_UINT, offsetof(Screen, pixel_scroll_offset_y), READONLY, "pixel_scroll_offset_y"},
     {"lines", T_UINT, offsetof(Screen, lines), READONLY, "lines"},
     {"columns", T_UINT, offsetof(Screen, columns), READONLY, "columns"},
     {"margin_top", T_UINT, offsetof(Screen, margin_top), READONLY, "margin_top"},
@@ -7883,6 +7921,12 @@ py_test_wide_runfill_fast_class(PyObject *self UNUSED, PyObject *args UNUSED) {
     Py_RETURN_NONE;
 }
 
+static PyObject *
+test_set_history_reuse(PyObject *self UNUSED, PyObject *val) {
+    history_reuse_disabled_for_tests = !PyObject_IsTrue(val);
+    Py_RETURN_NONE;
+}
+
 static PyMethodDef module_methods[] = {
     {"is_emoji_presentation_base", (PyCFunction)screen_is_emoji_presentation_base, METH_O, ""},
     {"set_ascii_runfill_enabled", (PyCFunction)py_set_ascii_runfill_enabled, METH_O, ""},
@@ -7890,6 +7934,7 @@ static PyMethodDef module_methods[] = {
     {"test_wide_runfill_fast_class", (PyCFunction)py_test_wide_runfill_fast_class, METH_NOARGS, ""},
     {"truncate_point_for_length", (PyCFunction)screen_truncate_point_for_length, METH_VARARGS, ""},
     {"test_ch_and_idx", test_ch_and_idx, METH_O, ""},
+    {"test_set_history_reuse", test_set_history_reuse, METH_O, ""},
     {NULL} /* Sentinel */
 };
 

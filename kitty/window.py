@@ -101,6 +101,8 @@ from .fast_data_types import (
 from .keys import keyboard_mode_name, mod_mask
 from .notifications import NotificationManager
 from .options.types import Options
+from .options.utils import mouse_wheel_buttons
+from .program_status import ProgramStatus
 from .progress import Progress
 from .rgb import to_color
 from .terminfo import get_capabilities
@@ -292,6 +294,7 @@ class WindowDict(TypedDict):
     session_name: str
     needs_attention: bool
     has_activity_since_last_focus: bool
+    program_status: list[dict[str, Any]]
 
 
 class PipeData(TypedDict):
@@ -342,6 +345,7 @@ class Watchers:
     on_set_user_var: list[Watcher]
     on_title_change: list[Watcher]
     on_cmd_startstop: list[Watcher]
+    on_program_status_change: list[Watcher]
     on_color_scheme_preference_change: list[Watcher]
     on_tab_bar_dirty: list[Watcher]
     on_quit: list[Watcher]
@@ -353,6 +357,7 @@ class Watchers:
         self.on_set_user_var = []
         self.on_title_change = []
         self.on_cmd_startstop = []
+        self.on_program_status_change = []
         self.on_color_scheme_preference_change = []
         self.on_tab_bar_dirty = []
         self.on_quit = []
@@ -369,6 +374,7 @@ class Watchers:
         merge(self.on_set_user_var, others.on_set_user_var)
         merge(self.on_title_change, others.on_title_change)
         merge(self.on_cmd_startstop, others.on_cmd_startstop)
+        merge(self.on_program_status_change, others.on_program_status_change)
         merge(self.on_color_scheme_preference_change, others.on_color_scheme_preference_change)
         merge(self.on_tab_bar_dirty, others.on_tab_bar_dirty)
         merge(self.on_quit, others.on_quit)
@@ -376,6 +382,7 @@ class Watchers:
     def clear(self) -> None:
         del self.on_close[:], self.on_resize[:], self.on_focus_change[:]
         del self.on_set_user_var[:], self.on_title_change[:], self.on_cmd_startstop[:]
+        del self.on_program_status_change[:]
         del self.on_color_scheme_preference_change[:]
         del self.on_tab_bar_dirty[:]
         del self.on_quit[:]
@@ -388,6 +395,7 @@ class Watchers:
         ans.on_set_user_var = self.on_set_user_var[:]
         ans.on_title_change = self.on_title_change[:]
         ans.on_cmd_startstop = self.on_cmd_startstop[:]
+        ans.on_program_status_change = self.on_program_status_change[:]
         ans.on_color_scheme_preference_change = self.on_color_scheme_preference_change[:]
         ans.on_tab_bar_dirty = self.on_tab_bar_dirty[:]
         ans.on_quit = self.on_quit[:]
@@ -403,6 +411,7 @@ class Watchers:
             or self.on_set_user_var
             or self.on_title_change
             or self.on_cmd_startstop
+            or self.on_program_status_change
             or self.on_tab_bar_dirty
             or self.on_quit
         )
@@ -685,11 +694,11 @@ class EdgeWidths:
         if self.left is not None:
             yield f'--spacing={prefix}-left={self.left}'
         if self.right is not None:
-            yield f'--spacing={prefix}-left={self.right}'
+            yield f'--spacing={prefix}-right={self.right}'
         if self.top is not None:
-            yield f'--spacing={prefix}-left={self.top}'
+            yield f'--spacing={prefix}-top={self.top}'
         if self.bottom is not None:
-            yield f'--spacing={prefix}-left={self.bottom}'
+            yield f'--spacing={prefix}-bottom={self.bottom}'
 
 
 class GlobalWatchers:
@@ -699,20 +708,23 @@ class GlobalWatchers:
         self.extra = ''
 
     def __call__(self) -> Watchers:
-        spec = get_options().watcher
-        if spec == self.options_spec:
+        raw_spec = get_options().watcher
+        if raw_spec == self.options_spec:
             return self.ans
         from .launch import load_watch_modules
 
+        spec = raw_spec.copy()
         if self.extra:
-            spec = spec.copy()
             spec[self.extra] = self.extra
-        self.ans = load_watch_modules(spec.keys()) or self.ans
-        self.options_spec = spec.copy()
+        ans = load_watch_modules(spec.keys())
+        self.ans = Watchers() if ans is None else ans
+        self.options_spec = raw_spec.copy()
         return self.ans
 
     def set_extra(self, extra: str) -> None:
-        self.extra = extra
+        if extra != self.extra:
+            self.extra = extra
+            self.options_spec = None
 
 
 global_watchers = GlobalWatchers()
@@ -720,6 +732,7 @@ global_watchers = GlobalWatchers()
 
 class Window:
     window_custom_type: str = ''
+    is_resize_overlay: bool = False
     overlay_type = OverlayType.transient
     initial_ignore_focus_changes: bool = False
     initial_ignore_focus_changes_context_manager_in_operation: bool = False
@@ -766,6 +779,7 @@ class Window:
         self.last_focused_at = 0.0
         self.is_focused: bool = False
         self.progress = Progress()
+        self.program_status = ProgramStatus()
         self.clear_progress_timer: int = 0
         self.last_resized_at = 0.0
         self.started_at = monotonic()
@@ -812,6 +826,7 @@ class Window:
         cell_width, cell_height = cell_size_for_window(self.os_window_id)
         opts = get_options()
         self.screen: Screen = Screen(self, 24, 80, opts.scrollback_lines, cell_width, cell_height, self.id)
+        self.screen.track_activity = bool(opts.tab_activity_symbol)
         if copy_colors_from is not None:
             self.screen.copy_colors_from(copy_colors_from.screen)
         self.remote_control_passwords = remote_control_passwords
@@ -901,6 +916,7 @@ class Window:
 
     def apply_options(self, is_active: bool) -> None:
         self.update_effective_padding()
+        self.screen.track_activity = bool(get_options().tab_activity_symbol)
         self.screen.color_profile.reload_from_opts()
 
     @property
@@ -1416,12 +1432,18 @@ class Window:
 
     def on_mouse_event(self, event: dict[str, Any]) -> bool:
         event['mods'] = event.get('mods', 0) & mod_mask
+        steps = 1
+        if event['button'] in mouse_wheel_buttons:  # repeat_count is the number of wheel steps
+            steps, event['repeat_count'] = event['repeat_count'], 1
         ev = MouseEvent(**event)
         self.current_mouse_event_button = ev.button
         action = get_options().mousemap.get(ev)
         if action is None:
             return False
-        return get_boss().combine(action, window_for_dispatch=self, dispatch_type='MouseEvent')
+        handled = False
+        for _step in range(steps):
+            handled = get_boss().combine(action, window_for_dispatch=self, dispatch_type='MouseEvent') or handled
+        return handled
 
     def drag_thumbnails(self, label: str) -> tuple[tuple[bytes, int, int], ...]:
         # Render label as a single line of text, clipped to the width of this window
@@ -1560,6 +1582,7 @@ class Window:
         if focused:
             self.last_focused_at = monotonic()
             update_ime_position_for_window(self.id, False, 1)
+            self.program_status_seen_by_user()
             changed = self.needs_attention
             self.needs_attention = False
             if changed:
@@ -1585,6 +1608,30 @@ class Window:
 
     def osc_context(self, ctx_data: memoryview) -> None:
         pass  # this is systemd's useless OSC 3008 context protocol https://systemd.io/OSC_CONTEXT/
+
+    def program_status_report(self, raw_data: memoryview) -> None:
+        # OSC 7501 https://www.superlogical.com/rex/docs/build/program-status
+        from .program_status import InvalidReport
+
+        try:
+            reply, changed = self.program_status.handle_escape_code(raw_data)
+        except InvalidReport as e:
+            log_error(f'Ignoring invalid OSC 7501 program status report: {e}')
+            return
+        if reply:
+            self.screen.send_escape_code_to_child(ESC_OSC, reply)
+        if changed:
+            self.program_status_changed()
+
+    def program_status_seen_by_user(self) -> None:
+        if self.program_status.on_seen_by_user():
+            self.program_status_changed()
+
+    def program_status_changed(self) -> None:
+        if self.watchers.on_program_status_change:
+            self.call_watchers(self.watchers.on_program_status_change, {'program_status': self.program_status.as_list()})
+        if (tab := self.tabref()) is not None:
+            tab.mark_tab_bar_dirty()
 
     def icon_changed(self, new_icon: memoryview) -> None:
         pass  # TODO: Implement this
@@ -1639,6 +1686,8 @@ class Window:
     def on_reset(self, is_hard_reset: bool = True) -> None:
         from .progress import ProgressState
 
+        if is_hard_reset and self.program_status.clear():
+            self.program_status_changed()
         if self.progress.state is not ProgressState.unset:
             self.progress.update(0)  # unset
             if (tab := self.tabref()) is not None:
@@ -2004,6 +2053,8 @@ class Window:
             self.last_cmd_cmdline = cmdline
             self.call_watchers(self.watchers.on_cmd_startstop, {'is_start': True, 'time': start_time, 'cmdline': cmdline, 'exit_status': 0})
         else:
+            if is_start is False and self.program_status.on_process_exit_or_prompt():  # a new shell prompt
+                self.program_status_changed()
             self.handle_cmd_end(cmdline)
 
     # }}}
@@ -2124,6 +2175,7 @@ class Window:
         self.clipboard_request_manager.close()
         del self.kitten_result_processors
         if hasattr(self, 'screen'):
+            self.finish_scroll_animation()
             if self.is_active and self.os_window_id == current_focused_os_window_id():
                 # Cancel IME composition when window is destroyed
                 update_ime_position_for_window(self.id, False, -1)
@@ -2371,6 +2423,7 @@ class Window:
             'session_name': self.created_in_session_name,
             'needs_attention': self.needs_attention,
             'has_activity_since_last_focus': self.has_activity_since_last_focus,
+            'program_status': self.program_status.as_list(),
         }
 
     def serialize_state(self) -> dict[str, Any]:

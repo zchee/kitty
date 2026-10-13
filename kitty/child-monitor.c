@@ -21,6 +21,7 @@
 #include <sys/un.h>
 #include <signal.h>
 #include <stdatomic.h>
+#include <limits.h>
 extern PyTypeObject Screen_Type;
 
 // Phase 4 (L5): host time of the last local key input, stamped on the main thread
@@ -474,6 +475,24 @@ add_child(ChildMonitor *self, PyObject *args) {
 
 static const unsigned write_buf_limit = 100 * 1024 * 1024;
 
+static bool
+ensure_write_buf_space(Screen *screen, size_t sz, size_t limit) {
+    if (screen->write_buf_sz - screen->write_buf_used >= sz) return true;
+    const size_t pending = screen->write_buf_used - screen->write_buf_start;
+    if (pending + sz > limit) return false;
+    if (screen->write_buf_start) {
+        memmove(screen->write_buf, screen->write_buf + screen->write_buf_start, pending);
+        screen->write_buf_start = 0;
+        screen->write_buf_used = pending;
+    }
+    if (screen->write_buf_sz - pending < sz) {
+        screen->write_buf_sz = pending + sz;
+        screen->write_buf = PyMem_RawRealloc(screen->write_buf, screen->write_buf_sz);
+        if (screen->write_buf == NULL) { fatal("Out of memory."); }
+    }
+    return true;
+}
+
 // W28.2 B2 — direct key write (KITTY_DIRECT_KEY_WRITE, default OFF). Skips
 // the io-thread hop (wakeup -> poll -> write_to_child) for keystroke-sized
 // payloads by issuing the nonblocking write(2) inline at the scheduling
@@ -558,16 +577,10 @@ try_direct_write(Child *child, Screen *screen, bool allow_direct, size_t payload
         if (children[i].id == id) { \
             Screen *screen = children[i].screen; \
             screen_mutex(lock, write); \
-            size_t space_left = screen->write_buf_sz - screen->write_buf_used; \
-            if (space_left < sz) { \
-                if (screen->write_buf_used + sz > write_buf_limit) { \
-                    too_much_data = true; \
-                    screen_mutex(unlock, write); \
-                    break; \
-                } \
-                screen->write_buf_sz = screen->write_buf_used + sz; \
-                screen->write_buf = PyMem_RawRealloc(screen->write_buf, screen->write_buf_sz); \
-                if (screen->write_buf == NULL) { fatal("Out of memory."); } \
+            if (!ensure_write_buf_space(screen, sz, write_buf_limit)) { \
+                too_much_data = true; \
+                screen_mutex(unlock, write); \
+                break; \
             } \
             found = true; \
             va_start(ap, num); \
@@ -600,16 +613,10 @@ schedule_write_to_child_if_possible(id_type id, const char *data, size_t sz, boo
         if (children[i].id == id) {
             Screen *screen = children[i].screen;
             screen_mutex(lock, write);
-            size_t space_left = screen->write_buf_sz - screen->write_buf_used;
-            if (space_left < sz) {
-                if (screen->write_buf_used + sz > limit) {
-                    *too_much_data = true;
-                    screen_mutex(unlock, write);
-                    break;
-                }
-                screen->write_buf_sz = screen->write_buf_used + sz;
-                screen->write_buf = PyMem_RawRealloc(screen->write_buf, screen->write_buf_sz);
-                if (screen->write_buf == NULL) { fatal("Out of memory."); }
+            if (!ensure_write_buf_space(screen, sz, limit)) {
+                *too_much_data = true;
+                screen_mutex(unlock, write);
+                break;
             }
             *found = true;
             memcpy(screen->write_buf + screen->write_buf_used, data, sz);
@@ -1537,6 +1544,29 @@ change_menubar_title(PyObject *title UNUSED) {
 #endif
 }
 
+static void
+sync_ime_position_with_cursor(OSWindow *os_window, Window *w) {
+    // Key presses update the IME position but cursor motion caused by child
+    // output, such as the echo of text committed by the IME, does not. Without
+    // this the next composition starts with a stale anchor and its candidate
+    // window flashes at the old position before jumping to the cursor.
+    Screen *screen = w->render_data.screen;
+    OverlayLine *ol = &screen->overlay_line;
+    if (screen_is_overlay_active(screen)) {
+        // During a composition the IME is anchored to the pre-edit text, see
+        // render_overlay_line(), so resync with the cursor once it ends.
+        ol->last_ime_cursor.valid = false;
+        return;
+    }
+    const index_type x = screen->cursor->x, y = screen->cursor->y;
+    if (ol->last_ime_cursor.valid && ol->last_ime_cursor.x == x && ol->last_ime_cursor.y == y) return;
+    ol->last_ime_cursor.x = x;
+    ol->last_ime_cursor.y = y;
+    ol->last_ime_cursor.valid = true;
+    // Redundant updates are dropped by the platform backends
+    update_ime_state_in_os_window(os_window, w, 0);
+}
+
 static bool
 prepare_to_render_os_window(
     OSWindow *os_window,
@@ -1639,6 +1669,7 @@ prepare_to_render_os_window(
                 *active_window_id = w->id;
                 if (collect_cursor_info(&WD.screen->cursor_render_info, w, now, os_window)) needs_render = true;
                 WD.screen->cursor_render_info.is_focused = os_window->is_focused;
+                if (global_state.ime_used && os_window->is_focused) sync_ime_position_with_cursor(os_window, w);
                 set_os_window_title_from_window(w, os_window);
                 *active_window_bg = window_bg;
                 if (OPT(cursor_trail)) {
@@ -2322,17 +2353,7 @@ render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images, bo
         }
 #else
         const bool stale = !nreq && no_render_frame_received_recently(w, now, ms_to_monotonic_t(250ll));
-        if (nreq || stale) {
-            if (w->render_state == RENDER_FRAME_REQUESTED) {
-                // The previously registered wl_surface.frame callback was lost (e.g. the
-                // wl_output was removed when the monitor went to sleep). Reset so that
-                // request_frame_render() can re-register it; touching
-                // last_render_frame_received_at rate-limits the retry to ~250 ms.
-                w->render_state = RENDER_FRAME_NOT_REQUESTED;
-                w->last_render_frame_received_at = now;
-            }
-            request_frame_render(w);
-        }
+        if (nreq || stale) request_frame_render(w);
 #endif
         if (!stall_rescue && w->id != global_state.thumbnail_callback.os_window) {
             // dont respect render frames soon after a resize on Wayland as they cause flicker because
@@ -3792,19 +3813,18 @@ print_text(const unsigned char *text, ssize_t sz) {
 
 static void
 write_to_child(int fd, Screen *screen) {
-    size_t written = 0;
     ssize_t ret = 0;
     screen_mutex(lock, write);
-    while (written < screen->write_buf_used) {
-        ret = write(fd, screen->write_buf + written, screen->write_buf_used - written);
+    while (screen->write_buf_start < screen->write_buf_used) {
+        ret = write(fd, screen->write_buf + screen->write_buf_start, screen->write_buf_used - screen->write_buf_start);
 #ifdef KITTY_PRINT_BYTES_SENT_TO_CHILD
         fprintf(stderr, "Wrote: %zd bytes: ", ret);
 #endif
         if (ret > 0) {
 #ifdef KITTY_PRINT_BYTES_SENT_TO_CHILD
-            print_text(screen->write_buf + written, ret);
+            print_text(screen->write_buf + screen->write_buf_start, ret);
 #endif
-            written += ret;
+            screen->write_buf_start += ret;
         } else if (ret == 0) {
             // could mean anything, ignore
             break;
@@ -3812,15 +3832,19 @@ write_to_child(int fd, Screen *screen) {
             if (errno == EINTR) continue;
             if (errno == EWOULDBLOCK || errno == EAGAIN) break;
             perror("Call to write() to child fd failed, discarding data.");
-            written = screen->write_buf_used;
+            screen->write_buf_start = screen->write_buf_used;
         }
 #ifdef KITTY_PRINT_BYTES_SENT_TO_CHILD
         fprintf(stderr, "\n");
 #endif
     }
-    if (written) {
-        screen->write_buf_used -= written;
-        if (screen->write_buf_used) { memmove(screen->write_buf, screen->write_buf + written, screen->write_buf_used); }
+    const size_t pending = screen->write_buf_used - screen->write_buf_start;
+    if (!pending) screen->write_buf_start = screen->write_buf_used = 0;
+    else if (screen->write_buf_start > pending) {
+        // compact lazily to keep large pastes linear
+        memmove(screen->write_buf, screen->write_buf + screen->write_buf_start, pending);
+        screen->write_buf_start = 0;
+        screen->write_buf_used = pending;
     }
     screen_mutex(unlock, write);
 }
@@ -3927,7 +3951,7 @@ io_loop(void *data) {
         if (has_pending_wakeups) {
             now = monotonic();
             monotonic_t time_delta = OPT(input_delay) - (now - last_main_loop_wakeup_at);
-            if (time_delta >= 0) TIMED_POLL(children_fds, self->count + EXTRA_FDS + pump_out_count, monotonic_t_to_ms(time_delta));
+            if (time_delta >= 0) TIMED_POLL(children_fds, self->count + EXTRA_FDS + pump_out_count, monotonic_t_to_ms_ceil(time_delta));
             else ret = 0;
         } else {
             TIMED_POLL(children_fds, self->count + EXTRA_FDS + pump_out_count, -1);
@@ -4128,6 +4152,9 @@ add_peer(int peer, bool is_remote_control_peer) {
         Peer *p = talk_data.peers + talk_data.num_peers++;
         memset(p, 0, sizeof(Peer));
         p->fd = peer;
+        // MSG_DONTWAIT still blocks on macOS
+        int flags = fcntl(peer, F_GETFL);
+        if (flags != -1) fcntl(peer, F_SETFL, flags | O_NONBLOCK);
         p->id = ++peer_id_counter;
         if (!p->id) p->id = ++peer_id_counter;
         ans = p->id;
@@ -4139,14 +4166,42 @@ add_peer(int peer, bool is_remote_control_peer) {
     return ans;
 }
 
+static atomic_int injected_accept_failures = 0; // testing only
+static bool accept_error_logged = false;
+
+static PyObject *
+fail_next_accepts(PyObject *s UNUSED, PyObject *a) {
+#define fail_next_accepts_doc "fail_next_accepts(n) -> make the next n talk thread accepts fail for testing"
+    long n = PyLong_AsLong(a);
+    if (n == -1 && PyErr_Occurred()) return NULL;
+    if (n > INT_MAX) n = INT_MAX;
+    const int prev = n >= 0 ? atomic_exchange(&injected_accept_failures, (int)n) : atomic_load(&injected_accept_failures);
+    return PyLong_FromLong(prev);
+}
+
 static bool
 accept_peer(int listen_fd, bool shutting_down, bool is_remote_control_peer, bool verify_peer_uid) {
-    int peer = accept(listen_fd, NULL, NULL);
-    if (UNLIKELY(peer == -1)) {
-        if (errno == EINTR) return true;
-        if (!shutting_down) perror("accept() on talk socket failed!");
-        return false;
+    int peer = -1, err = 0;
+    int injected = atomic_load_explicit(&injected_accept_failures, memory_order_relaxed);
+    while (UNLIKELY(injected > 0) && !atomic_compare_exchange_weak(&injected_accept_failures, &injected, injected - 1));
+    if (UNLIKELY(injected > 0)) err = EMFILE;
+    if (!err) {
+        peer = accept(listen_fd, NULL, NULL);
+        if (peer == -1) err = errno;
     }
+    if (UNLIKELY(peer == -1)) {
+        if (err == EINTR) return true;
+        if (shutting_down || err == EBADF || err == EINVAL || err == ENOTSOCK) return false;
+        if (!accept_error_logged) log_error("accept() on talk socket failed with error: %s", strerror(err));
+        accept_error_logged = true;
+        if (err != ECONNABORTED && err != EAGAIN && err != EWOULDBLOCK) {
+            // the pending connection was not consumed, avoid spinning on a readable listener
+            struct timespec ts = {.tv_nsec = 50 * 1000000};
+            nanosleep(&ts, NULL);
+        }
+        return true;
+    }
+    accept_error_logged = false;
     if (verify_peer_uid) {
         uid_t peer_uid;
         gid_t peer_gid;
@@ -4163,7 +4218,9 @@ accept_peer(int listen_fd, bool shutting_down, bool is_remote_control_peer, bool
             return true;
         }
     }
+    talk_mutex(lock);
     add_peer(peer, is_remote_control_peer);
+    talk_mutex(unlock);
     return true;
 }
 
@@ -4268,7 +4325,7 @@ read_from_peer(ChildMonitor *self, Peer *peer) {
         peer->read.used = 0;
         peer->read.capacity = 0;
     } else if (n < 0) {
-        if (errno != EINTR) failed(strerror(errno));
+        if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) failed(strerror(errno));
     } else {
         peer->read.used += n;
         while (has_complete_peer_command(peer)) dispatch_peer_command(self, peer);
@@ -4285,7 +4342,7 @@ write_to_peer(Peer *peer) {
         peer->write.used = 0;
         peer->write.failed = true;
     } else if (n < 0) {
-        if (errno != EINTR) {
+        if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
             log_error("write() to peer socket failed with error: %s", strerror(errno));
             peer->write.used = 0;
             peer->write.failed = true;
@@ -4434,8 +4491,12 @@ talk_loop(void *data) {
     }
 end:
     free_loop_data(&talk_data.loop_data);
+    talk_mutex(lock);
     for (size_t i = 0; i < talk_data.num_peers; i++) free_peer(talk_data.peers + i);
     free(talk_data.peers);
+    talk_data.peers = NULL;
+    talk_data.num_peers = talk_data.peers_capacity = 0;
+    talk_mutex(unlock);
     return 0;
 }
 
@@ -4473,9 +4534,9 @@ send_response_to_peer(id_type peer_id, const char *msg, size_t msg_sz, bool is_a
 
 // Boilerplate {{{
 static PyMethodDef methods[] = {
-    METHOD(add_child, METH_VARARGS) METHOD(inject_peer, METH_O) METHOD(needs_write, METH_VARARGS) METHOD(start, METH_NOARGS) METHOD(wakeup, METH_NOARGS)
-        METHOD(shutdown_monitor, METH_NOARGS) METHOD(main_loop, METH_NOARGS) METHOD(mark_for_close, METH_VARARGS) METHOD(resize_pty, METH_VARARGS)
-            METHODB(handled_signals, METH_NOARGS),
+    METHOD(add_child, METH_VARARGS) METHOD(inject_peer, METH_O) METHOD(fail_next_accepts, METH_O) METHOD(needs_write, METH_VARARGS) METHOD(start, METH_NOARGS)
+        METHOD(wakeup, METH_NOARGS) METHOD(shutdown_monitor, METH_NOARGS) METHOD(main_loop, METH_NOARGS) METHOD(mark_for_close, METH_VARARGS)
+            METHOD(resize_pty, METH_VARARGS) METHODB(handled_signals, METH_NOARGS),
     METHOD(set_wakeup_fd, METH_VARARGS) METHOD(parse_input_once, METH_NOARGS){"set_iutf8_winid", (PyCFunction)pyset_iutf8, METH_VARARGS, ""},
     {NULL} /* Sentinel */
 };

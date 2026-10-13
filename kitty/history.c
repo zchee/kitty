@@ -190,7 +190,7 @@ index_of(HistoryBuf *self, index_type lnum) {
 
 static bool
 hb_line_is_continued(HistoryBuf *self, index_type num) {
-    if (num == 0) {
+    if (num == self->start_of_data) {
         size_t sz;
         if (self->pagerhist && self->pagerhist->ringbuf && (sz = ringbuf_bytes_used(self->pagerhist->ringbuf)) > 0) {
             size_t pos = ringbuf_findchr(self->pagerhist->ringbuf, '\n', sz - 1);
@@ -198,7 +198,7 @@ hb_line_is_continued(HistoryBuf *self, index_type num) {
         }
         return false;
     }
-    return cpu_lineptr(self, num - 1)[self->xnum - 1].next_char_was_wrapped;
+    return cpu_lineptr(self, (num + self->ynum - 1) % self->ynum)[self->xnum - 1].next_char_was_wrapped;
 }
 
 static void
@@ -739,10 +739,9 @@ historybuf_next_dest_line(HistoryBuf *self, ANSIBuf *as_ansi_buf, Line *src_line
     historybuf_share_retire(self, idx);  // Wave-25: dest_line is written by the caller
     *attrptr(self, idx) = src_line->attrs;
     init_line(self, idx, dest_line);
-    if (needs_clear) {
-        zero_at_ptr_count(dest_line->cpu_cells, dest_line->xnum);
-        zero_at_ptr_count(dest_line->gpu_cells, dest_line->xnum);
-    }
+    // the slot may hold a stale line past the count a fast rewrap kept
+    zero_at_ptr_count(dest_line->cpu_cells, dest_line->xnum);
+    zero_at_ptr_count(dest_line->gpu_cells, dest_line->xnum);
     return dest_y + 1;
 }
 
@@ -804,9 +803,12 @@ historybuf_finish_rewrap(HistoryBuf *dest, HistoryBuf *src) {
 }
 
 void
-historybuf_fast_rewrap(HistoryBuf *dest, HistoryBuf *src) {
-    // per-line: slot ids must not cross pools, so content is copied into
-    // the dest's own slots (same total bytes as the old segment memcpys)
+historybuf_fast_rewrap(HistoryBuf *dest, HistoryBuf *src, index_type count, bool steal) {
+    // dest must have been created by historybuf_alloc_for_rewrap() with the same width as src.
+    // Slot ids must not cross pools, so content is always copied into the
+    // dest's own slots and src is left intact even when the caller allows
+    // stealing its storage.
+    (void)steal;
     const bool clip = consumer_tail_clip_enabled();
     for (index_type i = 0; i < src->positions_allocated; i++) {
         memcpy(cpu_lineptr(dest, i), cpu_lineptr(src, i), (size_t)src->xnum * sizeof(CPUCell));
@@ -824,7 +826,7 @@ historybuf_fast_rewrap(HistoryBuf *dest, HistoryBuf *src) {
             da->is_blank = 0;
         }
     }
-    dest->count = src->count;
+    dest->count = MIN(count, src->count);
     dest->start_of_data = src->start_of_data;
 }
 
@@ -839,7 +841,7 @@ rewrap(HistoryBuf *self, PyObject *args) {
     RAII_PyObject(cleanup, (PyObject *)dummy);
     (void)cleanup;
     TrackCursor cursors[1] = {{.is_sentinel = true}};
-    ResizeResult r = resize_screen_buffers(dummy, self, 8, xnum, &as_ansi_buf, cursors);
+    ResizeResult r = resize_screen_buffers(dummy, self, HISTORY_PRESERVE, 8, xnum, &as_ansi_buf, cursors);
     free(as_ansi_buf.buf);
     if (!r.ok) return PyErr_NoMemory();
     Py_CLEAR(r.lb);

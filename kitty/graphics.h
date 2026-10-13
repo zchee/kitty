@@ -128,7 +128,7 @@ typedef struct {
     bool root_frame_data_loaded;
     id_type ref_id_counter;
     Frame *extra_frames, root_frame;
-    uint32_t current_frame_index, frame_id_counter;
+    uint32_t current_frame_index, frame_id_counter, displayed_frame_id;
     // G3-lite: id of the frame whose fully-coalesced pixels currently live in the
     // GPU texture. When the next frame is a non-blended delta on exactly this
     // frame, only its delta rect needs uploading (SubImage) rather than a full
@@ -215,6 +215,8 @@ typedef struct {
     int32_t amt, limit;
     index_type margin_top, margin_bottom;
     bool has_margins;
+    // The history scrolls with the screen: lines move into it (amt < 0) or are popped back from it (amt > 0)
+    bool scroll_history;
 } ScrollData;
 
 
