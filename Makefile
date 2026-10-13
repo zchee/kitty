@@ -15,7 +15,7 @@ APP_TARGET ?= $(join $(addsuffix /,${APPLICATIONS_DIR}), $(APP))
 
 IDENTITY ?= $(shell security find-identity -v | grep 'Apple Development' | awk -F'"' '{print $$2}')
 
-PYTHON3 ?= PYTHONUNBUFFERED=1 PYTHONOPTIMIZE=2 python3.14
+PYTHON3 ?= PYTHONUNBUFFERED=1 PYTHONOPTIMIZE=2 python3.15
 
 default: devel
 
