@@ -278,8 +278,6 @@ Detailed list of changes
 - choose-files kitten: Fix switching between file filters made up of multiple
   patterns that share the same first pattern not updating the results
 
-- Fix a non-zero :opt:`input_delay` painting once before delayed program output is parsed and again when it is parsed, so it could use more CPU than :opt:`input_delay` ``0``
-
 - Linux/BSD: Detect MIME types for :doc:`open actions <open_actions>` and
   kittens using the fast binary shared-mime-info cache
   (:file:`mime/mime.cache`), matching the MIME types used by the rest of the
